@@ -9,7 +9,7 @@
 namespace hyper {
 
 constexpr int MOE_MAX_USED = 16;
-constexpr int MOE_BULK_ROWS = 512;   // prefill chunk
+constexpr int MOE_BULK_ROWS = 2048;  // prefill chunk
 
 // ---- hyper-connections (hc streams of n) ----
 // xn[t][s*n + e] = res[t][s*n + e] * rsqrt(mean_e res[t][s*n + e]^2 + eps) * w[s*n + e]

@@ -170,3 +170,22 @@ Pozor: QSA (sparse attention nad ~2k tokenů) zatím chybí → výsledky jsou p
   se prompt 64/64 identických; prodloužený se rozejde po 16 tokenech (jiné dělení chunků → GEMV vs GEMM numerika).
 - `~/run-hyper-fn.sh` (tmux hyper, :8080): ctx 131072, 65 % expertů na GPU → dekódování ~49 t/s (T=1,0).
   TODO: rozdělení attention po kv hlavách (GPU1 drží obě kv hlavy → méně místa na experty), MTP, překrytí CPU/GPU.
+
+## hyper4 – plný kontext 262k, prefill na reálném textu
+
+Pozor na benchmark: `pfbench` s opakovanými tokeny (ref2 × N) soustředí routing na pár (horkých) expertů → nereálně
+rychlé. Reálný text (`HYPER4_PFREAL=1`, ref6 = 12k tokenů zdrojáků/deníku) zasáhne skoro všechny studené experty v RAM.
+Server na promptu z opencode ukázal ~190 t/s (131k kontext, 65 % expertů na GPU, kalibrace z jiného textu).
+
+| Změna | prefill t/s (reálný text 8k) |
+|---|---|
+| CPU experty, chunk 512 | 790–820 |
+| streamování studených expertů na GPU (pinned, podíl podle PCIe 2:1:2, 2 staging buffery, upload l+2 během l), chunk 512 | 643–662 (každý chunk přenese ~22 GB) |
+| chunk 2048, CPU experty | 1144–1210 |
+| chunk 2048, streamování | **1271–1357** |
+| server, 21k tokenů reálného textu | **1122** (předtím 528) |
+
+- Attention po kv hlavách (GPU0 bez attention → víc expertů; GPU1/2 jedna kv hlava = 3,2 GB KV při 262k)
+- Experty podle volné VRAM každé GPU (dvě fáze načítání) → 262k kontext: 132/103/100 expertů na vrstvu (65 %)
+- Server ukládá statistiky routingu po každém požadavku (`--expert-stats`, kumulativně) → při dalším startu
+  rozmístění podle skutečného používání.

@@ -53,6 +53,7 @@ struct Live {
 
 struct Ctx {
     Live live;
+    std::function<void()> after_request;
     SamplingParams defaults;
     LLM * eng = nullptr;
     llama_model * vm = nullptr;
@@ -240,6 +241,7 @@ GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::strin
         return true;
     }, r.sp);
     c.eng->set_prefill_progress({});
+    if (c.after_request) c.after_request();
     auto t2 = clk::now();
     if (first) t1 = t2;
     o.reused = st.prompt_reused;
@@ -325,7 +327,8 @@ int main(int argc, char ** argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s model.gguf [--host H] [--port P] [--ctx N] [--draft K] [--alias name]\n", argv[0]); return 1; }
     std::string host = "0.0.0.0", alias;
     int port = 8080, ctx = 262144, draft = 3, snaps = 48, cpu_threads = 30;
-    float gpu_frac = 0.65f;
+    float gpu_frac = 1.0f;
+    std::string stats_path;   // qwen4exp: routing statistics, read at start and updated after every request
     bool ctx_given = false;
     SamplingParams defaults;   // Qwen's recommendation for thinking mode
     defaults.temp = 0.6f; defaults.top_p = 0.95f; defaults.top_k = 20; defaults.min_p = 0.0f;
@@ -333,7 +336,7 @@ int main(int argc, char ** argv) {
         const std::string k = argv[i], v = argv[i + 1];
         if (k == "--host") host = v; else if (k == "--port") port = std::stoi(v); else if (k == "--ctx") { ctx = std::stoi(v); ctx_given = true; }
         else if (k == "--gpu-frac") gpu_frac = std::stof(v); else if (k == "--cpu-threads") cpu_threads = std::stoi(v);
-        else if (k == "--expert-stats") setenv("HYPER4_STATS", v.c_str(), 1);
+        else if (k == "--expert-stats") { setenv("HYPER4_STATS", v.c_str(), 1); stats_path = v; }
         else if (k == "--draft") draft = std::stoi(v); else if (k == "--alias") alias = v;
         else if (k == "--temp") defaults.temp = std::stof(v); else if (k == "--top-p") defaults.top_p = std::stof(v);
         else if (k == "--top-k") defaults.top_k = std::stoi(v); else if (k == "--min-p") defaults.min_p = std::stof(v);
@@ -366,7 +369,12 @@ int main(int argc, char ** argv) {
         o4.cpu_threads = cpu_threads;
         o4.prompt_cache = true;
         o4.max_snapshots = snaps;
-        engine = std::make_unique<Engine4>(path, o4);
+        auto e4 = std::make_unique<Engine4>(path, o4);
+        if (!stats_path.empty()) {
+            Engine4 * pe = e4.get();
+            c.after_request = [pe, stats_path] { pe->save_expert_stats(stats_path); };
+        }
+        engine = std::move(e4);
         draft = 0;
     } else {
         EngineOptions opt;

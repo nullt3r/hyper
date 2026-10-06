@@ -76,6 +76,8 @@ int main(int argc, char ** argv) {
     if (!read_ref(argv[3], toks, ref, nv)) return 1;
     Engine4Options opt;
     opt.prompt_cache = cmd == "cachetest";
+    if (getenv("HYPER4_NOSTREAM")) opt.stream_experts = false;
+    if (getenv("HYPER4_STREAM")) opt.stream_experts = true;
     opt.max_pos = getenv("HYPER_MAXPOS") ? atoi(getenv("HYPER_MAXPOS")) : 8192;
     if (argc > 5) opt.gpu_expert_frac = (float) atof(argv[5]);
     if (getenv("HYPER_CPU_THREADS")) opt.cpu_threads = atoi(getenv("HYPER_CPU_THREADS"));
@@ -178,8 +180,9 @@ int main(int argc, char ** argv) {
                    cmp.kl_sum / cmp.n, cmp.kl_max);
         } else if (cmd == "pfbench") {   // prompt of n tokens (reference tokens repeated): prefill speed, then 64 decoded tokens
             const int n = argc > 4 ? atoi(argv[4]) : 2048;
+            if (getenv("HYPER4_PFREAL") && (int) toks.size() < n) { fprintf(stderr, "reference too short for a real-text prompt\n"); return 1; }
             std::vector<int> prompt(n);
-            for (int i = 0; i < n; ++i) prompt[i] = toks[i % toks.size()];
+            for (int i = 0; i < n; ++i) prompt[i] = toks[i % toks.size()];   // HYPER4_PFREAL with a long reference: real text
             for (int rep = 0; rep < 2; ++rep) {
                 eng.reset();
                 auto t0 = std::chrono::steady_clock::now();
@@ -203,7 +206,7 @@ int main(int argc, char ** argv) {
             for (; p < P; p += 4) { const int nt = std::min(4, P - p); next = eng.forward(&toks[p], nt, p)[nt - 1]; }
             for (int i = 0; i < n_gen; ++i) next = eng.forward(&next, 1, p++)[0];
             const std::string out = argc > 6 ? argv[6] : "expert_stats.bin";
-            eng.save_expert_stats(out);
+            eng.save_expert_stats(out);   // (loaded statistics + this run)
             printf("CALIB %d prompt + %d generated tokens -> %s\n", P, n_gen, out.c_str());
         } else if (cmd == "bench") {
             const int n_gen = argc > 4 ? atoi(argv[4]) : 128;

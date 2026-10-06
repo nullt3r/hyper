@@ -18,7 +18,9 @@ namespace hyper {
 struct Engine4Options {
     int n_devices = 3;
     int max_pos = 8192;
-    float gpu_expert_frac = 0.6f;   // fraction of each layer's experts placed on the GPUs (rest on the CPU)
+    float gpu_expert_frac = 1.0f;   // cap on the fraction of each layer's experts on the GPUs (the rest: CPU)
+    float vram_reserve_gib = 0.8f;  // left free on every GPU after the experts
+    bool stream_experts = true;     // prefill: copy the CPU experts' weights to the GPUs instead of computing them on the CPU
     int cpu_threads = 30;
     bool prompt_cache = false;      // reuse the common prefix with the previous sequence (recurrent-state snapshots)
     int max_snapshots = 48;
@@ -66,13 +68,16 @@ public:
     int max_pos() const override { return opt_.max_pos; }
     int n_draft() const override { return 0; }
     bool has_mtp() const override { return false; }
-    void save_expert_stats(const std::string & path) { cpu_->save_stats(path); }
+    // routing statistics: the loaded ones plus what the CPU side has seen since (decode routing of every layer)
+    void save_expert_stats(const std::string & path);
 
 private:
     struct DevLayer;
     struct Device;
     void load_weights();
     void load_layer(Device & dev, DevLayer & L, int il);
+    void load_experts(int il, const std::vector<int> & quota);
+    void upload_stage(Device & d, int il);
     void record_main(int gi, int nt);
     void build_graphs();
     void embed(const int * tokens, int nt, int pos);
