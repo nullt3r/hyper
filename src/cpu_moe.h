@@ -27,11 +27,12 @@ struct CpuExpertLayer {
 class CpuMoe {
 public:
     // recs/outs: mapped host arrays with one entry per slot
-    CpuMoe(int n_threads, int n_embd, int ff, int k, CpuMoeRec * recs, CpuMoeOut * outs, int n_slots);
+    CpuMoe(int n_threads, int n_embd, int ff, int k, CpuMoeRec * recs, CpuMoeOut * outs, int n_slots,
+           CpuMoeBulk * bulk = nullptr, CpuMoeBulkOut * bulk_out = nullptr);
     ~CpuMoe();
     void set_layer(int slot, const CpuExpertLayer & l) { layers_[slot] = l; }
     // the next forward (device counter value `counter`) will publish these slots in order
-    void expect(unsigned counter, const std::vector<int> & slots);
+    void expect(unsigned counter, const std::vector<int> & slots, bool bulk = false);
     // wait until every expected slot has been consumed
     void drain();
     std::string state();
@@ -42,7 +43,8 @@ public:
 private:
     void master_loop();
     void worker_loop(int id);
-    void run_layer(int slot, const CpuMoeRec & rec);
+    // ids/wts rows of MOE_MAX_USED, x/y rows of 4096
+    void run_layer(int slot, int nt, const int * ids, const float * wts, const float * x, float * y);
     // parallel for over [0, n) on the team (master participates)
     template <typename F> void parallel(int n, F && fn);
 
@@ -54,7 +56,10 @@ private:
     std::vector<std::thread> workers_;
     std::mutex mu_;
     std::condition_variable cv_, cv_done_;
-    std::deque<std::pair<unsigned, int>> queue_;   // (counter, slot)
+    struct Job { unsigned counter; int slot; bool bulk; };
+    std::deque<Job> queue_;
+    CpuMoeBulk * bulk_ = nullptr;
+    CpuMoeBulkOut * bulk_out_ = nullptr;
     bool stop_ = false;
     int pending_ = 0;
     std::atomic<unsigned> cur_counter_{0};
@@ -69,6 +74,8 @@ private:
     // scratch
     std::vector<float> h_, y_;
     std::vector<uint8_t> qx_, qh_;
+    struct Pair { int t; int e; float w; };
+    std::vector<Pair> pairs_;
 };
 
 } // namespace hyper

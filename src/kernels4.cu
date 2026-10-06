@@ -208,8 +208,10 @@ template <GType T> __device__ __forceinline__ float dot_row(const uint8_t * __re
 constexpr int MOE_ROWS = 8;   // rows per block: one per warp
 
 template <GType T>
-__global__ void k_moe_gate_up(MoeDev m, const float * __restrict__ x, int xs, const int * __restrict__ ids, int k, float * __restrict__ h, int kdim) {
-    const int p = blockIdx.x, t = p / k;
+__global__ void k_moe_gate_up(MoeDev m, const float * __restrict__ x, int xs, const int * __restrict__ ids, int k, float * __restrict__ h, int kdim,
+                              const int * __restrict__ order, const int * __restrict__ order_n) {
+    if (order && (int) blockIdx.x >= *order_n) return;
+    const int p = order ? order[blockIdx.x] : blockIdx.x, t = p / k;
     const int slot = m.slot[ids[p]];
     if (slot < 0) return;
     extern __shared__ float xsm[];
@@ -228,11 +230,13 @@ __global__ void k_moe_gate_up(MoeDev m, const float * __restrict__ x, int xs, co
 
 template <GType T>
 __global__ void k_moe_down(MoeDev m, const float * __restrict__ h, const int * __restrict__ ids, const float * __restrict__ wts, int k,
-                           float * __restrict__ y) {
-    const int p = blockIdx.x;
+                           float * __restrict__ y, const int * __restrict__ order, const int * __restrict__ order_n) {
+    if (order && (int) blockIdx.x >= *order_n) return;
+    const int p = order ? order[blockIdx.x] : blockIdx.x;
     const int slot = m.slot[ids[p]];
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     if (slot < 0) {
+        if (order) return;
         for (int i = threadIdx.x; i < MOE_ROWS; i += blockDim.x) {
             const int r = blockIdx.y * MOE_ROWS + i;
             if (r < m.n) y[(size_t) p * m.n + r] = 0.0f;
@@ -253,7 +257,7 @@ __global__ void k_moe_down(MoeDev m, const float * __restrict__ h, const int * _
 }
 
 __global__ void k_moe_reduce(const float * __restrict__ shexp, const float * __restrict__ sg, const float * __restrict__ y, int k,
-                             float * __restrict__ out, int n, const int * __restrict__ ids, const int * __restrict__ owner, int cpu_owner,
+                             float * __restrict__ out, int n, const int * __restrict__ ids, const int * __restrict__ owner, int g, int cpu_owner,
                              const volatile unsigned * cpu_flag, const float * cpu_y, const int * counter, unsigned seq_tag) {
     const int t = blockIdx.y, r = blockIdx.x * blockDim.x + threadIdx.x;
     bool need = false;
@@ -268,20 +272,37 @@ __global__ void k_moe_reduce(const float * __restrict__ shexp, const float * __r
     }
     if (r >= n) return;
     float acc = sg[t] * shexp[(size_t) t * n + r];
-    for (int j = 0; j < k; ++j) acc += y[(size_t) (t * k + j) * n + r];
+    for (int j = 0; j < k; ++j) if (owner[ids[t * k + j]] == g) acc += y[(size_t) (t * k + j) * n + r];
     if (need) acc += __ldcv(cpu_y + (size_t) t * 4096 + r);
     out[(size_t) t * n + r] = acc;
 }
 
-__global__ void k_moe_publish(CpuMoeRec * rec, const float * __restrict__ x, int xs, int n, const int * __restrict__ ids,
-                              const float * __restrict__ wts, int k, int nt, const int * counter, unsigned seq_tag) {
-    for (int t = 0; t < nt; ++t)
-        for (int i = threadIdx.x; i < n; i += blockDim.x) rec->x[t][i] = x[(size_t) t * xs + i];
-    for (int i = threadIdx.x; i < nt * k; i += blockDim.x) { rec->ids[i / k][i % k] = ids[i]; rec->wts[i / k][i % k] = wts[i]; }
-    if (threadIdx.x == 0) rec->nt = nt;
+__global__ void k_moe_publish(int * ntp, int * ids_dst, float * wts_dst, float * x_dst, const float * __restrict__ x, int xs, int n,
+                              const int * __restrict__ ids, const float * __restrict__ wts, int k, int nt) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < (size_t) nt * n) { const int t = (int) (i / n), e = (int) (i % n); x_dst[(size_t) t * 4096 + e] = x[(size_t) t * xs + e]; }
+    if (i < (size_t) nt * k) { const int t = (int) (i / k), j = (int) (i % k); ids_dst[t * MOE_MAX_USED + j] = ids[i]; wts_dst[t * MOE_MAX_USED + j] = wts[i]; }
+    if (i == 0) *ntp = nt;
     __threadfence_system();
+}
+__global__ void k_moe_seq(volatile unsigned * seq, const int * counter, unsigned seq_tag) {
+    __threadfence_system();
+    *seq = (unsigned) (*counter) * 64u + seq_tag;
+}
+// single block: counting sort of the local pairs by expert
+__global__ void k_moe_order(const int * __restrict__ slot, const int * __restrict__ ids, int P, int ne, int * order, int * order_n) {
+    __shared__ int cnt[1024], off[1024];
+    for (int e = threadIdx.x; e < ne; e += blockDim.x) cnt[e] = 0;
     __syncthreads();
-    if (threadIdx.x == 0) rec->seq = (unsigned) (*counter) * 64u + seq_tag;
+    for (int p = threadIdx.x; p < P; p += blockDim.x) { const int e = ids[p]; if (slot[e] >= 0) atomicAdd(&cnt[e], 1); }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int s = 0;
+        for (int e = 0; e < ne; ++e) { off[e] = s; s += cnt[e]; }
+        *order_n = s;
+    }
+    __syncthreads();
+    for (int p = threadIdx.x; p < P; p += blockDim.x) { const int e = ids[p]; if (slot[e] >= 0) order[atomicAdd(&off[e], 1)] = p; }
 }
 
 // ---------------- PLE ----------------
@@ -375,21 +396,29 @@ void moe_route(const float * logits, int ls, int n_expert, int k, int * ids, flo
         default: throw std::runtime_error(std::string("moe: unsupported expert type ") + gtype_name(T)); \
     }
 
-void moe_gate_up(const MoeDev & m, const float * x, int xs, const int * ids, int k, float * h, int nt, cudaStream_t s) {
+void moe_gate_up(const MoeDev & m, const float * x, int xs, const int * ids, int k, float * h, int nt, cudaStream_t s,
+                 const int * order, const int * order_n) {
     const int kdim = (int) (m.gate_bytes / m.ff / gtype_block_bytes(m.tg) * gtype_block_elems(m.tg));
-    MOE_TYPE_SWITCH(m.tg, (k_moe_gate_up<TT><<<dim3(nt * k, (m.ff + MOE_ROWS - 1) / MOE_ROWS), 256, kdim * sizeof(float), s>>>(m, x, xs, ids, k, h, kdim)));
+    MOE_TYPE_SWITCH(m.tg, (k_moe_gate_up<TT><<<dim3(nt * k, (m.ff + MOE_ROWS - 1) / MOE_ROWS), 256, kdim * sizeof(float), s>>>(m, x, xs, ids, k, h, kdim, order, order_n)));
 }
-void moe_down(const MoeDev & m, const float * h, const int * ids, const float * wts, int k, float * y, int nt, cudaStream_t s) {
-    MOE_TYPE_SWITCH(m.td, (k_moe_down<TT><<<dim3(nt * k, (m.n + MOE_ROWS - 1) / MOE_ROWS), 256, m.ff * sizeof(float), s>>>(m, h, ids, wts, k, y)));
+void moe_down(const MoeDev & m, const float * h, const int * ids, const float * wts, int k, float * y, int nt, cudaStream_t s,
+              const int * order, const int * order_n) {
+    MOE_TYPE_SWITCH(m.td, (k_moe_down<TT><<<dim3(nt * k, (m.n + MOE_ROWS - 1) / MOE_ROWS), 256, m.ff * sizeof(float), s>>>(m, h, ids, wts, k, y, order, order_n)));
+}
+void moe_order(const MoeDev & m, const int * ids, int n_pairs, int n_expert, int * order, int * order_n, cudaStream_t s) {
+    if (n_expert > 1024) throw std::runtime_error("moe_order: too many experts");
+    k_moe_order<<<1, 1024, 0, s>>>(m.slot, ids, n_pairs, n_expert, order, order_n);
 }
 void moe_reduce(const float * shexp, const float * sg, const float * y, int k, float * out, int n, int nt,
-                const int * ids, const int * owner, int cpu_owner, const volatile unsigned * cpu_flag, const float * cpu_y,
+                const int * ids, const int * owner, int g, int cpu_owner, const volatile unsigned * cpu_flag, const float * cpu_y,
                 const int * counter, unsigned seq_tag, cudaStream_t s) {
-    k_moe_reduce<<<dim3((n + 255) / 256, nt), 256, 0, s>>>(shexp, sg, y, k, out, n, ids, owner, cpu_owner, cpu_flag, cpu_y, counter, seq_tag);
+    k_moe_reduce<<<dim3((n + 255) / 256, nt), 256, 0, s>>>(shexp, sg, y, k, out, n, ids, owner, g, cpu_owner, cpu_flag, cpu_y, counter, seq_tag);
 }
-void moe_publish(CpuMoeRec * rec, const float * x, int xs, int n, const int * ids, const float * wts, int k, int nt,
-                 const int * counter, unsigned seq_tag, cudaStream_t s) {
-    k_moe_publish<<<1, 512, 0, s>>>(rec, x, xs, n, ids, wts, k, nt, counter, seq_tag);
+void moe_publish(volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_dst, float * x_dst, const float * x, int xs, int n,
+                 const int * ids, const float * wts, int k, int nt, const int * counter, unsigned seq_tag, cudaStream_t s) {
+    const size_t tot = (size_t) nt * n;
+    k_moe_publish<<<(unsigned) ((tot + 255) / 256), 256, 0, s>>>(ntp, ids_dst, wts_dst, x_dst, x, xs, n, ids, wts, k, nt);
+    k_moe_seq<<<1, 1, 0, s>>>(seq, counter, seq_tag);
 }
 void ple_apply(float * res, const float * key, const float * value, const float * wk, const float * wq, const float * wconv_norm,
                const float * conv_w, float * conv_state, float * conv_snap, int n, int hc, int K, int dil, float eps, int nt,

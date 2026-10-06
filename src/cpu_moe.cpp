@@ -3,6 +3,7 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -25,15 +26,16 @@ template <typename P> void spin_until(P && ready) {
 }
 } // namespace
 
-CpuMoe::CpuMoe(int n_threads, int n_embd, int ff, int k, CpuMoeRec * recs, CpuMoeOut * outs, int n_slots)
-    : n_threads_(n_threads), n_embd_(n_embd), ff_(ff), k_(k), recs_(recs), outs_(outs), layers_(n_slots) {
+CpuMoe::CpuMoe(int n_threads, int n_embd, int ff, int k, CpuMoeRec * recs, CpuMoeOut * outs, int n_slots,
+               CpuMoeBulk * bulk, CpuMoeBulkOut * bulk_out)
+    : n_threads_(n_threads), n_embd_(n_embd), ff_(ff), k_(k), recs_(recs), outs_(outs), layers_(n_slots), bulk_(bulk), bulk_out_(bulk_out) {
     if (n_embd > 4096 || k > MOE_MAX_USED) throw std::runtime_error("CpuMoe: dimensions too large");
     counts.assign(n_slots, std::vector<uint64_t>(1024, 0));
     ggml_cpu_init();
-    const int P = MAX_NT * k;
+    const int rows = bulk ? MOE_BULK_ROWS : MAX_NT, P = rows * k;
     h_.resize((size_t) P * ff);
     y_.resize((size_t) P * n_embd);
-    qx_.resize((size_t) MAX_NT * n_embd * 2 + 4096);
+    qx_.resize((size_t) rows * n_embd * 2 + 4096);
     qh_.resize((size_t) P * ff * 2 + 4096);
     master_ = std::thread([this] { master_loop(); });
     for (int i = 1; i < n_threads_; ++i) workers_.emplace_back([this, i] { worker_loop(i); });
@@ -50,9 +52,10 @@ CpuMoe::~CpuMoe() {
     for (auto & w : workers_) w.join();
 }
 
-void CpuMoe::expect(unsigned counter, const std::vector<int> & slots) {
+void CpuMoe::expect(unsigned counter, const std::vector<int> & slots, bool bulk) {
+    if (bulk && !bulk_) throw std::runtime_error("CpuMoe: no bulk record");
     std::lock_guard<std::mutex> lk(mu_);
-    for (int s : slots) queue_.push_back({counter, s});
+    for (int s : slots) queue_.push_back({counter, s, bulk});
     pending_ += (int) slots.size();
     cv_.notify_all();
 }
@@ -81,7 +84,7 @@ void CpuMoe::drain() {
 
 void CpuMoe::master_loop() {
     for (;;) {
-        std::pair<unsigned, int> job;
+        Job job;
         {
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait(lk, [&] { return stop_ || !queue_.empty(); });
@@ -89,12 +92,12 @@ void CpuMoe::master_loop() {
             job = queue_.front();
             queue_.pop_front();
         }
-        const unsigned want = job.first * 64u + (unsigned) job.second;
-        cur_counter_ = job.first; cur_slot_ = job.second; cur_phase_ = 1;
-        CpuMoeRec & rec = recs_[job.second];
+        const unsigned want = job.counter * 64u + (unsigned) job.slot;
+        cur_counter_ = job.counter; cur_slot_ = job.slot; cur_phase_ = 1;
+        volatile unsigned & rseq = job.bulk ? bulk_->seq : recs_[job.slot].seq;
         bool run = false;
         spin_until([&] {
-            const unsigned s = rec.seq;
+            const unsigned s = rseq;
             if (s == want) { run = true; return true; }
             if ((int) (s - want) > 0) return true;   // overwritten by a later forward: the GPU did not need us
             std::lock_guard<std::mutex> lk(mu_);
@@ -102,15 +105,21 @@ void CpuMoe::master_loop() {
         });
         std::atomic_thread_fence(std::memory_order_acquire);
         cur_phase_ = 2;
+        const int rows = job.bulk ? MOE_BULK_ROWS : MAX_NT;
+        const int nt = std::min(job.bulk ? bulk_->nt : recs_[job.slot].nt, rows);
+        const int * ids = job.bulk ? &bulk_->ids[0][0] : &recs_[job.slot].ids[0][0];
+        const float * wts = job.bulk ? &bulk_->wts[0][0] : &recs_[job.slot].wts[0][0];
+        const float * x = job.bulk ? &bulk_->x[0][0] : &recs_[job.slot].x[0][0];
+        float * y = job.bulk ? &bulk_out_->y[0][0] : &outs_[job.slot].y[0][0];
         if (run) {
-            auto & cnt = counts[job.second];
-            for (int t = 0; t < rec.nt && t < MAX_NT; ++t)
-                for (int j = 0; j < k_; ++j) { const int e = rec.ids[t][j]; if (e >= 0 && e < (int) cnt.size()) cnt[e]++; }
-            run_layer(job.second, rec);
+            auto & cnt = counts[job.slot];
+            for (int t = 0; t < nt; ++t)
+                for (int j = 0; j < k_; ++j) { const int e = ids[t * MOE_MAX_USED + j]; if (e >= 0 && e < (int) cnt.size()) cnt[e]++; }
+            run_layer(job.slot, nt, ids, wts, x, y);
         }
         cur_phase_ = 0;
         std::atomic_thread_fence(std::memory_order_release);
-        outs_[job.second].seq = want;
+        (job.bulk ? bulk_out_->seq : outs_[job.slot].seq) = want;
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (--pending_ == 0) cv_done_.notify_all();
@@ -163,64 +172,75 @@ void CpuMoe::worker_loop(int) {
     }
 }
 
-void CpuMoe::run_layer(int slot, const CpuMoeRec & rec) {
+void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, const float * x, float * yout) {
     const CpuExpertLayer & L = layers_[slot];
-    const int nt = rec.nt, k = k_, n = n_embd_, ff = ff_;
-    struct Pair { int t; int e; float w; };
-    std::vector<Pair> pairs;
-    bool tok[MAX_NT] = {};
+    const int k = k_, n = n_embd_, ff = ff_;
+    // the CPU-owned (token, expert) pairs, grouped by expert: each weight row is then read once per layer
+    auto & pairs = pairs_;
+    pairs.clear();
+    std::vector<uint8_t> tok(nt, 0);
     for (int t = 0; t < nt; ++t)
         for (int j = 0; j < k; ++j) {
-            const int e = rec.ids[t][j];
+            const int e = ids[t * MOE_MAX_USED + j];
             if (e < 0 || e >= (int) L.owned.size()) continue;   // garbage routing (NaN logits): the GPU side reports it
-            if (L.owned[e]) { pairs.push_back({t, e, rec.wts[t][j]}); tok[t] = true; }
+            if (L.owned[e]) { pairs.push_back({t, e, wts[t * MOE_MAX_USED + j]}); tok[t] = 1; }
         }
     if (pairs.empty()) return;
+    std::stable_sort(pairs.begin(), pairs.end(), [](const Pair & a, const Pair & b) { return a.e < b.e; });
+    std::vector<int> grp;   // group start indices (+ end)
+    for (int p = 0; p < (int) pairs.size(); ++p) if (p == 0 || pairs[p].e != pairs[p - 1].e) grp.push_back(p);
+    grp.push_back((int) pairs.size());
+    const int G = (int) grp.size() - 1, P = (int) pairs.size();
     const auto * tg = traits(L.tg), * td = traits(L.td);
     const ggml_type vg = tg->vec_dot_type, vd = td->vec_dot_type;
-    const size_t qx_row = ggml_row_size(vg, n), qh_row = ggml_row_size(vd, ff);
-    // activations go to the dot product's partner type (Q8_K for k-quants, Q8_1 for Q5_1, ...)
     const auto from_g = traits((GType) vg)->from_float, from_d = traits((GType) vd)->from_float;
-    for (int t = 0; t < nt; ++t) if (tok[t]) from_g(rec.x[t], qx_.data() + t * qx_row, n);
+    const size_t qx_row = ggml_row_size(vg, n), qh_row = ggml_row_size(vd, ff);
+    if (qx_.size() < (size_t) nt * qx_row) qx_.resize((size_t) nt * qx_row);
+    if (qh_.size() < (size_t) P * qh_row) qh_.resize((size_t) P * qh_row);
+    if (h_.size() < (size_t) P * ff) h_.resize((size_t) P * ff);
+    if (y_.size() < (size_t) P * n) y_.resize((size_t) P * n);
+    // activations to the dot product's partner type (Q8_K for k-quants, Q8_1 for Q5_1, ...)
+    std::vector<int> qt;
+    for (int t = 0; t < nt; ++t) if (tok[t]) qt.push_back(t);
+    parallel((int) qt.size(), [&](int i) { const int t = qt[i]; from_g(x + (size_t) t * 4096, qx_.data() + t * qx_row, n); });
     const size_t g_row = L.gate_bytes / ff, d_row = L.down_bytes / n;
-    const int P = (int) pairs.size();
     constexpr int RC = 16;
     const int gu_chunks = (ff + RC - 1) / RC;
-    parallel(P * gu_chunks, [&](int task) {
-        const Pair & pr = pairs[task / gu_chunks];
+    parallel(G * gu_chunks, [&](int task) {
+        const int gi = task / gu_chunks, p0 = grp[gi], p1 = grp[gi + 1];
         const int r0 = (task % gu_chunks) * RC, r1 = std::min(ff, r0 + RC);
-        const uint8_t * gb = L.gate + L.index(pr.e) * L.gate_bytes, * ub = L.up + L.index(pr.e) * L.gate_bytes;
-        const void * qx = qx_.data() + pr.t * qx_row;
-        float * h = h_.data() + (size_t) (task / gu_chunks) * ff;
-        for (int r = r0; r < r1; ++r) {
-            float g, u;
-            tg->vec_dot(n, &g, 0, gb + r * g_row, 0, qx, 0, 1);
-            tg->vec_dot(n, &u, 0, ub + r * g_row, 0, qx, 0, 1);
-            h[r] = silu(g) * u;
-        }
+        const uint8_t * gb = L.gate + L.index(pairs[p0].e) * L.gate_bytes, * ub = L.up + L.index(pairs[p0].e) * L.gate_bytes;
+        for (int r = r0; r < r1; ++r)
+            for (int p = p0; p < p1; ++p) {
+                float g, u;
+                const void * qx = qx_.data() + pairs[p].t * qx_row;
+                tg->vec_dot(n, &g, 0, gb + r * g_row, 0, qx, 0, 1);
+                tg->vec_dot(n, &u, 0, ub + r * g_row, 0, qx, 0, 1);
+                h_[(size_t) p * ff + r] = silu(g) * u;
+            }
     });
-    for (int p = 0; p < P; ++p) from_d(h_.data() + (size_t) p * ff, qh_.data() + p * qh_row, ff);
+    parallel(P, [&](int p) { from_d(h_.data() + (size_t) p * ff, qh_.data() + p * qh_row, ff); });
     const int d_chunks = (n + 31) / 32;
-    parallel(P * d_chunks, [&](int task) {
-        const int p = task / d_chunks;
+    parallel(G * d_chunks, [&](int task) {
+        const int gi = task / d_chunks, p0 = grp[gi], p1 = grp[gi + 1];
         const int r0 = (task % d_chunks) * 32, r1 = std::min(n, r0 + 32);
-        const uint8_t * db = L.down + L.index(pairs[p].e) * L.down_bytes;
-        const void * qh = qh_.data() + p * qh_row;
-        float * y = y_.data() + (size_t) p * n;
-        for (int r = r0; r < r1; ++r) td->vec_dot(ff, &y[r], 0, db + r * d_row, 0, qh, 0, 1);
+        const uint8_t * db = L.down + L.index(pairs[p0].e) * L.down_bytes;
+        for (int r = r0; r < r1; ++r)
+            for (int p = p0; p < p1; ++p) td->vec_dot(ff, &y_[(size_t) p * n + r], 0, db + r * d_row, 0, qh_.data() + p * qh_row, 0, 1);
     });
-    CpuMoeOut & out = outs_[slot];
-    for (int t = 0; t < nt; ++t) {
-        if (!tok[t]) continue;
-        float * o = out.y[t];
+    // per token: the weighted sum of its CPU pairs (pairs of one token in expert order: deterministic)
+    std::vector<std::vector<int>> by_tok(nt);
+    for (int p = 0; p < P; ++p) by_tok[pairs[p].t].push_back(p);
+    parallel((int) qt.size(), [&](int i) {
+        const int t = qt[i];
+        float * o = yout + (size_t) t * 4096;
         bool first = true;
-        for (int p = 0; p < P; ++p) {
-            if (pairs[p].t != t) continue;
+        for (int p : by_tok[t]) {
             const float w = pairs[p].w, * y = y_.data() + (size_t) p * n;
             if (first) { for (int r = 0; r < n; ++r) o[r] = w * y[r]; first = false; }
             else for (int r = 0; r < n; ++r) o[r] += w * y[r];
         }
-    }
+    });
 }
 
 } // namespace hyper

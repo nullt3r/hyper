@@ -9,6 +9,7 @@
 namespace hyper {
 
 constexpr int MOE_MAX_USED = 16;
+constexpr int MOE_BULK_ROWS = 512;   // prefill chunk
 
 // ---- hyper-connections (hc streams of n) ----
 // xn[t][s*n + e] = res[t][s*n + e] * rsqrt(mean_e res[t][s*n + e]^2 + eps) * w[s*n + e]
@@ -43,14 +44,20 @@ struct MoeDev {
     const int * slot = nullptr;              // [n_expert]
     int ff = 0, n = 0;
 };
-// h[p][f] = silu(gate_e . x[t]) * (up_e . x[t]) for every pair p = t*k + j whose expert is local
-void moe_gate_up(const MoeDev & m, const float * x, int xs, const int * ids, int k, float * h, int nt, cudaStream_t s);
-// y[p][r] = w[p] * (down_e . h[p]) for local pairs, 0 otherwise
-void moe_down(const MoeDev & m, const float * h, const int * ids, const float * wts, int k, float * y, int nt, cudaStream_t s);
-// out[t][r] = sg[t] * shexp[t][r] + sum_j y[t*k + j][r] (+ cpu[t][r] once the CPU result for seq is there, when
-// any of token t's experts lives on the CPU: owner[e] == cpu_owner)
+// order (optional): the local pairs sorted by expert (count in order_n), so that consecutive blocks share an expert's
+// weights in L2; without it every pair p = t*k + j is visited and non-local pairs are skipped
+// h[p][f] = silu(gate_e . x[t]) * (up_e . x[t]) for every local pair
+void moe_gate_up(const MoeDev & m, const float * x, int xs, const int * ids, int k, float * h, int nt, cudaStream_t s,
+                 const int * order = nullptr, const int * order_n = nullptr);
+// y[p][r] = w[p] * (down_e . h[p]) for local pairs (without order: 0 for the others)
+void moe_down(const MoeDev & m, const float * h, const int * ids, const float * wts, int k, float * y, int nt, cudaStream_t s,
+              const int * order = nullptr, const int * order_n = nullptr);
+// order = the pairs whose expert has slot >= 0, grouped by expert; order_n = their count (single block)
+void moe_order(const MoeDev & m, const int * ids, int n_pairs, int n_expert, int * order, int * order_n, cudaStream_t s);
+// out[t][r] = sg[t] * shexp[t][r] + sum_j [owner(e_j) == g] y[t*k + j][r] (+ cpu[t][r] once the CPU result for seq
+// is there, when any of token t's experts lives on the CPU: owner[e] == cpu_owner)
 void moe_reduce(const float * shexp, const float * sg, const float * y, int k, float * out, int n, int nt,
-                const int * ids, const int * owner, int cpu_owner, const volatile unsigned * cpu_flag, const float * cpu_y,
+                const int * ids, const int * owner, int g, int cpu_owner, const volatile unsigned * cpu_flag, const float * cpu_y,
                 const int * counter, unsigned seq_tag, cudaStream_t s);
 
 // CPU hand-off record in mapped host memory (one per layer)
@@ -65,9 +72,21 @@ struct CpuMoeOut {
     volatile unsigned seq;
     float y[MAX_NT][4096];
 };
-// write x, ids, wts and then the sequence tag (counter * 64 + tag) into rec
-void moe_publish(CpuMoeRec * rec, const float * x, int xs, int n, const int * ids, const float * wts, int k, int nt,
-                 const int * counter, unsigned seq_tag, cudaStream_t s);
+// prefill: one record reused by every layer (the CPU consumes them in order)
+struct CpuMoeBulk {
+    volatile unsigned seq;
+    int nt;
+    int ids[MOE_BULK_ROWS][MOE_MAX_USED];
+    float wts[MOE_BULK_ROWS][MOE_MAX_USED];
+    float x[MOE_BULK_ROWS][4096];
+};
+struct CpuMoeBulkOut {
+    volatile unsigned seq;
+    float y[MOE_BULK_ROWS][4096];
+};
+// write x, ids, wts (row strides 4096 / MOE_MAX_USED) and then the sequence tag (counter * 64 + tag)
+void moe_publish(volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_dst, float * x_dst, const float * x, int xs, int n,
+                 const int * ids, const float * wts, int k, int nt, const int * counter, unsigned seq_tag, cudaStream_t s);
 
 // ---- PLE ----
 // res += gated + silu(conv(rmsnorm_stream(gated) * w_conv)); gated_s = value * sigmoid(ssqrt(<rms(key_s)*wk, rms(res_s)*wq> / sqrt(n)))

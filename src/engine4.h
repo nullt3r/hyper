@@ -6,6 +6,7 @@
 #include "kernels4.cuh"
 #include "model4.h"
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -18,13 +19,36 @@ struct Engine4Options {
     int cpu_threads = 24;
 };
 
+// spin barrier for the per-device recording threads of a prefill chunk
+class Barrier4 {
+public:
+    explicit Barrier4(int n) : n_(n) {}
+    void wait() {
+        const unsigned gen = gen_.load(std::memory_order_acquire);
+        if (count_.fetch_add(1, std::memory_order_acq_rel) + 1 == n_) {
+            count_.store(0, std::memory_order_relaxed);
+            gen_.fetch_add(1, std::memory_order_acq_rel);
+        } else {
+            while (gen_.load(std::memory_order_acquire) == gen) {}
+        }
+    }
+private:
+    int n_;
+    std::atomic<int> count_{0};
+    std::atomic<unsigned> gen_{0};
+};
+
 class Engine4 {
 public:
     Engine4(const std::string & model_path, const Engine4Options & opt);
     ~Engine4();
 
-    // nt <= MAX_NT tokens at positions pos..; returns greedy argmax per token
+    // nt tokens at positions pos..: up to MAX_NT through the decode graphs, up to MOE_BULK_ROWS as a prefill chunk
+    // (tiled GEMMs, copy-engine allreduce, flash attention; only the last row gets logits).
+    // Returns the greedy argmax per token (prefill chunk: last token only, -1 elsewhere)
     std::vector<int> forward(const int * tokens, int nt, int pos);
+    // whole prompt in prefill chunks; returns the argmax after the last token
+    int prefill(const int * tokens, int n, int pos);
     void get_logits(int t, std::vector<float> & out);
     void reset();
     const Q4Config & config() const { return cfg_; }
@@ -55,6 +79,10 @@ private:
     uint2 * ar_ll_ = nullptr;
     CpuMoeRec * cpu_rec_ = nullptr; // mapped [n_layer]
     CpuMoeOut * cpu_out_ = nullptr; // mapped [n_layer]
+    CpuMoeBulk * cpu_bulk_ = nullptr;        // mapped, prefill
+    CpuMoeBulkOut * cpu_bulk_out_ = nullptr;
+    half * h_stage_ = nullptr;      // pinned DMA allreduce staging [parity][ndev][MOE_BULK_ROWS * n_embd]
+    std::unique_ptr<Barrier4> barrier_;
     unsigned fwd_counter_ = 0;
     bool graphs_ready_ = false;
     bool debug_ = false, nocpu_ = false;

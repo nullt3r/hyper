@@ -68,7 +68,7 @@ int main(int argc, char ** argv) {
     std::vector<int> toks; std::vector<float> ref; int nv = 0;
     if (!read_ref(argv[3], toks, ref, nv)) return 1;
     Engine4Options opt;
-    opt.max_pos = 8192;
+    opt.max_pos = getenv("HYPER_MAXPOS") ? atoi(getenv("HYPER_MAXPOS")) : 8192;
     if (argc > 5) opt.gpu_expert_frac = (float) atof(argv[5]);
     if (getenv("HYPER_CPU_THREADS")) opt.cpu_threads = atoi(getenv("HYPER_CPU_THREADS"));
     if (getenv("HYPER_NDEV")) opt.n_devices = atoi(getenv("HYPER_NDEV"));
@@ -102,6 +102,37 @@ int main(int argc, char ** argv) {
             const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             printf("CHECK4 nt=%d n=%d top1 %.2f%%  KL mean %.6f max %.5f  (%.1f tok/s incl. logits download)\n", nt, cmp.n,
                    100.0 * cmp.top1 / cmp.n, cmp.kl_sum / cmp.n, cmp.kl_max, cmp.n / s);
+        } else if (cmd == "checkpf") {   // prefill the first n_pf tokens in chunks, then decode the rest token by token
+            const int n_pf = argc > 4 ? atoi(argv[4]) : 128;
+            const int n = (int) toks.size();
+            Cmp cmp, cmp_pf;
+            std::vector<float> lg;
+            eng.reset();
+            eng.prefill(toks.data(), n_pf, 0);
+            eng.get_logits(0, lg);
+            cmp_pf.add(&ref[(size_t) (n_pf - 1) * nv], lg, nv);
+            for (int i = n_pf; i < n; ++i) {
+                eng.forward(&toks[i], 1, i);
+                eng.get_logits(0, lg);
+                cmp.add(&ref[(size_t) i * nv], lg, nv);
+            }
+            printf("CHECKPF prefill %d: last-row KL %.5f top1 %d | decoded after it: n=%d top1 %.2f%% KL mean %.6f max %.5f\n", n_pf,
+                   cmp_pf.kl_sum, cmp_pf.top1, cmp.n, 100.0 * cmp.top1 / std::max(1, cmp.n), cmp.kl_sum / std::max(1, cmp.n), cmp.kl_max);
+        } else if (cmd == "pfbench") {   // prompt of n tokens (reference tokens repeated): prefill speed, then 64 decoded tokens
+            const int n = argc > 4 ? atoi(argv[4]) : 2048;
+            std::vector<int> prompt(n);
+            for (int i = 0; i < n; ++i) prompt[i] = toks[i % toks.size()];
+            for (int rep = 0; rep < 2; ++rep) {
+                eng.reset();
+                auto t0 = std::chrono::steady_clock::now();
+                int next = eng.prefill(prompt.data(), n, 0);
+                const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                auto t1 = std::chrono::steady_clock::now();
+                int p = n;
+                for (int i = 0; i < 64; ++i) next = eng.forward(&next, 1, p++)[0];
+                const double s2 = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+                printf("PFBENCH4 n=%d prefill %.1f t/s (%.2f s)  decode after it %.1f t/s\n", n, n / s, s, 64 / s2);
+            }
         } else if (cmd == "sums") {   // HYPER4_DEBUG=1 HYPER4_SUMS=1 HYPER_NDEV=1: per-layer tensor sums over the first nt tokens
             const int n = argc > 4 ? atoi(argv[4]) : 3;
             eng.reset();
