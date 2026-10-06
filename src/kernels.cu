@@ -1,0 +1,305 @@
+#include "kernels.cuh"
+
+#include <cfloat>
+#include <cmath>
+#include <stdexcept>
+
+namespace hyper {
+
+namespace {
+
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+    return v;
+}
+__device__ __forceinline__ float warp_max(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+    return v;
+}
+// block-wide sum; all threads get the result. blockDim.x multiple of 32, <= 1024
+__device__ float block_sum(float v) {
+    __shared__ float red[32];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    v = warp_sum(v);
+    __syncthreads();
+    if (lane == 0) red[wid] = v;
+    __syncthreads();
+    const int nw = blockDim.x >> 5;
+    v = lane < nw ? red[lane] : 0.0f;
+    return warp_sum(v);
+}
+__device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
+__device__ __forceinline__ float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
+__device__ __forceinline__ float softplusf(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
+
+// ---------------- GEMV ----------------
+constexpr int GEMV_ROWS = 8;   // warps per block, one row per warp
+
+__global__ void k_gemv_q8(const int8_t * __restrict__ qs, const half * __restrict__ d, int n, int k,
+                          const float * __restrict__ x, float * __restrict__ y, const float * __restrict__ add) {
+    const int row = blockIdx.x * GEMV_ROWS + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= n) return;
+    const uint4 * wq = (const uint4 *) (qs + (size_t) row * k);
+    const half * wd = d + (size_t) row * (k / 32);
+    const float4 * x4 = (const float4 *) x;
+    float acc = 0.0f;
+    const int nchunk = k / 16;
+    for (int c = lane; c < nchunk; c += 32) {
+        const uint4 q = __ldg(wq + c);
+        const float s = __half2float(wd[c >> 1]);
+        const int8_t * b = (const int8_t *) &q;
+        float part = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float4 xv = __ldg(x4 + c * 4 + j);
+            part += xv.x * b[4 * j] + xv.y * b[4 * j + 1] + xv.z * b[4 * j + 2] + xv.w * b[4 * j + 3];
+        }
+        acc += part * s;
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y[row] = add ? add[row] + acc : acc;
+}
+
+__global__ void k_gemv_bf16(const __nv_bfloat16 * __restrict__ w, int n, int k,
+                            const float * __restrict__ x, float * __restrict__ y, const float * __restrict__ add) {
+    const int row = blockIdx.x * GEMV_ROWS + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= n) return;
+    const uint4 * w8 = (const uint4 *) (w + (size_t) row * k);
+    const float4 * x4 = (const float4 *) x;
+    float acc = 0.0f;
+    const int nchunk = k / 8;
+    for (int c = lane; c < nchunk; c += 32) {
+        const uint4 q = __ldg(w8 + c);
+        const __nv_bfloat162 * b = (const __nv_bfloat162 *) &q;
+        const float4 xa = __ldg(x4 + c * 2), xb = __ldg(x4 + c * 2 + 1);
+        float2 f0 = __bfloat1622float2(b[0]), f1 = __bfloat1622float2(b[1]);
+        float2 f2 = __bfloat1622float2(b[2]), f3 = __bfloat1622float2(b[3]);
+        acc += f0.x * xa.x + f0.y * xa.y + f1.x * xa.z + f1.y * xa.w + f2.x * xb.x + f2.y * xb.y + f3.x * xb.z + f3.y * xb.w;
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y[row] = add ? add[row] + acc : acc;
+}
+
+// ---------------- norms / embedding ----------------
+__global__ void k_rmsnorm(const float * __restrict__ x, const float * __restrict__ w, float * __restrict__ y, int n, float eps) {
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
+    ss = block_sum(ss);
+    const float inv = rsqrtf(ss / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * inv * w[i];
+}
+
+__global__ void k_embed_q8_0(const uint8_t * __restrict__ table, int64_t row_bytes, int token, float * __restrict__ y, int n) {
+    const uint8_t * row = table + (int64_t) token * row_bytes;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const uint8_t * blk = row + (i / 32) * 34;
+        const float d = __half2float(*(const half *) blk);
+        y[i] = d * (float) ((const int8_t *) (blk + 2))[i % 32];
+    }
+}
+
+// ---------------- gated attention ----------------
+// grid: n_head + n_head_kv blocks, blockDim = hd
+__global__ void k_attn_prep(float * qg, float * k, const float * v, const float * qnorm, const float * knorm,
+                            half * kcache, half * vcache, int pos, int n_head, int n_head_kv, int hd, int n_rot,
+                            float rope_base, float eps, int max_pos) {
+    const int b = blockIdx.x, i = threadIdx.x;
+    const bool is_q = b < n_head;
+    float * vec = is_q ? qg + (size_t) b * 2 * hd : k + (size_t) (b - n_head) * hd;
+    const float * nw = is_q ? qnorm : knorm;
+    __shared__ float buf[512];
+    float xi = vec[i];
+    const float ss = block_sum(xi * xi);
+    xi = xi * rsqrtf(ss / hd + eps) * nw[i];
+    buf[i] = xi;
+    __syncthreads();
+    const int half_rot = n_rot / 2;
+    if (i < n_rot) {
+        const int fi = i < half_rot ? i : i - half_rot;
+        const double theta = (double) pos * pow((double) rope_base, -2.0 * fi / n_rot);
+        double sn, cs;
+        sincos(theta, &sn, &cs);
+        const float c = (float) cs, s = (float) sn;
+        xi = i < half_rot ? buf[i] * c - buf[i + half_rot] * s : buf[i - half_rot] * s + buf[i] * c;
+    }
+    if (is_q) {
+        vec[i] = xi;
+    } else {
+        const int hk = b - n_head;
+        kcache[((size_t) hk * max_pos + pos) * hd + i] = __float2half(xi);
+        vcache[((size_t) hk * max_pos + pos) * hd + i] = __float2half(v[(size_t) hk * hd + i]);
+    }
+}
+
+// one block per q head, 8 warps; each warp walks positions w, w+8, ...; lane owns hd/32 dims
+template <int HD>
+__global__ void k_attn_decode(const float * __restrict__ qg, const half * __restrict__ kcache, const half * __restrict__ vcache,
+                              float * __restrict__ out, int n_pos, int n_head, int n_head_kv, float scale, int max_pos) {
+    constexpr int PER = HD / 32;
+    const int h = blockIdx.x, lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    const int hk = h / (n_head / n_head_kv);
+    const float * q = qg + (size_t) h * 2 * HD;
+    float qr[PER];
+#pragma unroll
+    for (int j = 0; j < PER; ++j) qr[j] = q[lane * PER + j] * scale;
+    float m = -FLT_MAX, l = 0.0f, acc[PER];
+#pragma unroll
+    for (int j = 0; j < PER; ++j) acc[j] = 0.0f;
+    const half * kb = kcache + (size_t) hk * max_pos * HD;
+    const half * vb = vcache + (size_t) hk * max_pos * HD;
+    for (int t = wid; t < n_pos; t += nw) {
+        const half * kt = kb + (size_t) t * HD + lane * PER;
+        float s = 0.0f;
+#pragma unroll
+        for (int j = 0; j < PER; ++j) s += qr[j] * __half2float(kt[j]);
+        s = warp_sum(s);
+        const float m_new = fmaxf(m, s);
+        const float corr = expf(m - m_new), p = expf(s - m_new);
+        l = l * corr + p;
+        const half * vt = vb + (size_t) t * HD + lane * PER;
+#pragma unroll
+        for (int j = 0; j < PER; ++j) acc[j] = acc[j] * corr + p * __half2float(vt[j]);
+        m = m_new;
+    }
+    // combine warps
+    __shared__ float sm[32], sl[32];
+    __shared__ float sacc[32][HD];
+    if (lane == 0) { sm[wid] = m; sl[wid] = l; }
+#pragma unroll
+    for (int j = 0; j < PER; ++j) sacc[wid][lane * PER + j] = acc[j];
+    __syncthreads();
+    float gm = -FLT_MAX;
+    for (int w = 0; w < nw; ++w) gm = fmaxf(gm, sm[w]);
+    for (int i = threadIdx.x; i < HD; i += blockDim.x) {
+        float num = 0.0f, den = 0.0f;
+        for (int w = 0; w < nw; ++w) {
+            if (sl[w] == 0.0f) continue;
+            const float c = expf(sm[w] - gm);
+            num += sacc[w][i] * c;
+            den += sl[w] * c;
+        }
+        const float gate = q[HD + i];
+        out[(size_t) h * HD + i] = (num / den) * sigmoidf(gate);
+    }
+}
+
+// ---------------- gated delta net ----------------
+__global__ void k_gdn_conv(float * qkv, float * st, const float * __restrict__ w, int channels, int K) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const float x = qkv[c];
+    float acc = w[(size_t) c * K + (K - 1)] * x;
+    for (int j = 0; j < K - 1; ++j) acc += w[(size_t) c * K + j] * st[(size_t) j * channels + c];
+    for (int j = 0; j < K - 2; ++j) st[(size_t) j * channels + c] = st[(size_t) (j + 1) * channels + c];
+    st[(size_t) (K - 2) * channels + c] = x;
+    qkv[c] = silu(acc);
+}
+
+// block per v-head, blockDim = dv (thread j owns column j of S[i][j]); dk == dv == blockDim
+__global__ void k_gdn_step(const float * __restrict__ qkv, const float * __restrict__ ab, const float * __restrict__ dt_bias,
+                           const float * __restrict__ ssm_a, float * __restrict__ state, float * __restrict__ o,
+                           int n_k, int n_v, int dk, int dv, float eps) {
+    const int h = blockIdx.x, j = threadIdx.x;
+    const int hk = h % n_k;
+    __shared__ float sq[256], sk[256];
+    const float * q = qkv + (size_t) hk * dk;
+    const float * k = qkv + (size_t) n_k * dk + (size_t) hk * dk;
+    const float * v = qkv + (size_t) 2 * n_k * dk + (size_t) h * dv;
+    float qj = j < dk ? q[j] : 0.0f, kj = j < dk ? k[j] : 0.0f;
+    const float qn = block_sum(qj * qj);
+    const float kn = block_sum(kj * kj);
+    if (j < dk) { sq[j] = qj * rsqrtf(qn + eps); sk[j] = kj * rsqrtf(kn + eps); }
+    __syncthreads();
+    const float g = softplusf(ab[h] + dt_bias[h]) * ssm_a[h];
+    const float decay = expf(g);
+    const float beta = sigmoidf(ab[n_v + h]);
+    float * S = state + (size_t) h * dk * dv;
+    float kv = 0.0f;
+    for (int i = 0; i < dk; ++i) kv += S[(size_t) i * dv + j] * sk[i];
+    kv *= decay;
+    const float delta = (v[j] - kv) * beta;
+    float out = 0.0f;
+    for (int i = 0; i < dk; ++i) {
+        const float s = S[(size_t) i * dv + j] * decay + sk[i] * delta;
+        S[(size_t) i * dv + j] = s;
+        out += s * sq[i];
+    }
+    o[(size_t) h * dv + j] = out * rsqrtf((float) dv);
+}
+
+__global__ void k_gated_norm(float * o, const float * __restrict__ z, const float * __restrict__ w, int dh, float eps) {
+    const int h = blockIdx.x, i = threadIdx.x;
+    float x = o[(size_t) h * dh + i];
+    const float ss = block_sum(x * x);
+    x = x * rsqrtf(ss / dh + eps) * w[i];
+    o[(size_t) h * dh + i] = x * silu(z[(size_t) h * dh + i]);
+}
+
+__global__ void k_silu_mul(const float * __restrict__ gu, float * __restrict__ h, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) h[i] = silu(gu[i]) * gu[n + i];
+}
+
+__global__ void k_argmax(const float * __restrict__ x, int n, int * out) {
+    float best = -FLT_MAX; int bi = 0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) if (x[i] > best) { best = x[i]; bi = i; }
+    __shared__ float sv[1024]; __shared__ int si[1024];
+    sv[threadIdx.x] = best; si[threadIdx.x] = bi;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s && (sv[threadIdx.x + s] > sv[threadIdx.x] ||
+            (sv[threadIdx.x + s] == sv[threadIdx.x] && si[threadIdx.x + s] < si[threadIdx.x]))) {
+            sv[threadIdx.x] = sv[threadIdx.x + s]; si[threadIdx.x] = si[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) *out = si[0];
+}
+
+} // namespace
+
+void gemv_q8(const Q8W & W, const float * x, float * y, const float * add, cudaStream_t s) {
+    k_gemv_q8<<<(W.n + GEMV_ROWS - 1) / GEMV_ROWS, GEMV_ROWS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, y, add);
+}
+void gemv_bf16(const BF16W & W, const float * x, float * y, const float * add, cudaStream_t s) {
+    k_gemv_bf16<<<(W.n + GEMV_ROWS - 1) / GEMV_ROWS, GEMV_ROWS * 32, 0, s>>>(W.w, W.n, W.k, x, y, add);
+}
+void rmsnorm(const float * x, const float * w, float * y, int n, float eps, cudaStream_t s) {
+    k_rmsnorm<<<1, 1024, 0, s>>>(x, w, y, n, eps);
+}
+void embed_q8_0(const uint8_t * table, int64_t row_bytes, int token, float * y, int n, cudaStream_t s) {
+    k_embed_q8_0<<<1, 1024, 0, s>>>(table, row_bytes, token, y, n);
+}
+void attn_prep(float * qg, float * k, const float * v, const float * qnorm, const float * knorm,
+               half * kcache, half * vcache, int pos, int max_pos, int n_head, int n_head_kv, int hd, int n_rot,
+               float rope_base, float eps, cudaStream_t s) {
+    k_attn_prep<<<n_head + n_head_kv, hd, 0, s>>>(qg, k, v, qnorm, knorm, kcache, vcache, pos, n_head, n_head_kv,
+                                                   hd, n_rot, rope_base, eps, max_pos);
+}
+void attn_decode(const float * qg, const half * kcache, const half * vcache, float * out, int n_pos, int max_pos,
+                 int n_head, int n_head_kv, int hd, float scale, cudaStream_t s) {
+    if (hd != 256) throw std::runtime_error("attn_decode: only head_dim 256 is instantiated");
+    k_attn_decode<256><<<n_head, 256, 0, s>>>(qg, kcache, vcache, out, n_pos, n_head, n_head_kv, scale, max_pos);
+}
+void gdn_conv(float * qkv, float * conv_state, const float * conv_w, int channels, int K, cudaStream_t s) {
+    k_gdn_conv<<<(channels + 255) / 256, 256, 0, s>>>(qkv, conv_state, conv_w, channels, K);
+}
+void gdn_step(const float * qkv, const float * ab, const float * dt_bias, const float * ssm_a, float * state, float * o,
+              int n_k, int n_v, int dk, int dv, float eps, cudaStream_t s) {
+    k_gdn_step<<<n_v, dv, 0, s>>>(qkv, ab, dt_bias, ssm_a, state, o, n_k, n_v, dk, dv, eps);
+}
+void gated_norm(float * o, const float * z, const float * w, int n_heads, int dh, float eps, cudaStream_t s) {
+    k_gated_norm<<<n_heads, dh, 0, s>>>(o, z, w, dh, eps);
+}
+void silu_mul(const float * gu, float * h, int n, cudaStream_t s) {
+    k_silu_mul<<<(n + 255) / 256, 256, 0, s>>>(gu, h, n);
+}
+void argmax(const float * x, int n, int * out, cudaStream_t s) {
+    k_argmax<<<1, 1024, 0, s>>>(x, n, out);
+}
+
+} // namespace hyper

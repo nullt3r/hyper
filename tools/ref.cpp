@@ -1,0 +1,72 @@
+// Golden reference: run mainline llama.cpp on a prompt and dump token ids + full logits for every
+// position. hyper's correctness check replays the same tokens and compares distributions.
+//
+// usage: ref <model.gguf> <prompt.txt> <out.bin> [n_gpu_layers=999] [max_tokens=0]
+// out.bin: int32 n_tokens, int32 n_vocab, int32 tokens[n_tokens], float logits[n_tokens][n_vocab]
+#include "llama.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+int main(int argc, char ** argv) {
+    if (argc < 4) {
+        fprintf(stderr, "usage: %s model.gguf prompt.txt out.bin [n_gpu_layers] [max_tokens]\n", argv[0]);
+        return 1;
+    }
+    const int ngl = argc > 4 ? atoi(argv[4]) : 999;
+    const int max_tokens = argc > 5 ? atoi(argv[5]) : 0;
+
+    std::ifstream in(argv[2]);
+    std::stringstream ss; ss << in.rdbuf();
+    const std::string prompt = ss.str();
+
+    llama_backend_init();
+    auto mp = llama_model_default_params();
+    mp.n_gpu_layers = ngl;
+    llama_model * model = llama_model_load_from_file(argv[1], mp);
+    if (!model) { fprintf(stderr, "load failed\n"); return 1; }
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    std::vector<llama_token> toks(prompt.size() + 16);
+    int n = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(), toks.data(), (int) toks.size(), true, false);
+    if (n < 0) { fprintf(stderr, "tokenize failed\n"); return 1; }
+    toks.resize(n);
+    if (max_tokens > 0 && (int) toks.size() > max_tokens) toks.resize(max_tokens);
+    n = (int) toks.size();
+
+    auto cp = llama_context_default_params();
+    cp.n_ctx = n + 16;
+    cp.n_batch = n;
+    cp.n_ubatch = n;
+    llama_context * ctx = llama_init_from_model(model, cp);
+    if (!ctx) { fprintf(stderr, "ctx failed\n"); return 1; }
+
+    llama_batch batch = llama_batch_init(n, 0, 1);
+    for (int i = 0; i < n; ++i) {
+        batch.token[i] = toks[i];
+        batch.pos[i] = i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = 1;
+    }
+    batch.n_tokens = n;
+    if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "decode failed\n"); return 1; }
+
+    FILE * f = fopen(argv[3], "wb");
+    fwrite(&n, 4, 1, f);
+    fwrite(&n_vocab, 4, 1, f);
+    fwrite(toks.data(), 4, n, f);
+    for (int i = 0; i < n; ++i) fwrite(llama_get_logits_ith(ctx, i), 4, n_vocab, f);
+    fclose(f);
+    fprintf(stderr, "wrote %d tokens x %d vocab to %s\n", n, n_vocab, argv[3]);
+
+    llama_batch_free(batch);
+    llama_free(ctx);
+    llama_model_free(model);
+    return 0;
+}
