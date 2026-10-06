@@ -12,7 +12,7 @@ SRC   := $(wildcard src/*.cpp)
 CU    := $(wildcard src/*.cu)
 OBJ   := $(SRC:src/%.cpp=$(BUILD)/%.o) $(CU:src/%.cu=$(BUILD)/%.o)
 
-all: $(BUILD)/hyper $(BUILD)/ref
+all: $(BUILD)/hyper $(BUILD)/ref $(BUILD)/arbench
 
 $(BUILD)/%.o: src/%.cpp src/*.h
 	@mkdir -p $(BUILD)
@@ -43,3 +43,6 @@ $(BUILD)/arbench: tools/arbench.cu $(BUILD)/kernels.o
 
 $(BUILD)/gemvbench: tools/gemvbench.cu $(BUILD)/kernels.o
 	$(NVCC) $(NVFLAGS) tools/gemvbench.cu $(BUILD)/kernels.o -o $@ $(LIBS)
+
+$(BUILD)/mmabench: tools/mmabench.cu $(BUILD)/kernels.o
+	$(NVCC) $(NVFLAGS) tools/mmabench.cu $(BUILD)/kernels.o -o $@ $(LIBS)

@@ -82,6 +82,22 @@ struct Engine::Device {
 namespace {
 
 struct RowRange { const GTensor * t; int64_t r0, r1; };
+
+// row-major int8 + scales -> fragment-ordered device weight
+Q8W to_device_q8(const std::function<void *(size_t)> & alloc, int dev, const int8_t * qs, const half * d, int n, int k) {
+    const size_t ntile = (n + 15) / 16, kb = k / 32;
+    std::vector<uint8_t> fq(ntile * kb * 512);
+    std::vector<half> fs(ntile * kb * 16);
+    repack_q8_frag(qs, d, n, k, fq.data(), fs.data());
+    CUDA_CHECK(cudaSetDevice(dev));
+    Q8W w; w.n = n; w.k = k;
+    void * pq = alloc(fq.size());
+    void * ps = alloc(fs.size() * sizeof(half));
+    CUDA_CHECK(cudaMemcpy(pq, fq.data(), fq.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ps, fs.data(), fs.size() * sizeof(half), cudaMemcpyHostToDevice));
+    w.q = (const uint4 *) pq; w.s = (const half *) ps;
+    return w;
+}
 using ColRanges = std::vector<std::pair<int64_t, int64_t>>;   // column-block ranges [b0, b1)
 
 // Q8_0 rows from several tensors (same k), restricted to column blocks, repacked to qs/d arrays
@@ -113,14 +129,7 @@ Q8W upload_q8(const std::function<void *(size_t)> & alloc, int dev, const std::v
         }
         row0 += p.r1 - p.r0;
     }
-    CUDA_CHECK(cudaSetDevice(dev));
-    Q8W w; w.n = (int) n; w.k = (int) k;
-    int8_t * dq = (int8_t *) alloc(qs.size());
-    half * dd = (half *) alloc(d.size() * sizeof(half));
-    CUDA_CHECK(cudaMemcpy(dq, qs.data(), qs.size(), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dd, d.data(), d.size() * sizeof(half), cudaMemcpyHostToDevice));
-    w.qs = dq; w.d = dd;
-    return w;
+    return to_device_q8(alloc, dev, qs.data(), d.data(), (int) n, (int) k);
 }
 
 // split [0, n) into ndev contiguous parts aligned to `align`
@@ -335,11 +344,8 @@ void Engine::load_weights() {
                         for (int e = 0; e < 32; ++e) qs[(size_t) r * k + b * 32 + e] = (int8_t) lrintf(v[e] * id);
                     }
                 }
-                int8_t * dq = dev.alloc<int8_t>(qs.size());
-                half * dd = dev.alloc<half>(dsc.size());
-                CUDA_CHECK(cudaMemcpy(dq, qs.data(), qs.size(), cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(dd, dsc.data(), dsc.size() * sizeof(half), cudaMemcpyHostToDevice));
-                dev.output_q8.qs = dq; dev.output_q8.d = dd; dev.output_q8.n = (int) rows; dev.output_q8.k = (int) k;
+                dev.output_q8 = to_device_q8([&](size_t nb) { return (void *) dev.alloc<uint8_t>(nb); }, dev.id,
+                                             qs.data(), dsc.data(), (int) rows, (int) k);
             }
         }
         {

@@ -10,12 +10,15 @@ namespace hyper {
 
 constexpr int MAX_NT = 4;
 
-// Q8_0 weight repacked for aligned vector loads: qs[n][k] int8 (row-major), d[n][k/32] fp16
+// Q8_0 weight repacked into mma fragment order. Tile = 16 rows x 32 columns (one Q8 block per row) stored as
+// 512 lane-ordered bytes, tiles ordered [row tile][k block]; scales s[row tile][k block][16] fp16. Rows padded to 16.
 struct Q8W {
-    const int8_t * qs = nullptr;
-    const half * d = nullptr;
-    int n = 0, k = 0;   // out features, in features
+    const uint4 * q = nullptr;
+    const half * s = nullptr;
+    int n = 0, k = 0;   // out features (unpadded), in features
 };
+// host: repack row-major int8 qs[n][k] + scales d[n][k/32] into fragment order (fq: ntile*kb*512 bytes, fs: ntile*kb*16)
+void repack_q8_frag(const int8_t * qs, const half * d, int n, int k, uint8_t * fq, half * fs);
 // BF16 weight [n][k] row-major
 struct BF16W {
     const __nv_bfloat16 * w = nullptr;
@@ -24,10 +27,10 @@ struct BF16W {
 // fused input RMSNorm: x' = x * rsqrt(sum(ss[t*nss .. t*nss+nss)) / k + eps) * w   (w == nullptr: no norm)
 struct NormIn { const float * w = nullptr; const float * ss = nullptr; int nss = 0; float eps = 1e-6f; };
 
-// y[t][r] = (add ? add[t][r] : 0) + W x[t]   for t < nt; x rows have stride xs, y/add rows stride ys
+// y[t][r] = (add ? add[t][r] : 0) + W x[t]   for t < nt; x rows have stride xs, y/add rows stride ys.
+// Q8: tensor cores (mma m16n8k16, fp16 activations, fp32 accumulation), split-K over 8 warps per row tile.
 void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const float * add, int nt, cudaStream_t s,
              const NormIn & nin = {});
-extern int g_gemv_r_multi;   // rows per warp in the Q8 GEMV when nt > 1 (1 or 2)
 void gemv_bf16(const BF16W & W, const float * x, int xs, float * y, int ys, const float * add, int nt, cudaStream_t s,
                const NormIn & nin = {});
 

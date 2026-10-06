@@ -39,81 +39,84 @@ __device__ __forceinline__ float input_inv_rms(const float * __restrict__ ss, in
     return rsqrtf(t / k + eps);
 }
 
-// each warp computes R consecutive rows for NT tokens; lane loop over 16-element chunks
-template <int R, int NT>
-__global__ void k_gemv_q8(const int8_t * __restrict__ qs, const half * __restrict__ d, int n, int k,
-                          const float * __restrict__ x, int xs, float * __restrict__ y, int ys, const float * __restrict__ add,
-                          NormIn nin) {
-    float inv[NT];
+// ---- tensor-core Q8 GEMM for few tokens ----
+// two int8 (bytes of v selected by `sel`) -> half2 exactly: half(1024 + (b ^ 0x80)) - 1152
+__device__ __forceinline__ unsigned i8x2_to_h2(unsigned v, unsigned sel) {
+    const unsigned xx = __byte_perm(v ^ 0x80808080u, 0x64646464u, sel);
+    const unsigned magic = 0x64806480u;   // half2(1152, 1152)
+    unsigned r;
+    asm("sub.f16x2 %0, %1, %2;" : "=r"(r) : "r"(xx), "r"(magic));
+    return r;
+}
+__device__ __forceinline__ void mma16816(float * c, const unsigned * a, const unsigned * b) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+__device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
+    const __half2 hh = __floats2half2_rn(lo, hi);
+    return *(const unsigned *) &hh;
+}
+
+// block = 8 warps on one 16-row tile (M), tokens are the N dimension (gid < nt valid), warp w takes k blocks
+// w, w+8, ...; per k block: one 16-byte fragment load per lane, 2 mma, block-local result scaled by the row
+// scales in fp32; partials reduced through shared memory. Optional fused input RMSNorm and residual add.
+__global__ void k_mma_q8(const uint4 * __restrict__ wq, const half * __restrict__ ws, int n, int k,
+                         const float * __restrict__ x, int xs, float * __restrict__ y, int ys, const float * __restrict__ add,
+                         int nt, NormIn nin) {
+    const int tile = blockIdx.x;
+    const int w = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    const int lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+    const int kb = k / 32;
+    const uint4 * tq = wq + (size_t) tile * kb * 32 + lane;
+    const half * ts = ws + (size_t) tile * kb * 16;
+    const bool tok_ok = gid < nt;
+    const int tok = tok_ok ? gid : 0;
+    const float * xr = x + (size_t) tok * xs;
+    const float inv = input_inv_rms(nin.ss + tok * nin.nss, nin.nss, k, nin.w, nin.eps);
+    float acc[4] = {0, 0, 0, 0};
+    for (int b = w; b < kb; b += nw) {
+        const uint4 q = __ldg(tq + (size_t) b * 32);
+        const float s_lo = __half2float(ts[(size_t) b * 16 + gid]), s_hi = __half2float(ts[(size_t) b * 16 + gid + 8]);
+        const unsigned qw[4] = {q.x, q.y, q.z, q.w};
+        float tmp[4] = {0, 0, 0, 0};
 #pragma unroll
-    for (int t = 0; t < NT; ++t) inv[t] = input_inv_rms(nin.ss + t * nin.nss, nin.nss, k, nin.w, nin.eps);
-    const int row0 = (blockIdx.x * GEMV_WARPS + (threadIdx.x >> 5)) * R;
-    const int lane = threadIdx.x & 31;
-    if (row0 >= n) return;
-    const float4 * nw4 = (const float4 *) nin.w;
-    const int nchunk = k / 16, kb = k / 32;
-    const int8_t * qrow[R];
-    const half * drow[R];
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
-        const int row = min(row0 + r, n - 1);
-        qrow[r] = qs + (size_t) row * k;
-        drow[r] = d + (size_t) row * kb;
-    }
-    float acc[R][NT];
-#pragma unroll
-    for (int r = 0; r < R; ++r)
-#pragma unroll
-        for (int t = 0; t < NT; ++t) acc[r][t] = 0.0f;
-    for (int c = lane; c < nchunk; c += 32) {
-        // dequantize the R weight chunks once (scale folded in), then reuse them for every token
-        float wf[R][16];
-#pragma unroll
-        for (int r = 0; r < R; ++r) {
-            const uint4 q = __ldg((const uint4 *) qrow[r] + c);
-            const float sc = __half2float(drow[r][c >> 1]);
-            const int8_t * b = (const int8_t *) &q;
-#pragma unroll
-            for (int e = 0; e < 16; ++e) wf[r][e] = sc * (float) b[e];
-        }
-        float4 wv[4];
-        if (nin.w) {
-#pragma unroll
-            for (int j = 0; j < 4; ++j) wv[j] = __ldg(nw4 + c * 4 + j);
-        }
-#pragma unroll
-        for (int t = 0; t < NT; ++t) {
-            const float4 * x4 = (const float4 *) (x + (size_t) t * xs);
-            float xv[16];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                float4 v = __ldg(x4 + c * 4 + j);
+        for (int ks = 0; ks < 2; ++ks) {
+            unsigned a[4];
+            a[0] = i8x2_to_h2(qw[2 * ks], 0x5140);
+            a[1] = i8x2_to_h2(qw[2 * ks], 0x7362);
+            a[2] = i8x2_to_h2(qw[2 * ks + 1], 0x5140);
+            a[3] = i8x2_to_h2(qw[2 * ks + 1], 0x7362);
+            const int c0 = b * 32 + ks * 16 + 2 * tig;
+            unsigned bb[2] = {0, 0};
+            if (tok_ok) {
+                float2 v0 = *(const float2 *) (xr + c0), v1 = *(const float2 *) (xr + c0 + 8);
                 if (nin.w) {
-                    const float f = inv[t];
-                    v.x *= f * wv[j].x; v.y *= f * wv[j].y; v.z *= f * wv[j].z; v.w *= f * wv[j].w;
+                    const float2 w0 = *(const float2 *) (nin.w + c0), w1 = *(const float2 *) (nin.w + c0 + 8);
+                    v0.x *= inv * w0.x; v0.y *= inv * w0.y; v1.x *= inv * w1.x; v1.y *= inv * w1.y;
                 }
-                xv[4 * j] = v.x; xv[4 * j + 1] = v.y; xv[4 * j + 2] = v.z; xv[4 * j + 3] = v.w;
+                bb[0] = pack_h2(v0.x, v0.y);
+                bb[1] = pack_h2(v1.x, v1.y);
             }
-#pragma unroll
-            for (int r = 0; r < R; ++r) {
-                float part = 0.0f;
-#pragma unroll
-                for (int e = 0; e < 16; ++e) part = fmaf(wf[r][e], xv[e], part);
-                acc[r][t] += part;
-            }
+            mma16816(tmp, a, bb);
         }
+        acc[0] += tmp[0] * s_lo; acc[1] += tmp[1] * s_lo;
+        acc[2] += tmp[2] * s_hi; acc[3] += tmp[3] * s_hi;
     }
+    __shared__ float red[8][32][4];
 #pragma unroll
-    for (int r = 0; r < R; ++r)
+    for (int i = 0; i < 4; ++i) red[w][lane][i] = acc[i];
+    __syncthreads();
+    if (w == 0) {
 #pragma unroll
-        for (int t = 0; t < NT; ++t) {
-            const float v = warp_sum(acc[r][t]);
-            const int row = row0 + r;
-            if (lane == 0 && row < n) {
-                const size_t o = (size_t) t * ys + row;
-                y[o] = add ? add[o] + v : v;
-            }
-        }
+        for (int i = 0; i < 4; ++i) { float t = 0; for (int ww = 0; ww < nw; ++ww) t += red[ww][lane][i]; acc[i] = t; }
+        const int r0 = tile * 16 + gid, t0 = 2 * tig;
+        auto put = [&](int row, int t, float v) {
+            if (row < n && t < nt) { const size_t o = (size_t) t * ys + row; y[o] = add ? add[o] + v : v; }
+        };
+        put(r0, t0, acc[0]); put(r0, t0 + 1, acc[1]);
+        put(r0 + 8, t0, acc[2]); put(r0 + 8, t0 + 1, acc[3]);
+    }
 }
 
 template <int NT>
@@ -436,15 +439,39 @@ __global__ void k_incr(int * c) { *c += 1; }
         default: throw std::runtime_error("unsupported nt");  \
     }
 
-int g_gemv_r_multi = 4;   // rows per warp when nt > 1 (tuning knob: 1, 2 or 4)
 void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const float * add, int nt, cudaStream_t s,
              const NormIn & nin) {
-    const int R = nt == 1 ? 2 : g_gemv_r_multi;
-#define GEMV_R(RR) { constexpr int R_ = RR; const int grid = (W.n + GEMV_WARPS * R_ - 1) / (GEMV_WARPS * R_); \
-        NT_SWITCH(nt, (k_gemv_q8<R_, NT><<<grid, GEMV_WARPS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, xs, y, ys, add, nin))); }
-    if (R == 1) GEMV_R(1) else if (R == 4) GEMV_R(4) else GEMV_R(2)
-#undef GEMV_R
+    if (nt < 1 || nt > 8) throw std::runtime_error("gemv_q8: nt must be 1..8");
+    k_mma_q8<<<(W.n + 15) / 16, 256, 0, s>>>(W.q, W.s, W.n, W.k, x, xs, y, ys, add, nt, nin);
 }
+
+void repack_q8_frag(const int8_t * qs, const half * d, int n, int k, uint8_t * fq, half * fs) {
+    const int ntile = (n + 15) / 16, kb = k / 32;
+#pragma omp parallel for schedule(static)
+    for (int t = 0; t < ntile; ++t)
+        for (int b = 0; b < kb; ++b) {
+            uint8_t * tile = fq + ((size_t) t * kb + b) * 512;
+            for (int lane = 0; lane < 32; ++lane) {
+                const int gid = lane >> 2, tig = lane & 3;
+                uint8_t * o = tile + lane * 16;
+                for (int ks = 0; ks < 2; ++ks) {
+                    const int cb = b * 32 + ks * 16 + 2 * tig;
+                    const int rows[4] = {gid, gid + 8, gid, gid + 8};
+                    const int cols[4] = {cb, cb, cb + 8, cb + 8};
+                    for (int p = 0; p < 4; ++p)
+                        for (int e = 0; e < 2; ++e) {
+                            const int r = t * 16 + rows[p];
+                            o[ks * 8 + p * 2 + e] = r < n ? (uint8_t) qs[(size_t) r * k + cols[p] + e] : 0;
+                        }
+                }
+            }
+            for (int r = 0; r < 16; ++r) {
+                const int rr = t * 16 + r;
+                fs[((size_t) t * kb + b) * 16 + r] = rr < n ? d[(size_t) rr * kb + b] : __float2half(0.0f);
+            }
+        }
+}
+
 void gemv_bf16(const BF16W & W, const float * x, int xs, float * y, int ys, const float * add, int nt, cudaStream_t s,
                const NormIn & nin) {
     const int grid = (W.n + GEMV_WARPS - 1) / GEMV_WARPS;
