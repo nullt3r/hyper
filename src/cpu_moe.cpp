@@ -28,6 +28,7 @@ template <typename P> void spin_until(P && ready) {
 CpuMoe::CpuMoe(int n_threads, int n_embd, int ff, int k, CpuMoeRec * recs, CpuMoeOut * outs, int n_slots)
     : n_threads_(n_threads), n_embd_(n_embd), ff_(ff), k_(k), recs_(recs), outs_(outs), layers_(n_slots) {
     if (n_embd > 4096 || k > MOE_MAX_USED) throw std::runtime_error("CpuMoe: dimensions too large");
+    counts.assign(n_slots, std::vector<uint64_t>(1024, 0));
     ggml_cpu_init();
     const int P = MAX_NT * k;
     h_.resize((size_t) P * ff);
@@ -54,6 +55,15 @@ void CpuMoe::expect(unsigned counter, const std::vector<int> & slots) {
     for (int s : slots) queue_.push_back({counter, s});
     pending_ += (int) slots.size();
     cv_.notify_all();
+}
+
+void CpuMoe::save_stats(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "wb");
+    if (!f) throw std::runtime_error("save_stats: cannot open " + path);
+    const int n = (int) counts.size(), w = 1024;
+    fwrite(&n, 4, 1, f); fwrite(&w, 4, 1, f);
+    for (auto & c : counts) fwrite(c.data(), 8, w, f);
+    fclose(f);
 }
 
 std::string CpuMoe::state() {
@@ -92,7 +102,12 @@ void CpuMoe::master_loop() {
         });
         std::atomic_thread_fence(std::memory_order_acquire);
         cur_phase_ = 2;
-        if (run) run_layer(job.second, rec);
+        if (run) {
+            auto & cnt = counts[job.second];
+            for (int t = 0; t < rec.nt && t < MAX_NT; ++t)
+                for (int j = 0; j < k_; ++j) { const int e = rec.ids[t][j]; if (e >= 0 && e < (int) cnt.size()) cnt[e]++; }
+            run_layer(job.second, rec);
+        }
         cur_phase_ = 0;
         std::atomic_thread_fence(std::memory_order_release);
         outs_[job.second].seq = want;
@@ -174,7 +189,7 @@ void CpuMoe::run_layer(int slot, const CpuMoeRec & rec) {
     parallel(P * gu_chunks, [&](int task) {
         const Pair & pr = pairs[task / gu_chunks];
         const int r0 = (task % gu_chunks) * RC, r1 = std::min(ff, r0 + RC);
-        const uint8_t * gb = L.gate + (size_t) pr.e * L.gate_bytes, * ub = L.up + (size_t) pr.e * L.gate_bytes;
+        const uint8_t * gb = L.gate + L.index(pr.e) * L.gate_bytes, * ub = L.up + L.index(pr.e) * L.gate_bytes;
         const void * qx = qx_.data() + pr.t * qx_row;
         float * h = h_.data() + (size_t) (task / gu_chunks) * ff;
         for (int r = r0; r < r1; ++r) {
@@ -189,7 +204,7 @@ void CpuMoe::run_layer(int slot, const CpuMoeRec & rec) {
     parallel(P * d_chunks, [&](int task) {
         const int p = task / d_chunks;
         const int r0 = (task % d_chunks) * 32, r1 = std::min(n, r0 + 32);
-        const uint8_t * db = L.down + (size_t) pairs[p].e * L.down_bytes;
+        const uint8_t * db = L.down + L.index(pairs[p].e) * L.down_bytes;
         const void * qh = qh_.data() + p * qh_row;
         float * y = y_.data() + (size_t) p * n;
         for (int r = r0; r < r1; ++r) td->vec_dot(ff, &y[r], 0, db + r * d_row, 0, qh, 0, 1);

@@ -65,8 +65,10 @@ __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
 // scales in fp32; partials reduced through shared memory. Optional fused input RMSNorm and residual add.
 __global__ void k_mma_q8(const uint4 * __restrict__ wq, const half * __restrict__ ws, int n, int k,
                          const float * __restrict__ x, int xs, float * __restrict__ y, int ys, const float * __restrict__ add,
-                         int nt, NormIn nin) {
-    const int tile = blockIdx.x;
+                         int nt, NormIn nin, float * __restrict__ kpart, unsigned * kcnt) {
+    // split-K (gridDim.y > 1): block (tile, part) covers k blocks [part*kb/P, (part+1)*kb/P); partials go to kpart,
+    // the last block of a tile to finish sums them in part order (deterministic) and resets the tile's counter
+    const int tile = blockIdx.x, part = blockIdx.y, P = gridDim.y;
     const int w = threadIdx.x >> 5, nw = blockDim.x >> 5;
     const int lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
     const int kb = k / 32;
@@ -77,7 +79,8 @@ __global__ void k_mma_q8(const uint4 * __restrict__ wq, const half * __restrict_
     const float * xr = x + (size_t) tok * xs;
     const float inv = input_inv_rms(nin.ss + tok * nin.nss, nin.nss, k, nin.w, nin.eps);
     float acc[4] = {0, 0, 0, 0};
-    for (int b = w; b < kb; b += nw) {
+    const int b_end = (int) ((int64_t) (part + 1) * kb / P);
+    for (int b = (int) ((int64_t) part * kb / P) + w; b < b_end; b += nw) {
         const uint4 q = __ldg(tq + (size_t) b * 32);
         const float s_lo = __half2float(ts[(size_t) b * 16 + gid]), s_hi = __half2float(ts[(size_t) b * 16 + gid + 8]);
         const unsigned qw[4] = {q.x, q.y, q.z, q.w};
@@ -109,9 +112,34 @@ __global__ void k_mma_q8(const uint4 * __restrict__ wq, const half * __restrict_
 #pragma unroll
     for (int i = 0; i < 4; ++i) red[w][lane][i] = acc[i];
     __syncthreads();
-    if (w == 0) {
+    if (P > 1) {
+        __shared__ unsigned ticket;
+        if (w == 0) {
+            float * dst = kpart + ((size_t) tile * P + part) * 128 + lane * 4;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { float t = 0; for (int ww = 0; ww < nw; ++ww) t += red[ww][lane][i]; dst[i] = t; }
+            __threadfence();
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) ticket = atomicAdd(&kcnt[tile], 1u);
+        __syncthreads();
+        if (ticket != (unsigned) P - 1) return;
+        __threadfence();
+        if (w == 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[i] = 0.0f;
+            for (int pp = 0; pp < P; ++pp) {
+                const float * src = kpart + ((size_t) tile * P + pp) * 128 + lane * 4;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) acc[i] += __ldcg(src + i);
+            }
+            if (lane == 0) kcnt[tile] = 0;
+        }
+    } else if (w == 0) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) { float t = 0; for (int ww = 0; ww < nw; ++ww) t += red[ww][lane][i]; acc[i] = t; }
+    }
+    if (w == 0) {
         const int r0 = tile * 16 + gid, t0 = 2 * tig;
         auto put = [&](int row, int t, float v) {
             if (row < n && t < nt) { const size_t o = (size_t) t * ys + row; y[o] = add ? add[o] + v : v; }
@@ -920,10 +948,27 @@ __global__ void k_incr(int * c) { *c += 1; }
         default: throw std::runtime_error("unsupported nt");  \
     }
 
+// split-K scratch per device (gemv_init): tile partials and per-tile counters
+namespace { struct KSplit { float * part = nullptr; unsigned * cnt = nullptr; }; KSplit g_ksplit[16]; }
+constexpr int KSPLIT_TILES = 512, KSPLIT_MAX = 16;
+void gemv_init(int dev) {
+    if (dev < 0 || dev >= 16 || g_ksplit[dev].part) return;
+    cudaMalloc(&g_ksplit[dev].part, (size_t) KSPLIT_TILES * KSPLIT_MAX * 128 * sizeof(float));
+    cudaMalloc(&g_ksplit[dev].cnt, KSPLIT_TILES * sizeof(unsigned));
+    cudaMemset(g_ksplit[dev].cnt, 0, KSPLIT_TILES * sizeof(unsigned));
+}
+
 void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const float * add, int nt, cudaStream_t s,
              const NormIn & nin) {
     if (nt < 1 || nt > 8) throw std::runtime_error("gemv_q8: nt must be 1..8");
-    k_mma_q8<<<(W.n + 15) / 16, 256, 0, s>>>(W.q, W.s, W.n, W.k, x, xs, y, ys, add, nt, nin);
+    const int tiles = (W.n + 15) / 16, kb = W.k / 32;
+    int P = 1;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 16 && g_ksplit[dev].part && tiles <= KSPLIT_TILES && tiles < 160)   // few row tiles: spread K over more SMs
+        P = std::max(1, std::min({KSPLIT_MAX, 320 / tiles, kb / 16}));
+    k_mma_q8<<<dim3(tiles, P), 256, 0, s>>>(W.q, W.s, W.n, W.k, x, xs, y, ys, add, nt, nin,
+                                           P > 1 ? g_ksplit[dev].part : nullptr, P > 1 ? g_ksplit[dev].cnt : nullptr);
 }
 
 void repack_q8_frag(const int8_t * qs, const half * d, int n, int k, uint8_t * fq, half * fs) {

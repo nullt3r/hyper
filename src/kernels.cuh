@@ -32,6 +32,8 @@ struct NormIn { const float * w = nullptr; const float * ss = nullptr; int nss =
 
 // y[t][r] = (add ? add[t][r] : 0) + W x[t]   for t < nt; x rows have stride xs, y/add rows stride ys.
 // Q8: tensor cores (mma m16n8k16, fp16 activations, fp32 accumulation), split-K over 8 warps per row tile.
+// allocate the split-K scratch on device dev (enables split-K for matrices with few row tiles)
+void gemv_init(int dev);
 void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const float * add, int nt, cudaStream_t s,
              const NormIn & nin = {});
 void gemv_bf16(const BF16W & W, const float * x, int xs, float * y, int ys, const float * add, int nt, cudaStream_t s,

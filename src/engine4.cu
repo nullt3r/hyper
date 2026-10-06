@@ -1,6 +1,7 @@
 #include "engine4.h"
 
 #include <cuda_runtime.h>
+#include <sys/mman.h>
 
 #include <algorithm>
 #include <chrono>
@@ -157,6 +158,7 @@ void mmq(const Q8W & W, const float * x, int xs, float * y, int ys, int nt, cuda
 
 Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : opt_(opt) {
     debug_ = getenv("HYPER4_DEBUG") != nullptr;
+    nocpu_ = getenv("HYPER4_NOCPU") != nullptr;   // timing experiment only: CPU experts ignored (wrong output)
     gguf_ = std::make_unique<GGUF>(model_path);
     cfg_ = Q4Config::from_gguf(*gguf_);
     fprintf(stderr, "hyper4: %s\n", cfg_.describe().c_str());
@@ -169,6 +171,7 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
         dev->id = g; dev->g = g;
         CUDA_CHECK(cudaSetDevice(g));
         CUDA_CHECK(cudaStreamCreateWithFlags(&dev->stream, cudaStreamNonBlocking));
+        gemv_init(g);
         devs_.push_back(std::move(dev));
     }
     const int nd = opt_.n_devices, n = cfg_.n_embd;
@@ -183,12 +186,34 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
     CUDA_CHECK(cudaHostAlloc(&cpu_out_, (size_t) cfg_.n_layer * sizeof(CpuMoeOut), cudaHostAllocPortable | cudaHostAllocMapped));
     memset((void *) cpu_rec_, 0, (size_t) cfg_.n_layer * sizeof(CpuMoeRec));
     memset((void *) cpu_out_, 0, (size_t) cfg_.n_layer * sizeof(CpuMoeOut));
+    if (const char * sp = getenv("HYPER4_STATS")) {   // routing statistics from `hyper4 calib`
+        FILE * f = fopen(sp, "rb");
+        if (f) {
+            int nl = 0, w = 0;
+            if (fread(&nl, 4, 1, f) == 1 && fread(&w, 4, 1, f) == 1 && nl == cfg_.n_layer) {
+                stats_.assign(nl, std::vector<uint64_t>(w));
+                for (auto & s : stats_) if (fread(s.data(), 8, w, f) != (size_t) w) { stats_.clear(); break; }
+            }
+            fclose(f);
+            fprintf(stderr, "hyper4: expert placement from %s (%s)\n", sp, stats_.empty() ? "unreadable, ignored" : "ok");
+        }
+    }
     cpu_ = std::make_unique<CpuMoe>(opt_.cpu_threads, n, cfg_.n_ff_exp, cfg_.n_expert_used, cpu_rec_, cpu_out_, cfg_.n_layer);
     load_weights();
 }
 
+void * Engine4::host_huge_alloc(size_t bytes) {
+    const size_t H = 2u << 20, sz = (bytes + H - 1) / H * H;
+    void * p = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) throw std::runtime_error("host_huge_alloc: mmap failed");
+    madvise(p, sz, MADV_HUGEPAGE);
+    host_bufs_.push_back({p, sz});
+    return p;
+}
+
 Engine4::~Engine4() {
     cpu_.reset();
+    for (auto & [p, sz] : host_bufs_) munmap(p, sz);
     devs_.clear();
     for (void * p : {(void *) h_embd_, (void *) h_ple_, (void *) h_pos_, (void *) h_res_, (void *) ar_ll_, (void *) cpu_rec_, (void *) cpu_out_})
         if (p) cudaFreeHost(p);
@@ -319,7 +344,15 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
         const int E = c.n_expert, ff = c.n_ff_exp;
         const int per = (int) (E * opt_.gpu_expert_frac / nd);
         std::vector<int> owner(E, CPU_OWNER), slot(E, -1);
-        for (int gg = 0; gg < nd; ++gg) for (int e = gg * per; e < (gg + 1) * per; ++e) owner[e] = gg;
+        // most used experts (routing statistics, if given) go to the GPUs, dealt round robin so each GPU gets an
+        // equal share of the traffic; without statistics: index order
+        std::vector<int> order(E);
+        for (int e = 0; e < E; ++e) order[e] = e;
+        if (!stats_.empty()) {
+            const auto & cnt = stats_[il];
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return cnt[a] > cnt[b]; });
+        }
+        for (int r = 0; r < per * nd && r < E; ++r) owner[order[r]] = r % nd;
         const size_t gb = tg.nbytes / E, db = tdn.nbytes / E;
         int nl = 0;
         for (int e = 0; e < E; ++e) if (owner[e] == g) slot[e] = nl++;
@@ -339,12 +372,25 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
         L.moe.slot = dev.upload(slot.data(), slot.size());
         L.owner = dev.upload(owner.data(), owner.size());
         if (g == 0) {
+            // CPU experts: compact copy into 2 MB pages (the mmapped file would be read through 4 KB pages)
             CpuExpertLayer cl;
             cl.tg = tg.type; cl.td = tdn.type;
-            cl.gate = tg.data; cl.up = tu.data; cl.down = tdn.data;
             cl.gate_bytes = gb; cl.down_bytes = db;
             cl.owned.resize(E);
-            for (int e = 0; e < E; ++e) cl.owned[e] = owner[e] == CPU_OWNER;
+            cl.cslot.assign(E, -1);
+            int nc = 0;
+            for (int e = 0; e < E; ++e) { cl.owned[e] = owner[e] == CPU_OWNER; if (cl.owned[e]) cl.cslot[e] = nc++; }
+            const size_t bytes = (size_t) nc * (2 * gb + db);
+            uint8_t * buf = (uint8_t *) host_huge_alloc(bytes);
+            cl.gate = buf; cl.up = buf + (size_t) nc * gb; cl.down = buf + (size_t) nc * 2 * gb;
+#pragma omp parallel for schedule(dynamic)
+            for (int e = 0; e < E; ++e) {
+                if (cl.cslot[e] < 0) continue;
+                const size_t i = (size_t) cl.cslot[e];
+                memcpy((uint8_t *) cl.gate + i * gb, tg.data + (size_t) e * gb, gb);
+                memcpy((uint8_t *) cl.up + i * gb, tu.data + (size_t) e * gb, gb);
+                memcpy((uint8_t *) cl.down + i * db, tdn.data + (size_t) e * db, db);
+            }
             cpu_->set_layer(il, cl);
         }
     }
@@ -518,7 +564,7 @@ void Engine4::record_main(int gi, int nt) {
         moe_down(L.moe, d.hexp, d.ids, d.wts, K, d.yexp, nt, s);
         dbg("shexp", il, d.shpart, (size_t) nt * n);
         dbg("experts", il, d.yexp, (size_t) nt * K * n);
-        moe_reduce(d.shpart, d.sg, d.yexp, K, d.part, n, nt, d.ids, L.owner, CPU_OWNER, d.g == 0 ? &cpu_out_[il].seq : nullptr,
+        moe_reduce(d.shpart, d.sg, d.yexp, K, d.part, n, nt, d.ids, L.owner, CPU_OWNER, d.g == 0 && !nocpu_ ? &cpu_out_[il].seq : nullptr,
                    cpu_out_[il].y[0], d.counter, (unsigned) il, s);
         dbg("moe_part", il, d.part, (size_t) nt * n);
         allreduce();

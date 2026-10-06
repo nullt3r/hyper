@@ -64,6 +64,18 @@ __global__ void k_hc_init(float * res, const float * __restrict__ x, int n, int 
     if (i < hc * n) res[(size_t) t * hc * n + i] = x[(size_t) t * n + i % n];
 }
 
+// block per row (few rows, long k): injections
+__global__ void k_gemv_f32_br(const float * __restrict__ W, int k, const float * __restrict__ x, int xs, float * __restrict__ y, int ys) {
+    const int r = blockIdx.x, t = blockIdx.y;
+    const float * wr = W + (size_t) r * k, * xr = x + (size_t) t * xs;
+    float acc = 0.0f;
+    for (int i = threadIdx.x * 4; i < k; i += blockDim.x * 4) {
+        const float4 a = *(const float4 *) (wr + i), b = *(const float4 *) (xr + i);
+        acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+    acc = block_sum4(acc);
+    if (threadIdx.x == 0) y[(size_t) t * ys + r] = acc;
+}
 // warp per row, fp32 weights
 __global__ void k_gemv_f32(const float * __restrict__ W, int rows, int k, const float * __restrict__ x, int xs, float * __restrict__ y, int ys) {
     const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), t = blockIdx.y, lane = threadIdx.x & 31;
@@ -94,48 +106,33 @@ __global__ void k_gated_norm_sig(float * o, int o_stride, const float * __restri
 }
 
 // ---------------- routing ----------------
-// block per token, 512 threads
+// block per token, one thread per expert (ne <= 1024): softmax, then each expert's rank among the probabilities
+// (ties to the lower index) decides whether it is selected and in which slot
 __global__ void k_moe_route(const float * __restrict__ logits, int ls, int ne, int k, int * ids, float * wts, float * sg) {
-    const int t = blockIdx.x;
+    const int t = blockIdx.x, e = threadIdx.x;
     const float * l = logits + (size_t) t * ls;
     __shared__ float p[1024];
-    __shared__ float bv[32]; __shared__ int bi[32];
+    __shared__ float bv[32];
     __shared__ float sel_w[MOE_MAX_USED];
-    float mx = -FLT_MAX;
-    for (int e = threadIdx.x; e < ne; e += blockDim.x) mx = fmaxf(mx, l[e]);
-    // block max
-    {
-        float v = mx;
-        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
-        __syncthreads();
-        if ((threadIdx.x & 31) == 0) bv[threadIdx.x >> 5] = v;
-        __syncthreads();
-        v = (threadIdx.x & 31) < (blockDim.x >> 5) ? bv[threadIdx.x & 31] : -FLT_MAX;
-        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
-        mx = v;
-    }
-    float sum = 0.0f;
-    for (int e = threadIdx.x; e < ne; e += blockDim.x) { const float v = expf(l[e] - mx); p[e] = v; sum += v; }
-    sum = block_sum4(sum);
-    for (int e = threadIdx.x; e < ne; e += blockDim.x) p[e] /= sum;
+    const float v = e < ne ? l[e] : -FLT_MAX;
+    float mx = v;
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+    if ((e & 31) == 0) bv[e >> 5] = mx;
     __syncthreads();
-    for (int j = 0; j < k; ++j) {
-        float v = -1.0f; int vi = 0x7fffffff;
-        for (int e = threadIdx.x; e < ne; e += blockDim.x) if (p[e] > v || (p[e] == v && e < vi)) { v = p[e]; vi = e; }
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffff, v, o); const int oi = __shfl_xor_sync(0xffffffff, vi, o);
-            if (ov > v || (ov == v && oi < vi)) { v = ov; vi = oi; }
-        }
-        __syncthreads();
-        if ((threadIdx.x & 31) == 0) { bv[threadIdx.x >> 5] = v; bi[threadIdx.x >> 5] = vi; }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            for (int w = 1; w < (int) (blockDim.x >> 5); ++w) if (bv[w] > v || (bv[w] == v && bi[w] < vi)) { v = bv[w]; vi = bi[w]; }
-            ids[t * k + j] = vi; sel_w[j] = v; p[vi] = -2.0f;
-        }
-        __syncthreads();
+    mx = -FLT_MAX;
+    for (int w = 0; w < (int) (blockDim.x >> 5); ++w) mx = fmaxf(mx, bv[w]);
+    const float ex = e < ne ? expf(v - mx) : 0.0f;
+    const float sum = block_sum4(ex);
+    const float pe = ex / sum;
+    if (e < ne) p[e] = pe;
+    __syncthreads();
+    if (e < ne) {
+        int rank = 0;
+        for (int j = 0; j < ne; ++j) { const float q = p[j]; rank += q > pe || (q == pe && j < e); }
+        if (rank < k) { ids[t * k + rank] = e; sel_w[rank] = pe; }
     }
-    if (threadIdx.x == 0) {
+    __syncthreads();
+    if (e == 0) {
         float s = 0.0f;
         for (int j = 0; j < k; ++j) s += sel_w[j];
         for (int j = 0; j < k; ++j) wts[t * k + j] = sel_w[j] / s;
@@ -156,10 +153,10 @@ template <> __device__ __forceinline__ void deq8<GType::Q4_K>(const uint8_t * __
     const int o = (c & 31) * 8, j = o >> 5, l = o & 31;
     int sc, m; scale_min_k4(j, b + 4, sc, m);
     const float d = h2f(b) * sc, mn = h2f(b + 2) * m;
-    const uint8_t * q = b + 16 + 32 * (j >> 1) + l;
+    const uint2 qq = *(const uint2 *) (b + 16 + 32 * (j >> 1) + l);   // 8-byte aligned: blocks are 144 B
     const int sh = 4 * (j & 1);
 #pragma unroll
-    for (int i = 0; i < 8; ++i) v[i] = d * ((q[i] >> sh) & 0xF) - mn;
+    for (int i = 0; i < 4; ++i) { v[i] = d * ((qq.x >> (8 * i + sh)) & 0xF) - mn; v[4 + i] = d * ((qq.y >> (8 * i + sh)) & 0xF) - mn; }
 }
 template <> __device__ __forceinline__ void deq8<GType::Q5_K>(const uint8_t * __restrict__ row, int c, float * v) {
     const uint8_t * b = row + (size_t) (c >> 5) * 176;
@@ -198,17 +195,17 @@ template <> __device__ __forceinline__ void deq8<GType::Q8_0>(const uint8_t * __
 
 template <GType T> __device__ __forceinline__ float dot_row(const uint8_t * __restrict__ row, const float * xs, int k, int lane) {
     float acc = 0.0f;
+#pragma unroll 2
     for (int c = lane; c < k / 8; c += 32) {
         float v[8];
         deq8<T>(row, c, v);
-        const float * x = xs + c * 8;
-#pragma unroll
-        for (int i = 0; i < 8; ++i) acc += v[i] * x[i];
+        const float4 x0 = *(const float4 *) (xs + c * 8), x1 = *(const float4 *) (xs + c * 8 + 4);
+        acc += v[0] * x0.x + v[1] * x0.y + v[2] * x0.z + v[3] * x0.w + v[4] * x1.x + v[5] * x1.y + v[6] * x1.z + v[7] * x1.w;
     }
     return warp_sum4(acc);
 }
 
-constexpr int MOE_ROWS = 32;   // rows per block (8 warps x 4)
+constexpr int MOE_ROWS = 8;   // rows per block: one per warp
 
 template <GType T>
 __global__ void k_moe_gate_up(MoeDev m, const float * __restrict__ x, int xs, const int * __restrict__ ids, int k, float * __restrict__ h, int kdim) {
@@ -357,7 +354,8 @@ void hc_init(float * res, const float * x, int n, int hc, int nt, cudaStream_t s
     k_hc_init<<<dim3((hc * n + 255) / 256, nt), 256, 0, s>>>(res, x, n, hc);
 }
 void gemv_f32(const float * W, int rows, int k, const float * x, int xs, float * y, int ys, int nt, cudaStream_t s) {
-    k_gemv_f32<<<dim3((rows + 7) / 8, nt), 256, 0, s>>>(W, rows, k, x, xs, y, ys);
+    if (rows < 64 && (k & 3) == 0) k_gemv_f32_br<<<dim3(rows, nt), 256, 0, s>>>(W, k, x, xs, y, ys);
+    else k_gemv_f32<<<dim3((rows + 7) / 8, nt), 256, 0, s>>>(W, rows, k, x, xs, y, ys);
 }
 void gated_norm_sigmoid(float * o, int o_stride, const float * z, int z_stride, const float * w, int n_heads, int dh, float eps,
                         int nt, cudaStream_t s) {
@@ -365,7 +363,7 @@ void gated_norm_sigmoid(float * o, int o_stride, const float * z, int z_stride, 
 }
 void moe_route(const float * logits, int ls, int n_expert, int k, int * ids, float * wts, float * sg, int nt, cudaStream_t s) {
     if (n_expert > 1024 || k > MOE_MAX_USED) throw std::runtime_error("moe_route: too many experts");
-    k_moe_route<<<nt, 512, 0, s>>>(logits, ls, n_expert, k, ids, wts, sg);
+    k_moe_route<<<nt, (n_expert + 31) / 32 * 32, 0, s>>>(logits, ls, n_expert, k, ids, wts, sg);
 }
 
 #define MOE_TYPE_SWITCH(T, CALL)                                                  \

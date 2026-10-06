@@ -106,6 +106,16 @@ int main(int argc, char ** argv) {
             const int n = argc > 4 ? atoi(argv[4]) : 3;
             eng.reset();
             for (int i = 0; i < n; ++i) eng.forward(&toks[i], 1, i);
+        } else if (cmd == "calib") {   // routing statistics: the reference prompt + n greedy tokens -> argv[6] or expert_stats.bin
+            const int n_gen = argc > 4 ? atoi(argv[4]) : 512;
+            eng.reset();
+            int p = 0, next = 0;
+            const int P = (int) toks.size();
+            for (; p < P; p += 4) { const int nt = std::min(4, P - p); next = eng.forward(&toks[p], nt, p)[nt - 1]; }
+            for (int i = 0; i < n_gen; ++i) next = eng.forward(&next, 1, p++)[0];
+            const std::string out = argc > 6 ? argv[6] : "expert_stats.bin";
+            eng.save_expert_stats(out);
+            printf("CALIB %d prompt + %d generated tokens -> %s\n", P, n_gen, out.c_str());
         } else if (cmd == "bench") {
             const int n_gen = argc > 4 ? atoi(argv[4]) : 128;
             eng.reset();

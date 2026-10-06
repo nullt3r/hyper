@@ -20,6 +20,8 @@ struct CpuExpertLayer {
     const uint8_t * gate = nullptr, * up = nullptr, * down = nullptr;   // [n_expert][...] GGUF data
     size_t gate_bytes = 0, down_bytes = 0;                              // bytes per expert matrix
     std::vector<uint8_t> owned;                                         // [n_expert]
+    std::vector<int> cslot;   // optional: expert e lives at index cslot[e] of gate/up/down (compact copy)
+    size_t index(int e) const { return cslot.empty() ? (size_t) e : (size_t) cslot[e]; }
 };
 
 class CpuMoe {
@@ -33,6 +35,9 @@ public:
     // wait until every expected slot has been consumed
     void drain();
     std::string state();
+    // routing statistics (every token of every published layer): counts[slot][expert]
+    void save_stats(const std::string & path);
+    std::vector<std::vector<uint64_t>> counts;
 
 private:
     void master_loop();

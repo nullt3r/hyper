@@ -121,3 +121,21 @@ Historicky (paměť): ik qwen-run2 TG@155k 25,1 t/s.
 - MoE 512 expertů top-10 softmax + renormalizace, sdílený expert se sigmoid gate; gate/up Q4_K (1 vrstva Q5_K),
   down Q5_1 (5 vrstev Q8_0)
 - PLE ve vrstvě 1: n-gram hash (n=2,3; 16 hlav × 160) do 27 GB IQ4_NL tabulky, gate přes key/query, kauzální konv K=4 dil=3
+
+## hyper4 – dekódování (bench: ref2 prompt 64 tok., 256 greedy tokenů; kalibrace rozmístění na jiném textu ref4)
+
+Správnost: KL vs mainline ref (256 tok.) 0,042–0,047, top-1 88–91 %. Šumová podlaha mainline sám proti sobě
+(ubatch 256 vs 1 vs 16): KL 0,030–0,038, top-1 89–91 % → MoE routing je chaotický, hyper je na podlaze.
+
+| Krok | t/s | jen GPU (CPU experty ignorovány, jen čas) |
+|---|---|---|
+| v0: naivní MoE kernely, 60 % expertů na GPU podle indexu | 40,0 | |
+| CPU experty zkopírované do 2 MB stránek (mmap → anon + MADV_HUGEPAGE) | 47,0 | |
+| 75 % expertů na GPU | 46,5 (ref2) / 53,2 (ref4) | |
+| rozmístění podle četnosti (kalibrace `hyper4 calib`, round-robin mezi GPU) | 51,3 | 59,9 |
+| MoE: řádek na warp + vektorové loady, router přes rank, f32 GEMV blok na řádek | 69,4 | 81,5 |
+| split-K Q8 GEMV pro matice s málo řádky (HC down 320 ř., shexp, router), deterministický součet | **74,5** | 97,6 |
+
+Baseline ik 38,4 / mainline 37,8 → **1,94×**. Bugy cestou: CPU aktivace kvantizovány typem vah místo vec_dot_type
+(NaN); race v poolu CPU vláken (vlákno z předchozí generace „spotřebovalo“ index úlohy → zaseknutí) → claim přes CAS
+na (generace << 32 | index).
