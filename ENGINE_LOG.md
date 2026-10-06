@@ -85,3 +85,17 @@ Mainline (llama-bench, -fa 1, -ub 2048): pp4096 1672 (layer) / 695 (tensor); pp2
 1. ~~Tensor-core Q8 GEMM~~, ~~prefill GEMM~~, ~~flash attention prefill~~, ~~split-K decode attention~~ (hotovo).
 2. Prefill: chunked Gated DeltaNet (gdn_step je sekvenční přes tokeny, ~12 % času prefillu), gdn_conv paralelně.
 3. Heterogenní režim CPU+GPU (velké modely): CPU jako 4. „zařízení“ v TP, souběžně s GPU.
+
+## Server (hyper-server, OpenAI API)
+
+- Šablony + parsování reasoning/tool calls z mainline libcommon, tokenizer z libllama (vocab only), cpp-httplib.
+- **Prompt cache**: KV platí pro společný prefix s předchozí sekvencí; rekurentní stav DeltaNetu se obnoví ze snapshotu
+  (~50 MB/GPU, pinned RAM) na pozici s ≤ L−1 (MTP záznam s−1 použil token s). Snapshoty: poslední 2 začátky zpráv
+  (`<|im_start|>`), starší jen ≥ 256 tokenů od předchozího, každých 4096 tokenů; max 48 (LRU-ish).
+  Test `cachetest`: výstup s cache = výstup od nuly (96/96) pro stejný / rozbíhající se / prodloužený prompt.
+- **Sampling se spekulací, přesný**: draft se přijme, když se rovná tokenu navzorkovanému na jeho řádku (sample-and-compare,
+  pro deterministický draft je to přesně rozdělení samplingu). Kandidáti: top-64 na GPU (radix select), host dělá
+  temperature/top-k/min-p/top-p. `samptest` (400 běhů, T=1, top-k 40): TV pozic 1–3 0,05–0,095 vs šum (pozice 0) 0,09.
+- Malé chunky: GEMM dlaždice 32/64/128 tokenů podle velikosti, ≤ 8 tokenů GEMV, < 48 tokenů LL allreduce místo DMA
+  (DMA má fixní ~0,4 ms/volání). Chunk 5 tokenů 69 → 21 ms, 128 tokenů 109 → 78 ms.
+- Multi-turn (1,9k tokenů systém): 2. kolo cached 1858/1986, prompt 0,44 s místo 1,34 s; generace T=0,6: 94–126 t/s.
