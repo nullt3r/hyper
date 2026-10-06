@@ -17,7 +17,7 @@ int main(int argc, char ** argv) {
     const int mode = argc > 3 ? atoi(argv[3]) : 0; const bool ll = mode >= 1;
     uint2 * llslots; CK(cudaHostAlloc(&llslots, (size_t) 2 * 3 * n * 8, cudaHostAllocPortable | cudaHostAllocMapped)); memset(llslots, 0xff, (size_t) 2 * 3 * n * 8);
     int nd = 0; CK(cudaGetDeviceCount(&nd));
-    const int nchunk = (n + hyper::AR_CHUNK - 1) / hyper::AR_CHUNK;
+    const int nchunk = 1;
     float * slots; unsigned long long * flags;
     CK(cudaHostAlloc(&slots, (size_t) 2 * nd * n * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped));
     CK(cudaHostAlloc(&flags, (size_t) nd * nchunk * 8, cudaHostAllocPortable | cudaHostAllocMapped));
@@ -33,7 +33,7 @@ int main(int argc, char ** argv) {
         cudaGraph_t gr;
         CK(cudaStreamBeginCapture(st[g], cudaStreamCaptureModeThreadLocal));
         hyper::incr_counter(ctr[g], st[g]);
-        for (int c = 0; c < calls; ++c) { if (mode == 2) hyper::allreduce_add_ll16(x[g], part[g], llslots, g, nd, n, ctr[g], c, st[g]); else if (ll) hyper::allreduce_add_ll(x[g], part[g], llslots, g, nd, n, ctr[g], c, st[g]); else hyper::allreduce_add(x[g], part[g], slots, flags, g, nd, n, ctr[g], c, st[g]); }
+        for (int c = 0; c < calls; ++c) hyper::allreduce_add_ll16(x[g], part[g], llslots, g, nd, n, ctr[g], c, st[g]);
         CK(cudaStreamEndCapture(st[g], &gr));
         CK(cudaGraphInstantiate(&ex[g], gr, 0));
     }

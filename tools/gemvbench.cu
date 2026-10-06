@@ -21,9 +21,8 @@ int main(int argc, char ** argv) {
     CK(cudaSetDevice(0));
     cudaStream_t s; CK(cudaStreamCreate(&s));
     cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
-    for (auto [R, U] : std::vector<std::pair<int,int>>{{1,1},{1,2},{1,4},{2,1},{2,2},{2,4},{4,1},{4,2}}) {
-    hyper::g_gemv_rows_per_warp = R; hyper::g_gemv_unroll = U;
-    printf("-- rows per warp %d, unroll %d\n", R, U);
+    for (int nt : {1, 2}) {
+    printf("-- tokens per call %d\n", nt);
     for (auto & sh : shapes) {
         // several distinct matrices so the working set exceeds L2 (6 MB on 3090)
         const int nmat = 8;
@@ -36,12 +35,12 @@ int main(int argc, char ** argv) {
             CK(cudaMemset(d, 0, (size_t) sh.n * sh.k / 32 * 2));
             W[m].qs = qs; W[m].d = d; W[m].n = sh.n; W[m].k = sh.k;
         }
-        float * x, * y; CK(cudaMalloc(&x, sh.k * 4)); CK(cudaMalloc(&y, sh.n * 4));
-        CK(cudaMemset(x, 0, sh.k * 4));
+        float * x, * y; CK(cudaMalloc(&x, 4 * sh.k * 4)); CK(cudaMalloc(&y, 4 * sh.n * 4));
+        CK(cudaMemset(x, 0, 4 * sh.k * 4));
         // capture the launches in a graph, as the engine does, so launch overhead does not distort timing
         cudaGraph_t gr; cudaGraphExec_t ge;
         CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
-        for (int i = 0; i < iters; ++i) hyper::gemv_q8(W[i % nmat], x, y, nullptr, s);
+        for (int i = 0; i < iters; ++i) hyper::gemv_q8(W[i % nmat], x, sh.k, y, sh.n, nullptr, nt, s);
         CK(cudaStreamEndCapture(s, &gr));
         CK(cudaGraphInstantiate(&ge, gr, 0));
         CK(cudaGraphLaunch(ge, s));
