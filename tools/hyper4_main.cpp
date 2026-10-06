@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -74,6 +75,7 @@ int main(int argc, char ** argv) {
     std::vector<int> toks; std::vector<float> ref; int nv = 0;
     if (!read_ref(argv[3], toks, ref, nv)) return 1;
     Engine4Options opt;
+    opt.prompt_cache = cmd == "cachetest";
     opt.max_pos = getenv("HYPER_MAXPOS") ? atoi(getenv("HYPER_MAXPOS")) : 8192;
     if (argc > 5) opt.gpu_expert_frac = (float) atof(argv[5]);
     if (getenv("HYPER_CPU_THREADS")) opt.cpu_threads = atoi(getenv("HYPER_CPU_THREADS"));
@@ -131,6 +133,36 @@ int main(int argc, char ** argv) {
             }
             printf("CHECKPF prefill %d: last-row KL %.5f top1 %d | decoded after it: n=%d top1 %.2f%% KL mean %.6f max %.5f\n", n_pf,
                    cmp_pf.kl_sum, cmp_pf.top1, cmp.n, 100.0 * cmp.top1 / std::max(1, cmp.n), cmp.kl_sum / std::max(1, cmp.n), cmp.kl_max);
+        } else if (cmd == "cachetest") {   // prompt cache: cached output == output from scratch (greedy)
+            const int n_gen = 64;
+            std::map<int, int> cnt;
+            for (int i = 0; i < 200; ++i) cnt[toks[i]]++;
+            int best = toks[0];
+            for (auto & [k, v] : cnt) if (v > cnt[best]) best = k;
+            eng.set_snapshot_token(best);
+            std::vector<int> A(toks.begin(), toks.begin() + 200);
+            auto run = [&](const std::vector<int> & B, const char * name) {
+                GenStats st;
+                eng.generate(A, n_gen, false, &st);
+                const std::vector<int> cached = eng.generate(B, n_gen, false, &st);
+                const int reused = st.prompt_reused;
+                eng.reset_cache();
+                const std::vector<int> fresh = eng.generate(B, n_gen, false, &st);
+                int same = 0;
+                while (same < n_gen && cached[same] == fresh[same]) ++same;
+                printf("CACHE4 %-9s prompt %zu reused %d identical %d / %d\n", name, B.size(), reused, same, n_gen);
+            };
+            run(A, "same");
+            std::vector<int> B(A.begin(), A.begin() + 150);
+            B.insert(B.end(), toks.begin() + 210, toks.begin() + 240);
+            run(B, "diverged");
+            eng.reset_cache();
+            GenStats st;
+            std::vector<int> outA = eng.generate(A, n_gen, false, &st);
+            std::vector<int> C = A;
+            C.insert(C.end(), outA.begin(), outA.end());
+            C.insert(C.end(), toks.begin() + 200, toks.begin() + 240);
+            run(C, "extended");
         } else if (cmd == "checkbulk") {   // HYPER4_ALLROWS=1: prefill up to the reference's first row, then its rows in one chunk
             const int n = (int) toks.size(), first = g_ref_first;
             Cmp cmp;

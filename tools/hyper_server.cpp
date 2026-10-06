@@ -6,7 +6,9 @@
 //
 // usage: hyper-server <model.gguf> [--host 0.0.0.0] [--port 8080] [--ctx 262144] [--draft 3] [--alias name]
 //                     [--temp 0.6] [--top-p 0.95] [--top-k 20] [--min-p 0] [--snapshots 48]   (request fields override)
+//                     qwen4exp: [--gpu-frac 0.65] [--cpu-threads 30] [--expert-stats file]   (context default 131072)
 #include "engine.h"
+#include "engine4.h"
 
 #include "chat.h"
 #include "llama.h"
@@ -52,7 +54,7 @@ struct Live {
 struct Ctx {
     Live live;
     SamplingParams defaults;
-    Engine * eng = nullptr;
+    LLM * eng = nullptr;
     llama_model * vm = nullptr;
     const llama_vocab * vocab = nullptr;
     common_chat_templates_ptr tmpls;
@@ -207,7 +209,7 @@ GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::strin
     });
     bool first = true;
     clk::time_point t1 = t0;
-    c.eng->generate(r.prompt, r.max_tokens, true, &st, [&](int tok) {
+    c.eng->generate(r.prompt, r.max_tokens, c.eng->has_mtp(), &st, [&](int tok) {
         const auto now = clk::now();
         if (first) {
             t1 = now; first = false; t_log = now;
@@ -322,12 +324,16 @@ ojson usage(const Request & r, const GenOut & o) {
 int main(int argc, char ** argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s model.gguf [--host H] [--port P] [--ctx N] [--draft K] [--alias name]\n", argv[0]); return 1; }
     std::string host = "0.0.0.0", alias;
-    int port = 8080, ctx = 262144, draft = 3, snaps = 48;
+    int port = 8080, ctx = 262144, draft = 3, snaps = 48, cpu_threads = 30;
+    float gpu_frac = 0.65f;
+    bool ctx_given = false;
     SamplingParams defaults;   // Qwen's recommendation for thinking mode
     defaults.temp = 0.6f; defaults.top_p = 0.95f; defaults.top_k = 20; defaults.min_p = 0.0f;
     for (int i = 2; i + 1 < argc; i += 2) {
         const std::string k = argv[i], v = argv[i + 1];
-        if (k == "--host") host = v; else if (k == "--port") port = std::stoi(v); else if (k == "--ctx") ctx = std::stoi(v);
+        if (k == "--host") host = v; else if (k == "--port") port = std::stoi(v); else if (k == "--ctx") { ctx = std::stoi(v); ctx_given = true; }
+        else if (k == "--gpu-frac") gpu_frac = std::stof(v); else if (k == "--cpu-threads") cpu_threads = std::stoi(v);
+        else if (k == "--expert-stats") setenv("HYPER4_STATS", v.c_str(), 1);
         else if (k == "--draft") draft = std::stoi(v); else if (k == "--alias") alias = v;
         else if (k == "--temp") defaults.temp = std::stof(v); else if (k == "--top-p") defaults.top_p = std::stof(v);
         else if (k == "--top-k") defaults.top_k = std::stoi(v); else if (k == "--min-p") defaults.min_p = std::stof(v);
@@ -349,12 +355,29 @@ int main(int argc, char ** argv) {
     c.vocab = llama_model_get_vocab(c.vm);
     c.tmpls = common_chat_templates_init(c.vm, "");
 
-    EngineOptions opt;
-    opt.max_pos = ctx;
-    opt.n_draft = draft;
-    opt.prompt_cache = true;
-    opt.max_snapshots = snaps;
-    Engine eng(path, opt);
+    std::string arch;
+    { GGUF g(path); arch = g.arch(); }
+    std::unique_ptr<LLM> engine;
+    if (arch == "qwen4exp") {
+        if (!ctx_given) ctx = 131072;
+        Engine4Options o4;
+        o4.max_pos = ctx;
+        o4.gpu_expert_frac = gpu_frac;
+        o4.cpu_threads = cpu_threads;
+        o4.prompt_cache = true;
+        o4.max_snapshots = snaps;
+        engine = std::make_unique<Engine4>(path, o4);
+        draft = 0;
+    } else {
+        EngineOptions opt;
+        opt.max_pos = ctx;
+        opt.n_draft = draft;
+        opt.prompt_cache = true;
+        opt.max_snapshots = snaps;
+        engine = std::make_unique<Engine>(path, opt);
+    }
+    c.live.ctx_max = ctx;
+    LLM & eng = *engine;
     c.eng = &eng;
     {
         const std::vector<int> im = tokenize(c.vocab, "<|im_start|>");
@@ -363,7 +386,7 @@ int main(int argc, char ** argv) {
     }
     {   // warm up: builds the CUDA graphs
         GenStats st;
-        eng.generate(tokenize(c.vocab, "Hello"), 4, true, &st);
+        eng.generate(tokenize(c.vocab, "Hello"), 4, eng.has_mtp(), &st);
     }
 
     httplib::Server srv;

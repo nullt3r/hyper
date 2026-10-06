@@ -4,9 +4,12 @@
 #include "cpu_moe.h"
 #include "gguf.h"
 #include "kernels4.cuh"
+#include "llm.h"
 #include "model4.h"
 
 #include <atomic>
+#include <functional>
+#include <random>
 #include <memory>
 #include <vector>
 
@@ -17,6 +20,8 @@ struct Engine4Options {
     int max_pos = 8192;
     float gpu_expert_frac = 0.6f;   // fraction of each layer's experts placed on the GPUs (rest on the CPU)
     int cpu_threads = 30;
+    bool prompt_cache = false;      // reuse the common prefix with the previous sequence (recurrent-state snapshots)
+    int max_snapshots = 48;
 };
 
 // spin barrier for the per-device recording threads of a prefill chunk
@@ -38,7 +43,7 @@ private:
     std::atomic<unsigned> gen_{0};
 };
 
-class Engine4 {
+class Engine4 : public LLM {
 public:
     Engine4(const std::string & model_path, const Engine4Options & opt);
     ~Engine4();
@@ -52,6 +57,15 @@ public:
     void get_logits(int t, std::vector<float> & out);
     void reset();
     const Q4Config & config() const { return cfg_; }
+    // LLM: greedy / sampled generation (no speculative decoding yet), prompt cache
+    std::vector<int> generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
+                              const std::function<bool(int)> & on_token = {}, const SamplingParams & sp = {}) override;
+    void set_snapshot_token(int tok) override { snap_token_ = tok; }
+    void reset_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); }
+    void set_prefill_progress(std::function<void(int, int, int)> fn) override { prefill_cb_ = std::move(fn); }
+    int max_pos() const override { return opt_.max_pos; }
+    int n_draft() const override { return 0; }
+    bool has_mtp() const override { return false; }
     void save_expert_stats(const std::string & path) { cpu_->save_stats(path); }
 
 private:
@@ -63,6 +77,18 @@ private:
     void build_graphs();
     void embed(const int * tokens, int nt, int pos);
     void * host_huge_alloc(size_t bytes);   // anonymous, transparent huge pages; freed with the engine
+    int sample_row(int t, const SamplingParams & sp);
+    struct Snap { int pos; std::vector<float *> h; };
+    size_t snap_floats(int gi) const;
+    void snap_copy(Snap & sn, bool to_host);
+    void take_snapshot(int pos);
+    std::vector<int> hist_;
+    std::vector<Snap> snaps_;
+    std::vector<std::vector<float *>> snap_pool_;
+    int snap_token_ = -1;
+    std::function<void(int, int, int)> prefill_cb_;
+    float * h_topk_ = nullptr;      // pinned [ndev][MAX_NT][TOPK][2]
+    std::mt19937_64 rng_;
     std::vector<std::pair<void *, size_t>> host_bufs_;
 
     Engine4Options opt_;

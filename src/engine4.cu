@@ -74,6 +74,7 @@ struct Engine4::Device {
     half * xh = nullptr, * p16 = nullptr, * recv = nullptr;   // GEMM input scratch; DMA allreduce own / peers' parts
     half * mix16 = nullptr, * h16 = nullptr;                  // prefill MoE: fp16 token rows, fp16 expert hidden rows
     int * egrp = nullptr;                                     // prefill MoE: active experts (expert, start, count)
+    float * topk = nullptr;                                   // sampling candidates [MAX_NT][TOPK][2]
     float * iq = nullptr, * ik = nullptr, * iqn = nullptr, * iscores = nullptr;   // QSA: projections, normed queries, scores
     int * ilist = nullptr, * ilist_n = nullptr;                                 // QSA: attended cells per token
     cublasHandle_t blas = nullptr;
@@ -222,6 +223,7 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
     barrier_ = std::make_unique<Barrier4>(nd);
     CUDA_CHECK(cudaHostAlloc(&h_pos_, 4 * sizeof(int), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_res_, (size_t) nd * MAX_NT * 2 * sizeof(float), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_topk_, (size_t) nd * MAX_NT * TOPK * 2 * sizeof(float), cudaHostAllocPortable));
     const size_t ll = (size_t) 2 * nd * MAX_NT * n / 2;
     CUDA_CHECK(cudaHostAlloc(&ar_ll_, ll * sizeof(uint2), cudaHostAllocPortable | cudaHostAllocMapped));
     memset(ar_ll_, 0xff, ll * sizeof(uint2));
@@ -256,6 +258,9 @@ void * Engine4::host_huge_alloc(size_t bytes) {
 }
 
 Engine4::~Engine4() {
+    for (auto & sn : snaps_) snap_pool_.push_back(sn.h);
+    for (auto & v : snap_pool_) for (float * p : v) cudaFreeHost(p);
+    if (h_topk_) cudaFreeHost(h_topk_);
     cpu_.reset();
     for (auto & [p, sz] : host_bufs_) munmap(p, sz);
     devs_.clear();
@@ -507,6 +512,7 @@ void Engine4::load_weights() {
         dev.recv = dev.alloc<half>((size_t) std::max(1, nd - 1) * R * n);
         dev.order = dev.alloc<int>((size_t) R * K);
         dev.order_n = dev.alloc<int>(2);
+        dev.topk = dev.alloc<float>((size_t) MAX_NT * TOPK * 2);
         dev.egrp = dev.alloc<int>((size_t) 3 * c.n_expert);
         dev.mix16 = dev.alloc<half>((size_t) R * n);
         dev.iq = dev.alloc<float>((size_t) R * c.idx_n_head * 128);
@@ -731,6 +737,12 @@ void Engine4::record_main(int gi, int nt) {
     mm(d.output, d.mixed, n, d.logits, d.output.n, hr);
     argmax_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.wts, hr, s);   // wts reused as the result pairs
     CUDA_CHECK(cudaMemcpyAsync(h_res_ + (size_t) gi * MAX_NT * 2, d.wts, (size_t) std::min(hr, MAX_NT) * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
+    {   // sampling candidates of the result rows (top-64 of this vocab slice)
+        const int tr = std::min(hr, MAX_NT);
+        topk_pairs(d.logits + (size_t) (hr - tr) * d.output.n, d.output.n, d.output.n, d.vocab_off, d.topk, TOPK, tr, s);
+        CUDA_CHECK(cudaMemcpyAsync(h_topk_ + (size_t) gi * MAX_NT * TOPK * 2, d.topk, (size_t) tr * TOPK * 2 * sizeof(float),
+                                   cudaMemcpyDeviceToHost, s));
+    }
 }
 
 void Engine4::build_graphs() {
@@ -861,6 +873,167 @@ std::vector<int> Engine4::forward(const int * tokens, int nt, int pos) {
         }
         out[t] = bi;
     }
+    return out;
+}
+
+// ---------------- prompt cache: recurrent-state snapshots (GDN conv + state, PLE conv history) ----------------
+size_t Engine4::snap_floats(int gi) const {
+    const Q4Config & c = cfg_;
+    size_t n = 0;
+    for (auto & L : devs_[gi]->layers) {
+        if (!L.full) n += (size_t) (c.ssm_conv - 1) * L.conv_ch + (size_t) L.n_v_l * c.ssm_d_state * c.head_v_dim();
+        if (L.ple) n += (size_t) (c.ple_conv - 1) * c.ple_ngram * c.hc_dim();
+    }
+    return n;
+}
+
+void Engine4::snap_copy(Snap & sn, bool to_host) {
+    const Q4Config & c = cfg_;
+    for (size_t gi = 0; gi < devs_.size(); ++gi) {
+        Device & d = *devs_[gi];
+        CUDA_CHECK(cudaSetDevice(d.id));
+        float * hp = sn.h[gi];
+        auto cp = [&](float * dev, size_t n) {
+            if (to_host) CUDA_CHECK(cudaMemcpyAsync(hp, dev, n * sizeof(float), cudaMemcpyDeviceToHost, d.stream));
+            else CUDA_CHECK(cudaMemcpyAsync(dev, hp, n * sizeof(float), cudaMemcpyHostToDevice, d.stream));
+            hp += n;
+        };
+        for (auto & L : d.layers) {
+            if (!L.full) {
+                cp(L.conv_state, (size_t) (c.ssm_conv - 1) * L.conv_ch);
+                cp(L.state, (size_t) L.n_v_l * c.ssm_d_state * c.head_v_dim());
+            }
+            if (L.ple) cp(L.ple_state, (size_t) (c.ple_conv - 1) * c.ple_ngram * c.hc_dim());
+        }
+    }
+    for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->stream)); }
+}
+
+void Engine4::take_snapshot(int pos) {
+    for (auto & s : snaps_) if (s.pos == pos) return;
+    if ((int) snaps_.size() >= opt_.max_snapshots) {
+        auto victim = snaps_.end();
+        for (auto it = snaps_.begin(); it != snaps_.end(); ++it)
+            if (it->pos % 4096 && (victim == snaps_.end() || it->pos < victim->pos)) victim = it;
+        if (victim == snaps_.end())
+            victim = std::min_element(snaps_.begin(), snaps_.end(), [](const Snap & a, const Snap & b) { return a.pos < b.pos; });
+        snap_pool_.push_back(victim->h);
+        snaps_.erase(victim);
+    }
+    Snap sn;
+    sn.pos = pos;
+    if (!snap_pool_.empty()) { sn.h = snap_pool_.back(); snap_pool_.pop_back(); }
+    else {
+        for (size_t gi = 0; gi < devs_.size(); ++gi) {
+            float * p = nullptr;
+            CUDA_CHECK(cudaHostAlloc(&p, snap_floats((int) gi) * sizeof(float), cudaHostAllocPortable));
+            sn.h.push_back(p);
+        }
+    }
+    snap_copy(sn, true);
+    snaps_.push_back(sn);
+}
+
+// candidates of row t from every device's top-K, then temperature / top-k / min-p / top-p
+int Engine4::sample_row(int t, const SamplingParams & sp) {
+    std::vector<std::pair<float, int>> cand;
+    for (size_t g = 0; g < devs_.size(); ++g) {
+        const float * p = h_topk_ + ((size_t) g * MAX_NT + t) * TOPK * 2;
+        for (int i = 0; i < TOPK; ++i) { const int idx = ((const int *) p)[2 * i + 1]; if (idx >= 0) cand.push_back({p[2 * i], idx}); }
+    }
+    std::sort(cand.begin(), cand.end(), [](auto & a, auto & b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+    int k = std::min<int>((int) cand.size(), sp.top_k > 0 ? std::min(sp.top_k, TOPK) : TOPK);
+    if (sp.temp <= 0.0f || k == 1) return cand[0].second;
+    std::vector<double> pr(k);
+    double z = 0;
+    for (int i = 0; i < k; ++i) { pr[i] = std::exp((cand[i].first - cand[0].first) / sp.temp); z += pr[i]; }
+    for (auto & v : pr) v /= z;
+    if (sp.min_p > 0) { int kk = 1; while (kk < k && pr[kk] >= sp.min_p * pr[0]) ++kk; k = kk; }
+    if (sp.top_p < 1.0f) { double cum = 0; int kk = 0; while (kk < k) { cum += pr[kk++]; if (cum >= sp.top_p) break; } k = kk; }
+    double tot = 0;
+    for (int i = 0; i < k; ++i) tot += pr[i];
+    double u = std::uniform_real_distribution<double>(0.0, tot)(rng_);
+    for (int i = 0; i < k; ++i) { u -= pr[i]; if (u <= 0) return cand[i].second; }
+    return cand[k - 1].second;
+}
+
+std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, bool, GenStats * stats,
+                                   const std::function<bool(int)> & on_token, const SamplingParams & sp) {
+    if (prompt.empty()) throw std::runtime_error("generate: empty prompt");
+    if ((int) prompt.size() + 8 > opt_.max_pos) throw std::runtime_error("generate: prompt longer than the context");
+    using clk = std::chrono::steady_clock;
+    const bool sampling = sp.temp > 0.0f;
+    rng_.seed(sp.seed ? sp.seed : std::random_device{}());
+    const int P = (int) prompt.size();
+    // prompt cache: KV / indexer entries stay valid for the common prefix L; the recurrent state comes from the
+    // latest snapshot at s <= L - 1
+    int s = 0;
+    if (opt_.prompt_cache) {
+        int L = 0;
+        while (L < P && L < (int) hist_.size() && prompt[L] == hist_[L]) ++L;
+        for (size_t i = 0; i < snaps_.size();)
+            if (snaps_[i].pos > L) { snap_pool_.push_back(snaps_[i].h); snaps_.erase(snaps_.begin() + i); } else ++i;
+        Snap * best = nullptr;
+        for (auto & sn : snaps_) if (sn.pos <= std::min(L - 1, P - 1) && (!best || sn.pos > best->pos)) best = &sn;
+        if (best) { s = best->pos; snap_copy(*best, false); }
+    }
+    if (s == 0) reset();
+    seq_.assign(prompt.begin(), prompt.begin() + s);   // PLE n-gram history
+    hist_.assign(prompt.begin(), prompt.begin() + s);
+    std::vector<int> snap_at;
+    if (opt_.prompt_cache) {   // last two message starts always, older ones >= 256 tokens apart, every 4096 tokens
+        std::vector<int> msg;
+        for (int q = s + 1; q < P; ++q) if (prompt[q] == snap_token_) msg.push_back(q);
+        for (int q = (s / 4096 + 1) * 4096; q < P; q += 4096) snap_at.push_back(q);
+        int last = s;
+        for (size_t i = 0; i < msg.size(); ++i)
+            if (i + 2 >= msg.size() || msg[i] - last >= 256) { snap_at.push_back(msg[i]); last = msg[i]; }
+        std::sort(snap_at.begin(), snap_at.end());
+        snap_at.erase(std::unique(snap_at.begin(), snap_at.end()), snap_at.end());
+    }
+    GenStats st;
+    auto tp = clk::now();
+    int next = -1;
+    size_t si = 0;
+    for (int c0 = s; c0 < P;) {
+        int end = std::min(c0 + R4, P);
+        while (si < snap_at.size() && snap_at[si] <= c0) ++si;
+        if (si < snap_at.size() && snap_at[si] < end) end = snap_at[si];
+        const int len = end - c0;
+        next = forward(&prompt[c0], len, c0)[len - 1];
+        if (sampling) next = sample_row(len <= MAX_NT ? len - 1 : 0, sp);
+        if (si < snap_at.size() && snap_at[si] == end) take_snapshot(end);
+        if (prefill_cb_) prefill_cb_(end, P, s);
+        c0 = end;
+    }
+    hist_ = prompt;
+    st.t_prefill = std::chrono::duration<double>(clk::now() - tp).count();
+    st.prompt_reused = s;
+    std::vector<int> out;
+    int p = P;
+    auto t0 = clk::now();
+    bool stop = false;
+    auto emit = [&](int tok) {
+        if (stop) return false;
+        out.push_back(tok);
+        if (on_token && !on_token(tok)) stop = true;
+        if ((int) out.size() >= n_gen) stop = true;
+        return !stop;
+    };
+    while (emit(next) && p + 1 < opt_.max_pos) {
+        next = forward(&next, 1, p++)[0];
+        if (sampling) next = sample_row(0, sp);
+        st.steps++;
+    }
+    {
+        std::vector<int> sq = prompt;
+        sq.insert(sq.end(), out.begin(), out.end());
+        sq.resize(std::min<size_t>(sq.size(), (size_t) p));
+        hist_ = sq;
+    }
+    st.tokens = (int) out.size();
+    st.seconds = std::chrono::duration<double>(clk::now() - t0).count();
+    if (stats) *stats = st;
     return out;
 }
 

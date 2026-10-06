@@ -4,6 +4,7 @@
 #pragma once
 #include "gguf.h"
 #include "kernels.cuh"
+#include "llm.h"
 #include "model.h"
 
 #include <atomic>
@@ -23,20 +24,7 @@ struct EngineOptions {
     int max_snapshots = 48;      // pinned host snapshots (~50 MB per GPU each for the 27B model)
 };
 
-struct SamplingParams {
-    float temp = 0.0f;           // 0: greedy
-    int top_k = 0;               // 0 or > 64: the 64 best candidates
-    float top_p = 1.0f, min_p = 0.0f;
-    uint64_t seed = 0;           // 0: random
-};
 
-struct GenStats {
-    int tokens = 0, steps = 0, accepted = 0;
-    double seconds = 0;
-    double t_main = 0, t_mtp = 0, t_restore = 0;   // wall time per phase
-    double t_prefill = 0;
-    int prompt_reused = 0;       // prompt tokens served from the prompt cache
-};
 
 // spin barrier for the per-device recording threads
 class Barrier {
@@ -57,7 +45,7 @@ private:
     std::atomic<unsigned> gen_{0};
 };
 
-class Engine {
+class Engine : public LLM {
 public:
     // per-stream activation view used while recording
     struct Act {
@@ -82,15 +70,16 @@ public:
     // greedy generation; prompt processed in chunks of up to 512 tokens. spec = use MTP drafts (1 per step)
     // on_token: called for every generated token in order; returning false stops generation
     std::vector<int> generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
-                              const std::function<bool(int)> & on_token = {}, const SamplingParams & sp = {});
+                              const std::function<bool(int)> & on_token = {}, const SamplingParams & sp = {}) override;
     // token at which prompt-cache snapshots are taken (message start, e.g. <|im_start|>)
-    void set_snapshot_token(int tok) { snap_token_ = tok; }
+    void set_snapshot_token(int tok) override { snap_token_ = tok; }
     // called after every prefill chunk with (tokens done incl. reused, prompt length, reused tokens)
-    void set_prefill_progress(std::function<void(int, int, int)> fn) { prefill_cb_ = std::move(fn); }
+    void set_prefill_progress(std::function<void(int, int, int)> fn) override { prefill_cb_ = std::move(fn); }
     void clear_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); }
     int n_snapshots() const { return (int) snaps_.size(); }
-    int max_pos() const { return opt_.max_pos; }
-    int n_draft() const { return opt_.n_draft; }
+    int max_pos() const override { return opt_.max_pos; }
+    int n_draft() const override { return opt_.n_draft; }
+    bool has_mtp() const override { return opt_.mtp; }
 
     const Qwen35Config & config() const { return cfg_; }
 

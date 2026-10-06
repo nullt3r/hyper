@@ -155,3 +155,18 @@ stejný pro chunky 128 i 50+50+28 (každý token se počítá stejně nezávisle
 Baseline: mainline pp512 461, pp2048@32k 584; ik pp512 530–610. Profil: GPU0 čeká v moe_reduce na CPU experty
 (~40 % času) → další krok: překrytí CPU a GPU (2 mikro-dávky), rychlejší CPU kernel (víc tokenů na řádek vah).
 Pozor: QSA (sparse attention nad ~2k tokenů) zatím chybí → výsledky jsou přesné jen do ~2k kontextu.
+
+## hyper4 – QSA + server
+
+- QSA (sparse attention): indexer replikovaný na GPU (q/k projekce BF16→fp16 frag., raw klíče fp16, bloky po 4: průměr →
+  RMS norm → RoPE na první pozici), skóre Σ_h relu(q·k)/√128, top-512 radix select (8bit číslice, shody → nižší index),
+  attention přes seznam buněk (split-K kernel). Dekódování vždy přes seznam (do ~2k = 0..p), prefill hustý flash dokud
+  celý chunk ≤ 2048 bloků. **Výběr bloků se shoduje s mainline 511/512** (vrstva 3, token 3199; jediný rozdíl = těsná
+  shoda skóre). KL na 12k je vyšší (0,21 vs mainline-vs-mainline 0,05) kvůli chaotickým přepnutím výběru/routingu
+  na citlivých pozicích – stejné pozice skáčou i u mainline proti sobě.
+- 32k: prefill 513 t/s (mainline pp2048@32k 584), dekódování 51,6 t/s (mainline 36,1).
+- Server: společné rozhraní `LLM` (llm.h), server vybere engine podle arch (qwen35 → v1, qwen4exp → Engine4).
+  Engine4: prompt cache (snapshoty DeltaNet + PLE konvoluce), sampling top-64 z GPU. `cachetest`: stejný i rozbíhající
+  se prompt 64/64 identických; prodloužený se rozejde po 16 tokenech (jiné dělení chunků → GEMV vs GEMM numerika).
+- `~/run-hyper-fn.sh` (tmux hyper, :8080): ctx 131072, 65 % expertů na GPU → dekódování ~49 t/s (T=1,0).
+  TODO: rozdělení attention po kv hlavách (GPU1 drží obě kv hlavy → méně místa na experty), MTP, překrytí CPU/GPU.
