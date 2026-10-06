@@ -16,14 +16,20 @@
 
 using namespace hyper;
 
+static int g_ref_first = 0;   // v2 references hold logits for positions g_ref_first.. only
+
 static bool read_ref(const char * path, std::vector<int> & toks, std::vector<float> & logits, int & nv) {
     FILE * f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); return false; }
     int n = 0;
-    if (fread(&n, 4, 1, f) != 1 || fread(&nv, 4, 1, f) != 1) return false;
+    if (fread(&n, 4, 1, f) != 1) return false;
+    const bool v2 = n == 0x32464552;
+    if (v2 && fread(&n, 4, 1, f) != 1) return false;
+    if (fread(&nv, 4, 1, f) != 1) return false;
+    if (v2 && fread(&g_ref_first, 4, 1, f) != 1) return false;
     toks.resize(n);
     if (fread(toks.data(), 4, n, f) != (size_t) n) return false;
-    logits.resize((size_t) n * nv);
+    logits.resize((size_t) (n - g_ref_first) * nv);
     if (fread(logits.data(), 4, logits.size(), f) != logits.size()) return false;
     fclose(f);
     return true;
@@ -103,21 +109,41 @@ int main(int argc, char ** argv) {
             printf("CHECK4 nt=%d n=%d top1 %.2f%%  KL mean %.6f max %.5f  (%.1f tok/s incl. logits download)\n", nt, cmp.n,
                    100.0 * cmp.top1 / cmp.n, cmp.kl_sum / cmp.n, cmp.kl_max, cmp.n / s);
         } else if (cmd == "checkpf") {   // prefill the first n_pf tokens in chunks, then decode the rest token by token
-            const int n_pf = argc > 4 ? atoi(argv[4]) : 128;
+            int n_pf = argc > 4 ? atoi(argv[4]) : 128;
+            if (g_ref_first > 0) n_pf = g_ref_first + 1;   // v2 reference: logits from g_ref_first on
             const int n = (int) toks.size();
             Cmp cmp, cmp_pf;
             std::vector<float> lg;
             eng.reset();
             eng.prefill(toks.data(), n_pf, 0);
             eng.get_logits(0, lg);
-            cmp_pf.add(&ref[(size_t) (n_pf - 1) * nv], lg, nv);
-            for (int i = n_pf; i < n; ++i) {
-                eng.forward(&toks[i], 1, i);
-                eng.get_logits(0, lg);
-                cmp.add(&ref[(size_t) i * nv], lg, nv);
+            cmp_pf.add(&ref[(size_t) (n_pf - 1 - g_ref_first) * nv], lg, nv);
+            const int step = getenv("HYPER4_DSTEP") ? atoi(getenv("HYPER4_DSTEP")) : 1;   // tokens per decode forward
+            for (int i0 = n_pf; i0 < n; i0 += step) {
+                const int nt = std::min(step, n - i0);
+                eng.forward(&toks[i0], nt, i0);
+                for (int tt = 0; tt < nt; ++tt) {
+                const int i = i0 + tt;
+                eng.get_logits(tt, lg);
+                cmp.add(&ref[(size_t) (i - g_ref_first) * nv], lg, nv);
+                if (getenv("HYPER4_PERPOS") && i < n_pf + 24) fprintf(stderr, "  pos %6d (mod4 %d) KL %.5f\n", i, i % 4, cmp.last);
+                }
             }
             printf("CHECKPF prefill %d: last-row KL %.5f top1 %d | decoded after it: n=%d top1 %.2f%% KL mean %.6f max %.5f\n", n_pf,
                    cmp_pf.kl_sum, cmp_pf.top1, cmp.n, 100.0 * cmp.top1 / std::max(1, cmp.n), cmp.kl_sum / std::max(1, cmp.n), cmp.kl_max);
+        } else if (cmd == "checkbulk") {   // HYPER4_ALLROWS=1: prefill up to the reference's first row, then its rows in one chunk
+            const int n = (int) toks.size(), first = g_ref_first;
+            Cmp cmp;
+            std::vector<float> lg;
+            eng.reset();
+            if (first > 0) eng.prefill(toks.data(), first, 0);
+            for (int c0 = first; c0 < n; c0 += 512) {
+                const int nt = std::min(512, n - c0);
+                eng.forward(&toks[c0], nt, c0);
+                for (int t = 0; t < nt; ++t) { eng.get_logits(t, lg); cmp.add(&ref[(size_t) (c0 + t - first) * nv], lg, nv); }
+            }
+            printf("CHECKBULK rows %d..%d: n=%d top1 %.2f%% KL mean %.6f max %.5f\n", first, n - 1, cmp.n, 100.0 * cmp.top1 / cmp.n,
+                   cmp.kl_sum / cmp.n, cmp.kl_max);
         } else if (cmd == "pfbench") {   // prompt of n tokens (reference tokens repeated): prefill speed, then 64 decoded tokens
             const int n = argc > 4 ? atoi(argv[4]) : 2048;
             std::vector<int> prompt(n);

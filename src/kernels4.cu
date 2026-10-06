@@ -1,5 +1,6 @@
 #include "kernels4.cuh"
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <stdexcept>
@@ -415,6 +416,153 @@ __global__ void __launch_bounds__(256) k_moe_gemm(MoeDev m, const half * __restr
     }
 }
 
+// ---------------- QSA indexer ----------------
+// rotate the first n_rot dims (NEOX pairs i, i + n_rot/2) of a 128-dim vector held in shared memory buf, thread i
+__device__ __forceinline__ float rope_dim(const float * buf, int i, int pos, int n_rot, float base) {
+    const int half_rot = n_rot / 2;
+    if (i >= n_rot) return buf[i];
+    const int fi = i < half_rot ? i : i - half_rot;
+    const double theta = (double) pos * pow((double) base, -2.0 * fi / n_rot);
+    double sn, cs;
+    sincos(theta, &sn, &cs);
+    return i < half_rot ? buf[i] * (float) cs - buf[i + half_rot] * (float) sn : buf[i - half_rot] * (float) sn + buf[i] * (float) cs;
+}
+// grid (nt, n_head + 1), 128 threads: query heads normed + rotated into qn; the last "head" stores the raw key (fp16)
+__global__ void k_idx_prep(const float * __restrict__ qi, const float * __restrict__ kr, const float * __restrict__ qnorm,
+                           float * __restrict__ qn, half * __restrict__ kraw, const int * pos_p, int n_head, int n_rot, float base, float eps) {
+    const int t = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
+    const int pos = *pos_p + t;
+    if (h == n_head) { kraw[(size_t) pos * 128 + i] = __float2half(kr[(size_t) t * 128 + i]); return; }
+    __shared__ float buf[128];
+    float x = qi[((size_t) t * n_head + h) * 128 + i];
+    const float ss = block_sum4(x * x);
+    buf[i] = x * rsqrtf(ss / 128 + eps) * qnorm[i];
+    __syncthreads();
+    qn[((size_t) t * n_head + h) * 128 + i] = rope_dim(buf, i, pos, n_rot, base);
+}
+// grid (candidate blocks), 128 threads: blocks of 4 cells completed by tokens pos..pos+nt-1: mean raw key -> rms norm ->
+// rope at the block's first position -> pool[b]
+__global__ void k_idx_pool(const half * __restrict__ kraw, half * __restrict__ pool, const float * __restrict__ knorm, const int * pos_p,
+                           int nt, int n_rot, float base, float eps) {
+    const int pos = *pos_p;
+    const int b = pos / 4 + blockIdx.x, last = 4 * b + 3, i = threadIdx.x;
+    if (last < pos || last > pos + nt - 1) return;
+    __shared__ float buf[128];
+    float x = 0.0f;
+    for (int j = 0; j < 4; ++j) x += __half2float(kraw[(size_t) (4 * b + j) * 128 + i]);
+    x *= 0.25f;
+    const float ss = block_sum4(x * x);
+    buf[i] = x * rsqrtf(ss / 128 + eps) * knorm[i];
+    __syncthreads();
+    pool[(size_t) b * 128 + i] = __float2half(rope_dim(buf, i, 4 * b, n_rot, base));
+}
+// block per token (1024 threads): visible complete pools np = (p+1)/4; np <= top: all cells 0..p. Otherwise the top
+// `top` pools by sum_h relu(q_h . pool) / sqrt(128) (radix select on the non-negative score bits, ties to the lower
+// pool index), as ascending cell lists, plus the incomplete tail block
+__global__ void __launch_bounds__(1024) k_idx_select(const float * __restrict__ qn, const half * __restrict__ pool, const int * pos_p, int t_off,
+                                                     int n_head, int top, float * __restrict__ scores, int score_stride,
+                                                     int * __restrict__ list, int list_stride, int * __restrict__ list_n) {
+    const int tl = blockIdx.x, t = t_off + tl;
+    const int p = *pos_p + t, np = (p + 1) / 4;
+    int * lt = list + (size_t) t * list_stride;
+    if (np <= top) {
+        for (int i = threadIdx.x; i <= p; i += blockDim.x) lt[i] = i;
+        if (threadIdx.x == 0) list_n[t] = p + 1;
+        return;
+    }
+    __shared__ float qs[4 * 128];
+    for (int i = threadIdx.x; i < n_head * 128; i += blockDim.x) qs[i] = qn[(size_t) t * n_head * 128 + i];
+    __syncthreads();
+    float * sc = scores + (size_t) tl * score_stride;
+    for (int b = threadIdx.x; b < np; b += blockDim.x) {
+        const half * pk = pool + (size_t) b * 128;
+        float acc[4] = {0, 0, 0, 0};
+        for (int i = 0; i < 128; i += 8) {
+            const uint4 v = *(const uint4 *) (pk + i);
+            const __half2 * h2 = (const __half2 *) &v;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 f = __half22float2(h2[j]);
+                for (int h = 0; h < n_head; ++h) acc[h] += f.x * qs[h * 128 + i + 2 * j] + f.y * qs[h * 128 + i + 2 * j + 1];
+            }
+        }
+        float s = 0.0f;
+        for (int h = 0; h < n_head; ++h) s += fmaxf(acc[h], 0.0f);
+        sc[b] = s * rsqrtf(128.0f);
+    }
+    __syncthreads();
+    // radix select of the top-th largest key (scores >= 0: float bits are monotonic)
+    __shared__ unsigned hist[256];
+    __shared__ unsigned prefix, need;
+    if (threadIdx.x == 0) { prefix = 0; need = top; }
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
+        __syncthreads();
+        const unsigned mask_hi = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+        for (int b = threadIdx.x; b < np; b += blockDim.x) {
+            const unsigned key = __float_as_uint(sc[b]);
+            if ((key & mask_hi) == (prefix & mask_hi)) atomicAdd(&hist[(key >> shift) & 255], 1u);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            unsigned acc = 0;
+            for (int d = 255; d >= 0; --d) {
+                if (acc + hist[d] >= need) { prefix |= (unsigned) d << shift; need -= acc; break; }
+                acc += hist[d];
+            }
+        }
+        __syncthreads();
+    }
+    // prefix = threshold key; take every key > threshold and the first `need` keys == threshold (pool order)
+    const unsigned thr = prefix;
+    __shared__ int base_cnt, eq_left;
+    __shared__ int warp_sums[32];
+    if (threadIdx.x == 0) { base_cnt = 0; eq_left = (int) need; }
+    __syncthreads();
+    for (int b0 = 0; b0 < np; b0 += blockDim.x) {
+        const int b = b0 + threadIdx.x;
+        const unsigned key = b < np ? __float_as_uint(sc[b]) : 0u;
+        const int gt = b < np && key > thr, eq = b < np && key == thr;
+        // ordered rank of eq within this chunk
+        const unsigned m_eq = __ballot_sync(0xffffffff, eq), m_gt = __ballot_sync(0xffffffff, gt);
+        const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+        if (lane == 0) warp_sums[wid] = __popc(m_eq) | (__popc(m_gt) << 16);
+        __syncthreads();
+        int eq_before = 0, gt_before = 0;
+        for (int w = 0; w < wid; ++w) { eq_before += warp_sums[w] & 0xffff; gt_before += warp_sums[w] >> 16; }
+        eq_before += __popc(m_eq & ((1u << lane) - 1));
+        gt_before += __popc(m_gt & ((1u << lane) - 1));
+        int tot_eq = 0, tot_gt = 0;
+        for (int w = 0; w < (int) (blockDim.x >> 5); ++w) { tot_eq += warp_sums[w] & 0xffff; tot_gt += warp_sums[w] >> 16; }
+        const int eq_take = min(tot_eq, eq_left);
+        const bool sel = gt || (eq && eq_before < eq_left);
+        // selected pools of this chunk in pool order: rank = (selected before me in the chunk)
+        const int sel_before = gt_before + min(eq_before, eq_left);   // gt and eq interleave: count both kinds before me
+        (void) sel_before;
+        __syncthreads();
+        // exact ordered rank: prefix count of sel over the chunk
+        const unsigned m_sel = __ballot_sync(0xffffffff, sel);
+        if (lane == 0) warp_sums[wid] = __popc(m_sel);
+        __syncthreads();
+        int r = __popc(m_sel & ((1u << lane) - 1));
+        for (int w = 0; w < wid; ++w) r += warp_sums[w];
+        int chunk_sel = 0;
+        for (int w = 0; w < (int) (blockDim.x >> 5); ++w) chunk_sel += warp_sums[w];
+        if (sel) {
+            const int o = (base_cnt + r) * 4;
+            lt[o] = 4 * b; lt[o + 1] = 4 * b + 1; lt[o + 2] = 4 * b + 2; lt[o + 3] = 4 * b + 3;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) { base_cnt += chunk_sel; eq_left -= eq_take; }
+        __syncthreads();
+        (void) tot_gt;
+    }
+    // tail: cells after the last complete block
+    const int tail0 = 4 * np;
+    for (int c = tail0 + threadIdx.x; c <= p; c += blockDim.x) lt[base_cnt * 4 + (c - tail0)] = c;
+    if (threadIdx.x == 0) list_n[t] = base_cnt * 4 + (p - tail0 + 1);
+}
+
 // ---------------- PLE ----------------
 // grid (hc, nt): per stream sums of key^2, res^2, key*wk*res*wq; stream 0 also sum value^2
 __global__ void k_ple_stats(const float * __restrict__ res, const float * __restrict__ key, const float * __restrict__ value,
@@ -543,6 +691,19 @@ void moe_publish(volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_
     k_moe_publish<<<(unsigned) ((tot + 255) / 256), 256, 0, s>>>(ntp, ids_dst, wts_dst, x_dst, x, xs, n, ids, wts, k, nt);
     k_moe_seq<<<1, 1, 0, s>>>(seq, counter, seq_tag);
 }
+void idx_prep(const float * qi, const float * kr, const float * qnorm, float * qn, half * kraw, const int * pos, int n_head, int n_rot,
+              float base, float eps, int nt, cudaStream_t s) {
+    k_idx_prep<<<dim3(nt, n_head + 1), 128, 0, s>>>(qi, kr, qnorm, qn, kraw, pos, n_head, n_rot, base, eps);
+}
+void idx_pool(const half * kraw, half * pool, const float * knorm, const int * pos, int nt, int n_rot, float base, float eps, cudaStream_t s) {
+    k_idx_pool<<<nt / 4 + 2, 128, 0, s>>>(kraw, pool, knorm, pos, nt, n_rot, base, eps);
+}
+void idx_select(const float * qn, const half * pool, const int * pos, int nt, int n_head, int top, float * scores, int score_stride,
+                int score_rows, int * list, int list_stride, int * list_n, cudaStream_t s) {
+    for (int t0 = 0; t0 < nt; t0 += score_rows)
+        k_idx_select<<<std::min(score_rows, nt - t0), 1024, 0, s>>>(qn, pool, pos, t0, n_head, top, scores, score_stride, list, list_stride, list_n);
+}
+
 void ple_apply(float * res, const float * key, const float * value, const float * wk, const float * wq, const float * wconv_norm,
                const float * conv_w, float * conv_state, float * conv_snap, int n, int hc, int K, int dil, float eps, int nt,
                float * scratch, cudaStream_t s) {

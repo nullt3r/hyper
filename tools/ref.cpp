@@ -7,6 +7,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -20,6 +21,17 @@ static bool dump_cb(struct ggml_tensor * t, bool ask, void *) {
     const std::string name = t->name;
     bool match = false;
     for (auto & p : g_dump) if (name.rfind(p, 0) == 0) match = true;
+    const char * raw = getenv("REF_DUMPRAW");   // exact tensor name: raw data to /tmp/<name>.bin (+ shape on stderr)
+    if (raw && name == raw) {
+        if (ask) return true;
+        std::vector<uint8_t> buf(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+        FILE * f = fopen((std::string("/tmp/") + name + ".bin").c_str(), "wb");
+        fwrite(buf.data(), 1, buf.size(), f);
+        fclose(f);
+        fprintf(stderr, "DUMPRAW %s type %d ne %lld %lld %lld\n", name.c_str(), (int) t->type, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2]);
+        return true;
+    }
     if (ask) return match;
     if (!match || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) return true;
     std::vector<float> buf(ggml_nelements(t));
@@ -62,6 +74,7 @@ int main(int argc, char ** argv) {
     cp.n_batch = n;
     cp.n_ubatch = n;
     if (getenv("REF_UBATCH")) cp.n_ubatch = atoi(getenv("REF_UBATCH"));   // other kernels / numerics (noise floor)
+    if (getenv("REF_DUMPRAW") && !getenv("REF_DUMP")) { cp.cb_eval = dump_cb; cp.cb_eval_user_data = nullptr; }
     if (const char * d = getenv("REF_DUMP")) {
         std::string s = d;
         size_t p = 0;
@@ -79,15 +92,23 @@ int main(int argc, char ** argv) {
         batch.n_seq_id[i] = 1;
         batch.seq_id[i][0] = 0;
         batch.logits[i] = 1;
+        if (getenv("REF_LAST") && i < n - atoi(getenv("REF_LAST"))) batch.logits[i] = 0;
     }
     batch.n_tokens = n;
     if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "decode failed\n"); return 1; }
 
     FILE * f = fopen(argv[3], "wb");
+    int first = 0;
+    if (getenv("REF_LAST")) {   // v2: 'REF2', n, n_vocab, first, tokens, logits of positions first..n-1
+        first = std::max(0, n - atoi(getenv("REF_LAST")));
+        const int magic = 0x32464552;
+        fwrite(&magic, 4, 1, f);
+    }
     fwrite(&n, 4, 1, f);
     fwrite(&n_vocab, 4, 1, f);
+    if (getenv("REF_LAST")) fwrite(&first, 4, 1, f);
     fwrite(toks.data(), 4, n, f);
-    for (int i = 0; i < n; ++i) fwrite(llama_get_logits_ith(ctx, i), 4, n_vocab, f);
+    for (int i = first; i < n; ++i) fwrite(llama_get_logits_ith(ctx, i), 4, n_vocab, f);
     fclose(f);
     fprintf(stderr, "wrote %d tokens x %d vocab to %s\n", n, n_vocab, argv[3]);
 

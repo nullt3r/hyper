@@ -95,6 +95,17 @@ struct CpuMoeBulkOut {
 void moe_publish(volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_dst, float * x_dst, const float * x, int xs, int n,
                  const int * ids, const float * wts, int k, int nt, const int * counter, unsigned seq_tag, cudaStream_t s);
 
+// ---- QSA indexer (sparse attention over the top blocks of 4 cells) ----
+// qi [nt][n_head*128] -> qn (rms norm * qnorm, rope at pos + t); kr [nt][128] -> kraw[pos + t] (fp16)
+void idx_prep(const float * qi, const float * kr, const float * qnorm, float * qn, half * kraw, const int * pos, int n_head, int n_rot,
+              float base, float eps, int nt, cudaStream_t s);
+// blocks completed by these tokens: pool[b] = rope(rmsnorm(mean of kraw[4b..4b+3]) * knorm, 4b)
+void idx_pool(const half * kraw, half * pool, const float * knorm, const int * pos, int nt, int n_rot, float base, float eps, cudaStream_t s);
+// per token: the attended cells (ascending): everything while (p+1)/4 <= top, else the top pools' cells + the tail.
+// scores: scratch [score_rows][score_stride >= max_pos/4]; tokens are processed score_rows at a time
+void idx_select(const float * qn, const half * pool, const int * pos, int nt, int n_head, int top, float * scores, int score_stride,
+                int score_rows, int * list, int list_stride, int * list_n, cudaStream_t s);
+
 // ---- PLE ----
 // res += gated + silu(conv(rmsnorm_stream(gated) * w_conv)); gated_s = value * sigmoid(ssqrt(<rms(key_s)*wk, rms(res_s)*wq> / sqrt(n)))
 // conv: depthwise causal, kernel K, dilation dil, history state [(K-1)*dil][hc*n] (oldest first); snap (optional):

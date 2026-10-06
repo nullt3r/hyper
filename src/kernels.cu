@@ -468,13 +468,16 @@ template <int HD, int G>
 __global__ void __launch_bounds__(128) k_attn_split(const float * __restrict__ qkv, int stride, const half * __restrict__ kcache,
                                                     const half * __restrict__ vcache, float * __restrict__ part, const int * pos_p,
                                                     int max_pos, int n_head_l, int head_off, int group, int kv_off, float scale,
-                                                    int n_chunk) {
+                                                    int n_chunk, const int * __restrict__ list, int list_stride,
+                                                    const int * __restrict__ list_n) {
+    // list (optional, sparse attention): token t attends to the cells list[t * list_stride + i], i < list_n[t]
     static_assert(HD == 256, "lane owns 8 dims");
     constexpr int NW = 4;
     // blockIdx.x = kv head * n_chunk + chunk of G q heads (GQA groups larger than G take several blocks)
     const int hk = blockIdx.x / n_chunk, hchunk = blockIdx.x % n_chunk, split = blockIdx.y, t = blockIdx.z, nsplit = gridDim.y;
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
-    const int n_pos = *pos_p + t + 1;
+    const int n_pos = list ? list_n[t] : *pos_p + t + 1;
+    const int * lt = list ? list + (size_t) t * list_stride : nullptr;
     const int chunk = (n_pos + nsplit - 1) / nsplit;
     const int p0 = split * chunk, p1 = min(n_pos, p0 + chunk);
     const int hb = max(0, (kv_off + hk) * group - head_off), he = min(n_head_l, (kv_off + hk + 1) * group - head_off);
@@ -491,7 +494,8 @@ __global__ void __launch_bounds__(128) k_attn_split(const float * __restrict__ q
     }
     const half * kb = kcache + (size_t) hk * max_pos * HD + lane * 8;
     const half * vb = vcache + (size_t) hk * max_pos * HD + lane * 8;
-    for (int p = p0 + w; p < p1; p += NW) {
+    for (int pi = p0 + w; pi < p1; pi += NW) {
+        const int p = lt ? lt[pi] : pi;
         const uint4 kr = *(const uint4 *) (kb + (size_t) p * HD);
         const uint4 vr = *(const uint4 *) (vb + (size_t) p * HD);
         float kf[8], vf[8];
@@ -1083,12 +1087,12 @@ int attn_nsplit(int n_kv, int nt) { return std::max(1, std::min(64, 256 / (n_kv 
 size_t attn_part_floats(int n_head, int n_kv, int nt, int hd) { return (size_t) nt * n_head * attn_nsplit(n_kv, nt) * (hd + 2); }
 void attn_split(const float * qkv, int stride, const half * kcache, const half * vcache, float * part, float * out, int out_stride,
                 const int * pos, int max_pos, int n_head, int n_kv, int head_off, int group, int kv_off, int hd,
-                float scale, int nt, cudaStream_t s) {
+                float scale, int nt, cudaStream_t s, const int * list, int list_stride, const int * list_n) {
     if (hd != 256) throw std::runtime_error("attn_split: only head_dim 256 is instantiated");
     const int ns = attn_nsplit(n_kv, nt);
     const int n_chunk = (std::min(group, n_head) + 5) / 6;   // local q heads of one kv head <= min(group, n_head)
     k_attn_split<256, 6><<<dim3(n_kv * n_chunk, ns, nt), 128, 0, s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head, head_off,
-                                                                     group, kv_off, scale, n_chunk);
+                                                                     group, kv_off, scale, n_chunk, list, list_stride, list_n);
     k_attn_combine<256><<<dim3(n_head, nt), 256, 0, s>>>(qkv, stride, part, ns, out, out_stride, n_head);
 }
 void gdn_conv(float * in, int stride, float * conv_state, float * conv_snap, const float * conv_w, int channels, int K,

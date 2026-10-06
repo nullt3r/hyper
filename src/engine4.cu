@@ -22,6 +22,8 @@ namespace hyper {
 
 constexpr int CPU_OWNER = 3;
 constexpr int R4 = MOE_BULK_ROWS;   // activation rows (prefill chunk)
+constexpr int QSA_SCORE_ROWS = 64; // tokens scored at a time (scratch rows of max_pos/4 scores)
+constexpr int QSA_LIST = 2052;     // max attended cells per token: 512 pools * 4 + 3 tail cells (+1)
 
 struct Engine4::DevLayer {
     bool full = false, ple = false;
@@ -33,6 +35,10 @@ struct Engine4::DevLayer {
     float * q_norm = nullptr, * k_norm = nullptr;
     half * kcache = nullptr, * vcache = nullptr;
     int n_head_l = 0, head_off = 0, n_kv_l = 0, kv_off = 0;
+    // QSA indexer (replicated): query / raw key projections, norms, raw key cache [max_pos][128], pooled keys [max_pos/4][128]
+    BF16W idx_q, idx_k;
+    float * idx_qn = nullptr, * idx_kn = nullptr;
+    half * kraw = nullptr, * kpool = nullptr;
     // gated delta net (head-aligned partition)
     Q8W win, wout;
     float * ab_w = nullptr;   // fp32 rows [alpha local | beta local]
@@ -68,6 +74,8 @@ struct Engine4::Device {
     half * xh = nullptr, * p16 = nullptr, * recv = nullptr;   // GEMM input scratch; DMA allreduce own / peers' parts
     half * mix16 = nullptr, * h16 = nullptr;                  // prefill MoE: fp16 token rows, fp16 expert hidden rows
     int * egrp = nullptr;                                     // prefill MoE: active experts (expert, start, count)
+    float * iq = nullptr, * ik = nullptr, * iqn = nullptr, * iscores = nullptr;   // QSA: projections, normed queries, scores
+    int * ilist = nullptr, * ilist_n = nullptr;                                 // QSA: attended cells per token
     cublasHandle_t blas = nullptr;
     cudaEvent_t ev_ar[2] = {};
     int big_stride = 0;
@@ -101,6 +109,21 @@ struct Engine4::Device {
 namespace {
 
 struct RowRange { const GTensor * t; int64_t r0, r1; };
+
+// bf16 rows -> fp16 fragment-ordered weight
+BF16W upload_bf16(const std::function<void *(size_t)> & alloc, int dev, const GTensor & t) {
+    if (t.type != GType::BF16) throw std::runtime_error("expected BF16: " + t.name);
+    const int n = (int) t.rows(), k = (int) t.ne[0];
+    const size_t ntile = (n + 15) / 16;
+    std::vector<uint8_t> fq(ntile * (k / 16) * 512);
+    repack_bf16_frag((const uint16_t *) t.data, n, k, (size_t) k, fq.data());
+    CUDA_CHECK(cudaSetDevice(dev));
+    BF16W w; w.n = n; w.k = k;
+    void * p = alloc(fq.size());
+    CUDA_CHECK(cudaMemcpy(p, fq.data(), fq.size(), cudaMemcpyHostToDevice));
+    w.q = (const uint4 *) p;
+    return w;
+}
 using ColRanges = std::vector<std::pair<int64_t, int64_t>>;
 
 Q8W to_device_q8(const std::function<void *(size_t)> & alloc, int dev, const int8_t * qs, const half * d, int n, int k) {
@@ -167,7 +190,8 @@ void mmq(const Q8W & W, const float * x, int xs, float * y, int ys, int nt, cuda
 
 Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : opt_(opt) {
     debug_ = getenv("HYPER4_DEBUG") != nullptr;
-    nocpu_ = getenv("HYPER4_NOCPU") != nullptr;   // timing experiment only: CPU experts ignored (wrong output)
+    nocpu_ = getenv("HYPER4_NOCPU") != nullptr;
+    allrows_ = getenv("HYPER4_ALLROWS") != nullptr;   // timing experiment only: CPU experts ignored (wrong output)
     gguf_ = std::make_unique<GGUF>(model_path);
     cfg_ = Q4Config::from_gguf(*gguf_);
     fprintf(stderr, "hyper4: %s\n", cfg_.describe().c_str());
@@ -279,6 +303,15 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
         const size_t kv = (size_t) L.n_kv_l * opt_.max_pos * hd;
         L.kcache = dev.alloc<half>(kv);
         L.vcache = dev.alloc<half>(kv);
+        if (c.compress[il] > 0) {
+            if (c.compress[il] != 4 || c.idx_dim != 128 || c.idx_n_head > 4) throw std::runtime_error("QSA: only kpool 4, 128-dim, <= 4 heads");
+            L.idx_q = upload_bf16(A, dev.id, gguf_->need(p + "indexer.q_proj.weight"));
+            L.idx_k = upload_bf16(A, dev.id, gguf_->need(p + "indexer.k_proj.weight"));
+            L.idx_qn = f32(p + "indexer.q_norm.weight");
+            L.idx_kn = f32(p + "indexer.k_norm.weight");
+            L.kraw = dev.alloc<half>((size_t) opt_.max_pos * 128);
+            L.kpool = dev.alloc<half>((size_t) (opt_.max_pos / 4 + 1) * 128);
+        }
     } else {
         auto [k0, k1] = split(nk, nd, g);
         std::vector<int> vh;
@@ -450,7 +483,11 @@ void Engine4::load_weights() {
         dev.part = dev.alloc<float>((size_t) R * n);
         dev.big0 = dev.alloc<float>((size_t) R * dev.big_stride);
         dev.o = dev.alloc<float>((size_t) R * std::max(c.ssm_d_inner, c.n_head * c.head_dim));
-        dev.attn_part = dev.alloc<float>(attn_part_floats(c.n_head, c.n_head_kv, 1, c.head_dim) * 8 + (size_t) R * 64 * 1024);
+        {
+            size_t mx = 0;
+            for (int r = 1; r <= R; ++r) mx = std::max(mx, attn_part_floats(c.n_head / nd, 1, r, c.head_dim));
+            dev.attn_part = dev.alloc<float>(mx);
+        }
         dev.rlog = dev.alloc<float>((size_t) R * (c.n_expert + 1));
         dev.ids = dev.alloc<int>((size_t) R * K);
         dev.wts = dev.alloc<float>((size_t) R * K);
@@ -464,7 +501,7 @@ void Engine4::load_weights() {
         dev.ple_key = dev.alloc<float>((size_t) R * hcn);
         dev.ple_val = dev.alloc<float>((size_t) R * n);
         dev.ple_sc = dev.alloc<float>((size_t) R * c.hc * 4);
-        dev.logits = dev.alloc<float>((size_t) MAX_NT * dev.output.n);
+        dev.logits = dev.alloc<float>((size_t) (allrows_ ? R : MAX_NT) * dev.output.n);
         dev.xh = dev.alloc<half>((size_t) R * std::max(hcn, c.n_ff_shexp));
         dev.p16 = dev.alloc<half>((size_t) R * n);
         dev.recv = dev.alloc<half>((size_t) std::max(1, nd - 1) * R * n);
@@ -472,6 +509,12 @@ void Engine4::load_weights() {
         dev.order_n = dev.alloc<int>(2);
         dev.egrp = dev.alloc<int>((size_t) 3 * c.n_expert);
         dev.mix16 = dev.alloc<half>((size_t) R * n);
+        dev.iq = dev.alloc<float>((size_t) R * c.idx_n_head * 128);
+        dev.ik = dev.alloc<float>((size_t) R * 128);
+        dev.iqn = dev.alloc<float>((size_t) R * c.idx_n_head * 128);
+        dev.iscores = dev.alloc<float>((size_t) QSA_SCORE_ROWS * (opt_.max_pos / 4 + 4));
+        dev.ilist = dev.alloc<int>((size_t) R * QSA_LIST);
+        dev.ilist_n = dev.alloc<int>(R);
         dev.h16 = dev.alloc<half>((size_t) R * K * c.n_ff_exp);
         dev.pos = dev.alloc<int>(1);
         dev.counter = dev.alloc<int>(1);
@@ -589,10 +632,41 @@ void Engine4::record_main(int gi, int nt) {
         dbg("hc_mix_attn", il, d.mixed, (size_t) nt * n);
         if (L.full) {
             mm(L.wqkv, d.mixed, n, d.big0, bs, nt);
+            const bool qsa = L.kraw != nullptr;
+            const int top = getenv("HYPER4_NOQSA") ? (1 << 28) : getenv("HYPER4_TOP") ? atoi(getenv("HYPER4_TOP")) : c.idx_top_k / 4;   // experiments
+            if (qsa) {   // indexer: cells each token attends to (all of them while the context has <= top complete blocks)
+                if (bulk) {
+                    to_half(d.mixed, n, nullptr, n, 0.0f, d.xh, nt, s);
+                    gemm_f16(L.idx_q, d.xh, nt, d.iq, c.idx_n_head * 128, nullptr, s);
+                    gemm_f16(L.idx_k, d.xh, nt, d.ik, 128, nullptr, s);
+                } else {
+                    gemv_bf16(L.idx_q, d.mixed, n, d.iq, c.idx_n_head * 128, nullptr, nt, s);
+                    gemv_bf16(L.idx_k, d.mixed, n, d.ik, 128, nullptr, nt, s);
+                }
+                idx_prep(d.iq, d.ik, L.idx_qn, d.iqn, L.kraw, d.pos, c.idx_n_head, c.n_rot, c.rope_base, eps, nt, s);
+                idx_pool(L.kraw, L.kpool, L.idx_kn, d.pos, nt, c.n_rot, c.rope_base, eps, s);
+                idx_select(d.iqn, L.kpool, d.pos, nt, c.idx_n_head, top, d.iscores, opt_.max_pos / 4 + 4, QSA_SCORE_ROWS, d.ilist,
+                           QSA_LIST, d.ilist_n, s);
+            }
+            cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(s, &cap);
+            if (qsa && cap == cudaStreamCaptureStatusNone && getenv("HYPER4_DUMPSEL") && atoi(getenv("HYPER4_DUMPSEL")) == il && d.g == 0) {   // debugging: last token's cells
+                CUDA_CHECK(cudaStreamSynchronize(s));
+                int ln = 0;
+                CUDA_CHECK(cudaMemcpy(&ln, d.ilist_n + nt - 1, sizeof(int), cudaMemcpyDeviceToHost));
+                std::vector<int> lst(ln);
+                CUDA_CHECK(cudaMemcpy(lst.data(), d.ilist + (size_t) (nt - 1) * QSA_LIST, ln * sizeof(int), cudaMemcpyDeviceToHost));
+                FILE * f = fopen("/tmp/hyper_sel.bin", "wb");
+                fwrite(lst.data(), 4, ln, f);
+                fclose(f);
+                fprintf(stderr, "DUMPSEL layer %d: %d cells\n", il, ln);
+            }
+                        // a prefill chunk entirely below the sparse regime keeps the (identical, faster) dense flash attention
+            const bool dense_chunk = !qsa || (h_pos_[0] + nt) / 4 <= top;
             attn_prep(d.big0, bs, L.q_norm, L.k_norm, L.kcache, L.vcache, d.pos, opt_.max_pos, L.n_head_l, L.n_kv_l, c.head_dim,
                       c.n_rot, c.rope_base, eps, nt, s);
             const int ostride = L.n_head_l * c.head_dim;
-            if (bulk)
+            if (bulk && dense_chunk)
                 attn_prefill(d.big0, bs, L.kcache, L.vcache, d.o, ostride, d.pos, opt_.max_pos, L.n_head_l, L.head_off,
                              c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), nt, s);
             else if (getenv("HYPER4_OLDATTN"))
@@ -600,7 +674,8 @@ void Engine4::record_main(int gi, int nt) {
                             c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), nt, s);
             else
                 attn_split(d.big0, bs, L.kcache, L.vcache, d.attn_part, d.o, ostride, d.pos, opt_.max_pos, L.n_head_l, L.n_kv_l,
-                           L.head_off, c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), nt, s);
+                           L.head_off, c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), nt, s,
+                           qsa ? d.ilist : nullptr, QSA_LIST, qsa ? d.ilist_n : nullptr);
             mm(L.wo, d.o, ostride, d.part, n, nt);
         } else {
             const int dv = c.head_v_dim();
@@ -651,11 +726,11 @@ void Engine4::record_main(int gi, int nt) {
         dbg("l_last", il, d.res, (size_t) nt * hcn);
     }
     // final mixer = output norm (prefill chunk: last row only)
-    const int hr = bulk ? 1 : nt;
+    const int hr = bulk && !allrows_ ? 1 : nt;   // HYPER4_ALLROWS (debugging): logits for every row of a prefill chunk
     hc_mix(d.head_norm, d.head_down, d.head_up, nullptr, d.res + (size_t) (nt - hr) * hcn, hr);
     mm(d.output, d.mixed, n, d.logits, d.output.n, hr);
     argmax_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.wts, hr, s);   // wts reused as the result pairs
-    CUDA_CHECK(cudaMemcpyAsync(h_res_ + (size_t) gi * MAX_NT * 2, d.wts, (size_t) hr * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(h_res_ + (size_t) gi * MAX_NT * 2, d.wts, (size_t) std::min(hr, MAX_NT) * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
 }
 
 void Engine4::build_graphs() {
