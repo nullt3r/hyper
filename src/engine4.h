@@ -20,6 +20,8 @@ struct Engine4Options {
     int max_pos = 8192;
     float gpu_expert_frac = 1.0f;   // cap on the fraction of each layer's experts on the GPUs (the rest: CPU)
     float vram_reserve_gib = 0.8f;  // left free on every GPU after the experts
+    std::string mtp_path;           // separate NextN (MTP) GGUF: speculative decoding
+    int n_draft = 3;
     bool stream_experts = true;     // prefill: copy the CPU experts' weights to the GPUs instead of computing them on the CPU
     int cpu_threads = 30;
     bool prompt_cache = false;      // reuse the common prefix with the previous sequence (recurrent-state snapshots)
@@ -66,8 +68,8 @@ public:
     void reset_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); }
     void set_prefill_progress(std::function<void(int, int, int)> fn) override { prefill_cb_ = std::move(fn); }
     int max_pos() const override { return opt_.max_pos; }
-    int n_draft() const override { return 0; }
-    bool has_mtp() const override { return false; }
+    int n_draft() const override { return mtp_g_ ? opt_.n_draft : 0; }
+    bool has_mtp() const override { return mtp_g_ != nullptr; }
     // routing statistics: the loaded ones plus what the CPU side has seen since (decode routing of every layer)
     void save_expert_stats(const std::string & path);
 
@@ -78,9 +80,15 @@ private:
     void load_layer(Device & dev, DevLayer & L, int il);
     void load_experts(int il, const std::vector<int> & quota);
     void upload_stage(Device & d, int il);
-    void record_main(int gi, int nt);
+    void record_main(int gi, int nt, int kind = 0);
+    void record_restore(int gi, int keep);
     void build_graphs();
     void embed(const int * tokens, int nt, int pos);
+    void embed_tok(const int * tokens, int nt, float * dst);
+    void run(int kind, int nt);   // 0 main, 1 MTP, 2 MTP chain, 3 restore (nt = rows kept)
+    int mtp_result() const;
+    int mtp_draft(const int * tokens, int nt, int pos);
+    int mtp_chain(int token, int pos);
     void * host_huge_alloc(size_t bytes);   // anonymous, transparent huge pages; freed with the engine
     int sample_row(int t, const SamplingParams & sp);
     struct Snap { int pos; std::vector<float *> h; };
@@ -97,7 +105,8 @@ private:
     std::vector<std::pair<void *, size_t>> host_bufs_;
 
     Engine4Options opt_;
-    std::unique_ptr<GGUF> gguf_;
+    std::unique_ptr<GGUF> gguf_, mtp_g_;
+    const GGUF * src_ = nullptr;     // file the layer loaders read from
     Q4Config cfg_;
     std::vector<std::unique_ptr<Device>> devs_;
     std::unique_ptr<CpuMoe> cpu_;
@@ -107,6 +116,9 @@ private:
     float * h_ple_ = nullptr;       // pinned [MAX_NT][ple heads * ple dim]
     int * h_pos_ = nullptr;
     float * h_res_ = nullptr;       // pinned [ndev][MAX_NT][2]
+    float * h_membd_ = nullptr;     // pinned [R][n_embd]: MTP input embeddings
+    float * h_mres_ = nullptr;      // pinned [ndev][2]: MTP draft argmax
+    bool mtp_whole_norm_ = false;   // MTP hidden norm over all hc streams (ik layout) instead of per stream
     uint2 * ar_ll_ = nullptr;
     CpuMoeRec * cpu_rec_ = nullptr; // mapped [n_layer]
     CpuMoeOut * cpu_out_ = nullptr; // mapped [n_layer]

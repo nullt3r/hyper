@@ -189,3 +189,15 @@ Server na promptu z opencode ukázal ~190 t/s (131k kontext, 65 % expertů na GP
 - Experty podle volné VRAM každé GPU (dvě fáze načítání) → 262k kontext: 132/103/100 expertů na vrstvu (65 %)
 - Server ukládá statistiky routingu po každém požadavku (`--expert-stats`, kumulativně) → při dalším startu
   rozmístění podle skutečného používání.
+
+## hyper4 – MTP (NextN z `~/models/mtp/Qwen3.8-Flash-Next-MTP-Q4_K_M.gguf`)
+
+- Obecné husté váhy: Q8_0 (rychlá cesta) nebo fp16 dekvantizované při načtení přes ggml `to_float` (bezztrátové);
+  malé tenzory / embeddingy z libovolného typu. (Nutné pro MTP soubor: Q4_K/Q5_0/Q6_K.)
+- MTP blok = vrstva 48: hustá attention (compress_ratio 0), HC mixery, vlastních 512 expertů (v rozpočtu VRAM jako 49.
+  vrstva, CPU slot 48), vstup [rms(e)·enorm | rms(h_s)·hnorm_s] → eh_proj po proudech, výstupní mixer = output_hc_*
+  z MTP souboru (předictor-only layout jako v ik). Rollback: snapshoty DeltaNet conv/state + PLE konvoluce po řádcích.
+- `mtpgen` (greedy, ref2 prompt, 256 tok.): **plain 77,6 → MTP 124,1 t/s**, výstup identický 256/256,
+  1,91 přijatých draftů/krok (K=3); K=2: 124,9 (1,51), K=1: 110,7. Norma skrytého stavu po proudech 1,91 vs přes
+  všechny proudy (ik) 1,88 → ponechána po proudech.
+- Server (T=1,0, 262k ctx, 61 % expertů na GPU): krátký prompt 83,4 t/s (předtím ~49), 21k kontext 55 t/s.

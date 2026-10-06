@@ -6,7 +6,7 @@
 //
 // usage: hyper-server <model.gguf> [--host 0.0.0.0] [--port 8080] [--ctx 262144] [--draft 3] [--alias name]
 //                     [--temp 0.6] [--top-p 0.95] [--top-k 20] [--min-p 0] [--snapshots 48]   (request fields override)
-//                     qwen4exp: [--gpu-frac 0.65] [--cpu-threads 30] [--expert-stats file]   (context default 131072)
+//                     qwen4exp: [--gpu-frac 1.0] [--cpu-threads 30] [--expert-stats file] [--mtp nextn.gguf]   (context default 131072)
 #include "engine.h"
 #include "engine4.h"
 
@@ -329,6 +329,7 @@ int main(int argc, char ** argv) {
     int port = 8080, ctx = 262144, draft = 3, snaps = 48, cpu_threads = 30;
     float gpu_frac = 1.0f;
     std::string stats_path;   // qwen4exp: routing statistics, read at start and updated after every request
+    std::string mtp_path;     // qwen4exp: separate NextN (MTP) GGUF for speculative decoding
     bool ctx_given = false;
     SamplingParams defaults;   // Qwen's recommendation for thinking mode
     defaults.temp = 0.6f; defaults.top_p = 0.95f; defaults.top_k = 20; defaults.min_p = 0.0f;
@@ -337,6 +338,7 @@ int main(int argc, char ** argv) {
         if (k == "--host") host = v; else if (k == "--port") port = std::stoi(v); else if (k == "--ctx") { ctx = std::stoi(v); ctx_given = true; }
         else if (k == "--gpu-frac") gpu_frac = std::stof(v); else if (k == "--cpu-threads") cpu_threads = std::stoi(v);
         else if (k == "--expert-stats") { setenv("HYPER4_STATS", v.c_str(), 1); stats_path = v; }
+        else if (k == "--mtp") mtp_path = v;
         else if (k == "--draft") draft = std::stoi(v); else if (k == "--alias") alias = v;
         else if (k == "--temp") defaults.temp = std::stof(v); else if (k == "--top-p") defaults.top_p = std::stof(v);
         else if (k == "--top-k") defaults.top_k = std::stoi(v); else if (k == "--min-p") defaults.min_p = std::stof(v);
@@ -369,13 +371,15 @@ int main(int argc, char ** argv) {
         o4.cpu_threads = cpu_threads;
         o4.prompt_cache = true;
         o4.max_snapshots = snaps;
+        o4.mtp_path = mtp_path;
+        o4.n_draft = draft;
         auto e4 = std::make_unique<Engine4>(path, o4);
         if (!stats_path.empty()) {
             Engine4 * pe = e4.get();
             c.after_request = [pe, stats_path] { pe->save_expert_stats(stats_path); };
         }
+        draft = engine ? draft : e4->n_draft();
         engine = std::move(e4);
-        draft = 0;
     } else {
         EngineOptions opt;
         opt.max_pos = ctx;

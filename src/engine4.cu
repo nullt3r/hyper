@@ -55,6 +55,7 @@ struct Engine4::DevLayer {
     float * ab_w = nullptr;   // fp32 rows [alpha local | beta local]
     float * conv_w = nullptr, * dt_bias = nullptr, * ssm_a = nullptr, * ssm_norm = nullptr;
     float * conv_state = nullptr, * state = nullptr;
+    float * conv_snap = nullptr, * state_snap = nullptr;   // MTP verification: state after each of the first nt-1 rows
     int n_v_l = 0, n_k_l = 0, conv_ch = 0;
     // MoE
     float * router = nullptr;  // fp32 [n_expert + 1][n]: experts, then the shared-expert gate
@@ -69,7 +70,7 @@ struct Engine4::DevLayer {
     const uint8_t * st_host_g = nullptr, * st_host_u = nullptr, * st_host_d = nullptr;   // pinned host (whole CPU layer)
     // PLE
     DW ple_key, ple_value;
-    float * ple_wk = nullptr, * ple_wq = nullptr, * ple_wc = nullptr, * ple_conv = nullptr, * ple_state = nullptr;
+    float * ple_wk = nullptr, * ple_wq = nullptr, * ple_wc = nullptr, * ple_conv = nullptr, * ple_state = nullptr, * ple_snap = nullptr;
 };
 
 struct Engine4::Device {
@@ -77,6 +78,13 @@ struct Engine4::Device {
     cudaStream_t stream = nullptr;
     cudaGraphExec_t g_main[MAX_NT + 1] = {};
     std::vector<DevLayer> layers;
+    // MTP (NextN) block: layer `mtp`, its embedding / hidden norms, eh_proj (per hc stream), its own exit mixer
+    DevLayer mtp;
+    float * m_enorm = nullptr, * m_hnorm = nullptr, * m_head_norm = nullptr;
+    DW m_eh, m_head_down, m_head_up;
+    float * mres = nullptr, * mh = nullptr, * ecat = nullptr;   // MTP residual rows, chained hidden (1 row), eh_proj input
+    int * mpos = nullptr;
+    cudaGraphExec_t g_mtp[MAX_NT + 1] = {}, g_chain = nullptr, g_restore[MAX_NT] = {};
     float * head_norm = nullptr;
     DW head_down, head_up, output;
     int vocab_off = 0;
@@ -120,6 +128,9 @@ struct Engine4::Device {
     ~Device() {
         cudaSetDevice(id);
         for (auto & gr : g_main) if (gr) cudaGraphExecDestroy(gr);
+        for (auto & gr : g_mtp) if (gr) cudaGraphExecDestroy(gr);
+        for (auto & gr : g_restore) if (gr) cudaGraphExecDestroy(gr);
+        if (g_chain) cudaGraphExecDestroy(g_chain);
         for (auto & ev : ev_ar) if (ev) cudaEventDestroy(ev);
         if (blas) cublasDestroy(blas);
         for (auto & ev : ev_up) if (ev) cudaEventDestroy(ev);
@@ -265,6 +276,13 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
     allrows_ = getenv("HYPER4_ALLROWS") != nullptr;   // timing experiment only: CPU experts ignored (wrong output)
     gguf_ = std::make_unique<GGUF>(model_path);
     cfg_ = Q4Config::from_gguf(*gguf_);
+    src_ = gguf_.get();
+    if (!opt_.mtp_path.empty()) {
+        mtp_g_ = std::make_unique<GGUF>(opt_.mtp_path);
+        if (!mtp_g_->tensor("blk." + std::to_string(cfg_.n_layer) + ".nextn.eh_proj.weight"))
+            throw std::runtime_error("MTP file has no NextN block for layer " + std::to_string(cfg_.n_layer));
+        fprintf(stderr, "hyper4: MTP head from %s\n", opt_.mtp_path.c_str());
+    }
     fprintf(stderr, "hyper4: %s\n", cfg_.describe().c_str());
     if (cfg_.n_embd > 4096 || cfg_.n_expert_used > MOE_MAX_USED) throw std::runtime_error("hyper4: model dimensions unsupported");
     int ndev = 0;
@@ -297,13 +315,17 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
     CUDA_CHECK(cudaHostAlloc(&h_pos_, 4 * sizeof(int), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_res_, (size_t) nd * MAX_NT * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_topk_, (size_t) nd * MAX_NT * TOPK * 2 * sizeof(float), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_membd_, (size_t) R4 * n * sizeof(float), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_mres_, (size_t) nd * 2 * sizeof(float), cudaHostAllocPortable));
+    mtp_whole_norm_ = getenv("HYPER4_MTP_WHOLE_NORM") != nullptr;
     const size_t ll = (size_t) 2 * nd * MAX_NT * n / 2;
     CUDA_CHECK(cudaHostAlloc(&ar_ll_, ll * sizeof(uint2), cudaHostAllocPortable | cudaHostAllocMapped));
     memset(ar_ll_, 0xff, ll * sizeof(uint2));
-    CUDA_CHECK(cudaHostAlloc(&cpu_rec_, (size_t) cfg_.n_layer * sizeof(CpuMoeRec), cudaHostAllocPortable | cudaHostAllocMapped));
-    CUDA_CHECK(cudaHostAlloc(&cpu_out_, (size_t) cfg_.n_layer * sizeof(CpuMoeOut), cudaHostAllocPortable | cudaHostAllocMapped));
-    memset((void *) cpu_rec_, 0, (size_t) cfg_.n_layer * sizeof(CpuMoeRec));
-    memset((void *) cpu_out_, 0, (size_t) cfg_.n_layer * sizeof(CpuMoeOut));
+    const int slots = cfg_.n_layer + 1;   // + the MTP block
+    CUDA_CHECK(cudaHostAlloc(&cpu_rec_, (size_t) slots * sizeof(CpuMoeRec), cudaHostAllocPortable | cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostAlloc(&cpu_out_, (size_t) slots * sizeof(CpuMoeOut), cudaHostAllocPortable | cudaHostAllocMapped));
+    memset((void *) cpu_rec_, 0, (size_t) slots * sizeof(CpuMoeRec));
+    memset((void *) cpu_out_, 0, (size_t) slots * sizeof(CpuMoeOut));
     if (const char * sp = getenv("HYPER4_STATS")) {   // routing statistics from `hyper4 calib`
         FILE * f = fopen(sp, "rb");
         if (f) {
@@ -316,7 +338,7 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
             fprintf(stderr, "hyper4: expert placement from %s (%s)\n", sp, stats_.empty() ? "unreadable, ignored" : "ok");
         }
     }
-    cpu_ = std::make_unique<CpuMoe>(opt_.cpu_threads, n, cfg_.n_ff_exp, cfg_.n_expert_used, cpu_rec_, cpu_out_, cfg_.n_layer,
+    cpu_ = std::make_unique<CpuMoe>(opt_.cpu_threads, n, cfg_.n_ff_exp, cfg_.n_expert_used, cpu_rec_, cpu_out_, slots,
                                     cpu_bulk_, cpu_bulk_out_);
     load_weights();
 }
@@ -334,6 +356,8 @@ Engine4::~Engine4() {
     for (auto & sn : snaps_) snap_pool_.push_back(sn.h);
     for (auto & v : snap_pool_) for (float * p : v) cudaFreeHost(p);
     if (h_topk_) cudaFreeHost(h_topk_);
+    if (h_membd_) cudaFreeHost(h_membd_);
+    if (h_mres_) cudaFreeHost(h_mres_);
     cpu_.reset();
     for (auto & [p, sz] : host_bufs_) munmap(p, sz);
     devs_.clear();
@@ -347,14 +371,14 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
     const int nd = opt_.n_devices, g = dev.g, n = c.n_embd;
     const int dk = c.ssm_d_state, dv = c.head_v_dim(), nk = c.ssm_n_group, nv = c.ssm_dt_rank;
     auto A = [&](size_t nb) { return (void *) dev.alloc<uint8_t>(nb); };
-    auto T = [&](const std::string & name) { return &gguf_->need(name); };
+    auto T = [&](const std::string & name) { return &src_->need(name); };
     auto f32 = [&](const std::string & name) {
-        const std::vector<float> v = to_f32(gguf_->need(name));
+        const std::vector<float> v = to_f32(src_->need(name));
         return dev.upload(v.data(), v.size());
     };
     auto q8full = [&](const std::string & name) { const GTensor * t = T(name); return upload_dense(A, dev.id, {{t, 0, t->rows()}}); };
     const std::string p = "blk." + std::to_string(il) + ".";
-    L.full = c.is_full_attn(il);
+    L.full = c.is_full_attn(il) || il == c.n_layer;   // the MTP block is an attention layer
     // hyper-connection mixers
     L.hca_norm = f32(p + "hc_attn_norm.weight");
     L.hcf_norm = f32(p + "hc_ffn_norm.weight");
@@ -388,8 +412,8 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
         L.vcache = dev.alloc<half>(kv);
         if (c.compress[il] > 0) {
             if (c.compress[il] != 4 || c.idx_dim != 128 || c.idx_n_head > 4) throw std::runtime_error("QSA: only kpool 4, 128-dim, <= 4 heads");
-            L.idx_q = upload_bf16(A, dev.id, gguf_->need(p + "indexer.q_proj.weight"));
-            L.idx_k = upload_bf16(A, dev.id, gguf_->need(p + "indexer.k_proj.weight"));
+            L.idx_q = upload_bf16(A, dev.id, src_->need(p + "indexer.q_proj.weight"));
+            L.idx_k = upload_bf16(A, dev.id, src_->need(p + "indexer.k_proj.weight"));
             L.idx_qn = f32(p + "indexer.q_norm.weight");
             L.idx_kn = f32(p + "indexer.k_norm.weight");
             L.kraw = dev.alloc<half>((size_t) opt_.max_pos * 128);
@@ -421,14 +445,14 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
         L.win = upload_dense(A, dev.id, rows);
         L.wout = upload_dense(A, dev.id, {{T(p + "ssm_out.weight"), 0, n}}, out_cols);
         {   // alpha / beta rows (fp32)
-            const std::vector<float> fa = to_f32(gguf_->need(p + "ssm_alpha.weight")), fb = to_f32(gguf_->need(p + "ssm_beta.weight"));
+            const std::vector<float> fa = to_f32(src_->need(p + "ssm_alpha.weight")), fb = to_f32(src_->need(p + "ssm_beta.weight"));
             std::vector<float> buf;
             for (int h : vh) buf.insert(buf.end(), fa.begin() + (size_t) h * n, fa.begin() + (size_t) (h + 1) * n);
             for (int h : vh) buf.insert(buf.end(), fb.begin() + (size_t) h * n, fb.begin() + (size_t) (h + 1) * n);
             L.ab_w = dev.upload(buf.data(), buf.size());
         }
         {
-            const std::vector<float> cw = to_f32(gguf_->need(p + "ssm_conv1d.weight"));
+            const std::vector<float> cw = to_f32(src_->need(p + "ssm_conv1d.weight"));
             const int K = c.ssm_conv;
             std::vector<float> buf((size_t) L.conv_ch * K);
             for (size_t j = 0; j < chans.size(); ++j)
@@ -436,7 +460,7 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
             L.conv_w = dev.upload(buf.data(), buf.size());
         }
         auto gather = [&](const std::string & name) {
-            const std::vector<float> t = to_f32(gguf_->need(name));
+            const std::vector<float> t = to_f32(src_->need(name));
             std::vector<float> buf;
             for (int h : vh) buf.push_back(t[h]);
             return dev.upload(buf.data(), buf.size());
@@ -446,6 +470,10 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
         L.ssm_norm = f32(p + "ssm_norm.weight");
         L.conv_state = dev.alloc<float>((size_t) (c.ssm_conv - 1) * L.conv_ch);
         L.state = dev.alloc<float>((size_t) L.n_v_l * dk * dv);
+        if (!opt_.mtp_path.empty()) {
+            L.conv_snap = dev.alloc<float>((size_t) (c.ssm_conv - 1) * L.conv_ch * (MAX_NT - 1));
+            L.state_snap = dev.alloc<float>((size_t) L.n_v_l * dk * dv * (MAX_NT - 1));
+        }
     }
     // PLE (replicated)
     L.ple = il == c.ple_layer;
@@ -457,11 +485,12 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
         L.ple_wc = f32(p + "ple_norm_conv.weight");
         L.ple_conv = f32(p + "ple_conv1d.weight");
         L.ple_state = dev.alloc<float>((size_t) (c.ple_conv - 1) * c.ple_ngram * c.hc_dim());
+        if (!opt_.mtp_path.empty()) L.ple_snap = dev.alloc<float>((size_t) (c.ple_conv - 1) * c.ple_ngram * c.hc_dim() * (MAX_NT - 1));
     }
     // router + shared-expert gate (replicated, fp32)
     {
-        std::vector<float> buf = to_f32(gguf_->need(p + "ffn_gate_inp.weight"));
-        const std::vector<float> sgt = to_f32(gguf_->need(p + "ffn_gate_inp_shexp.weight"));
+        std::vector<float> buf = to_f32(src_->need(p + "ffn_gate_inp.weight"));
+        const std::vector<float> sgt = to_f32(src_->need(p + "ffn_gate_inp_shexp.weight"));
         buf.insert(buf.end(), sgt.begin(), sgt.end());
         L.router = dev.upload(buf.data(), buf.size());
     }
@@ -480,13 +509,13 @@ void Engine4::load_experts(int il, const std::vector<int> & quota) {
     const Q4Config & c = cfg_;
     const int nd = opt_.n_devices, n = c.n_embd;
     const std::string p = "blk." + std::to_string(il) + ".";
-    const GTensor & tg = gguf_->need(p + "ffn_gate_exps.weight"), & tu = gguf_->need(p + "ffn_up_exps.weight"),
-                  & tdn = gguf_->need(p + "ffn_down_exps.weight");
+    const GTensor & tg = src_->need(p + "ffn_gate_exps.weight"), & tu = src_->need(p + "ffn_up_exps.weight"),
+                  & tdn = src_->need(p + "ffn_down_exps.weight");
     if (tu.type != tg.type) throw std::runtime_error("expert gate/up types differ");
     const int E = c.n_expert, ff = c.n_ff_exp;
     std::vector<int> order(E);
     for (int e = 0; e < E; ++e) order[e] = e;
-    if (!stats_.empty()) {
+    if (il < (int) stats_.size()) {
         const auto & cnt = stats_[il];
         std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return cnt[a] > cnt[b]; });
     }
@@ -507,7 +536,7 @@ void Engine4::load_experts(int il, const std::vector<int> & quota) {
     const size_t gb = tg.nbytes / E, db = tdn.nbytes / E;
     for (auto & dp : devs_) {
         Device & dev = *dp;
-        DevLayer & L = dev.layers[il];
+        DevLayer & L = il < c.n_layer ? dev.layers[il] : dev.mtp;
         const int g = dev.g;
         std::vector<int> slot(E, -1);
         int nl = 0;
@@ -558,7 +587,7 @@ void Engine4::load_experts(int il, const std::vector<int> & quota) {
         int a = 0;
         double acc = 0;
         for (auto & dp : devs_) {
-            DevLayer & L = dp->layers[il];
+            DevLayer & L = il < c.n_layer ? dp->layers[il] : dp->mtp;
             acc += wbw[dp->g];
             const int b = dp->g == nd - 1 ? nc : (int) (nc * acc / tw + 0.5);
             L.st_a = a; L.st_b = b;
@@ -569,7 +598,7 @@ void Engine4::load_experts(int il, const std::vector<int> & quota) {
             dp->stage_bytes = std::max(dp->stage_bytes, (size_t) (b - a) * (2 * gb + db));
             a = b;
         }
-        for (auto & dp : devs_) dp->layers[il].owner_bulk = dp->upload(bulk_owner.data(), bulk_owner.size());
+        for (auto & dp : devs_) (il < c.n_layer ? dp->layers[il] : dp->mtp).owner_bulk = dp->upload(bulk_owner.data(), bulk_owner.size());
     }
 }
 
@@ -582,7 +611,26 @@ void Engine4::load_weights() {
         const int g = dev.g;
         auto A = [&](size_t nb) { return (void *) dev.alloc<uint8_t>(nb); };
         dev.layers.resize(c.n_layer);
+        src_ = gguf_.get();
         for (int il = 0; il < c.n_layer; ++il) load_layer(dev, dev.layers[il], il);
+        if (mtp_g_) {   // NextN block from the separate MTP file
+            src_ = mtp_g_.get();
+            const std::string p = "blk." + std::to_string(c.n_layer) + ".";
+            load_layer(dev, dev.mtp, c.n_layer);
+            auto up32 = [&](const std::string & name) { const std::vector<float> v = to_f32(mtp_g_->need(name)); return dev.upload(v.data(), v.size()); };
+            dev.m_enorm = up32(p + "nextn.enorm.weight");
+            dev.m_hnorm = up32(p + "nextn.hnorm.weight");
+            { const GTensor * t = &mtp_g_->need(p + "nextn.eh_proj.weight"); dev.m_eh = upload_dense(A, dev.id, {{t, 0, t->rows()}}); }
+            // exit mixer: the file's own nextn.hc_head_* or, in predictor-only files, its output_hc_*
+            const bool own = mtp_g_->tensor(p + "nextn.hc_head_norm.weight") != nullptr;
+            const std::string hn = own ? p + "nextn.hc_head_norm.weight" : "output_hc_norm.weight";
+            const std::string hd = own ? p + "nextn.hc_head_down.weight" : "output_hc_down.weight";
+            const std::string hu = own ? p + "nextn.hc_head_up.weight" : "output_hc_up.weight";
+            dev.m_head_norm = up32(hn);
+            { const GTensor * t = &mtp_g_->need(hd); dev.m_head_down = upload_dense(A, dev.id, {{t, 0, t->rows()}}); }
+            { const GTensor * t = &mtp_g_->need(hu); dev.m_head_up = upload_dense(A, dev.id, {{t, 0, t->rows()}}); }
+            src_ = gguf_.get();
+        }
         { const std::vector<float> v = to_f32(gguf_->need("output_hc_norm.weight")); dev.head_norm = dev.upload(v.data(), v.size()); }
         { const GTensor * t = &gguf_->need("output_hc_down.weight"); dev.head_down = upload_dense(A, dev.id, {{t, 0, t->rows()}}); }
         { const GTensor * t = &gguf_->need("output_hc_up.weight"); dev.head_up = upload_dense(A, dev.id, {{t, 0, t->rows()}}); }
@@ -640,6 +688,12 @@ void Engine4::load_weights() {
         dev.ilist_n = dev.alloc<int>(R);
         dev.h16 = dev.alloc<half>((size_t) R * K * c.n_ff_exp);
         dev.pos = dev.alloc<int>(1);
+        dev.mpos = dev.alloc<int>(1);
+        if (mtp_g_) {
+            dev.mres = dev.alloc<float>((size_t) R * hcn);
+            dev.mh = dev.alloc<float>((size_t) hcn);
+            dev.ecat = dev.alloc<float>((size_t) R * c.hc * 2 * n);
+        }
         dev.counter = dev.alloc<int>(1);
     }
     // experts fill what is left on each GPU (minus a runtime reserve), capped at gpu_expert_frac of every layer
@@ -666,7 +720,7 @@ void Engine4::load_weights() {
             int tq = 0;
             for (int g = 0; g < nd; ++g) {
                 const double cap = std::max(0.0, (double) freeb[g] - opt_.vram_reserve_gib * 1073741824.0 - stage_est[g]);
-                quota[g] = std::min((int) (cap / eb / c.n_layer), (int) (c.n_expert * opt_.gpu_expert_frac / nd + 0.999));
+                quota[g] = std::min((int) (cap / eb / (c.n_layer + (mtp_g_ ? 1 : 0))), (int) (c.n_expert * opt_.gpu_expert_frac / nd + 0.999));
                 tq += quota[g];
             }
             if (!opt_.stream_experts) break;
@@ -679,6 +733,7 @@ void Engine4::load_weights() {
         for (int q : quota) fprintf(stderr, " %d", q);
         fprintf(stderr, " (%.0f%% of %d), the rest on the CPU\n", 100.0 * tq / c.n_expert, c.n_expert);
         for (int il = 0; il < c.n_layer; ++il) load_experts(il, quota);
+        if (mtp_g_) { src_ = mtp_g_.get(); load_experts(c.n_layer, quota); src_ = gguf_.get(); }
         if (opt_.stream_experts)
             for (auto & dp : devs_) {
                 for (auto & sb : dp->stage) sb = dp->alloc<uint8_t>(std::max<size_t>(dp->stage_bytes, 1));
@@ -705,7 +760,8 @@ void Engine4::reset() {
     seq_.clear();
 }
 
-void Engine4::record_main(int gi, int nt) {
+// kind 0: main model; 1: MTP block over (token t+1, main hidden row t); 2: MTP chained on its own last hidden row
+void Engine4::record_main(int gi, int nt, int kind) {
     const Q4Config & c = cfg_;
     Device & d = *devs_[gi];
     cudaStream_t s = d.stream;
@@ -736,13 +792,19 @@ void Engine4::record_main(int gi, int nt) {
         if (cublasSgemm(d.blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, nr, k, &one, W, k, x, xs, &zero, y, ys) != CUBLAS_STATUS_SUCCESS)
             throw std::runtime_error("cublasSgemm failed");
     };
-    CUDA_CHECK(cudaMemcpyAsync(d.pos, h_pos_, sizeof(int), cudaMemcpyHostToDevice, s));
-    CUDA_CHECK(cudaMemcpyAsync(d.x, h_embd_, (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
-    if (c.ple_layer >= 0)
+    float * R = kind ? d.mres : d.res;   // hc-wide residual rows
+    int * P = kind ? d.mpos : d.pos;
+    const int pos_host = h_pos_[kind ? 1 : 0];
+    CUDA_CHECK(cudaMemcpyAsync(P, h_pos_ + (kind ? 1 : 0), sizeof(int), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(d.x, kind ? h_membd_ : h_embd_, (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
+    if (!kind && c.ple_layer >= 0)
         CUDA_CHECK(cudaMemcpyAsync(d.ple_emb, h_ple_, (size_t) nt * c.ple_n_heads() * c.ple_dim * sizeof(float), cudaMemcpyHostToDevice, s));
     incr_counter(d.counter, s);
-    if (bulk && opt_.stream_experts && d.layers[0].owner_bulk) { upload_stage(d, 0); if (c.n_layer > 1) upload_stage(d, 1); }
-    hc_init(d.res, d.x, n, hc, nt, s);
+    if (bulk && opt_.stream_experts) {
+        if (!kind && d.layers[0].owner_bulk) { upload_stage(d, 0); if (c.n_layer > 1) upload_stage(d, 1); }
+        if (kind && d.mtp.owner_bulk) upload_stage(d, c.n_layer);
+    }
+    if (!kind) hc_init(d.res, d.x, n, hc, nt, s);
     int call = 0;
     // debug (HYPER4_DEBUG, direct recording, single GPU): sync after a stage, report errors and non-finite values
     auto dbg = [&](const char * what, int il, const float * buf, size_t cnt) {
@@ -785,7 +847,7 @@ void Engine4::record_main(int gi, int nt) {
     };
     // hyper-connection mixer: res -> mixed (and the inject logits)
     auto hc_mix = [&](const float * norm, const DW & down, const DW & up, const float * inj, const float * res = nullptr, int rows = -1) {
-        if (!res) res = d.res;
+        if (!res) res = R;
         if (rows < 0) rows = nt;
         hc_norm(res, norm, d.xn, n, hc, eps, rows, s);
         mm(down, d.xn, hcn, d.lo, lr, rows);
@@ -794,16 +856,26 @@ void Engine4::record_main(int gi, int nt) {
         if (inj) f32mm(inj, hc, hcn, d.xn, hcn, d.inj, 4, rows);
         hc_mixed(d.xn, d.gate, d.mixed, n, hc, rows, s);
     };
-    for (int il = 0; il < c.n_layer; ++il) {
-        DevLayer & L = d.layers[il];
+    if (kind) {   // [rms(e) * enorm | rms(h_s) * hnorm_s] -> eh_proj, one row per hc stream
+        mtp_prep(d.x, d.m_enorm, kind == 1 ? d.res : d.mh, kind == 1 ? hcn : 0, d.m_hnorm, eps, n, hc, mtp_whole_norm_, d.ecat, nt, s);
+        const int blk = std::max(1, R4 * std::max(hcn, c.n_ff_shexp) / (2 * n));   // rows the fp16 scratch holds
+        for (int r0 = 0; r0 < nt * hc; r0 += blk) {
+            const int rr = std::min(blk, nt * hc - r0);
+            mm(d.m_eh, d.ecat + (size_t) r0 * 2 * n, 2 * n, d.mres + (size_t) r0 * n, n, rr);
+        }
+    }
+    const int il0 = kind ? c.n_layer : 0, il1 = kind ? c.n_layer + 1 : c.n_layer;
+    const bool snap = !kind && !bulk && nt > 1 && mtp_g_;   // verification: keep the state after every row for rollback
+    for (int il = il0; il < il1; ++il) {
+        DevLayer & L = kind ? d.mtp : d.layers[il];
         if (L.ple) {
             const int pe = c.ple_n_heads() * c.ple_dim;
             mm(L.ple_key, d.ple_emb, pe, d.ple_key, hcn, nt);
             mm(L.ple_value, d.ple_emb, pe, d.ple_val, n, nt);
-            ple_apply(d.res, d.ple_key, d.ple_val, L.ple_wk, L.ple_wq, L.ple_wc, L.ple_conv, L.ple_state, nullptr, n, hc, c.ple_conv,
+            ple_apply(R, d.ple_key, d.ple_val, L.ple_wk, L.ple_wq, L.ple_wc, L.ple_conv, L.ple_state, snap ? L.ple_snap : nullptr, n, hc, c.ple_conv,
                       c.ple_ngram, eps, nt, d.ple_sc, s);
         }
-        if (L.ple) dbg("ple", il, d.res, (size_t) nt * hcn);
+        if (L.ple) dbg("ple", il, R, (size_t) nt * hcn);
         // ---- token mixer ----
         hc_mix(L.hca_norm, L.hca_down, L.hca_up, L.hca_inj);
         dbg("hc_mix_attn", il, d.mixed, (size_t) nt * n);
@@ -822,9 +894,9 @@ void Engine4::record_main(int gi, int nt) {
                     gemv_bf16(L.idx_q, d.mixed, n, d.iq, c.idx_n_head * 128, nullptr, nt, s);
                     gemv_bf16(L.idx_k, d.mixed, n, d.ik, 128, nullptr, nt, s);
                 }
-                idx_prep(d.iq, d.ik, L.idx_qn, d.iqn, L.kraw, d.pos, c.idx_n_head, c.n_rot, c.rope_base, eps, nt, s);
-                idx_pool(L.kraw, L.kpool, L.idx_kn, d.pos, nt, c.n_rot, c.rope_base, eps, s);
-                idx_select(d.iqn, L.kpool, d.pos, nt, c.idx_n_head, top, d.iscores, opt_.max_pos / 4 + 4, QSA_SCORE_ROWS, d.ilist,
+                idx_prep(d.iq, d.ik, L.idx_qn, d.iqn, L.kraw, P, c.idx_n_head, c.n_rot, c.rope_base, eps, nt, s);
+                idx_pool(L.kraw, L.kpool, L.idx_kn, P, nt, c.n_rot, c.rope_base, eps, s);
+                idx_select(d.iqn, L.kpool, P, nt, c.idx_n_head, top, d.iscores, opt_.max_pos / 4 + 4, QSA_SCORE_ROWS, d.ilist,
                            QSA_LIST, d.ilist_n, s);
             }
             cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
@@ -841,18 +913,18 @@ void Engine4::record_main(int gi, int nt) {
                 fprintf(stderr, "DUMPSEL layer %d: %d cells\n", il, ln);
             }
                         // a prefill chunk entirely below the sparse regime keeps the (identical, faster) dense flash attention
-            const bool dense_chunk = !qsa || (h_pos_[0] + nt) / 4 <= top;
-            attn_prep(d.big0, bs, L.q_norm, L.k_norm, L.kcache, L.vcache, d.pos, opt_.max_pos, L.n_head_l, L.n_kv_l, c.head_dim,
+            const bool dense_chunk = !qsa || (pos_host + nt) / 4 <= top;
+            attn_prep(d.big0, bs, L.q_norm, L.k_norm, L.kcache, L.vcache, P, opt_.max_pos, L.n_head_l, L.n_kv_l, c.head_dim,
                       c.n_rot, c.rope_base, eps, nt, s);
             const int ostride = L.n_head_l * c.head_dim;
             if (bulk && dense_chunk)
-                attn_prefill(d.big0, bs, L.kcache, L.vcache, d.o, ostride, d.pos, opt_.max_pos, L.n_head_l, L.head_off,
+                attn_prefill(d.big0, bs, L.kcache, L.vcache, d.o, ostride, P, opt_.max_pos, L.n_head_l, L.head_off,
                              c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), nt, s);
             else if (getenv("HYPER4_OLDATTN"))
-                attn_decode(d.big0, bs, L.kcache, L.vcache, d.o, ostride, d.pos, opt_.max_pos, L.n_head_l, L.n_kv_l, L.head_off,
+                attn_decode(d.big0, bs, L.kcache, L.vcache, d.o, ostride, P, opt_.max_pos, L.n_head_l, L.n_kv_l, L.head_off,
                             c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), nt, s);
             else
-                attn_split(d.big0, bs, L.kcache, L.vcache, d.attn_part, d.o, ostride, d.pos, opt_.max_pos, L.n_head_l, L.n_kv_l,
+                attn_split(d.big0, bs, L.kcache, L.vcache, d.attn_part, d.o, ostride, P, opt_.max_pos, L.n_head_l, L.n_kv_l,
                            L.head_off, c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), nt, s,
                            qsa ? d.ilist : nullptr, QSA_LIST, qsa ? d.ilist_n : nullptr);
             mm(L.wo, d.o, ostride, d.part, n, nt);
@@ -861,15 +933,15 @@ void Engine4::record_main(int gi, int nt) {
             mm(L.win, d.mixed, n, d.big0, bs, nt);
             const int z_off = L.conv_ch, ab_off = L.conv_ch + L.n_v_l * dv;
             f32mm(L.ab_w, 2 * L.n_v_l, n, d.mixed, n, d.big0 + ab_off, bs, nt);
-            gdn_conv(d.big0, bs, L.conv_state, nullptr, L.conv_w, L.conv_ch, c.ssm_conv, nt, s);
+            gdn_conv(d.big0, bs, L.conv_state, snap ? L.conv_snap : nullptr, L.conv_w, L.conv_ch, c.ssm_conv, nt, s);
             const int ostride = L.n_v_l * dv;
-            gdn_step(d.big0, bs, ab_off, L.state, nullptr, d.o, ostride, L.dt_bias, L.ssm_a, L.n_k_l, L.n_v_l, c.ssm_d_state, dv, eps, nt, s);
+            gdn_step(d.big0, bs, ab_off, L.state, snap ? L.state_snap : nullptr, d.o, ostride, L.dt_bias, L.ssm_a, L.n_k_l, L.n_v_l, c.ssm_d_state, dv, eps, nt, s);
             gated_norm_sigmoid(d.o, ostride, d.big0 + z_off, bs, L.ssm_norm, L.n_v_l, dv, eps, nt, s);
             mm(L.wout, d.o, ostride, d.part, n, nt);
         }
         dbg(L.full ? "attn_part" : "gdn_part", il, d.part, (size_t) nt * n);
         allreduce();
-        hc_combine(d.res, d.bo, d.inj, 4, n, hc, nt, s);
+        hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s);
         // ---- MoE ----
         hc_mix(L.hcf_norm, L.hcf_down, L.hcf_up, L.hcf_inj);
         f32mm(L.router, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt);
@@ -917,8 +989,16 @@ void Engine4::record_main(int gi, int nt) {
                    bulk ? &cpu_bulk_out_->y[0][0] : &cpu_out_[il].y[0][0], d.counter, (unsigned) il, s);
         dbg("moe_part", il, d.part, (size_t) nt * n);
         allreduce();
-        hc_combine(d.res, d.bo, d.inj, 4, n, hc, nt, s);
-        dbg("l_last", il, d.res, (size_t) nt * hcn);
+        hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s);
+        dbg("l_last", il, R, (size_t) nt * hcn);
+    }
+    if (kind) {   // drafts: the last row only; its residual feeds the next chained step
+        CUDA_CHECK(cudaMemcpyAsync(d.mh, d.mres + (size_t) (nt - 1) * hcn, (size_t) hcn * sizeof(float), cudaMemcpyDeviceToDevice, s));
+        hc_mix(d.m_head_norm, d.m_head_down, d.m_head_up, nullptr, d.mres + (size_t) (nt - 1) * hcn, 1);
+        mm(d.output, d.mixed, n, d.logits, d.output.n(), 1);
+        argmax_pairs(d.logits, d.output.n(), d.output.n(), d.vocab_off, d.wts, 1, s);
+        CUDA_CHECK(cudaMemcpyAsync(h_mres_ + (size_t) gi * 2, d.wts, 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
+        return;
     }
     // final mixer = output norm (prefill chunk: last row only)
     const int hr = bulk && !allrows_ ? 1 : nt;   // HYPER4_ALLROWS (debugging): logits for every row of a prefill chunk
@@ -937,7 +1017,7 @@ void Engine4::record_main(int gi, int nt) {
 // copy this GPU's share of layer il's CPU experts into staging buffer il % 2 (on the copy stream, after the buffer's
 // previous user has finished)
 void Engine4::upload_stage(Device & d, int il) {
-    DevLayer & L = d.layers[il];
+    DevLayer & L = il < cfg_.n_layer ? d.layers[il] : d.mtp;
     const int sb = il & 1, cnt = L.st_b - L.st_a;
     CUDA_CHECK(cudaStreamWaitEvent(d.cstream, d.ev_free[sb], 0));
     if (cnt > 0) {
@@ -951,35 +1031,64 @@ void Engine4::upload_stage(Device & d, int il) {
     CUDA_CHECK(cudaEventRecord(d.ev_up[sb], d.cstream));
 }
 
+// roll the recurrent state (GDN conv + state, PLE conv) back to the snapshot after row keep-1 of the last verification
+void Engine4::record_restore(int gi, int keep) {
+    const Q4Config & c = cfg_;
+    Device & d = *devs_[gi];
+    for (auto & L : d.layers) {
+        if (!L.full) {
+            const size_t cs = (size_t) (c.ssm_conv - 1) * L.conv_ch, ssz = (size_t) L.n_v_l * c.ssm_d_state * c.head_v_dim();
+            CUDA_CHECK(cudaMemcpyAsync(L.conv_state, L.conv_snap + (keep - 1) * cs, cs * sizeof(float), cudaMemcpyDeviceToDevice, d.stream));
+            CUDA_CHECK(cudaMemcpyAsync(L.state, L.state_snap + (keep - 1) * ssz, ssz * sizeof(float), cudaMemcpyDeviceToDevice, d.stream));
+        }
+        if (L.ple) {
+            const size_t ps = (size_t) (c.ple_conv - 1) * c.ple_ngram * c.hc_dim();
+            CUDA_CHECK(cudaMemcpyAsync(L.ple_state, L.ple_snap + (keep - 1) * ps, ps * sizeof(float), cudaMemcpyDeviceToDevice, d.stream));
+        }
+    }
+}
+
 void Engine4::build_graphs() {
     for (int gi = 0; gi < (int) devs_.size(); ++gi) {
         Device & d = *devs_[gi];
         CUDA_CHECK(cudaSetDevice(d.id));
-        for (int nt = 1; nt <= MAX_NT; ++nt) {
+        auto capture = [&](const std::function<void()> & rec) {
             cudaGraph_t graph;
+            cudaGraphExec_t exec;
             CUDA_CHECK(cudaStreamBeginCapture(d.stream, cudaStreamCaptureModeThreadLocal));
-            record_main(gi, nt);
+            rec();
             CUDA_CHECK(cudaStreamEndCapture(d.stream, &graph));
-            CUDA_CHECK(cudaGraphInstantiate(&d.g_main[nt], graph, 0));
+            CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
             CUDA_CHECK(cudaGraphDestroy(graph));
+            return exec;
+        };
+        for (int nt = 1; nt <= MAX_NT; ++nt) d.g_main[nt] = capture([&] { record_main(gi, nt, 0); });
+        if (mtp_g_) {
+            for (int nt = 1; nt <= MAX_NT; ++nt) d.g_mtp[nt] = capture([&] { record_main(gi, nt, 1); });
+            d.g_chain = capture([&] { record_main(gi, 1, 2); });
+            for (int keep = 1; keep < MAX_NT; ++keep) d.g_restore[keep] = capture([&] { record_restore(gi, keep); });
         }
     }
     graphs_ready_ = true;
 }
 
-// token embeddings (Q8_0 rows) and the PLE n-gram hash rows (IQ4_NL), for positions pos..pos+nt-1
-void Engine4::embed(const int * tokens, int nt, int pos) {
-    const Q4Config & c = cfg_;
-    if ((int) seq_.size() < pos + nt) seq_.resize(pos + nt, -1);
-    for (int t = 0; t < nt; ++t) seq_[pos + t] = tokens[t];
+void Engine4::embed_tok(const int * tokens, int nt, float * dst) {
     const GTensor & te = gguf_->need("token_embd.weight");
     const auto * te_tr = ggml_get_type_traits((ggml_type) te.type);
     for (int t = 0; t < nt; ++t) {
         const uint8_t * row = te.data + (size_t) tokens[t] * te.row_bytes();
-        float * out = h_embd_ + (size_t) t * c.n_embd;
-        if (te.type == GType::F32) memcpy(out, row, c.n_embd * sizeof(float));
-        else te_tr->to_float(row, out, c.n_embd);
+        float * out = dst + (size_t) t * cfg_.n_embd;
+        if (te.type == GType::F32) memcpy(out, row, cfg_.n_embd * sizeof(float));
+        else te_tr->to_float(row, out, cfg_.n_embd);
     }
+}
+
+// token embeddings and the PLE n-gram hash rows, for positions pos..pos+nt-1
+void Engine4::embed(const int * tokens, int nt, int pos) {
+    const Q4Config & c = cfg_;
+    if ((int) seq_.size() < pos + nt) seq_.resize(pos + nt, -1);
+    for (int t = 0; t < nt; ++t) seq_[pos + t] = tokens[t];
+    embed_tok(tokens, nt, h_embd_);
     if (c.ple_layer < 0) return;
     const GTensor & pt = gguf_->need("per_layer_token_embd.weight");
     const auto * pt_tr = ggml_get_type_traits((ggml_type) pt.type);
@@ -1008,23 +1117,24 @@ void Engine4::embed(const int * tokens, int nt, int pos) {
     }
 }
 
-std::vector<int> Engine4::forward(const int * tokens, int nt, int pos) {
-    if (nt < 1 || nt > R4) throw std::runtime_error("forward: bad token count");
+// launch one forward of `kind` over nt rows on every device and wait (hang diagnostics after 10 s)
+void Engine4::run(int kind, int nt) {
     const bool bulk = nt > MAX_NT;
-    if (pos + nt > opt_.max_pos) throw std::runtime_error("forward: position exceeds max_pos");
     if (!graphs_ready_ && !debug_) build_graphs();
-    embed(tokens, nt, pos);
-    h_pos_[0] = pos;
     ++fwd_counter_;
-    std::vector<int> slots(cfg_.n_layer);
-    for (int i = 0; i < cfg_.n_layer; ++i) slots[i] = i;
-    if (!(bulk && opt_.stream_experts)) cpu_->expect(fwd_counter_, slots, bulk);
+    if (kind == 3) --fwd_counter_;   // restore graphs do not count
+    if (kind <= 2 && !(bulk && opt_.stream_experts)) {
+        std::vector<int> slots;
+        if (kind == 0) for (int i = 0; i < cfg_.n_layer; ++i) slots.push_back(i);
+        else slots.push_back(cfg_.n_layer);
+        cpu_->expect(fwd_counter_, slots, bulk);
+    }
     if (bulk) {   // record straight into the streams, one host thread per device (barriers inside the allreduces)
         std::vector<std::thread> th;
         std::vector<std::string> err(devs_.size());
         for (int gi = 0; gi < (int) devs_.size(); ++gi)
             th.emplace_back([&, gi] {
-                try { CUDA_CHECK(cudaSetDevice(devs_[gi]->id)); record_main(gi, nt); }
+                try { CUDA_CHECK(cudaSetDevice(devs_[gi]->id)); record_main(gi, nt, kind); }
                 catch (const std::exception & ex) { err[gi] = ex.what(); }
             });
         for (auto & t : th) t.join();
@@ -1033,11 +1143,12 @@ std::vector<int> Engine4::forward(const int * tokens, int nt, int pos) {
         for (int gi = 0; gi < (int) devs_.size(); ++gi) {
             auto & dp = devs_[gi];
             CUDA_CHECK(cudaSetDevice(dp->id));
-            if (debug_) record_main(gi, nt);
-            else CUDA_CHECK(cudaGraphLaunch(dp->g_main[nt], dp->stream));
+            if (debug_ && kind < 3) { record_main(gi, nt, kind); continue; }
+            cudaGraphExec_t ex = kind == 0 ? dp->g_main[nt] : kind == 1 ? dp->g_mtp[nt] : kind == 2 ? dp->g_chain : dp->g_restore[nt];
+            if (!ex) throw std::runtime_error("run: graph missing (kind " + std::to_string(kind) + ", nt " + std::to_string(nt) + ")");
+            CUDA_CHECK(cudaGraphLaunch(ex, dp->stream));
         }
     }
-    // wait; after 10 s report the hand-off state (hang diagnostics)
     auto t_wait = std::chrono::steady_clock::now();
     bool reported = false;
     for (auto & dp : devs_) {
@@ -1048,14 +1159,20 @@ std::vector<int> Engine4::forward(const int * tokens, int nt, int pos) {
             if (q != cudaErrorNotReady) CUDA_CHECK(q);
             if (!reported && std::chrono::steady_clock::now() - t_wait > std::chrono::seconds(10)) {
                 reported = true;
-                fprintf(stderr, "hyper4: forward %u stuck on device %d; cpu: %s\n", fwd_counter_, dp->id, cpu_->state().c_str());
-                for (int l = 0; l < cfg_.n_layer; ++l)
-                    fprintf(stderr, "  L%-2d rec %u (fwd %u slot %u)  out %u (fwd %u)\n", l, cpu_rec_[l].seq, cpu_rec_[l].seq / 64,
-                            cpu_rec_[l].seq % 64, cpu_out_[l].seq, cpu_out_[l].seq / 64);
+                fprintf(stderr, "hyper4: forward %u (kind %d) stuck on device %d; cpu: %s\\n", fwd_counter_, kind, dp->id, cpu_->state().c_str());
             }
             std::this_thread::yield();
         }
     }
+}
+
+std::vector<int> Engine4::forward(const int * tokens, int nt, int pos) {
+    if (nt < 1 || nt > R4) throw std::runtime_error("forward: bad token count");
+    if (pos + nt > opt_.max_pos) throw std::runtime_error("forward: position exceeds max_pos");
+    const bool bulk = nt > MAX_NT;
+    embed(tokens, nt, pos);
+    h_pos_[0] = pos;
+    run(0, nt);
     last_nt_ = nt;
     std::vector<int> out(nt, -1);
     for (int t = bulk ? nt - 1 : 0; t < nt; ++t) {
@@ -1069,6 +1186,32 @@ std::vector<int> Engine4::forward(const int * tokens, int nt, int pos) {
         out[t] = bi;
     }
     return out;
+}
+
+int Engine4::mtp_result() const {
+    float best = -INFINITY; int bi = -1;
+    for (size_t g = 0; g < devs_.size(); ++g) {
+        const float v = h_mres_[g * 2];
+        const int idx = ((const int *) h_mres_)[g * 2 + 1];
+        if (v > best) { best = v; bi = idx; }
+    }
+    return bi;
+}
+
+// MTP over (tokens[t], main hidden row t) at positions pos + t; returns the draft after the last row
+int Engine4::mtp_draft(const int * tokens, int nt, int pos) {
+    embed_tok(tokens, nt, h_membd_);
+    h_pos_[1] = pos;
+    run(1, nt);
+    return mtp_result();
+}
+
+// MTP over (token, its own last hidden row) at pos
+int Engine4::mtp_chain(int token, int pos) {
+    embed_tok(&token, 1, h_membd_);
+    h_pos_[1] = pos;
+    run(2, 1);
+    return mtp_result();
 }
 
 // ---------------- prompt cache: recurrent-state snapshots (GDN conv + state, PLE conv history) ----------------
@@ -1152,8 +1295,9 @@ int Engine4::sample_row(int t, const SamplingParams & sp) {
     return cand[k - 1].second;
 }
 
-std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, bool, GenStats * stats,
+std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, bool spec_req, GenStats * stats,
                                    const std::function<bool(int)> & on_token, const SamplingParams & sp) {
+    const bool spec = spec_req && mtp_g_;
     if (prompt.empty()) throw std::runtime_error("generate: empty prompt");
     if ((int) prompt.size() + 8 > opt_.max_pos) throw std::runtime_error("generate: prompt longer than the context");
     using clk = std::chrono::steady_clock;
@@ -1187,6 +1331,8 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
         snap_at.erase(std::unique(snap_at.begin(), snap_at.end()), snap_at.end());
     }
     GenStats st;
+    const int K = opt_.n_draft;
+    std::vector<int> drafts(std::max(1, K));
     auto tp = clk::now();
     int next = -1;
     size_t si = 0;
@@ -1197,6 +1343,12 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
         const int len = end - c0;
         next = forward(&prompt[c0], len, c0)[len - 1];
         if (sampling) next = sample_row(len <= MAX_NT ? len - 1 : 0, sp);
+        if (spec) {   // MTP consumes (t_{q+1}, h_q) at q for the chunk; the last pair uses the predicted next token
+            std::vector<int> mt(len);
+            for (int j = 0; j < len; ++j) mt[j] = c0 + 1 + j < P ? prompt[c0 + 1 + j] : next;
+            const int d0 = mtp_draft(mt.data(), len, c0);
+            if (end == P) drafts[0] = d0;
+        }
         if (si < snap_at.size() && snap_at[si] == end) take_snapshot(end);
         if (prefill_cb_) prefill_cb_(end, P, s);
         c0 = end;
@@ -1215,10 +1367,47 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
         if ((int) out.size() >= n_gen) stop = true;
         return !stop;
     };
-    while (emit(next) && p + 1 < opt_.max_pos) {
-        next = forward(&next, 1, p++)[0];
-        if (sampling) next = sample_row(0, sp);
-        st.steps++;
+    auto since = [](clk::time_point a) { return std::chrono::duration<double>(clk::now() - a).count(); };
+    if (!spec) {
+        while (emit(next) && p + 1 < opt_.max_pos) {
+            next = forward(&next, 1, p++)[0];
+            if (sampling) next = sample_row(0, sp);
+            st.steps++;
+        }
+    } else {
+        auto make_drafts = [&](const int * mt, int nt, int pos) {   // first from the main hidden rows, the rest chained
+            auto ta = clk::now();
+            drafts[0] = mtp_draft(mt, nt, pos);
+            for (int j = 1; j < K; ++j) drafts[j] = mtp_chain(drafts[j - 1], pos + nt - 1 + j);
+            st.t_mtp += since(ta);
+        };
+        for (int j = 1; j < K; ++j) drafts[j] = mtp_chain(drafts[j - 1], p - 1 + j);   // first draft came with the prompt
+        int cur = next;                            // token at position p, not yet in the main model
+        std::vector<int> in(K + 1), mt(K + 1);
+        while (!stop && p + K + 1 < opt_.max_pos) {
+            in[0] = cur;
+            for (int j = 0; j < K; ++j) in[j + 1] = drafts[j];
+            auto ta = clk::now();
+            std::vector<int> a = forward(in.data(), K + 1, p);
+            st.t_main += since(ta);
+            st.steps++;
+            // a draft is kept iff the token sampled (or argmax) at its row equals it: exact plain sampling
+            int m = 0;
+            if (sampling) { while (m < K && (a[m] = sample_row(m, sp)) == drafts[m]) ++m; if (m == K) a[K] = sample_row(K, sp); }
+            else while (m < K && a[m] == drafts[m]) ++m;
+            st.accepted += m;
+            if (emit(cur)) for (int j = 0; j < m; ++j) if (!emit(drafts[j])) break;
+            if (stop) break;
+            if (m < K) {                            // keep rows 0..m of the verified block
+                ta = clk::now();
+                run(3, m + 1);
+                st.t_restore += since(ta);
+            }
+            for (int i = 0; i <= m; ++i) mt[i] = i < m ? drafts[i] : a[m];
+            make_drafts(mt.data(), m + 1, p);       // positions p..p+m with main hidden rows 0..m
+            cur = a[m];
+            p += m + 1;
+        }
     }
     {
         std::vector<int> sq = prompt;

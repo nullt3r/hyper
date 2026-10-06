@@ -106,6 +106,12 @@ void idx_pool(const half * kraw, half * pool, const float * knorm, const int * p
 void idx_select(const float * qn, const half * pool, const int * pos, int nt, int n_head, int top, float * scores, int score_stride,
                 int score_rows, int * list, int list_stride, int * list_n, cudaStream_t s);
 
+// ---- MTP ----
+// ecat[t*hc + s] = [rms(x[t]) * enorm | rms(H[t][s]) * hnorm[s]] for the per-stream eh_proj (hs: H row stride, 0 = shared row;
+// whole: one norm over all streams)
+void mtp_prep(const float * x, const float * enorm, const float * H, int hs, const float * hnorm, float eps, int n, int hc, bool whole,
+              float * ecat, int nt, cudaStream_t s);
+
 // ---- PLE ----
 // res += gated + silu(conv(rmsnorm_stream(gated) * w_conv)); gated_s = value * sigmoid(ssqrt(<rms(key_s)*wk, rms(res_s)*wq> / sqrt(n)))
 // conv: depthwise causal, kernel K, dilation dil, history state [(K-1)*dil][hc*n] (oldest first); snap (optional):

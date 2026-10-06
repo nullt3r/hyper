@@ -563,6 +563,28 @@ __global__ void __launch_bounds__(1024) k_idx_select(const float * __restrict__ 
     if (threadIdx.x == 0) list_n[t] = base_cnt * 4 + (p - tail0 + 1);
 }
 
+// ---------------- MTP prelude ----------------
+// grid (hc, nt): ecat[t*hc + s] = [rms(x[t]) * enorm | norm(H[t][s]) * hnorm[s]] (2n); H row stride hs (0: one row
+// for every token); whole: the hidden norm runs over all hc streams together instead of per stream
+__global__ void k_mtp_prep(const float * __restrict__ x, const float * __restrict__ enorm, const float * __restrict__ H, int hs,
+                           const float * __restrict__ hnorm, float eps, int n, int hc, int whole, float * __restrict__ ecat) {
+    const int s = blockIdx.x, t = blockIdx.y;
+    const float * xr = x + (size_t) t * n;
+    const float * hr = H + (size_t) t * hs;
+    float a = 0.0f, b = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) a += xr[i] * xr[i];
+    if (whole) { for (int i = threadIdx.x; i < hc * n; i += blockDim.x) b += hr[i] * hr[i]; }
+    else for (int i = threadIdx.x; i < n; i += blockDim.x) { const float v = hr[(size_t) s * n + i]; b += v * v; }
+    a = block_sum4(a);
+    b = block_sum4(b);
+    const float ia = rsqrtf(a / n + eps), ib = rsqrtf(b / (whole ? hc * n : n) + eps);
+    float * o = ecat + ((size_t) t * hc + s) * 2 * n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        o[i] = xr[i] * ia * enorm[i];
+        o[n + i] = hr[(size_t) s * n + i] * ib * hnorm[(size_t) s * n + i];
+    }
+}
+
 // ---------------- PLE ----------------
 // grid (hc, nt): per stream sums of key^2, res^2, key*wk*res*wq; stream 0 also sum value^2
 __global__ void k_ple_stats(const float * __restrict__ res, const float * __restrict__ key, const float * __restrict__ value,
@@ -702,6 +724,11 @@ void idx_select(const float * qn, const half * pool, const int * pos, int nt, in
                 int score_rows, int * list, int list_stride, int * list_n, cudaStream_t s) {
     for (int t0 = 0; t0 < nt; t0 += score_rows)
         k_idx_select<<<std::min(score_rows, nt - t0), 1024, 0, s>>>(qn, pool, pos, t0, n_head, top, scores, score_stride, list, list_stride, list_n);
+}
+
+void mtp_prep(const float * x, const float * enorm, const float * H, int hs, const float * hnorm, float eps, int n, int hc, bool whole,
+              float * ecat, int nt, cudaStream_t s) {
+    k_mtp_prep<<<dim3(hc, nt), 256, 0, s>>>(x, enorm, H, hs, hnorm, eps, n, hc, whole ? 1 : 0, ecat);
 }
 
 void ple_apply(float * res, const float * key, const float * value, const float * wk, const float * wq, const float * wconv_norm,

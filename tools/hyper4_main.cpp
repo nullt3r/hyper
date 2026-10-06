@@ -78,6 +78,8 @@ int main(int argc, char ** argv) {
     opt.prompt_cache = cmd == "cachetest";
     if (getenv("HYPER4_NOSTREAM")) opt.stream_experts = false;
     if (getenv("HYPER4_STREAM")) opt.stream_experts = true;
+    if (getenv("HYPER4_MTP")) opt.mtp_path = getenv("HYPER4_MTP");
+    if (getenv("HYPER_DRAFT")) opt.n_draft = atoi(getenv("HYPER_DRAFT"));
     opt.max_pos = getenv("HYPER_MAXPOS") ? atoi(getenv("HYPER_MAXPOS")) : 8192;
     if (argc > 5) opt.gpu_expert_frac = (float) atof(argv[5]);
     if (getenv("HYPER_CPU_THREADS")) opt.cpu_threads = atoi(getenv("HYPER_CPU_THREADS"));
@@ -165,6 +167,19 @@ int main(int argc, char ** argv) {
             C.insert(C.end(), outA.begin(), outA.end());
             C.insert(C.end(), toks.begin() + 200, toks.begin() + 240);
             run(C, "extended");
+        } else if (cmd == "mtpgen") {   // HYPER4_MTP=file: greedy plain vs MTP speculative (identical output), speed
+            const int n_gen = argc > 4 ? atoi(argv[4]) : 256;
+            std::vector<int> prompt(toks.begin(), toks.begin() + std::min<size_t>(toks.size(), 128));
+            GenStats a, b;
+            const std::vector<int> plain = eng.generate(prompt, n_gen, false, &a);
+            const std::vector<int> spec = eng.generate(prompt, n_gen, true, &b);
+            int same = 0;
+            while (same < n_gen && plain[same] == spec[same]) ++same;
+            printf("MTPGEN plain %.2f t/s | spec %.2f t/s  steps %d  accepted/step %.2f  tokens/step %.2f  main %.2f ms  mtp %.2f ms  restore %.2f ms\n",
+                   a.tokens / a.seconds, b.tokens / b.seconds, b.steps, (double) b.accepted / std::max(1, b.steps),
+                   (double) b.tokens / std::max(1, b.steps), 1e3 * b.t_main / std::max(1, b.steps), 1e3 * b.t_mtp / std::max(1, b.steps),
+                   1e3 * b.t_restore / std::max(1, b.steps));
+            printf("MTPGEN identical prefix %d / %d%s\n", same, n_gen, same == n_gen ? " (sequences match)" : "");
         } else if (cmd == "checkbulk") {   // HYPER4_ALLROWS=1: prefill up to the reference's first row, then its rows in one chunk
             const int n = (int) toks.size(), first = g_ref_first;
             Cmp cmp;
