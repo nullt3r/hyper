@@ -27,6 +27,8 @@ struct BF16W {
 };
 // host: repack row-major bf16 w[n][k] into fp16 fragment tiles (out: ntile * (k/16) * 512 bytes)
 void repack_bf16_frag(const uint16_t * w, int n, int k, size_t row_stride, uint8_t * out);
+// same from fp32 rows (dequantized K-quants etc.)
+void repack_f32_frag(const float * w, int n, int k, size_t row_stride, uint8_t * out);
 // fused input RMSNorm: x' = x * rsqrt(sum(ss[t*nss .. t*nss+nss)) / k + eps) * w   (w == nullptr: no norm)
 struct NormIn { const float * w = nullptr; const float * ss = nullptr; int nss = 0; float eps = 1e-6f; };
 

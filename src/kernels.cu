@@ -152,8 +152,9 @@ __global__ void k_mma_q8(const uint4 * __restrict__ wq, const half * __restrict_
 // fp16 weights in fragment order: per k-step (16 cols) one 16-byte load per lane gives a full A fragment
 __global__ void k_mma_f16(const uint4 * __restrict__ wq, int n, int k,
                           const float * __restrict__ x, int xs, float * __restrict__ y, int ys, const float * __restrict__ add,
-                          int nt, NormIn nin) {
-    const int tile = blockIdx.x;
+                          int nt, NormIn nin, float * __restrict__ kpart, unsigned * kcnt) {
+    // split-K as in k_mma_q8 (gridDim.y parts, last block of a tile sums them in order)
+    const int tile = blockIdx.x, part = blockIdx.y, P = gridDim.y;
     const int w = threadIdx.x >> 5, nw = blockDim.x >> 5;
     const int lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
     const int nks = k / 16;
@@ -163,7 +164,8 @@ __global__ void k_mma_f16(const uint4 * __restrict__ wq, int n, int k,
     const float * xr = x + (size_t) tok * xs;
     const float inv = input_inv_rms(nin.ss + tok * nin.nss, nin.nss, k, nin.w, nin.eps);
     float acc[4] = {0, 0, 0, 0};
-    for (int ks = w; ks < nks; ks += nw) {
+    const int ks_end = (int) ((int64_t) (part + 1) * nks / P);
+    for (int ks = (int) ((int64_t) part * nks / P) + w; ks < ks_end; ks += nw) {
         const uint4 q = __ldg(tq + (size_t) ks * 32);
         const unsigned a[4] = {q.x, q.y, q.z, q.w};
         const int c0 = ks * 16 + 2 * tig;
@@ -183,9 +185,34 @@ __global__ void k_mma_f16(const uint4 * __restrict__ wq, int n, int k,
 #pragma unroll
     for (int i = 0; i < 4; ++i) red[w][lane][i] = acc[i];
     __syncthreads();
-    if (w == 0) {
+    if (P > 1) {
+        __shared__ unsigned ticket;
+        if (w == 0) {
+            float * dst = kpart + ((size_t) tile * P + part) * 128 + lane * 4;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { float t = 0; for (int ww = 0; ww < nw; ++ww) t += red[ww][lane][i]; dst[i] = t; }
+            __threadfence();
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) ticket = atomicAdd(&kcnt[tile], 1u);
+        __syncthreads();
+        if (ticket != (unsigned) P - 1) return;
+        __threadfence();
+        if (w == 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[i] = 0.0f;
+            for (int pp = 0; pp < P; ++pp) {
+                const float * src = kpart + ((size_t) tile * P + pp) * 128 + lane * 4;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) acc[i] += __ldcg(src + i);
+            }
+            if (lane == 0) kcnt[tile] = 0;
+        }
+    } else if (w == 0) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) { float t = 0; for (int ww = 0; ww < nw; ++ww) t += red[ww][lane][i]; acc[i] = t; }
+    }
+    if (w == 0) {
         const int r0 = tile * 16 + gid, t0 = 2 * tig;
         auto put = [&](int row, int t, float v) {
             if (row < n && t < nt) { const size_t o = (size_t) t * ys + row; y[o] = add ? add[o] + v : v; }
@@ -1005,7 +1032,13 @@ void repack_q8_frag(const int8_t * qs, const half * d, int n, int k, uint8_t * f
 void gemv_bf16(const BF16W & W, const float * x, int xs, float * y, int ys, const float * add, int nt, cudaStream_t s,
                const NormIn & nin) {
     if (nt < 1 || nt > 8) throw std::runtime_error("gemv_bf16: nt must be 1..8");
-    k_mma_f16<<<(W.n + 15) / 16, 256, 0, s>>>(W.q, W.n, W.k, x, xs, y, ys, add, nt, nin);
+    const int tiles = (W.n + 15) / 16, nks = W.k / 16;
+    int P = 1, dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 16 && g_ksplit[dev].part && tiles <= KSPLIT_TILES && tiles < 160)
+        P = std::max(1, std::min({KSPLIT_MAX, 320 / tiles, nks / 32}));
+    k_mma_f16<<<dim3(tiles, P), 256, 0, s>>>(W.q, W.n, W.k, x, xs, y, ys, add, nt, nin,
+                                            P > 1 ? g_ksplit[dev].part : nullptr, P > 1 ? g_ksplit[dev].cnt : nullptr);
 }
 
 void to_half(const float * x, int xs, const float * w, int k, float eps, half * xh, int nt, cudaStream_t s) {
@@ -1026,6 +1059,26 @@ void gemm_q8(const Q8W & W, const half * xh, int T, float * y, int ys, const flo
 void gemm_f16(const BF16W & W, const half * xh, int T, float * y, int ys, const float * add, cudaStream_t s) {
     if (W.k % 32) throw std::runtime_error("gemm_f16: k must be a multiple of 32");
     gemm_launch<FragF16>(W.q, nullptr, W.n, W.k, xh, T, y, ys, add, s);
+}
+
+void repack_f32_frag(const float * w, int n, int k, size_t row_stride, uint8_t * out) {
+    const int ntile = (n + 15) / 16, nks = k / 16;
+#pragma omp parallel for schedule(static)
+    for (int t = 0; t < ntile; ++t)
+        for (int ks = 0; ks < nks; ++ks) {
+            half * tile = (half *) (out + ((size_t) t * nks + ks) * 512);
+            for (int lane = 0; lane < 32; ++lane) {
+                const int gid = lane >> 2, tig = lane & 3;
+                const int cb = ks * 16 + 2 * tig;
+                const int rows[4] = {gid, gid + 8, gid, gid + 8};
+                const int cols[4] = {cb, cb, cb + 8, cb + 8};
+                for (int p = 0; p < 4; ++p)
+                    for (int e = 0; e < 2; ++e) {
+                        const int r = t * 16 + rows[p];
+                        tile[lane * 8 + p * 2 + e] = r < n ? __float2half(w[(size_t) r * row_stride + cols[p] + e]) : __float2half(0.0f);
+                    }
+            }
+        }
 }
 
 void repack_bf16_frag(const uint16_t * w, int n, int k, size_t row_stride, uint8_t * out) {

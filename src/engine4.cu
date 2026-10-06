@@ -1,5 +1,7 @@
 #include "engine4.h"
 
+#include "ggml.h"
+
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <sys/mman.h>
@@ -21,6 +23,15 @@ namespace hyper {
     throw std::runtime_error(std::string("CUDA: ") + cudaGetErrorString(e_) + " at " + __FILE__ + ":" + std::to_string(__LINE__)); } while (0)
 
 constexpr int CPU_OWNER = 3;
+
+// dense weight: Q8_0 (fragment-ordered int8, the fast path) or anything else dequantized to fp16 at load (exact)
+struct DW {
+    Q8W q8;
+    BF16W f;
+    bool f16 = false;
+    int n() const { return f16 ? f.n : q8.n; }
+    int k() const { return f16 ? f.k : q8.k; }
+};
 constexpr int R4 = MOE_BULK_ROWS;   // activation rows (prefill chunk)
 constexpr int QSA_SCORE_ROWS = 64; // tokens scored at a time (scratch rows of max_pos/4 scores)
 constexpr int QSA_LIST = 2052;     // max attended cells per token: 512 pools * 4 + 3 tail cells (+1)
@@ -29,9 +40,9 @@ struct Engine4::DevLayer {
     bool full = false, ple = false;
     // hyper-connection mixers (replicated): norm [hc*n], down [lr x hc*n], up [hc*n x lr], inject [hc][hc*n]
     float * hca_norm = nullptr, * hcf_norm = nullptr, * hca_inj = nullptr, * hcf_inj = nullptr;
-    Q8W hca_down, hca_up, hcf_down, hcf_up;
+    DW hca_down, hca_up, hcf_down, hcf_up;
     // gated attention: local q heads [head_off, +n_head_l), local kv heads [kv_off, +n_kv_l)
-    Q8W wqkv, wo;
+    DW wqkv, wo;
     float * q_norm = nullptr, * k_norm = nullptr;
     half * kcache = nullptr, * vcache = nullptr;
     int n_head_l = 0, head_off = 0, n_kv_l = 0, kv_off = 0;
@@ -40,14 +51,14 @@ struct Engine4::DevLayer {
     float * idx_qn = nullptr, * idx_kn = nullptr;
     half * kraw = nullptr, * kpool = nullptr;
     // gated delta net (head-aligned partition)
-    Q8W win, wout;
+    DW win, wout;
     float * ab_w = nullptr;   // fp32 rows [alpha local | beta local]
     float * conv_w = nullptr, * dt_bias = nullptr, * ssm_a = nullptr, * ssm_norm = nullptr;
     float * conv_state = nullptr, * state = nullptr;
     int n_v_l = 0, n_k_l = 0, conv_ch = 0;
     // MoE
     float * router = nullptr;  // fp32 [n_expert + 1][n]: experts, then the shared-expert gate
-    Q8W sh_gu, sh_down;
+    DW sh_gu, sh_down;
     int n_sh_l = 0;
     MoeDev moe;
     int * owner = nullptr;     // [n_expert]: device or CPU_OWNER
@@ -57,7 +68,7 @@ struct Engine4::DevLayer {
     int st_a = 0, st_b = 0;
     const uint8_t * st_host_g = nullptr, * st_host_u = nullptr, * st_host_d = nullptr;   // pinned host (whole CPU layer)
     // PLE
-    Q8W ple_key, ple_value;
+    DW ple_key, ple_value;
     float * ple_wk = nullptr, * ple_wq = nullptr, * ple_wc = nullptr, * ple_conv = nullptr, * ple_state = nullptr;
 };
 
@@ -67,7 +78,7 @@ struct Engine4::Device {
     cudaGraphExec_t g_main[MAX_NT + 1] = {};
     std::vector<DevLayer> layers;
     float * head_norm = nullptr;
-    Q8W head_down, head_up, output;
+    DW head_down, head_up, output;
     int vocab_off = 0;
     // activations [MAX_NT] rows
     float * x = nullptr, * res = nullptr, * xn = nullptr, * gate = nullptr, * lo = nullptr, * inj = nullptr, * mixed = nullptr;
@@ -186,6 +197,53 @@ Q8W upload_q8(const std::function<void *(size_t)> & alloc, int dev, const std::v
     return to_device_q8(alloc, dev, qs.data(), d.data(), (int) n, (int) k);
 }
 
+// any GGUF type -> fp32 (ggml's reference dequantization)
+std::vector<float> to_f32(const GTensor & t, int64_t r0 = 0, int64_t r1 = -1) {
+    if (r1 < 0) r1 = t.rows();
+    const int64_t k = t.ne[0];
+    std::vector<float> out((size_t) (r1 - r0) * k);
+    if (t.type == GType::F32) { memcpy(out.data(), t.data + (size_t) r0 * t.row_bytes(), out.size() * sizeof(float)); return out; }
+    const auto * tr = ggml_get_type_traits((ggml_type) t.type);
+    if (!tr || !tr->to_float) throw std::runtime_error("to_f32: no dequantizer for " + t.name);
+#pragma omp parallel for schedule(static)
+    for (int64_t r = r0; r < r1; ++r) tr->to_float(t.data + (size_t) r * t.row_bytes(), out.data() + (size_t) (r - r0) * k, k);
+    return out;
+}
+
+// dense rows from several tensors (same k), restricted to column blocks of 32: Q8_0 stays int8, the rest -> fp16
+DW upload_dense(const std::function<void *(size_t)> & alloc, int dev, const std::vector<RowRange> & parts, ColRanges cols = {}) {
+    DW w;
+    bool all_q8 = true;
+    for (auto & p : parts) all_q8 &= p.t->type == GType::Q8_0;
+    if (all_q8) { w.q8 = upload_q8(alloc, dev, parts, cols); return w; }
+    const int64_t k_full = parts[0].t->ne[0];
+    if (cols.empty()) cols.push_back({0, k_full / 32});
+    std::vector<int64_t> cidx;
+    for (auto & [b0, b1] : cols) for (int64_t c = b0 * 32; c < b1 * 32; ++c) cidx.push_back(c);
+    const int k = (int) cidx.size();
+    int n = 0;
+    for (auto & p : parts) n += (int) (p.r1 - p.r0);
+    std::vector<float> rows((size_t) n * k);
+    int row0 = 0;
+    for (auto & p : parts) {
+        if (p.t->ne[0] != k_full) throw std::runtime_error("upload_dense: k mismatch " + p.t->name);
+        const std::vector<float> full = to_f32(*p.t, p.r0, p.r1);
+        for (int64_t r = 0; r < p.r1 - p.r0; ++r)
+            for (int j = 0; j < k; ++j) rows[(size_t) (row0 + r) * k + j] = full[(size_t) r * k_full + cidx[j]];
+        row0 += (int) (p.r1 - p.r0);
+    }
+    const size_t ntile = (n + 15) / 16;
+    std::vector<uint8_t> fq(ntile * (k / 16) * 512);
+    repack_f32_frag(rows.data(), n, k, (size_t) k, fq.data());
+    CUDA_CHECK(cudaSetDevice(dev));
+    w.f16 = true;
+    w.f.n = n; w.f.k = k;
+    void * pd = alloc(fq.size());
+    CUDA_CHECK(cudaMemcpy(pd, fq.data(), fq.size(), cudaMemcpyHostToDevice));
+    w.f.q = (const uint4 *) pd;
+    return w;
+}
+
 std::pair<int64_t, int64_t> split(int64_t n, int ndev, int g, int64_t align = 1) {
     const int64_t units = n / align;
     return {units * g / ndev * align, units * (g + 1) / ndev * align};
@@ -291,11 +349,10 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
     auto A = [&](size_t nb) { return (void *) dev.alloc<uint8_t>(nb); };
     auto T = [&](const std::string & name) { return &gguf_->need(name); };
     auto f32 = [&](const std::string & name) {
-        const GTensor & t = gguf_->need(name);
-        if (t.type != GType::F32) throw std::runtime_error("expected F32: " + name);
-        return dev.upload((const float *) t.data, (size_t) t.nelements());
+        const std::vector<float> v = to_f32(gguf_->need(name));
+        return dev.upload(v.data(), v.size());
     };
-    auto q8full = [&](const std::string & name) { const GTensor * t = T(name); return upload_q8(A, dev.id, {{t, 0, t->rows()}}); };
+    auto q8full = [&](const std::string & name) { const GTensor * t = T(name); return upload_dense(A, dev.id, {{t, 0, t->rows()}}); };
     const std::string p = "blk." + std::to_string(il) + ".";
     L.full = c.is_full_attn(il);
     // hyper-connection mixers
@@ -319,10 +376,10 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
     }
     if (L.full && L.n_head_l > 0) {
         const int hd = c.head_dim;
-        L.wqkv = upload_q8(A, dev.id, {{T(p + "attn_q.weight"), (int64_t) L.head_off * 2 * hd, (int64_t) (L.head_off + L.n_head_l) * 2 * hd},
+        L.wqkv = upload_dense(A, dev.id, {{T(p + "attn_q.weight"), (int64_t) L.head_off * 2 * hd, (int64_t) (L.head_off + L.n_head_l) * 2 * hd},
                                        {T(p + "attn_k.weight"), (int64_t) L.kv_off * hd, (int64_t) (L.kv_off + L.n_kv_l) * hd},
                                        {T(p + "attn_v.weight"), (int64_t) L.kv_off * hd, (int64_t) (L.kv_off + L.n_kv_l) * hd}});
-        L.wo = upload_q8(A, dev.id, {{T(p + "attn_output.weight"), 0, n}},
+        L.wo = upload_dense(A, dev.id, {{T(p + "attn_output.weight"), 0, n}},
                          {{(int64_t) L.head_off * hd / 32, (int64_t) (L.head_off + L.n_head_l) * hd / 32}});
         L.q_norm = f32(p + "attn_q_norm.weight");
         L.k_norm = f32(p + "attn_k_norm.weight");
@@ -361,28 +418,27 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
             for (int64_t ch = voff + (int64_t) h * dv; ch < voff + (int64_t) (h + 1) * dv; ++ch) chans.push_back(ch);
         }
         rows.insert(rows.end(), z_rows.begin(), z_rows.end());
-        L.win = upload_q8(A, dev.id, rows);
-        L.wout = upload_q8(A, dev.id, {{T(p + "ssm_out.weight"), 0, n}}, out_cols);
+        L.win = upload_dense(A, dev.id, rows);
+        L.wout = upload_dense(A, dev.id, {{T(p + "ssm_out.weight"), 0, n}}, out_cols);
         {   // alpha / beta rows (fp32)
-            const GTensor & ta = gguf_->need(p + "ssm_alpha.weight"), & tb = gguf_->need(p + "ssm_beta.weight");
-            if (ta.type != GType::F32 || tb.type != GType::F32) throw std::runtime_error("ssm_alpha/beta: expected F32");
+            const std::vector<float> fa = to_f32(gguf_->need(p + "ssm_alpha.weight")), fb = to_f32(gguf_->need(p + "ssm_beta.weight"));
             std::vector<float> buf;
-            for (int h : vh) buf.insert(buf.end(), (const float *) ta.data + (size_t) h * n, (const float *) ta.data + (size_t) (h + 1) * n);
-            for (int h : vh) buf.insert(buf.end(), (const float *) tb.data + (size_t) h * n, (const float *) tb.data + (size_t) (h + 1) * n);
+            for (int h : vh) buf.insert(buf.end(), fa.begin() + (size_t) h * n, fa.begin() + (size_t) (h + 1) * n);
+            for (int h : vh) buf.insert(buf.end(), fb.begin() + (size_t) h * n, fb.begin() + (size_t) (h + 1) * n);
             L.ab_w = dev.upload(buf.data(), buf.size());
         }
         {
-            const GTensor & cw = gguf_->need(p + "ssm_conv1d.weight");
+            const std::vector<float> cw = to_f32(gguf_->need(p + "ssm_conv1d.weight"));
             const int K = c.ssm_conv;
             std::vector<float> buf((size_t) L.conv_ch * K);
             for (size_t j = 0; j < chans.size(); ++j)
-                memcpy(buf.data() + j * K, (const float *) cw.data + chans[j] * K, K * sizeof(float));
+                memcpy(buf.data() + j * K, cw.data() + chans[j] * K, K * sizeof(float));
             L.conv_w = dev.upload(buf.data(), buf.size());
         }
         auto gather = [&](const std::string & name) {
-            const GTensor & t = gguf_->need(name);
+            const std::vector<float> t = to_f32(gguf_->need(name));
             std::vector<float> buf;
-            for (int h : vh) buf.push_back(((const float *) t.data)[h]);
+            for (int h : vh) buf.push_back(t[h]);
             return dev.upload(buf.data(), buf.size());
         };
         L.dt_bias = gather(p + "ssm_dt.bias");
@@ -404,18 +460,17 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
     }
     // router + shared-expert gate (replicated, fp32)
     {
-        const GTensor & r = gguf_->need(p + "ffn_gate_inp.weight"), & sgt = gguf_->need(p + "ffn_gate_inp_shexp.weight");
-        if (r.type != GType::F32 || sgt.type != GType::F32) throw std::runtime_error("router: expected F32");
-        std::vector<float> buf((const float *) r.data, (const float *) r.data + r.nelements());
-        buf.insert(buf.end(), (const float *) sgt.data, (const float *) sgt.data + sgt.nelements());
+        std::vector<float> buf = to_f32(gguf_->need(p + "ffn_gate_inp.weight"));
+        const std::vector<float> sgt = to_f32(gguf_->need(p + "ffn_gate_inp_shexp.weight"));
+        buf.insert(buf.end(), sgt.begin(), sgt.end());
         L.router = dev.upload(buf.data(), buf.size());
     }
     // shared expert: hidden split
     {
         auto [f0, f1] = split(c.n_ff_shexp, nd, g, 32);
-        L.n_sh_l = (int) (f1 - f0);
-        L.sh_gu = upload_q8(A, dev.id, {{T(p + "ffn_gate_shexp.weight"), f0, f1}, {T(p + "ffn_up_shexp.weight"), f0, f1}});
-        L.sh_down = upload_q8(A, dev.id, {{T(p + "ffn_down_shexp.weight"), 0, n}}, {{f0 / 32, f1 / 32}});
+        L.n_sh_l = (int) (f1 - f0);   // (K-sliced down projection: blocks of 32 columns)
+        L.sh_gu = upload_dense(A, dev.id, {{T(p + "ffn_gate_shexp.weight"), f0, f1}, {T(p + "ffn_up_shexp.weight"), f0, f1}});
+        L.sh_down = upload_dense(A, dev.id, {{T(p + "ffn_down_shexp.weight"), 0, n}}, {{f0 / 32, f1 / 32}});
     }
 }
 
@@ -528,12 +583,12 @@ void Engine4::load_weights() {
         auto A = [&](size_t nb) { return (void *) dev.alloc<uint8_t>(nb); };
         dev.layers.resize(c.n_layer);
         for (int il = 0; il < c.n_layer; ++il) load_layer(dev, dev.layers[il], il);
-        dev.head_norm = dev.upload((const float *) gguf_->need("output_hc_norm.weight").data, (size_t) hcn);
-        { const GTensor * t = &gguf_->need("output_hc_down.weight"); dev.head_down = upload_q8(A, dev.id, {{t, 0, t->rows()}}); }
-        { const GTensor * t = &gguf_->need("output_hc_up.weight"); dev.head_up = upload_q8(A, dev.id, {{t, 0, t->rows()}}); }
+        { const std::vector<float> v = to_f32(gguf_->need("output_hc_norm.weight")); dev.head_norm = dev.upload(v.data(), v.size()); }
+        { const GTensor * t = &gguf_->need("output_hc_down.weight"); dev.head_down = upload_dense(A, dev.id, {{t, 0, t->rows()}}); }
+        { const GTensor * t = &gguf_->need("output_hc_up.weight"); dev.head_up = upload_dense(A, dev.id, {{t, 0, t->rows()}}); }
         auto [o0, o1] = split(c.n_vocab, nd, g);
         dev.vocab_off = (int) o0;
-        dev.output = upload_q8(A, dev.id, {{&gguf_->need("output.weight"), o0, o1}});
+        dev.output = upload_dense(A, dev.id, {{&gguf_->need("output.weight"), o0, o1}});
         // activations
         const int conv_dim = c.conv_dim();
         dev.big_stride = conv_dim + c.ssm_d_inner + 2 * c.ssm_dt_rank + 2 * c.n_head * c.head_dim + 2 * c.n_head_kv * c.head_dim;
@@ -568,7 +623,7 @@ void Engine4::load_weights() {
         dev.ple_key = dev.alloc<float>((size_t) R * hcn);
         dev.ple_val = dev.alloc<float>((size_t) R * n);
         dev.ple_sc = dev.alloc<float>((size_t) R * c.hc * 4);
-        dev.logits = dev.alloc<float>((size_t) (allrows_ ? R : MAX_NT) * dev.output.n);
+        dev.logits = dev.alloc<float>((size_t) (allrows_ ? R : MAX_NT) * dev.output.n());
         dev.xh = dev.alloc<half>((size_t) R * std::max(hcn, c.n_ff_shexp));
         dev.p16 = dev.alloc<half>((size_t) R * n);
         dev.recv = dev.alloc<half>((size_t) std::max(1, nd - 1) * R * n);
@@ -589,10 +644,12 @@ void Engine4::load_weights() {
     }
     // experts fill what is left on each GPU (minus a runtime reserve), capped at gpu_expert_frac of every layer
     {
-        size_t eb = 0;   // bytes of one expert, averaged over the layers
+        size_t eb = 0, eb_max = 0;   // bytes of one expert: average over the layers, largest layer
         for (int il = 0; il < c.n_layer; ++il) {
             const std::string p = "blk." + std::to_string(il) + ".";
-            eb += (gguf_->need(p + "ffn_gate_exps.weight").nbytes * 2 + gguf_->need(p + "ffn_down_exps.weight").nbytes) / c.n_expert;
+            const size_t b = (gguf_->need(p + "ffn_gate_exps.weight").nbytes * 2 + gguf_->need(p + "ffn_down_exps.weight").nbytes) / c.n_expert;
+            eb += b;
+            eb_max = std::max(eb_max, b);
         }
         eb /= c.n_layer;
         std::vector<int> quota(nd);
@@ -613,7 +670,7 @@ void Engine4::load_weights() {
                 tq += quota[g];
             }
             if (!opt_.stream_experts) break;
-            const double cold = std::max(0, c.n_expert - tq) * (double) eb * 1.08;   // + slack for layers with bigger experts
+            const double cold = (std::max(0, c.n_expert - tq) + 2) * (double) eb_max;   // the layer with the biggest experts
             for (int g = 0; g < nd; ++g) stage_est[g] = 2.0 * cold * (nd > 1 && g == 1 ? 1.0 : 2.0) / (2.0 * nd - (nd > 1 ? 1.0 : 0.0));
         }
         int tq = 0;
@@ -657,7 +714,17 @@ void Engine4::record_main(int gi, int nt) {
     const float eps = c.rms_eps;
     const bool bulk = nt > MAX_NT;
     // matmul: decode GEMV (split-K for few rows) or, for a prefill chunk, fp16 conversion + tiled tensor-core GEMM
-    auto mm = [&](const Q8W & W, const float * x, int xs, float * y, int ys, int rows) {
+    auto mm = [&](const DW & W, const float * x, int xs, float * y, int ys, int rows) {
+        if (rows <= MAX_NT) {
+            if (W.f16) gemv_bf16(W.f, x, xs, y, ys, nullptr, rows, s, NormIn{});
+            else gemv_q8(W.q8, x, xs, y, ys, nullptr, rows, s, NormIn{});
+            return;
+        }
+        to_half(x, xs, nullptr, W.k(), 0.0f, d.xh, rows, s);
+        if (W.f16) gemm_f16(W.f, d.xh, rows, y, ys, nullptr, s);
+        else gemm_q8(W.q8, d.xh, rows, y, ys, nullptr, s);
+    };
+    auto mmo = [&](const Q8W & W, const float * x, int xs, float * y, int ys, int rows) {   // LM head (Q8_0)
         if (rows <= MAX_NT) { gemv_q8(W, x, xs, y, ys, nullptr, rows, s, NormIn{}); return; }
         to_half(x, xs, nullptr, W.k, 0.0f, d.xh, rows, s);
         gemm_q8(W, d.xh, rows, y, ys, nullptr, s);
@@ -717,7 +784,7 @@ void Engine4::record_main(int gi, int nt) {
         add_parts(d.bo, d.p16, d.recv, (size_t) R4 * n, nd - 1, (int) N, s);
     };
     // hyper-connection mixer: res -> mixed (and the inject logits)
-    auto hc_mix = [&](const float * norm, const Q8W & down, const Q8W & up, const float * inj, const float * res = nullptr, int rows = -1) {
+    auto hc_mix = [&](const float * norm, const DW & down, const DW & up, const float * inj, const float * res = nullptr, int rows = -1) {
         if (!res) res = d.res;
         if (rows < 0) rows = nt;
         hc_norm(res, norm, d.xn, n, hc, eps, rows, s);
@@ -856,12 +923,12 @@ void Engine4::record_main(int gi, int nt) {
     // final mixer = output norm (prefill chunk: last row only)
     const int hr = bulk && !allrows_ ? 1 : nt;   // HYPER4_ALLROWS (debugging): logits for every row of a prefill chunk
     hc_mix(d.head_norm, d.head_down, d.head_up, nullptr, d.res + (size_t) (nt - hr) * hcn, hr);
-    mm(d.output, d.mixed, n, d.logits, d.output.n, hr);
-    argmax_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.wts, hr, s);   // wts reused as the result pairs
+    mm(d.output, d.mixed, n, d.logits, d.output.n(), hr);
+    argmax_pairs(d.logits, d.output.n(), d.output.n(), d.vocab_off, d.wts, hr, s);   // wts reused as the result pairs
     CUDA_CHECK(cudaMemcpyAsync(h_res_ + (size_t) gi * MAX_NT * 2, d.wts, (size_t) std::min(hr, MAX_NT) * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
     {   // sampling candidates of the result rows (top-64 of this vocab slice)
         const int tr = std::min(hr, MAX_NT);
-        topk_pairs(d.logits + (size_t) (hr - tr) * d.output.n, d.output.n, d.output.n, d.vocab_off, d.topk, TOPK, tr, s);
+        topk_pairs(d.logits + (size_t) (hr - tr) * d.output.n(), d.output.n(), d.output.n(), d.vocab_off, d.topk, TOPK, tr, s);
         CUDA_CHECK(cudaMemcpyAsync(h_topk_ + (size_t) gi * MAX_NT * TOPK * 2, d.topk, (size_t) tr * TOPK * 2 * sizeof(float),
                                    cudaMemcpyDeviceToHost, s));
     }
@@ -906,19 +973,16 @@ void Engine4::embed(const int * tokens, int nt, int pos) {
     if ((int) seq_.size() < pos + nt) seq_.resize(pos + nt, -1);
     for (int t = 0; t < nt; ++t) seq_[pos + t] = tokens[t];
     const GTensor & te = gguf_->need("token_embd.weight");
-    if (te.type != GType::Q8_0) throw std::runtime_error("token_embd: expected Q8_0");
+    const auto * te_tr = ggml_get_type_traits((ggml_type) te.type);
     for (int t = 0; t < nt; ++t) {
         const uint8_t * row = te.data + (size_t) tokens[t] * te.row_bytes();
         float * out = h_embd_ + (size_t) t * c.n_embd;
-        for (int b = 0; b < c.n_embd / 32; ++b) {
-            const uint8_t * blk = row + b * 34;
-            const float dd = f16(blk);
-            for (int i = 0; i < 32; ++i) out[b * 32 + i] = dd * (float) ((const int8_t *) (blk + 2))[i];
-        }
+        if (te.type == GType::F32) memcpy(out, row, c.n_embd * sizeof(float));
+        else te_tr->to_float(row, out, c.n_embd);
     }
     if (c.ple_layer < 0) return;
     const GTensor & pt = gguf_->need("per_layer_token_embd.weight");
-    if (pt.type != GType::IQ4_NL) throw std::runtime_error("per_layer_token_embd: expected IQ4_NL");
+    const auto * pt_tr = ggml_get_type_traits((ggml_type) pt.type);
     const int ng = c.ple_ngram, nh = c.ple_n_heads(), dim = c.ple_dim;
     for (int t = 0; t < nt; ++t) {
         const int p = pos + t;
@@ -938,15 +1002,7 @@ void Engine4::embed(const int * tokens, int nt, int pos) {
             for (int gq = 0; gq < c.ple_heads_per_ngram; ++gq) {
                 const int h = (ngr - 2) * c.ple_heads_per_ngram + gq;
                 const uint64_t row = mixed % c.ple_vocab[h] + c.ple_offsets[h];
-                const uint8_t * r = pt.data + row * pt.row_bytes();
-                for (int b = 0; b < dim / 32; ++b) {
-                    const uint8_t * blk = r + b * 18;
-                    const float dd = f16(blk);
-                    for (int j = 0; j < 16; ++j) {
-                        out[h * dim + b * 32 + j] = dd * kIQ4NL[blk[2 + j] & 0xF];
-                        out[h * dim + b * 32 + j + 16] = dd * kIQ4NL[blk[2 + j] >> 4];
-                    }
-                }
+                pt_tr->to_float(pt.data + row * pt.row_bytes(), out + h * dim, dim);
             }
         }
     }
@@ -1209,7 +1265,7 @@ void Engine4::get_logits(int t, std::vector<float> & out) {
     out.resize(cfg_.n_vocab);
     for (auto & dp : devs_) {
         CUDA_CHECK(cudaSetDevice(dp->id));
-        CUDA_CHECK(cudaMemcpy(out.data() + dp->vocab_off, dp->logits + (size_t) t * dp->output.n, (size_t) dp->output.n * sizeof(float),
+        CUDA_CHECK(cudaMemcpy(out.data() + dp->vocab_off, dp->logits + (size_t) t * dp->output.n(), (size_t) dp->output.n() * sizeof(float),
                               cudaMemcpyDeviceToHost));
     }
 }
