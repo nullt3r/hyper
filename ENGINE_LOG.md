@@ -30,6 +30,22 @@ Model A/C: čas = součet zařízení (střídají se) → 26,4 t/s = 93 % strop
 
 Mainline: B 34,6 t/s → hyper **1,92×**; A 26,4 → **2,5×**.
 
+## MTP spekulativní dekódování (prompt: chat, programovací otázka s thinkingem; 512 tokenů, greedy)
+
+Výstup je ve všech variantách **token po tokenu identický** s obyčejným greedy generováním (ověřeno 512/512).
+
+| Krok | t/s | tokenů/krok | ověření | MTP |
+|---|---|---|---|---|
+| obyčejné greedy (nt=1, přes API) | 62,4 | 1 | 15,9 ms | – |
+| MTP K=1 (ověření 2 tokenů, rollback GDN ze snapshotu) | 96,4 | 1,94 | 18,3 ms | 1,5 ms |
+| multi-token GEMV: dequant jednou na chunk, 4 řádky/warp | 98,2 | 1,94 | 18,3 ms | 1,5 ms |
+| řetězené drafty K=2 (MTP ze svého výstupu) | 109,7 | 2,68 | 21,4 ms | 3,0 ms |
+| Q8 kopie LM hlavy pro drafty, jen poslední řádek | **115,1** | 2,68 | 21,3 ms | 1,9 ms |
+| (K=3 s Q8 hlavou) | 111,4 | 3,22 | 25,9 ms | 2,9 ms |
+
+Úspěšnost draftu 1: 94 %, druhého (podmíněně) ~79 %. hyper K=2 vs mainline: **3,3× (TP), 4,4× (layer)**.
+
+
 ## Zjištění
 - Allreduce bez P2P: pevná latence ~3,5 µs (n=256), zbytek přenos (PCIe; GPU1 x8). LL protokol odstraní fence + flag.
 - Hash výstupu není vhodný test; správnost = top-1 + KL proti llama.cpp referenci (`build/ref`).
@@ -37,7 +53,7 @@ Mainline: B 34,6 t/s → hyper **1,92×**; A 26,4 → **2,5×**.
 - Unroll/pipelining GEMV nepomáhá; limit je DRAM, ne počet požadavků v letu.
 
 ## Další kroky
-1. **MTP spekulativní dekódování** (model má NextN hlavu): ověření 2–3 tokenů ≈ cena 1 (bandwidth-bound) → odhad 1,5–1,8×.
-   Vyžaduje multi-token GEMV (malé N), GDN se snapshoty stavu pro rollback, attention pro více dotazů.
+1. **Tensor-core Q8 GEMM** (mma.sync, váhy přeskládané do pořadí fragmentů): multi-token ověření je dnes
+   omezené počtem instrukcí (int8→float + FMA na token); stejný kernel s velkými dlaždicemi = GEMM pro prefill.
 2. **Prefill**: tensor-core GEMM pro Q8, chunked Gated DeltaNet, flash attention prefill (dnes jen token po tokenu).
 3. Heterogenní režim CPU+GPU (velké modely): CPU jako 4. „zařízení“ v TP, souběžně s GPU.

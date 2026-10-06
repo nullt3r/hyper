@@ -47,6 +47,7 @@ struct Engine::Device {
     std::vector<DevLayer> layers;
     DevLayer mtp;
     BF16W output;             // vocab slice
+    Q8W output_q8;            // same slice quantized to Q8_0: cheaper LM head for MTP drafts
     int vocab_off = 0;
     float * output_norm = nullptr;
     // activations, MAX_NT rows each
@@ -313,6 +314,33 @@ void Engine::load_weights() {
             __nv_bfloat16 * pd = dev.alloc<__nv_bfloat16>((size_t) dev.output.n * dev.output.k);
             CUDA_CHECK(cudaMemcpy(pd, t.data + (size_t) o0 * t.row_bytes(), (size_t) dev.output.n * t.row_bytes(), cudaMemcpyHostToDevice));
             dev.output.w = pd;
+            if (opt_.mtp) {
+                // draft head: quantize the bf16 slice to Q8_0 (absmax per 32 weights); drafts are verified
+                // against the exact bf16 head, so this only affects acceptance, never the output
+                const int64_t rows = dev.output.n, k = dev.output.k, kb = k / 32;
+                std::vector<int8_t> qs((size_t) rows * k);
+                std::vector<half> dsc((size_t) rows * kb);
+                const uint16_t * src = (const uint16_t *) (t.data + (size_t) o0 * t.row_bytes());
+#pragma omp parallel for schedule(static)
+                for (int64_t r = 0; r < rows; ++r) {
+                    for (int64_t b = 0; b < kb; ++b) {
+                        float v[32], amax = 0.0f;
+                        for (int e = 0; e < 32; ++e) {
+                            const uint32_t bits = (uint32_t) src[(size_t) r * k + b * 32 + e] << 16;
+                            float f; memcpy(&f, &bits, 4);
+                            v[e] = f; amax = std::max(amax, std::fabs(f));
+                        }
+                        const float dd = amax / 127.0f, id = dd > 0 ? 1.0f / dd : 0.0f;
+                        dsc[(size_t) r * kb + b] = __float2half(dd);
+                        for (int e = 0; e < 32; ++e) qs[(size_t) r * k + b * 32 + e] = (int8_t) lrintf(v[e] * id);
+                    }
+                }
+                int8_t * dq = dev.alloc<int8_t>(qs.size());
+                half * dd = dev.alloc<half>(dsc.size());
+                CUDA_CHECK(cudaMemcpy(dq, qs.data(), qs.size(), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(dd, dsc.data(), dsc.size() * sizeof(half), cudaMemcpyHostToDevice));
+                dev.output_q8.qs = dq; dev.output_q8.d = dd; dev.output_q8.n = (int) rows; dev.output_q8.k = (int) k;
+            }
         }
         {
             const GTensor & t = gguf_->need("output_norm.weight");
@@ -449,8 +477,10 @@ void Engine::record_mtp(int gi, int nt, bool chain) {
     const float * hw = L.head_norm ? L.head_norm : d.output_norm;
     rmsnorm(d.x + (size_t) (nt - 1) * n, n, hw, d.mhn, n, n, 1, c.rms_eps, s);   // feeds chained drafts
     NormIn ni; ni.w = hw; ni.ss = d.ss; ni.nss = nss; ni.eps = c.rms_eps;
-    gemv_bf16(d.output, d.x, n, d.logits, d.output.n, nullptr, nt, s, ni);
-    argmax_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.mres, nt, s);
+    // only the last row's draft is used: run the (Q8) head on that row alone
+    NormIn nl = ni; nl.ss = d.ss + (size_t) (nt - 1) * nss;
+    gemv_q8(d.output_q8, d.x + (size_t) (nt - 1) * n, n, d.logits, d.output.n, nullptr, 1, s, nl);
+    argmax_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.mres + (size_t) (nt - 1) * 2, 1, s);
     CUDA_CHECK(cudaMemcpyAsync(h_mres_ + (size_t) gi * MAX_NT * 2, d.mres, (size_t) nt * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
 }
 

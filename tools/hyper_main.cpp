@@ -88,8 +88,8 @@ static int cmd_gen(const char * model, const char * ref_path, int n_prompt, int 
     printf("GEN plain: %d tokens %.2f t/s\n", a.tokens, a.tokens / a.seconds);
     printf("GEN spec (%d drafts): %d tokens %.2f t/s  steps %d  accepted drafts/step %.2f  tokens/step %.2f\n", opt.n_draft,
            b.tokens, b.tokens / b.seconds, b.steps, (double) b.accepted / b.steps, (double) b.tokens / b.steps);
-    printf("GEN spec per step: main %.2f ms  mtp %.2f ms  restore %.3f ms (per reject)\n", 1e3 * b.t_main / b.steps,
-           1e3 * b.t_mtp / b.steps, b.steps > b.accepted ? 1e3 * b.t_restore / (b.steps - b.accepted) : 0.0);
+    printf("GEN spec per step: main %.2f ms  mtp %.2f ms  restore %.3f ms\n", 1e3 * b.t_main / b.steps,
+           1e3 * b.t_mtp / b.steps, 1e3 * b.t_restore / b.steps);
     printf("GEN plain per token: %.2f ms\n", 1e3 * a.seconds / a.tokens);
     printf("GEN identical prefix %d / %d%s\n", same, n_gen, same == n_gen ? " (sequences match)" : "");
     return 0;
