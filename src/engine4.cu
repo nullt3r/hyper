@@ -1,5 +1,6 @@
 #include "engine4.h"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <sys/mman.h>
 
@@ -65,6 +66,9 @@ struct Engine4::Device {
     float * logits = nullptr, * res2 = nullptr;
     int * ids = nullptr, * pos = nullptr, * counter = nullptr, * order = nullptr, * order_n = nullptr;
     half * xh = nullptr, * p16 = nullptr, * recv = nullptr;   // GEMM input scratch; DMA allreduce own / peers' parts
+    half * mix16 = nullptr, * h16 = nullptr;                  // prefill MoE: fp16 token rows, fp16 expert hidden rows
+    int * egrp = nullptr;                                     // prefill MoE: active experts (expert, start, count)
+    cublasHandle_t blas = nullptr;
     cudaEvent_t ev_ar[2] = {};
     int big_stride = 0;
     size_t used = 0;
@@ -88,6 +92,7 @@ struct Engine4::Device {
         cudaSetDevice(id);
         for (auto & gr : g_main) if (gr) cudaGraphExecDestroy(gr);
         for (auto & ev : ev_ar) if (ev) cudaEventDestroy(ev);
+        if (blas) cublasDestroy(blas);
         for (void * p : allocs) cudaFree(p);
         if (stream) cudaStreamDestroy(stream);
     }
@@ -177,6 +182,9 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
         CUDA_CHECK(cudaStreamCreateWithFlags(&dev->stream, cudaStreamNonBlocking));
         gemv_init(g);
         for (auto & ev : dev->ev_ar) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+        if (cublasCreate(&dev->blas) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasCreate failed");
+        cublasSetStream(dev->blas, dev->stream);
+        cublasSetMathMode(dev->blas, CUBLAS_DEFAULT_MATH);   // plain fp32 (no TF32): routing must not move
         devs_.push_back(std::move(dev));
     }
     const int nd = opt_.n_devices, n = cfg_.n_embd;
@@ -461,7 +469,10 @@ void Engine4::load_weights() {
         dev.p16 = dev.alloc<half>((size_t) R * n);
         dev.recv = dev.alloc<half>((size_t) std::max(1, nd - 1) * R * n);
         dev.order = dev.alloc<int>((size_t) R * K);
-        dev.order_n = dev.alloc<int>(1);
+        dev.order_n = dev.alloc<int>(2);
+        dev.egrp = dev.alloc<int>((size_t) 3 * c.n_expert);
+        dev.mix16 = dev.alloc<half>((size_t) R * n);
+        dev.h16 = dev.alloc<half>((size_t) R * K * c.n_ff_exp);
         dev.pos = dev.alloc<int>(1);
         dev.counter = dev.alloc<int>(1);
         fprintf(stderr, "hyper4: device %d holds %.2f GiB\n", dev.id, dev.used / 1073741824.0);
@@ -498,6 +509,13 @@ void Engine4::record_main(int gi, int nt) {
         if (rows <= MAX_NT) { gemv_q8(W, x, xs, y, ys, nullptr, rows, s, NormIn{}); return; }
         to_half(x, xs, nullptr, W.k, 0.0f, d.xh, rows, s);
         gemm_q8(W, d.xh, rows, y, ys, nullptr, s);
+    };
+    // fp32 weights (routers, alpha/beta, injections): warp GEMV per token, or cuBLAS sgemm for a prefill chunk
+    auto f32mm = [&](const float * W, int rows, int k, const float * x, int xs, float * y, int ys, int nr) {
+        if (nr <= MAX_NT) { gemv_f32(W, rows, k, x, xs, y, ys, nr, s); return; }
+        const float one = 1.0f, zero = 0.0f;
+        if (cublasSgemm(d.blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, nr, k, &one, W, k, x, xs, &zero, y, ys) != CUBLAS_STATUS_SUCCESS)
+            throw std::runtime_error("cublasSgemm failed");
     };
     CUDA_CHECK(cudaMemcpyAsync(d.pos, h_pos_, sizeof(int), cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaMemcpyAsync(d.x, h_embd_, (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
@@ -553,7 +571,7 @@ void Engine4::record_main(int gi, int nt) {
         mm(down, d.xn, hcn, d.lo, lr, rows);
         silu_scale(d.lo, lr, 1.0f / hc, rows, lr, s);
         mm(up, d.lo, lr, d.gate, hcn, rows);
-        if (inj) gemv_f32(inj, hc, hcn, d.xn, hcn, d.inj, 4, rows, s);
+        if (inj) f32mm(inj, hc, hcn, d.xn, hcn, d.inj, 4, rows);
         hc_mixed(d.xn, d.gate, d.mixed, n, hc, rows, s);
     };
     for (int il = 0; il < c.n_layer; ++il) {
@@ -588,7 +606,7 @@ void Engine4::record_main(int gi, int nt) {
             const int dv = c.head_v_dim();
             mm(L.win, d.mixed, n, d.big0, bs, nt);
             const int z_off = L.conv_ch, ab_off = L.conv_ch + L.n_v_l * dv;
-            gemv_f32(L.ab_w, 2 * L.n_v_l, n, d.mixed, n, d.big0 + ab_off, bs, nt, s);
+            f32mm(L.ab_w, 2 * L.n_v_l, n, d.mixed, n, d.big0 + ab_off, bs, nt);
             gdn_conv(d.big0, bs, L.conv_state, nullptr, L.conv_w, L.conv_ch, c.ssm_conv, nt, s);
             const int ostride = L.n_v_l * dv;
             gdn_step(d.big0, bs, ab_off, L.state, nullptr, d.o, ostride, L.dt_bias, L.ssm_a, L.n_k_l, L.n_v_l, c.ssm_d_state, dv, eps, nt, s);
@@ -600,7 +618,7 @@ void Engine4::record_main(int gi, int nt) {
         hc_combine(d.res, d.bo, d.inj, 4, n, hc, nt, s);
         // ---- MoE ----
         hc_mix(L.hcf_norm, L.hcf_down, L.hcf_up, L.hcf_inj);
-        gemv_f32(L.router, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt, s);
+        f32mm(L.router, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt);
         dbg("router", il, d.rlog, (size_t) nt * (c.n_expert + 1));
         moe_route(d.rlog, c.n_expert + 1, c.n_expert, K, d.ids, d.wts, d.sg, nt, s);
         dbg("route_w", il, d.wts, (size_t) nt * K);
@@ -614,9 +632,10 @@ void Engine4::record_main(int gi, int nt) {
         silu_mul(d.shgu, 2 * L.n_sh_l, d.shh, c.n_ff_shexp, L.n_sh_l, nt, s);
         mm(L.sh_down, d.shh, c.n_ff_shexp, d.shpart, n, nt);
         if (bulk) {   // local pairs grouped by expert: consecutive blocks share the expert's weights in L2
-            moe_order(L.moe, d.ids, nt * K, c.n_expert, d.order, d.order_n, s);
-            moe_gate_up(L.moe, d.mixed, n, d.ids, K, d.hexp, nt, s, d.order, d.order_n);
-            moe_down(L.moe, d.hexp, d.ids, d.wts, K, d.yexp, nt, s, d.order, d.order_n);
+            moe_order(L.moe, d.ids, nt * K, c.n_expert, d.order, d.order_n, s, d.egrp);
+            to_half(d.mixed, n, nullptr, n, 0.0f, d.mix16, nt, s);
+            moe_gemm_gate_up(L.moe, d.mix16, n, K, d.order, d.order_n, d.egrp, c.n_expert, d.h16, s);
+            moe_gemm_down(L.moe, d.h16, d.order, d.order_n, d.egrp, c.n_expert, d.wts, d.yexp, s);
         } else {
             moe_gate_up(L.moe, d.mixed, n, d.ids, K, d.hexp, nt, s);
             moe_down(L.moe, d.hexp, d.ids, d.wts, K, d.yexp, nt, s);

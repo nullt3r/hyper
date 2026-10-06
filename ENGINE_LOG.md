@@ -139,3 +139,19 @@ Správnost: KL vs mainline ref (256 tok.) 0,042–0,047, top-1 88–91 %. Šumov
 Baseline ik 38,4 / mainline 37,8 → **1,94×**. Bugy cestou: CPU aktivace kvantizovány typem vah místo vec_dot_type
 (NaN); race v poolu CPU vláken (vlákno z předchozí generace „spotřebovalo“ index úlohy → zaseknutí) → claim přes CAS
 na (generace << 32 | index).
+
+## hyper4 – prefill (pfbench: 4096 tokenů, chunky po 512)
+
+Správnost: `checkpf` (prefill 128 tok. → dekódování zbytku po tokenu) KL 0,033–0,037 = šumová podlaha; výsledek je bitově
+stejný pro chunky 128 i 50+50+28 (každý token se počítá stejně nezávisle na rozdělení).
+
+| Krok | prefill t/s |
+|---|---|
+| v0: GEMM + DMA allreduce + flash attn, MoE po párech (GEMV), CPU experty seskupené podle experta | 455 |
+| skupinový tensor-core GEMM pro experty (dekvantizace do fp16 v shared memory, váha 1× za chunk), cuBLAS sgemm pro fp32 router | 531 |
+| 83 % expertů na GPU | 667 |
+| 30 CPU vláken (16: 545, 48: 727 ale horší dekódování) | **708** |
+
+Baseline: mainline pp512 461, pp2048@32k 584; ik pp512 530–610. Profil: GPU0 čeká v moe_reduce na CPU experty
+(~40 % času) → další krok: překrytí CPU a GPU (2 mikro-dávky), rychlejší CPU kernel (víc tokenů na řádek vah).
+Pozor: QSA (sparse attention nad ~2k tokenů) zatím chybí → výsledky jsou přesné jen do ~2k kontextu.

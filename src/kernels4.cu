@@ -289,20 +289,130 @@ __global__ void k_moe_seq(volatile unsigned * seq, const int * counter, unsigned
     __threadfence_system();
     *seq = (unsigned) (*counter) * 64u + seq_tag;
 }
-// single block: counting sort of the local pairs by expert
-__global__ void k_moe_order(const int * __restrict__ slot, const int * __restrict__ ids, int P, int ne, int * order, int * order_n) {
+// single block: counting sort of the local pairs by expert, plus the active experts as (expert, start, count) in
+// egrp[3 * i ..] (i < order_n[1]); pairs within an expert are ordered by pair index (deterministic)
+__global__ void k_moe_order(const int * __restrict__ slot, const int * __restrict__ ids, int P, int ne, int * order, int * order_n,
+                            int * egrp) {
     __shared__ int cnt[1024], off[1024];
     for (int e = threadIdx.x; e < ne; e += blockDim.x) cnt[e] = 0;
     __syncthreads();
     for (int p = threadIdx.x; p < P; p += blockDim.x) { const int e = ids[p]; if (slot[e] >= 0) atomicAdd(&cnt[e], 1); }
     __syncthreads();
     if (threadIdx.x == 0) {
-        int s = 0;
-        for (int e = 0; e < ne; ++e) { off[e] = s; s += cnt[e]; }
-        *order_n = s;
+        int s = 0, na = 0;
+        for (int e = 0; e < ne; ++e) {
+            off[e] = s;
+            if (cnt[e] && egrp) { egrp[3 * na] = e; egrp[3 * na + 1] = s; egrp[3 * na + 2] = cnt[e]; ++na; }
+            s += cnt[e];
+        }
+        order_n[0] = s;
+        order_n[1] = na;
     }
     __syncthreads();
-    for (int p = threadIdx.x; p < P; p += blockDim.x) { const int e = ids[p]; if (slot[e] >= 0) order[atomicAdd(&off[e], 1)] = p; }
+    // stable placement: one thread per expert walks the pairs in index order
+    for (int e = threadIdx.x; e < ne; e += blockDim.x) {
+        if (!cnt[e]) continue;
+        int o = off[e];
+        for (int p = 0; p < P; ++p) if (ids[p] == e) order[o++] = p;
+    }
+}
+
+// ---- grouped expert GEMM (prefill) ----
+__device__ __forceinline__ void mma16816_4(float * c, const unsigned * a, const unsigned * b) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+__device__ __forceinline__ void ldsm_x4(unsigned * r, const void * smem) {
+    const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(sa));
+}
+constexpr int GE_M = 64, GE_N = 32, GE_K = 128, GE_LD = GE_K + 8;
+
+// Block: one active expert (blockIdx.y < n_active), 64 weight rows (blockIdx.x), the expert's tokens in passes of 32.
+// Weights dequantized from their GGUF blocks into fp16 shared tiles; tokens' fp16 rows gathered; m16n8k16 mma.
+// GU: rows = 32 gate rows + the same 32 up rows; writes h16[pair][r] = silu(g) * u.  Down: y[pair][r] = w * acc.
+template <GType T, bool GU>
+__global__ void __launch_bounds__(256) k_moe_gemm(MoeDev m, const half * __restrict__ in, int in_stride, const int * __restrict__ in_row,
+                                                  int in_div, const int * __restrict__ order, const int * __restrict__ order_n,
+                                                  const int * __restrict__ egrp, const float * __restrict__ wts,
+                                                  half * __restrict__ h16, float * __restrict__ y, int kdim, int rows_out) {
+    if ((int) blockIdx.y >= order_n[1]) return;
+    __shared__ __align__(16) half As[GE_M * GE_LD];
+    __shared__ __align__(16) half Bs[GE_N * GE_LD];
+    __shared__ float Cs[GE_M][GE_N + 1];
+    const int e = egrp[3 * blockIdx.y], start = egrp[3 * blockIdx.y + 1], cnt = egrp[3 * blockIdx.y + 2];
+    const int slot = m.slot[e];
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+    const int wm = w & 3, wn = w >> 2;
+    const int r_base = blockIdx.x * (GU ? GE_M / 2 : GE_M);
+    const size_t mbytes = GU ? m.gate_bytes : m.down_bytes;
+    const int mrows = GU ? m.ff : m.n;
+    const size_t rb = mbytes / mrows;
+    const uint8_t * W0 = (GU ? m.gate : m.down) + (size_t) slot * mbytes;
+    const uint8_t * W1 = GU ? m.up + (size_t) slot * mbytes : nullptr;
+    for (int t0 = 0; t0 < cnt; t0 += GE_N) {
+        const int nt = min(GE_N, cnt - t0);
+        float acc[2][4] = {};
+        for (int k0 = 0; k0 < kdim; k0 += GE_K) {
+            __syncthreads();
+            // A: 64 rows x 128 cols = 1024 chunks of 8
+            for (int ci = threadIdx.x; ci < GE_M * (GE_K / 8); ci += blockDim.x) {
+                const int rr = ci / (GE_K / 8), cc = ci % (GE_K / 8);
+                int row; const uint8_t * base;
+                if (GU) { row = r_base + (rr & 31); base = rr < 32 ? W0 : W1; }
+                else { row = r_base + rr; base = W0; }
+                float v[8];
+                if (row < mrows) deq8<T>(base + (size_t) row * rb, (k0 >> 3) + cc, v);
+                else for (int i = 0; i < 8; ++i) v[i] = 0.0f;
+                __half2 hv[4];
+                for (int i = 0; i < 4; ++i) hv[i] = __floats2half2_rn(v[2 * i], v[2 * i + 1]);
+                *(uint4 *) &As[rr * GE_LD + cc * 8] = *(const uint4 *) hv;
+            }
+            // B: nt token rows x 128 cols
+            for (int ci = threadIdx.x; ci < GE_N * (GE_K / 8); ci += blockDim.x) {
+                const int tr = ci / (GE_K / 8), cc = ci % (GE_K / 8);
+                uint4 v = make_uint4(0, 0, 0, 0);
+                if (tr < nt) {
+                    const int p = order[start + t0 + tr];
+                    const int src = in_row ? in_row[p] : p / in_div;
+                    v = *(const uint4 *) (in + (size_t) src * in_stride + k0 + cc * 8);
+                }
+                *(uint4 *) &Bs[tr * GE_LD + cc * 8] = v;
+            }
+            __syncthreads();
+#pragma unroll
+            for (int kk = 0; kk < GE_K / 16; ++kk) {
+                unsigned a[4], b[4];
+                ldsm_x4(a, &As[(wm * 16 + (lane & 15)) * GE_LD + kk * 16 + (lane >> 4) * 8]);
+                ldsm_x4(b, &Bs[(wn * 16 + (lane & 7) + ((lane >> 4) << 3)) * GE_LD + kk * 16 + ((lane >> 3) & 1) * 8]);
+                const unsigned b0[2] = {b[0], b[1]}, b1[2] = {b[2], b[3]};
+                mma16816_4(acc[0], a, b0);
+                mma16816_4(acc[1], a, b1);
+            }
+        }
+        // results to shared memory [row][token]
+#pragma unroll
+        for (int ni = 0; ni < 2; ++ni)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) Cs[wm * 16 + gid + (q >> 1) * 8][wn * 16 + ni * 8 + 2 * tig + (q & 1)] = acc[ni][q];
+        __syncthreads();
+        if (GU) {
+            for (int i = threadIdx.x; i < 32 * nt; i += blockDim.x) {
+                const int rr = i % 32, tr = i / 32, row = r_base + rr;
+                if (row >= mrows) continue;
+                const int p = order[start + t0 + tr];
+                h16[(size_t) p * rows_out + row] = __float2half(silu4(Cs[rr][tr]) * Cs[rr + 32][tr]);
+            }
+        } else {
+            for (int i = threadIdx.x; i < GE_M * nt; i += blockDim.x) {
+                const int rr = i % GE_M, tr = i / GE_M, row = r_base + rr;
+                if (row >= mrows) continue;
+                const int p = order[start + t0 + tr];
+                y[(size_t) p * rows_out + row] = wts[p] * Cs[rr][tr];
+            }
+        }
+    }
 }
 
 // ---------------- PLE ----------------
@@ -405,9 +515,22 @@ void moe_down(const MoeDev & m, const float * h, const int * ids, const float * 
               const int * order, const int * order_n) {
     MOE_TYPE_SWITCH(m.td, (k_moe_down<TT><<<dim3(nt * k, (m.n + MOE_ROWS - 1) / MOE_ROWS), 256, m.ff * sizeof(float), s>>>(m, h, ids, wts, k, y, order, order_n)));
 }
-void moe_order(const MoeDev & m, const int * ids, int n_pairs, int n_expert, int * order, int * order_n, cudaStream_t s) {
+void moe_order(const MoeDev & m, const int * ids, int n_pairs, int n_expert, int * order, int * order_n, cudaStream_t s, int * egrp) {
     if (n_expert > 1024) throw std::runtime_error("moe_order: too many experts");
-    k_moe_order<<<1, 1024, 0, s>>>(m.slot, ids, n_pairs, n_expert, order, order_n);
+    k_moe_order<<<1, 1024, 0, s>>>(m.slot, ids, n_pairs, n_expert, order, order_n, egrp);
+}
+void moe_gemm_gate_up(const MoeDev & m, const half * x16, int xs, int k, const int * order, const int * order_n, const int * egrp,
+                      int max_active, half * h16, cudaStream_t s) {
+    const int kdim = (int) (m.gate_bytes / m.ff / gtype_block_bytes(m.tg) * gtype_block_elems(m.tg));
+    if (kdim % GE_K) throw std::runtime_error("moe_gemm: k must be a multiple of 128");
+    MOE_TYPE_SWITCH(m.tg, (k_moe_gemm<TT, true><<<dim3((m.ff + 31) / 32, max_active), 256, 0, s>>>(m, x16, xs, nullptr, k, order, order_n, egrp,
+                                                                                                   nullptr, h16, nullptr, kdim, m.ff)));
+}
+void moe_gemm_down(const MoeDev & m, const half * h16, const int * order, const int * order_n, const int * egrp, int max_active,
+                   const float * wts, float * y, cudaStream_t s) {
+    if (m.ff % GE_K) throw std::runtime_error("moe_gemm: ff must be a multiple of 128");
+    MOE_TYPE_SWITCH(m.td, (k_moe_gemm<TT, false><<<dim3((m.n + GE_M - 1) / GE_M, max_active), 256, 0, s>>>(m, h16, m.ff, nullptr, 1, order, order_n,
+                                                                                                          egrp, wts, nullptr, y, m.ff, m.n)));
 }
 void moe_reduce(const float * shexp, const float * sg, const float * y, int k, float * out, int n, int nt,
                 const int * ids, const int * owner, int g, int cpu_owner, const volatile unsigned * cpu_flag, const float * cpu_y,

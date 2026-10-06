@@ -52,8 +52,15 @@ void moe_gate_up(const MoeDev & m, const float * x, int xs, const int * ids, int
 // y[p][r] = w[p] * (down_e . h[p]) for local pairs (without order: 0 for the others)
 void moe_down(const MoeDev & m, const float * h, const int * ids, const float * wts, int k, float * y, int nt, cudaStream_t s,
               const int * order = nullptr, const int * order_n = nullptr);
-// order = the pairs whose expert has slot >= 0, grouped by expert; order_n = their count (single block)
-void moe_order(const MoeDev & m, const int * ids, int n_pairs, int n_expert, int * order, int * order_n, cudaStream_t s);
+// order = the pairs whose expert has slot >= 0, grouped by expert; order_n[0] = their count, order_n[1] = active experts,
+// egrp (optional) = (expert, start, count) per active expert (single block)
+void moe_order(const MoeDev & m, const int * ids, int n_pairs, int n_expert, int * order, int * order_n, cudaStream_t s,
+               int * egrp = nullptr);
+// prefill: grouped tensor-core expert GEMMs over the ordered pairs (x16: fp16 token rows; pair p reads row p / k)
+void moe_gemm_gate_up(const MoeDev & m, const half * x16, int xs, int k, const int * order, const int * order_n, const int * egrp,
+                      int max_active, half * h16, cudaStream_t s);
+void moe_gemm_down(const MoeDev & m, const half * h16, const int * order, const int * order_n, const int * egrp, int max_active,
+                   const float * wts, float * y, cudaStream_t s);
 // out[t][r] = sg[t] * shexp[t][r] + sum_j [owner(e_j) == g] y[t*k + j][r] (+ cpu[t][r] once the CPU result for seq
 // is there, when any of token t's experts lives on the CPU: owner[e] == cpu_owner)
 void moe_reduce(const float * shexp, const float * sg, const float * y, int k, float * out, int n, int nt,

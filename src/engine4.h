@@ -16,7 +16,7 @@ struct Engine4Options {
     int n_devices = 3;
     int max_pos = 8192;
     float gpu_expert_frac = 0.6f;   // fraction of each layer's experts placed on the GPUs (rest on the CPU)
-    int cpu_threads = 24;
+    int cpu_threads = 30;
 };
 
 // spin barrier for the per-device recording threads of a prefill chunk
