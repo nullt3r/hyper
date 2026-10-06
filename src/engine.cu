@@ -139,6 +139,8 @@ Engine::Engine(const std::string & model_path, const EngineOptions & opt) : opt_
     CUDA_CHECK(cudaHostAlloc(&ar_slots_, (size_t) 2 * nd * cfg_.n_embd * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped));
     CUDA_CHECK(cudaHostAlloc(&ar_flags_, (size_t) nd * nchunk * sizeof(unsigned long long), cudaHostAllocPortable | cudaHostAllocMapped));
     memset(ar_flags_, 0, (size_t) nd * nchunk * sizeof(unsigned long long));
+    CUDA_CHECK(cudaHostAlloc(&ar_ll_, (size_t) 2 * nd * cfg_.n_embd * sizeof(uint2), cudaHostAllocPortable | cudaHostAllocMapped));
+    memset(ar_ll_, 0xff, (size_t) 2 * nd * cfg_.n_embd * sizeof(uint2));
     load_weights();
 }
 
@@ -149,6 +151,7 @@ Engine::~Engine() {
     if (h_res_) cudaFreeHost(h_res_);
     if (ar_slots_) cudaFreeHost(ar_slots_);
     if (ar_flags_) cudaFreeHost(ar_flags_);
+    if (ar_ll_) cudaFreeHost(ar_ll_);
 }
 
 void Engine::load_weights() {
@@ -287,6 +290,11 @@ void Engine::record(int gi) {
     CUDA_CHECK(cudaMemcpyAsync(d.x, h_embd_, c.n_embd * sizeof(float), cudaMemcpyHostToDevice, s));
     incr_counter(d.counter, s);
     int call = 0;
+    auto reduce = [&]() {
+        if (opt_.ar_mode == 2) allreduce_add_ll16(d.x, d.part, ar_ll_, g, nd, c.n_embd, d.counter, call++, s);
+        else if (opt_.ar_mode == 1) allreduce_add_ll(d.x, d.part, ar_ll_, g, nd, c.n_embd, d.counter, call++, s);
+        else allreduce_add(d.x, d.part, ar_slots_, ar_flags_, g, nd, c.n_embd, d.counter, call++, s);
+    };
     for (int il = 0; il < c.n_layer; ++il) {
         DevLayer & L = d.layers[il];
         rmsnorm(d.x, L.attn_norm, d.xn, c.n_embd, eps, s);
@@ -308,13 +316,13 @@ void Engine::record(int gi) {
             gated_norm(d.o, d.big1, L.ssm_norm, L.n_v_l, c.head_v_dim(), eps, s);
             gemv_q8(L.wout, d.o, d.part, nullptr, s);
         }
-        allreduce_add(d.x, d.part, ar_slots_, ar_flags_, g, nd, c.n_embd, d.counter, call++, s);
+        reduce();
         rmsnorm(d.x, L.post_norm, d.xn, c.n_embd, eps, s);
         gemv_q8(L.ffn_gate, d.xn, d.big1, nullptr, s);
         gemv_q8(L.ffn_up, d.xn, d.big1 + L.n_ff_l, nullptr, s);
         silu_mul(d.big1, d.h, L.n_ff_l, s);
         gemv_q8(L.ffn_down, d.h, d.part, nullptr, s);
-        allreduce_add(d.x, d.part, ar_slots_, ar_flags_, g, nd, c.n_embd, d.counter, call++, s);
+        reduce();
     }
     rmsnorm(d.x, d.output_norm, d.xn, c.n_embd, eps, s);
     gemv_bf16(d.output, d.xn, d.logits, nullptr, s);

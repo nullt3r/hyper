@@ -15,6 +15,7 @@ struct EngineOptions {
     int n_devices = 3;
     int max_pos = 32768;
     bool use_graphs = true;
+    int ar_mode = 2;          // 0: flag protocol fp32, 1: LL fp32, 2: LL fp16 payload
 };
 
 class Engine {
@@ -46,6 +47,7 @@ private:
     float * h_res_ = nullptr;                 // [ndev][2] argmax pairs
     float * ar_slots_ = nullptr;              // mapped [2][ndev][n_embd]
     unsigned long long * ar_flags_ = nullptr; // mapped [ndev][nchunk]
+    uint2 * ar_ll_ = nullptr;                 // mapped [2][ndev][n_embd] LL packets
     bool graphs_ready_ = false;
     int last_argmax_ = -1;
 };

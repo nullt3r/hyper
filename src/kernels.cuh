@@ -62,6 +62,13 @@ void argmax_pair(const float * x, int n, int offset, float * out2, cudaStream_t 
 constexpr int AR_CHUNK = 512;
 void allreduce_add(float * x, const float * part, float * slots, unsigned long long * flags, int g, int ndev, int n,
                    const int * counter, int call, cudaStream_t s);
+// LL protocol variant: every 8-byte packet carries {float value, uint32 sequence}; no fences or flags.
+// slots: host-mapped uint2[2][ndev][n]
+void allreduce_add_ll(float * x, const float * part, uint2 * slots, int g, int ndev, int n,
+                      const int * counter, int call, cudaStream_t s);
+// LL with fp16 payload: packet {half2 values, uint32 seq}; n must be even
+void allreduce_add_ll16(float * x, const float * part, uint2 * slots, int g, int ndev, int n,
+                        const int * counter, int call, cudaStream_t s);
 // small helper kernels used inside captured graphs
 void incr_counter(int * c, cudaStream_t s);
 

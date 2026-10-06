@@ -11,6 +11,8 @@
 #include <vector>
 
 using namespace hyper;
+
+static int env_int(const char * k, int def) { const char * v = getenv(k); return v ? atoi(v) : def; }
 using clk = std::chrono::steady_clock;
 
 static double secs(clk::time_point a, clk::time_point b) { return std::chrono::duration<double>(b - a).count(); }
@@ -27,6 +29,7 @@ static int cmd_check(const char * model, const char * ref_path) {
     fclose(f);
 
     EngineOptions opt;
+    opt.ar_mode = env_int("HYPER_AR", 2);
     opt.max_pos = n + 16;
     Engine eng(model, opt);
     if (eng.config().n_vocab != nv) { fprintf(stderr, "vocab mismatch %d vs %d\n", eng.config().n_vocab, nv); return 1; }
@@ -66,6 +69,7 @@ static int cmd_check(const char * model, const char * ref_path) {
 
 static int cmd_bench(const char * model, int n_prompt, int n_gen) {
     EngineOptions opt;
+    opt.ar_mode = env_int("HYPER_AR", 2);
     opt.max_pos = n_prompt + n_gen + 16;
     Engine eng(model, opt);
     auto t0 = clk::now();

@@ -37,3 +37,6 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all clean
+
+$(BUILD)/arbench: tools/arbench.cu $(BUILD)/kernels.o
+	$(NVCC) $(NVFLAGS) tools/arbench.cu $(BUILD)/kernels.o -o $@ $(LIBS)
