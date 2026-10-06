@@ -427,7 +427,7 @@ __global__ void k_incr(int * c) { *c += 1; }
 
 } // namespace
 
-int g_gemv_rows_per_warp = 4;
+int g_gemv_rows_per_warp = 2;
 void gemv_q8(const Q8W & W, const float * x, float * y, const float * add, cudaStream_t s, const NormIn & nin) {
     const int R = g_gemv_rows_per_warp;
     const int per_block = GEMV_ROWS * R;

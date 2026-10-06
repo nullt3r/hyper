@@ -37,9 +37,15 @@ int main(int argc, char ** argv) {
         }
         float * x, * y; CK(cudaMalloc(&x, sh.k * 4)); CK(cudaMalloc(&y, sh.n * 4));
         CK(cudaMemset(x, 0, sh.k * 4));
-        for (int i = 0; i < 20; ++i) hyper::gemv_q8(W[i % nmat], x, y, nullptr, s);
-        CK(cudaEventRecord(e0, s));
+        // capture the launches in a graph, as the engine does, so launch overhead does not distort timing
+        cudaGraph_t gr; cudaGraphExec_t ge;
+        CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
         for (int i = 0; i < iters; ++i) hyper::gemv_q8(W[i % nmat], x, y, nullptr, s);
+        CK(cudaStreamEndCapture(s, &gr));
+        CK(cudaGraphInstantiate(&ge, gr, 0));
+        CK(cudaGraphLaunch(ge, s));
+        CK(cudaEventRecord(e0, s));
+        CK(cudaGraphLaunch(ge, s));
         CK(cudaEventRecord(e1, s));
         CK(cudaEventSynchronize(e1));
         float ms; CK(cudaEventElapsedTime(&ms, e0, e1));
