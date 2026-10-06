@@ -97,6 +97,7 @@ struct Engine4::Device {
     int * ids = nullptr, * pos = nullptr, * counter = nullptr, * order = nullptr, * order_n = nullptr;
     half * xh = nullptr, * p16 = nullptr, * recv = nullptr;   // GEMM input scratch; DMA allreduce own / peers' parts
     half * mix16 = nullptr, * h16 = nullptr;                  // prefill MoE: fp16 token rows, fp16 expert hidden rows
+    float * conv_raw = nullptr;                               // prefill: raw conv inputs
     int * egrp = nullptr;                                     // prefill MoE: active experts (expert, start, count)
     float * topk = nullptr;                                   // sampling candidates [MAX_NT][TOPK][2]
     float * iq = nullptr, * ik = nullptr, * iqn = nullptr, * iscores = nullptr;   // QSA: projections, normed queries, scores
@@ -682,6 +683,7 @@ void Engine4::load_weights() {
         dev.topk = dev.alloc<float>((size_t) MAX_NT * TOPK * 2);
         dev.egrp = dev.alloc<int>((size_t) 3 * c.n_expert);
         dev.mix16 = dev.alloc<half>((size_t) R * n);
+        dev.conv_raw = dev.alloc<float>((size_t) R * c.conv_dim());
         dev.iq = dev.alloc<float>((size_t) R * c.idx_n_head * 128);
         dev.ik = dev.alloc<float>((size_t) R * 128);
         dev.iqn = dev.alloc<float>((size_t) R * c.idx_n_head * 128);
@@ -941,7 +943,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
             mm(L.win, d.mixed, n, d.big0, bs, nt);
             const int z_off = L.conv_ch, ab_off = L.conv_ch + L.n_v_l * dv;
             f32mm(L.ab_w, 2 * L.n_v_l, n, d.mixed, n, d.big0 + ab_off, bs, nt);
-            gdn_conv(d.big0, bs, L.conv_state, snap ? L.conv_snap : nullptr, L.conv_w, L.conv_ch, c.ssm_conv, nt, s);
+            gdn_conv(d.big0, bs, L.conv_state, snap ? L.conv_snap : nullptr, L.conv_w, L.conv_ch, c.ssm_conv, nt, s, bulk ? d.conv_raw : nullptr);
             const int ostride = L.n_v_l * dv;
             gdn_step(d.big0, bs, ab_off, L.state, snap ? L.state_snap : nullptr, d.o, ostride, L.dt_bias, L.ssm_a, L.n_k_l, L.n_v_l, c.ssm_d_state, dv, eps, nt, s);
             gated_norm_sigmoid(d.o, ostride, d.big0 + z_off, bs, L.ssm_norm, L.n_v_l, dv, eps, nt, s);

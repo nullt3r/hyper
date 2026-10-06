@@ -359,12 +359,8 @@ __global__ void k_moe_order(const int * __restrict__ slot, const int * __restric
         order_n[1] = na;
     }
     __syncthreads();
-    // stable placement: one thread per expert walks the pairs in index order
-    for (int e = threadIdx.x; e < ne; e += blockDim.x) {
-        if (!cnt[e]) continue;
-        int o = off[e];
-        for (int p = 0; p < P; ++p) if (ids[p] == e) order[o++] = p;
-    }
+    // placement (order within an expert does not matter: every pair is computed independently)
+    for (int p = threadIdx.x; p < P; p += blockDim.x) { const int e = ids[p]; if (slot[e] >= 0) order[atomicAdd(&off[e], 1)] = p; }
 }
 
 // ---- grouped expert GEMM (prefill) ----

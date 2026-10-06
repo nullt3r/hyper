@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -812,6 +813,84 @@ __global__ void k_gdn_step(const float * __restrict__ in, int stride, int ab_off
     for (int ii = 0; ii < IPW; ++ii) S[(size_t) (i0 + ii) * dv + j] = sreg[ii];
 }
 
+// warp per value column j of head h, the column S[:, j] (dk = 128) in registers (4 per lane): every reduction is a warp
+// shuffle, so tokens advance without block barriers; grid (n_v, dv / 8), 8 warps. Same arithmetic as k_gdn_step.
+__global__ void __launch_bounds__(256) k_gdn_step_w(const float * __restrict__ in, int stride, int ab_off, float * __restrict__ state,
+                                                    float * __restrict__ snap, float * __restrict__ o, int o_stride,
+                                                    const float * __restrict__ dt_bias, const float * __restrict__ ssm_a,
+                                                    int n_k, int n_v, int dk, int dv, float eps, int nt) {
+    const int h = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int j = blockIdx.y * 8 + w;
+    const int hk = h % n_k;
+    float * S = state + (size_t) h * dk * dv;
+    float s[4];
+#pragma unroll
+    for (int ii = 0; ii < 4; ++ii) s[ii] = S[(size_t) (lane * 4 + ii) * dv + j];
+    const float dtb = dt_bias[h], sa = ssm_a[h];
+    const float rdv = rsqrtf((float) dv);
+    for (int t = 0; t < nt; ++t) {
+        const float * row = in + (size_t) t * stride;
+        const float4 q4 = *(const float4 *) (row + (size_t) hk * dk + lane * 4);
+        const float4 k4 = *(const float4 *) (row + (size_t) n_k * dk + (size_t) hk * dk + lane * 4);
+        const float q[4] = {q4.x, q4.y, q4.z, q4.w}, k[4] = {k4.x, k4.y, k4.z, k4.w};
+        float qq = 0.0f, kk = 0.0f, part = 0.0f;
+#pragma unroll
+        for (int ii = 0; ii < 4; ++ii) { qq += q[ii] * q[ii]; kk += k[ii] * k[ii]; part += s[ii] * k[ii]; }
+        qq = warp_sum(qq); kk = warp_sum(kk); part = warp_sum(part);
+        const float qs = rsqrtf(qq + eps), ks = rsqrtf(kk + eps);
+        const float g = softplusf(row[ab_off + h] + dtb) * sa;
+        const float decay = expf(g);
+        const float beta = sigmoidf(row[ab_off + n_v + h]);
+        const float kv = part * ks * decay;
+        const float delta = (row[(size_t) 2 * n_k * dk + (size_t) h * dv + j] - kv) * beta;
+        float out = 0.0f;
+#pragma unroll
+        for (int ii = 0; ii < 4; ++ii) {
+            s[ii] = s[ii] * decay + k[ii] * ks * delta;
+            out += s[ii] * q[ii];
+        }
+        out = warp_sum(out);
+        if (lane == 0) o[(size_t) t * o_stride + (size_t) h * dv + j] = out * qs * rdv;
+        if (snap && t < nt - 1) {
+            float * Sn = snap + (size_t) t * n_v * dk * dv + (size_t) h * dk * dv;
+#pragma unroll
+            for (int ii = 0; ii < 4; ++ii) Sn[(size_t) (lane * 4 + ii) * dv + j] = s[ii];
+        }
+    }
+#pragma unroll
+    for (int ii = 0; ii < 4; ++ii) S[(size_t) (lane * 4 + ii) * dv + j] = s[ii];
+}
+
+// causal conv over many tokens: thread per (channel, token), inputs from a raw copy (in is overwritten); the state
+// update (last K-1 raw inputs) is done by the token-0 threads after all reads (separate kernel)
+__global__ void k_gdn_conv_par(float * in, int stride, const float * __restrict__ raw, const float * __restrict__ st,
+                               const float * __restrict__ w, int channels, int K, int nt) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (c >= channels) return;
+    float acc = 0.0f;
+    for (int kk = 0; kk < K; ++kk) {
+        const int tt = t - (K - 1) + kk;   // input position for tap kk
+        const float x = tt >= 0 ? raw[(size_t) tt * channels + c] : st[(size_t) (K - 1 + tt) * channels + c];
+        acc += w[(size_t) c * K + kk] * x;
+    }
+    in[(size_t) t * stride + c] = silu(acc);
+}
+__global__ void k_gdn_conv_gather(const float * __restrict__ in, int stride, float * __restrict__ raw, int channels) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (c < channels) raw[(size_t) t * channels + c] = in[(size_t) t * stride + c];
+}
+__global__ void k_gdn_conv_state(float * st, const float * __restrict__ raw, int channels, int K, int nt) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    // new state = the last K-1 inputs (from raw, or the old state when nt < K-1)
+    float h[8];
+    for (int j = 0; j < K - 1; ++j) {
+        const int tt = nt - (K - 1) + j;
+        h[j] = tt >= 0 ? raw[(size_t) tt * channels + c] : st[(size_t) (K - 1 + tt) * channels + c];
+    }
+    for (int j = 0; j < K - 1; ++j) st[(size_t) j * channels + c] = h[j];
+}
+
 // grid (n_heads, nt), blockDim = dh
 __global__ void k_gated_norm(float * o, int o_stride, const float * __restrict__ z, int z_stride, const float * __restrict__ w,
                              int dh, float eps) {
@@ -1263,16 +1342,27 @@ void attn_split(const float * qkv, int stride, const half * kcache, const half *
     k_attn_combine<256><<<dim3(n_head, nt), 256, 0, s>>>(qkv, stride, part, ns, out, out_stride, n_head);
 }
 void gdn_conv(float * in, int stride, float * conv_state, float * conv_snap, const float * conv_w, int channels, int K,
-              int nt, cudaStream_t s) {
+              int nt, cudaStream_t s, float * raw) {
     if (K > 9) throw std::runtime_error("gdn_conv: kernel too large");
+    if (raw && !conv_snap && nt > 8) {   // many tokens: parallel over (channel, token) from a raw copy
+        const dim3 grid((channels + 255) / 256, nt);
+        k_gdn_conv_gather<<<grid, 256, 0, s>>>(in, stride, raw, channels);
+        k_gdn_conv_par<<<grid, 256, 0, s>>>(in, stride, raw, conv_state, conv_w, channels, K, nt);
+        k_gdn_conv_state<<<(channels + 255) / 256, 256, 0, s>>>(conv_state, raw, channels, K, nt);
+        return;
+    }
     k_gdn_conv<<<(channels + 255) / 256, 256, 0, s>>>(in, stride, conv_state, conv_snap, conv_w, channels, K, nt);
 }
 void gdn_step(const float * in, int stride, int ab_off, float * state, float * state_snap, float * o, int o_stride,
               const float * dt_bias, const float * ssm_a, int n_k, int n_v, int dk, int dv, float eps, int nt,
               cudaStream_t s) {
     if (dk != 128 || dv % 32) throw std::runtime_error("gdn_step: expects dk = 128");
-    k_gdn_step<16><<<dim3(n_v, dv / 32), 256, 0, s>>>(in, stride, ab_off, state, state_snap, o, o_stride, dt_bias, ssm_a,
-                                                      n_k, n_v, dk, dv, eps, nt);
+    if (dk == 128 && dv % 8 == 0 && nt > 8 && !getenv("HYPER_GDN_OLD"))   // many tokens: warp per column
+        k_gdn_step_w<<<dim3(n_v, dv / 8), 256, 0, s>>>(in, stride, ab_off, state, state_snap, o, o_stride, dt_bias, ssm_a,
+                                                       n_k, n_v, dk, dv, eps, nt);
+    else
+        k_gdn_step<16><<<dim3(n_v, dv / 32), 256, 0, s>>>(in, stride, ab_off, state, state_snap, o, o_stride, dt_bias, ssm_a,
+                                                          n_k, n_v, dk, dv, eps, nt);
 }
 void gated_norm(float * o, int o_stride, const float * z, int z_stride, const float * w, int n_heads, int dh, float eps,
                 int nt, cudaStream_t s) {

@@ -80,8 +80,9 @@ void attn_split(const float * qkv, int stride, const half * kcache, const half *
 // in rows: [q n_k*dk | k n_k*dk | v n_v*dv | z n_v*dv | alpha n_v | beta n_v]  (conv runs over the first `channels`)
 // causal conv1d (kernel K) + SiLU over tokens in order; conv_state holds the K-1 previous inputs.
 // conv_snap (optional): state after token t is stored at conv_snap[t] for t < nt-1
+// raw (optional, nt * channels floats): scratch for a parallel conv over many tokens
 void gdn_conv(float * in, int stride, float * conv_state, float * conv_snap, const float * conv_w, int channels, int K,
-              int nt, cudaStream_t s);
+              int nt, cudaStream_t s, float * raw = nullptr);
 // recurrent gated delta rule over the nt tokens; state [n_v][dk][dv] fp32 (S[i][j], i: key dim, j: value dim);
 // state_snap (optional): state after token t at state_snap[t] for t < nt-1; o rows have stride o_stride
 void gdn_step(const float * in, int stride, int ab_off, float * state, float * state_snap, float * o, int o_stride,
