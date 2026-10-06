@@ -37,30 +37,46 @@ __device__ __forceinline__ float softplusf(float x) { return x > 20.0f ? x : log
 // ---------------- GEMV ----------------
 constexpr int GEMV_ROWS = 8;   // warps per block, one row per warp
 
+// each warp computes R consecutive rows; one x chunk (16 floats) serves all R rows
+template <int R>
 __global__ void k_gemv_q8(const int8_t * __restrict__ qs, const half * __restrict__ d, int n, int k,
                           const float * __restrict__ x, float * __restrict__ y, const float * __restrict__ add) {
-    const int row = blockIdx.x * GEMV_ROWS + (threadIdx.x >> 5);
+    const int row0 = (blockIdx.x * GEMV_ROWS + (threadIdx.x >> 5)) * R;
     const int lane = threadIdx.x & 31;
-    if (row >= n) return;
-    const uint4 * wq = (const uint4 *) (qs + (size_t) row * k);
-    const half * wd = d + (size_t) row * (k / 32);
+    if (row0 >= n) return;
     const float4 * x4 = (const float4 *) x;
-    float acc = 0.0f;
-    const int nchunk = k / 16;
-    for (int c = lane; c < nchunk; c += 32) {
-        const uint4 q = __ldg(wq + c);
-        const float s = __half2float(wd[c >> 1]);
-        const int8_t * b = (const int8_t *) &q;
-        float part = 0.0f;
+    const int nchunk = k / 16, kb = k / 32;
+    float acc[R];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float4 xv = __ldg(x4 + c * 4 + j);
-            part += xv.x * b[4 * j] + xv.y * b[4 * j + 1] + xv.z * b[4 * j + 2] + xv.w * b[4 * j + 3];
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+    for (int c = lane; c < nchunk; c += 32) {
+        uint4 q[R];
+        float sc[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int row = min(row0 + r, n - 1);
+            q[r] = __ldg((const uint4 *) (qs + (size_t) row * k) + c);
+            sc[r] = __half2float(d[(size_t) row * kb + (c >> 1)]);
         }
-        acc += part * s;
+        float4 xv[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) xv[j] = __ldg(x4 + c * 4 + j);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int8_t * b = (const int8_t *) &q[r];
+            float part = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                part += xv[j].x * b[4 * j] + xv[j].y * b[4 * j + 1] + xv[j].z * b[4 * j + 2] + xv[j].w * b[4 * j + 3];
+            acc[r] += part * sc[r];
+        }
     }
-    acc = warp_sum(acc);
-    if (lane == 0) y[row] = add ? add[row] + acc : acc;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const float v = warp_sum(acc[r]);
+        const int row = row0 + r;
+        if (lane == 0 && row < n) y[row] = add ? add[row] + v : v;
+    }
 }
 
 __global__ void k_gemv_bf16(const __nv_bfloat16 * __restrict__ w, int n, int k,
@@ -361,8 +377,16 @@ __global__ void k_incr(int * c) { *c += 1; }
 
 } // namespace
 
+int g_gemv_rows_per_warp = 4;
 void gemv_q8(const Q8W & W, const float * x, float * y, const float * add, cudaStream_t s) {
-    k_gemv_q8<<<(W.n + GEMV_ROWS - 1) / GEMV_ROWS, GEMV_ROWS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, y, add);
+    const int R = g_gemv_rows_per_warp;
+    const int per_block = GEMV_ROWS * R;
+    const int grid = (W.n + per_block - 1) / per_block;
+    switch (R) {
+        case 1: k_gemv_q8<1><<<grid, GEMV_ROWS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, y, add); break;
+        case 2: k_gemv_q8<2><<<grid, GEMV_ROWS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, y, add); break;
+        default: k_gemv_q8<4><<<grid, GEMV_ROWS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, y, add); break;
+    }
 }
 void gemv_bf16(const BF16W & W, const float * x, float * y, const float * add, cudaStream_t s) {
     k_gemv_bf16<<<(W.n + GEMV_ROWS - 1) / GEMV_ROWS, GEMV_ROWS * 32, 0, s>>>(W.w, W.n, W.k, x, y, add);

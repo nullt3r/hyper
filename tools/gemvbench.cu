@@ -20,6 +20,9 @@ int main(int argc, char ** argv) {
     CK(cudaSetDevice(0));
     cudaStream_t s; CK(cudaStreamCreate(&s));
     cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+    for (int R : {1, 2, 4}) {
+    hyper::g_gemv_rows_per_warp = R;
+    printf("-- rows per warp %d\n", R);
     for (auto & sh : shapes) {
         // several distinct matrices so the working set exceeds L2 (6 MB on 3090)
         const int nmat = 8;
@@ -44,6 +47,7 @@ int main(int argc, char ** argv) {
         printf("%-26s %7.1f us  %6.0f GB/s\n", sh.name, 1000.0 * ms / iters, bytes * iters / (ms * 1e-3) / 1e9);
         for (auto & w : W) { cudaFree((void *) w.qs); cudaFree((void *) w.d); }
         cudaFree(x); cudaFree(y);
+    }
     }
     return 0;
 }

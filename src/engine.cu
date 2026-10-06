@@ -21,18 +21,18 @@ struct Engine::DevLayer {
     bool full = false;
     float * attn_norm = nullptr, * post_norm = nullptr;
     // gated attention: local q heads [head_off, head_off + n_head_l), local kv heads [kv_off, kv_off + n_kv_l)
-    BF16W wq, wk, wv;
+    BF16W wqkv;               // rows: [q|gate per local head | k local | v local]
     Q8W wo;
     float * q_norm = nullptr, * k_norm = nullptr;
     half * kcache = nullptr, * vcache = nullptr;
     int n_head_l = 0, head_off = 0, n_kv_l = 0, kv_off = 0;
     // gated delta net: all q/k heads (replicated) + local v heads
-    Q8W wqkv, wgate, wab, wout;
+    Q8W win, wout;            // win rows: [q k v (local) | z | alpha | beta]
     float * conv_w = nullptr, * dt_bias = nullptr, * ssm_a = nullptr, * ssm_norm = nullptr;
     float * conv_state = nullptr, * state = nullptr;
     int n_v_l = 0, n_k_l = 0, conv_ch = 0;
     // ffn: local slice of the hidden dimension
-    Q8W ffn_gate, ffn_up, ffn_down;
+    Q8W ffn_gu, ffn_down;     // gate and up rows stacked: output [gate | up]
     int n_ff_l = 0;
 };
 
@@ -187,6 +187,20 @@ void Engine::load_weights() {
             return w;
         };
         auto T = [&](const std::string & name) { return &gguf_->need(name); };
+        auto bf16_rows = [&](const std::vector<RowRange> & parts) {
+            BF16W w; w.k = (int) parts[0].t->ne[0]; w.n = 0;
+            for (auto & pr : parts) w.n += (int) (pr.r1 - pr.r0);
+            __nv_bfloat16 * pd = dev.alloc<__nv_bfloat16>((size_t) w.n * w.k);
+            size_t off = 0;
+            for (auto & pr : parts) {
+                if (pr.t->type != GType::BF16 || pr.t->ne[0] != w.k) throw std::runtime_error("bf16_rows: bad tensor " + pr.t->name);
+                const size_t bytes = (size_t) (pr.r1 - pr.r0) * pr.t->row_bytes();
+                CUDA_CHECK(cudaMemcpy((uint8_t *) pd + off, pr.t->data + (size_t) pr.r0 * pr.t->row_bytes(), bytes, cudaMemcpyHostToDevice));
+                off += bytes;
+            }
+            w.w = pd;
+            return w;
+        };
 
         dev.layers.resize(c.n_layer);
         for (int il = 0; il < c.n_layer; ++il) {
@@ -201,9 +215,9 @@ void Engine::load_weights() {
                 L.head_off = g * L.n_head_l;
                 L.kv_off = L.head_off / group;
                 L.n_kv_l = (L.head_off + L.n_head_l - 1) / group - L.kv_off + 1;
-                L.wq = bf16(p + "attn_q.weight", (int64_t) L.head_off * 2 * hd, (int64_t) (L.head_off + L.n_head_l) * 2 * hd);
-                L.wk = bf16(p + "attn_k.weight", (int64_t) L.kv_off * hd, (int64_t) (L.kv_off + L.n_kv_l) * hd);
-                L.wv = bf16(p + "attn_v.weight", (int64_t) L.kv_off * hd, (int64_t) (L.kv_off + L.n_kv_l) * hd);
+                L.wqkv = bf16_rows({{T(p + "attn_q.weight"), (int64_t) L.head_off * 2 * hd, (int64_t) (L.head_off + L.n_head_l) * 2 * hd},
+                                    {T(p + "attn_k.weight"), (int64_t) L.kv_off * hd, (int64_t) (L.kv_off + L.n_kv_l) * hd},
+                                    {T(p + "attn_v.weight"), (int64_t) L.kv_off * hd, (int64_t) (L.kv_off + L.n_kv_l) * hd}});
                 // attn_output: k = n_head*hd; local column blocks of the local heads
                 L.wo = upload_q8(A, dev.id, {{T(p + "attn_output.weight"), 0, c.n_embd}},
                                  {{(int64_t) L.head_off * hd / 32, (int64_t) (L.head_off + L.n_head_l) * hd / 32}});
@@ -241,9 +255,10 @@ void Engine::load_weights() {
                     for (int64_t ch = voff + (int64_t) h * dv; ch < voff + (int64_t) (h + 1) * dv; ++ch) chans.push_back(ch);
                 }
                 std::vector<RowRange> ab_rows = a_rows; ab_rows.insert(ab_rows.end(), b_rows.begin(), b_rows.end());
-                L.wqkv = upload_q8(A, dev.id, qkv_rows);
-                L.wgate = upload_q8(A, dev.id, z_rows);
-                L.wab = upload_q8(A, dev.id, ab_rows);
+                std::vector<RowRange> in_rows = qkv_rows;
+                in_rows.insert(in_rows.end(), z_rows.begin(), z_rows.end());
+                in_rows.insert(in_rows.end(), ab_rows.begin(), ab_rows.end());
+                L.win = upload_q8(A, dev.id, in_rows);
                 L.wout = upload_q8(A, dev.id, {{T(p + "ssm_out.weight"), 0, c.n_embd}}, out_cols);
                 {
                     const GTensor & cw = gguf_->need(p + "ssm_conv1d.weight");
@@ -271,8 +286,7 @@ void Engine::load_weights() {
             // ffn: hidden dim split in 32-blocks; gate/up rows and down column blocks match
             auto [f0, f1] = split(c.n_ff, nd, g, 32);
             L.n_ff_l = (int) (f1 - f0);
-            L.ffn_gate = upload_q8(A, dev.id, {{T(p + "ffn_gate.weight"), f0, f1}});
-            L.ffn_up = upload_q8(A, dev.id, {{T(p + "ffn_up.weight"), f0, f1}});
+            L.ffn_gu = upload_q8(A, dev.id, {{T(p + "ffn_gate.weight"), f0, f1}, {T(p + "ffn_up.weight"), f0, f1}});
             L.ffn_down = upload_q8(A, dev.id, {{T(p + "ffn_down.weight"), 0, c.n_embd}}, {{f0 / 32, f1 / 32}});
         }
         auto [o0, o1] = split(c.n_vocab, nd, g);
@@ -332,27 +346,26 @@ void Engine::record(int gi) {
         DevLayer & L = d.layers[il];
         rmsnorm(d.x, L.attn_norm, d.xn, c.n_embd, eps, s);
         if (L.full) {
-            gemv_bf16(L.wq, d.xn, d.big0, nullptr, s);
-            gemv_bf16(L.wk, d.xn, d.kbuf, nullptr, s);
-            gemv_bf16(L.wv, d.xn, d.vbuf, nullptr, s);
-            attn_prep(d.big0, d.kbuf, d.vbuf, L.q_norm, L.k_norm, L.kcache, L.vcache, d.pos, opt_.max_pos,
+            gemv_bf16(L.wqkv, d.xn, d.big0, nullptr, s);
+            float * kb = d.big0 + (size_t) L.n_head_l * 2 * c.head_dim;
+            float * vb = kb + (size_t) L.n_kv_l * c.head_dim;
+            attn_prep(d.big0, kb, vb, L.q_norm, L.k_norm, L.kcache, L.vcache, d.pos, opt_.max_pos,
                       L.n_head_l, L.n_kv_l, c.head_dim, c.n_rot, c.rope_base, eps, s);
             attn_decode(d.big0, L.kcache, L.vcache, d.o, d.pos, opt_.max_pos, L.n_head_l, L.head_off,
                         c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), s);
             gemv_q8(L.wo, d.o, d.part, nullptr, s);
         } else {
-            gemv_q8(L.wqkv, d.xn, d.big0, nullptr, s);
-            gemv_q8(L.wgate, d.xn, d.big1, nullptr, s);
-            gemv_q8(L.wab, d.xn, d.ab, nullptr, s);
+            gemv_q8(L.win, d.xn, d.big0, nullptr, s);
+            float * z = d.big0 + L.conv_ch;
+            float * ab = z + (size_t) L.n_v_l * c.head_v_dim();
             gdn_conv(d.big0, L.conv_state, L.conv_w, L.conv_ch, c.ssm_conv, s);
-            gdn_step(d.big0, d.ab, L.dt_bias, L.ssm_a, L.state, d.o, L.n_k_l, L.n_v_l, c.ssm_d_state, c.head_v_dim(), eps, s);
-            gated_norm(d.o, d.big1, L.ssm_norm, L.n_v_l, c.head_v_dim(), eps, s);
+            gdn_step(d.big0, ab, L.dt_bias, L.ssm_a, L.state, d.o, L.n_k_l, L.n_v_l, c.ssm_d_state, c.head_v_dim(), eps, s);
+            gated_norm(d.o, z, L.ssm_norm, L.n_v_l, c.head_v_dim(), eps, s);
             gemv_q8(L.wout, d.o, d.part, nullptr, s);
         }
         reduce();
         rmsnorm(d.x, L.post_norm, d.xn, c.n_embd, eps, s);
-        gemv_q8(L.ffn_gate, d.xn, d.big1, nullptr, s);
-        gemv_q8(L.ffn_up, d.xn, d.big1 + L.n_ff_l, nullptr, s);
+        gemv_q8(L.ffn_gu, d.xn, d.big1, nullptr, s);
         silu_mul(d.big1, d.h, L.n_ff_l, s);
         gemv_q8(L.ffn_down, d.h, d.part, nullptr, s);
         reduce();

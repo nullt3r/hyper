@@ -40,3 +40,6 @@ clean:
 
 $(BUILD)/arbench: tools/arbench.cu $(BUILD)/kernels.o
 	$(NVCC) $(NVFLAGS) tools/arbench.cu $(BUILD)/kernels.o -o $@ $(LIBS)
+
+$(BUILD)/gemvbench: tools/gemvbench.cu $(BUILD)/kernels.o
+	$(NVCC) $(NVFLAGS) tools/gemvbench.cu $(BUILD)/kernels.o -o $@ $(LIBS)

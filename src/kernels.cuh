@@ -19,6 +19,7 @@ struct BF16W {
 };
 
 // y[n] = W x  (+ optional residual add: y[n] = add[n] + W x)
+extern int g_gemv_rows_per_warp;   // tuning knob: rows per warp in the Q8 GEMV (1, 2 or 4)
 void gemv_q8(const Q8W & W, const float * x, float * y, const float * add, cudaStream_t s);
 void gemv_bf16(const BF16W & W, const float * x, float * y, const float * add, cudaStream_t s);
 
