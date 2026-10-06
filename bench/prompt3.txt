@@ -1,4 +1,59 @@
-// hyper kernels. Activations are fp32, laid out as nt token rows with an explicit row stride.
+# hyper – deník vývoje
+
+Cíl: vlastní inference engine pro 3× RTX 3090 (bez P2P, GPU1 PCIe x8) + TR 3970X (4× DDR4-3200, ~77 GB/s),
+dlouhodobě pro velké MoE modely přes 3 GPU + CPU/RAM. Vývojový model: Qwen3.8-27B UD-Q8_K_XL (`qwen35`,
+48× Gated DeltaNet + 16× gated attention, dense FFN, 31,5 GB). Kód: `~/Projects/ik-llama-claude/hyper` (git),
+build/test na `~/hyper` (sync přes `./sync.sh`).
+
+## Baseline – mainline llama.cpp d812350 (llama-bench, -fa on, -ub 2048)
+
+| Konfigurace | pp512 | tg128 | tg @8k | tg @32k |
+|---|---|---|---|---|
+| A: 3 GPU, -sm layer | 1396 | **26,4** | 26,0 | 24,8 |
+| B: 3 GPU, -sm tensor | 683 | **34,6** | 34,4 | 33,4 |
+| C: 20× FFN na CPU, -sm layer | – | 9,2 | 9,1 | 9,0 |
+
+Model A/C: čas = součet zařízení (střídají se) → 26,4 t/s = 93 % stropu sériového layer-splitu.
+
+## Decode (hyper bench, gen 256 tokenů, mělký kontext)
+
+| Krok | t/s | ms/tok | Poznámka |
+|---|---|---|---|
+| M1: layer split, fp32 aktivace, repack Q8 (qs/d zvlášť) | 25,7 | 38,9 | top-1 100 %, KL 2,2e-4 vs llama.cpp |
+| M2: tensor parallel 3 GPU, allreduce přes mapovanou RAM (flag), CUDA graphs | 53,0 | 18,9 | |
+| LL allreduce fp32 (8B paket {val,seq}) | 56,1 | 17,8 | allreduce 22 → 15,5 µs |
+| LL allreduce fp16 payload | 58,6 | 17,1 | 8,8 µs; KL beze změny |
+| head-aligned GDN partition (v-hlava h → k-hlava h%16) | 60,1 | 16,7 | bez replikace q/k |
+| fúze matic se stejným vstupem (gate+up, GDN in, attn qkv), 4 řádky/warp | 61,5 | 16,3 | |
+| paralelní gdn_step (72 bloků), RMSNorm do GEMV se statistikou z allreduce | 64,0 | 15,6 | gdn 0,91 → 0,23 ms |
+| 2 řádky/warp | **66,3** | **15,1** | GEMV ~805–823 GB/s (~90 % praxe) |
+
+Mainline: B 34,6 t/s → hyper **1,92×**; A 26,4 → **2,5×**.
+
+## MTP spekulativní dekódování (prompt: chat, programovací otázka s thinkingem; 512 tokenů, greedy)
+
+Výstup je ve všech variantách **token po tokenu identický** s obyčejným greedy generováním (ověřeno 512/512).
+
+| Krok | t/s | tokenů/krok | ověření | MTP |
+|---|---|---|---|---|
+| obyčejné greedy (nt=1, přes API) | 62,4 | 1 | 15,9 ms | – |
+| MTP K=1 (ověření 2 tokenů, rollback GDN ze snapshotu) | 96,4 | 1,94 | 18,3 ms | 1,5 ms |
+| multi-token GEMV: dequant jednou na chunk, 4 řádky/warp | 98,2 | 1,94 | 18,3 ms | 1,5 ms |
+| řetězené drafty K=2 (MTP ze svého výstupu) | 109,7 | 2,68 | 21,4 ms | 3,0 ms |
+| Q8 kopie LM hlavy pro drafty, jen poslední řádek | **115,1** | 2,68 | 21,3 ms | 1,9 ms |
+| (K=3 s Q8 hlavou) | 111,4 | 3,22 | 25,9 ms | 2,9 ms |
+
+Úspěšnost draftu 1: 94 %, druhého (podmíněně) ~79 %. hyper K=2 vs mainline: **3,3× (TP), 4,4× (layer)**.
+
+
+## Zjištění
+- Allreduce bez P2P: pevná latence ~3,5 µs (n=256), zbytek přenos (PCIe; GPU1 x8). LL protokol odstraní fence + flag.
+- Hash výstupu není vhodný test; správnost = top-1 + KL proti llama.cpp referenci (`build/ref`).
+- RMSNorm fúzovaný naivně (každý blok počítá normu) zpomalil GEMV o ~1 ms → statistiku počítá allreduce.
+- Unroll/pipelining GEMV nepomáhá; limit je DRAM, ne počet požadavků v letu.
+
+## Další kroky
+1. **Tensor-core Q8 GEMM** (mma.sync, váhy přeskládané do// hyper kernels. Activations are fp32, laid out as nt token rows with an explicit row stride.
 // Weights are repacked at load time. nt (tokens per call) is small: 1 for plain decode,
 // 2..MAX_NT for speculative verification.
 #pragma once
@@ -58,43 +113,3 @@ void attn_decode(const float * qkv, int stride, const half * kcache, const half 
                  const int * pos, int max_pos, int n_head, int n_kv, int head_off, int group, int kv_off, int hd,
                  float scale, int nt, cudaStream_t s);
 
-// ---- gated delta net, local heads ----
-// in rows: [q n_k*dk | k n_k*dk | v n_v*dv | z n_v*dv | alpha n_v | beta n_v]  (conv runs over the first `channels`)
-// causal conv1d (kernel K) + SiLU over tokens in order; conv_state holds the K-1 previous inputs.
-// conv_snap (optional): state after token t is stored at conv_snap[t] for t < nt-1
-void gdn_conv(float * in, int stride, float * conv_state, float * conv_snap, const float * conv_w, int channels, int K,
-              int nt, cudaStream_t s);
-// recurrent gated delta rule over the nt tokens; state [n_v][dk][dv] fp32 (S[i][j], i: key dim, j: value dim);
-// state_snap (optional): state after token t at state_snap[t] for t < nt-1; o rows have stride o_stride
-void gdn_step(const float * in, int stride, int ab_off, float * state, float * state_snap, float * o, int o_stride,
-              const float * dt_bias, const float * ssm_a, int n_k, int n_v, int dk, int dv, float eps, int nt,
-              cudaStream_t s);
-// o[t] = rmsnorm_per_head(o[t]) * w * silu(z[t])
-void gated_norm(float * o, int o_stride, const float * z, int z_stride, const float * w, int n_heads, int dh, float eps,
-                int nt, cudaStream_t s);
-
-// ---- ffn ----
-// h[t][i] = silu(gu[t][i]) * gu[t][n + i]
-void silu_mul(const float * gu, int gu_stride, float * h, int h_stride, int n, int nt, cudaStream_t s);
-
-// out[t] = {max value, index + offset} (index stored as int bits)
-void argmax_pairs(const float * x, int xs, int n, int offset, float * out, int nt, cudaStream_t s);
-
-// ---- multi-GPU allreduce without P2P (LL protocol, fp16 payload) ----
-// x[i] += sum_d part_d[i] for i < n (n = nt * n_embd, even); exchanged through host-mapped uint2 slots
-// [2][ndev][n/2]. ss_out (optional): partial sums of squares of the new x, AR_SS_SPAN elements per entry,
-// so token t's statistics are ss_out[t * (n_embd / AR_SS_SPAN) ...]
-constexpr int AR_SS_SPAN = 512;
-void allreduce_add_ll16(float * x, const float * part, uint2 * slots, int g, int ndev, int n,
-                        const int * counter, int call, cudaStream_t s, float * ss_out = nullptr);
-// bulk variant (many tokens, no sum-of-squares output): data [2][ndev][n] fp16 and flags [2][ndev][n/1024]
-// in mapped host memory
-void allreduce_add_bulk(float * x, const float * part, half * data, unsigned * flags, int g, int ndev, int n,
-                        const int * counter, int call, cudaStream_t s);
-// x[i] += own[i] + sum_{j < nparts} recv[j * stride + i]  (fp16 parts; copy-engine allreduce)
-void add_parts(float * x, const half * own, const half * recv, size_t stride, int nparts, int n, cudaStream_t s);
-// sum of squares of each token row into ss[t * nss] (remaining nss-1 entries zeroed)
-void sumsq(const float * x, int xs, int n, int nt, float * ss, int nss, cudaStream_t s);
-void incr_counter(int * c, cudaStream_t s);
-
-} // namespace hyper

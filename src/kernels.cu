@@ -166,6 +166,165 @@ __global__ void k_mma_f16(const uint4 * __restrict__ wq, int n, int k,
     }
 }
 
+// ---- tensor-core GEMM for many tokens (prefill) ----
+// Activations are first converted to fp16 [T][k] (optionally RMS-normed). Block = 8 warps, tile 128 weight rows
+// x 128 tokens: warp (wm = w & 3, wn = w >> 2) owns 2 row tiles x 64 tokens (16 mma per k16 step). Weight
+// fragments are read straight from global memory (fragment order is already coalesced) one k-block ahead;
+// Q8 scales are folded into the fp16 fragment (q * d rounded to fp16). Activations go through shared memory
+// with cp.async double buffering and ldmatrix.
+
+// x[t] (fp32, stride xs) -> xh[t] (fp16, stride k), times rsqrt(mean(x^2) + eps) * w when w != nullptr
+__global__ void k_to_half(const float * __restrict__ x, int xs, const float * __restrict__ w, int k, float eps,
+                          half * __restrict__ xh) {
+    const float * xr = x + (size_t) blockIdx.x * xs;
+    half * yr = xh + (size_t) blockIdx.x * k;
+    float inv = 1.0f;
+    if (w) {
+        float ss = 0.0f;
+        for (int i = threadIdx.x; i < k; i += blockDim.x) ss += xr[i] * xr[i];
+        inv = rsqrtf(block_sum(ss) / k + eps);
+    }
+    for (int i = 2 * threadIdx.x; i < k; i += 2 * blockDim.x) {
+        float2 v = *(const float2 *) (xr + i);
+        if (w) { v.x *= inv * w[i]; v.y *= inv * w[i + 1]; }
+        *(__half2 *) (yr + i) = __floats2half2_rn(v.x, v.y);
+    }
+}
+
+__device__ __forceinline__ void cp_async16(void * smem, const void * gmem, bool valid) {
+    const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(sa), "l"(gmem), "r"(valid ? 16 : 0));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
+__device__ __forceinline__ void cp_async_wait1() { asm volatile("cp.async.wait_group 1;"); }
+__device__ __forceinline__ void ldmatrix_x4(unsigned * r, const void * smem) {
+    const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(sa));
+}
+
+// raw fragment data of one 16-row tile for one 32-column k block
+struct FragQ8 {
+    uint4 q; half s0, s1;
+    __device__ __forceinline__ void load(const uint4 * wq, const half * ws, int tile, int kb, int b, int lane) {
+        const size_t i = (size_t) tile * kb + b;
+        q = __ldg(wq + i * 32 + lane);
+        s0 = ws[i * 16 + (lane >> 2)];
+        s1 = ws[i * 16 + (lane >> 2) + 8];
+    }
+    // a[ks][4] for the two k16 steps
+    __device__ __forceinline__ void unpack(unsigned (*a)[4]) const {
+        const __half2 h0 = __half2half2(s0), h1 = __half2half2(s1);
+        const unsigned w2[2][2] = {{q.x, q.y}, {q.z, q.w}};
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            unsigned r[4];
+            r[0] = i8x2_to_h2(w2[ks][0], 0x5140);
+            r[1] = i8x2_to_h2(w2[ks][0], 0x7362);
+            r[2] = i8x2_to_h2(w2[ks][1], 0x5140);
+            r[3] = i8x2_to_h2(w2[ks][1], 0x7362);
+            __half2 t;
+            t = __hmul2(*(__half2 *) &r[0], h0); a[ks][0] = *(unsigned *) &t;
+            t = __hmul2(*(__half2 *) &r[1], h1); a[ks][1] = *(unsigned *) &t;
+            t = __hmul2(*(__half2 *) &r[2], h0); a[ks][2] = *(unsigned *) &t;
+            t = __hmul2(*(__half2 *) &r[3], h1); a[ks][3] = *(unsigned *) &t;
+        }
+    }
+};
+struct FragF16 {
+    uint4 q0, q1;
+    __device__ __forceinline__ void load(const uint4 * wq, const half *, int tile, int kb, int b, int lane) {
+        const size_t i = ((size_t) tile * kb + b) * 2;
+        q0 = __ldg(wq + i * 32 + lane);
+        q1 = __ldg(wq + (i + 1) * 32 + lane);
+    }
+    __device__ __forceinline__ void unpack(unsigned (*a)[4]) const {
+        a[0][0] = q0.x; a[0][1] = q0.y; a[0][2] = q0.z; a[0][3] = q0.w;
+        a[1][0] = q1.x; a[1][1] = q1.y; a[1][2] = q1.z; a[1][3] = q1.w;
+    }
+};
+
+constexpr int GM_BN = 128, GM_LDS = 40;   // tokens per block, smem row stride in halfs (32 + 8 pad)
+
+template <typename Frag>
+__global__ void __launch_bounds__(256) k_gemm(const uint4 * __restrict__ wq, const half * __restrict__ ws, int n, int k,
+                                              const half * __restrict__ xh, int T, float * __restrict__ y, int ys,
+                                              const float * __restrict__ add) {
+    __shared__ __align__(16) half bs[2][GM_BN * GM_LDS];
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+    const int wm = w & 3, wn = w >> 2;
+    const int t0 = blockIdx.x * GM_BN;
+    const int ntile = (n + 15) / 16, kb = k / 32;
+    const int tile0 = blockIdx.y * 8 + wm * 2;
+    // activation tile loader: 128 rows x 64 bytes = 512 16-byte chunks, 2 per thread
+    auto load_b = [&](int buf, int b) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int c = threadIdx.x + i * 256, row = c >> 2, part = c & 3;
+            const int tok = t0 + row;
+            const bool ok = tok < T;
+            cp_async16(&bs[buf][row * GM_LDS + part * 8], xh + (size_t) (ok ? tok : 0) * k + b * 32 + part * 8, ok);
+        }
+        cp_async_commit();
+    };
+    float acc[2][8][4];
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < 8; ++ni)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[mi][ni][e] = 0.0f;
+    Frag fr[2];
+    const bool tv0 = tile0 < ntile, tv1 = tile0 + 1 < ntile;
+    if (tv0) fr[0].load(wq, ws, tile0, kb, 0, lane);
+    if (tv1) fr[1].load(wq, ws, tile0 + 1, kb, 0, lane);
+    load_b(0, 0);
+    for (int b = 0; b < kb; ++b) {
+        const int cur = b & 1;
+        if (b + 1 < kb) load_b(cur ^ 1, b + 1); else cp_async_commit();
+        unsigned a[2][2][4];
+        fr[0].unpack(a[0]);
+        fr[1].unpack(a[1]);
+        if (b + 1 < kb) {
+            if (tv0) fr[0].load(wq, ws, tile0, kb, b + 1, lane);
+            if (tv1) fr[1].load(wq, ws, tile0 + 1, kb, b + 1, lane);
+        }
+        cp_async_wait1();
+        __syncthreads();
+        const half * sb = bs[cur] + (wn * 64 + (lane & 7) + ((lane >> 4) << 3)) * GM_LDS + ((lane >> 3) & 1) * 8;
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks)
+#pragma unroll
+            for (int np = 0; np < 4; ++np) {
+                unsigned r[4];
+                ldmatrix_x4(r, sb + np * 16 * GM_LDS + ks * 16);
+                const unsigned b0[2] = {r[0], r[1]}, b1[2] = {r[2], r[3]};
+#pragma unroll
+                for (int mi = 0; mi < 2; ++mi) {
+                    mma16816(acc[mi][2 * np], a[mi][ks], b0);
+                    mma16816(acc[mi][2 * np + 1], a[mi][ks], b1);
+                }
+            }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi) {
+        const int r0 = (tile0 + mi) * 16 + gid;
+#pragma unroll
+        for (int ni = 0; ni < 8; ++ni) {
+            const int tk = t0 + wn * 64 + ni * 8 + 2 * tig;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int row = r0 + (e >> 1) * 8, t = tk + (e & 1);
+                if (row < n && t < T) {
+                    const size_t o = (size_t) t * ys + row;
+                    y[o] = add ? add[o] + acc[mi][ni][e] : acc[mi][ni][e];
+                }
+            }
+        }
+    }
+}
+
 // ---------------- norms ----------------
 __global__ void k_rmsnorm(const float * __restrict__ x, int xs, const float * __restrict__ w, float * __restrict__ y, int ys,
                           int n, float eps) {
@@ -427,6 +586,72 @@ __global__ void k_allreduce_add_ll16(float * x, const float * __restrict__ part,
     }
 }
 
+// bulk variant for many tokens: block = 128 threads x 8 elements; fp16 data written with 16-byte stores, one flag
+// per block (after a system fence), peers' data read with 16-byte uncached loads once their flag shows up
+constexpr int ARB_ELEMS = 1024;
+__global__ void k_allreduce_bulk(float * x, const float * __restrict__ part, half * data, unsigned * flags, int g, int ndev,
+                                 int n, const int * counter, int call) {
+    const unsigned seq = (unsigned) (*counter) * 1024u + (unsigned) call + 1u;
+    const int buf = call & 1, nb = gridDim.x;
+    const size_t base = (size_t) blockIdx.x * ARB_ELEMS + threadIdx.x * 8;
+    const bool ok = base < (size_t) n;
+    float acc[8];
+    if (ok) {
+        const float4 p0 = *(const float4 *) (part + base), p1 = *(const float4 *) (part + base + 4);
+        __half2 hv[4] = {__floats2half2_rn(p0.x, p0.y), __floats2half2_rn(p0.z, p0.w),
+                         __floats2half2_rn(p1.x, p1.y), __floats2half2_rn(p1.z, p1.w)};
+        *(uint4 *) (data + ((size_t) buf * ndev + g) * n + base) = *(const uint4 *) hv;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { const float2 f = __half22float2(hv[i]); acc[2 * i] = f.x; acc[2 * i + 1] = f.y; }
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) *(volatile unsigned *) &flags[((size_t) buf * ndev + g) * nb + blockIdx.x] = seq;
+    if (threadIdx.x < ndev && threadIdx.x != g) {
+        volatile unsigned * f = &flags[((size_t) buf * ndev + threadIdx.x) * nb + blockIdx.x];
+        while (*f != seq) {}
+    }
+    __syncthreads();
+    __threadfence_system();
+    if (!ok) return;
+    for (int d = 0; d < ndev; ++d) {
+        if (d == g) continue;
+        const uint4 q = __ldcv((const uint4 *) (data + ((size_t) buf * ndev + d) * n + base));
+        const __half2 * hq = (const __half2 *) &q;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { const float2 f = __half22float2(hq[i]); acc[2 * i] += f.x; acc[2 * i + 1] += f.y; }
+    }
+    float4 * xp = (float4 *) (x + base);
+    float4 a = xp[0], b = xp[1];
+    a.x += acc[0]; a.y += acc[1]; a.z += acc[2]; a.w += acc[3];
+    b.x += acc[4]; b.y += acc[5]; b.z += acc[6]; b.w += acc[7];
+    xp[0] = a; xp[1] = b;
+}
+
+// x[i] += own[i] + sum_j recv[j * stride + i]   (fp16 parts, 8 elements per thread)
+__global__ void k_add_parts(float * x, const half * __restrict__ own, const half * __restrict__ recv, size_t stride, int nparts, int n) {
+    const size_t i = ((size_t) blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (i >= (size_t) n) return;
+    float acc[8];
+    {
+        const uint4 q = *(const uint4 *) (own + i);
+        const __half2 * h = (const __half2 *) &q;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) { const float2 f = __half22float2(h[k]); acc[2 * k] = f.x; acc[2 * k + 1] = f.y; }
+    }
+    for (int j = 0; j < nparts; ++j) {
+        const uint4 q = *(const uint4 *) (recv + j * stride + i);
+        const __half2 * h = (const __half2 *) &q;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) { const float2 f = __half22float2(h[k]); acc[2 * k] += f.x; acc[2 * k + 1] += f.y; }
+    }
+    float4 * xp = (float4 *) (x + i);
+    float4 a = xp[0], b = xp[1];
+    a.x += acc[0]; a.y += acc[1]; a.z += acc[2]; a.w += acc[3];
+    b.x += acc[4]; b.y += acc[5]; b.z += acc[6]; b.w += acc[7];
+    xp[0] = a; xp[1] = b;
+}
+
 __global__ void k_incr(int * c) { *c += 1; }
 
 } // namespace
@@ -478,6 +703,17 @@ void gemv_bf16(const BF16W & W, const float * x, int xs, float * y, int ys, cons
                const NormIn & nin) {
     if (nt < 1 || nt > 8) throw std::runtime_error("gemv_bf16: nt must be 1..8");
     k_mma_f16<<<(W.n + 15) / 16, 256, 0, s>>>(W.q, W.n, W.k, x, xs, y, ys, add, nt, nin);
+}
+
+void to_half(const float * x, int xs, const float * w, int k, float eps, half * xh, int nt, cudaStream_t s) {
+    k_to_half<<<nt, 256, 0, s>>>(x, xs, w, k, eps, xh);
+}
+void gemm_q8(const Q8W & W, const half * xh, int T, float * y, int ys, const float * add, cudaStream_t s) {
+    k_gemm<FragQ8><<<dim3((T + GM_BN - 1) / GM_BN, ((W.n + 15) / 16 + 7) / 8), 256, 0, s>>>(W.q, W.s, W.n, W.k, xh, T, y, ys, add);
+}
+void gemm_f16(const BF16W & W, const half * xh, int T, float * y, int ys, const float * add, cudaStream_t s) {
+    if (W.k % 32) throw std::runtime_error("gemm_f16: k must be a multiple of 32");
+    k_gemm<FragF16><<<dim3((T + GM_BN - 1) / GM_BN, ((W.n + 15) / 16 + 7) / 8), 256, 0, s>>>(W.q, nullptr, W.n, W.k, xh, T, y, ys, add);
 }
 
 void repack_bf16_frag(const uint16_t * w, int n, int k, size_t row_stride, uint8_t * out) {
@@ -548,6 +784,15 @@ void allreduce_add_ll16(float * x, const float * part, uint2 * slots, int g, int
     const int n2 = n / 2;
     // AR_SS_SPAN elements per block -> 256 threads x 2 elements
     k_allreduce_add_ll16<<<(n2 + 255) / 256, 256, 0, s>>>(x, part, slots, g, ndev, n2, counter, call, ss_out);
+}
+void allreduce_add_bulk(float * x, const float * part, half * data, unsigned * flags, int g, int ndev, int n,
+                        const int * counter, int call, cudaStream_t s) {
+    if (n % 8) throw std::runtime_error("allreduce_add_bulk: n must be a multiple of 8");
+    k_allreduce_bulk<<<(n + ARB_ELEMS - 1) / ARB_ELEMS, ARB_ELEMS / 8, 0, s>>>(x, part, data, flags, g, ndev, n, counter, call);
+}
+void add_parts(float * x, const half * own, const half * recv, size_t stride, int nparts, int n, cudaStream_t s) {
+    if (n % 8) throw std::runtime_error("add_parts: n must be a multiple of 8");
+    k_add_parts<<<(n / 8 + 255) / 256, 256, 0, s>>>(x, own, recv, stride, nparts, n);
 }
 void incr_counter(int * c, cudaStream_t s) { k_incr<<<1, 1, 0, s>>>(c); }
 

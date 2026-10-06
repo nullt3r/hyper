@@ -10,11 +10,18 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <type_traits>
 
 namespace hyper {
 
 #define CUDA_CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) \
     throw std::runtime_error(std::string("CUDA: ") + cudaGetErrorString(e_) + " at " + __FILE__ + ":" + std::to_string(__LINE__)); } while (0)
+
+// rows per forward: up to MAX_NT through the decode GEMV + CUDA graphs, up to MAX_ROWS (prefill chunk)
+// through the tensor-core GEMM, recorded directly
+constexpr int MAX_ROWS = 512;
+constexpr int MIN_MICRO = 64;   // prefill chunks of at least 2 * MIN_MICRO rows run as two overlapping micro-batches
 
 // one GPU's slice of one layer
 struct Engine::DevLayer {
@@ -55,6 +62,13 @@ struct Engine::Device {
     float * hn = nullptr, * mhn = nullptr, * me = nullptr, * cat = nullptr;   // mhn: MTP's last normed output
     int big_stride = 0;
     float * logits = nullptr, * res = nullptr, * mres = nullptr, * ss = nullptr;
+    half * xh = nullptr;      // fp16 GEMM input scratch [MAX_ROWS][max k]
+    // bulk (prefill) allreduce and micro-batching
+    half * p16 = nullptr, * recv = nullptr;   // own part in fp16 [MAX_ROWS][n]; peers' parts [ndev-1][MAX_ROWS][n]
+    cudaStream_t stream2 = nullptr;
+    cudaEvent_t ev_ar[2][2] = {}, ev_fork = nullptr, ev_join = nullptr;
+    std::vector<cudaEvent_t> ev_layer;
+    int * pos2 = nullptr;
     int * pos = nullptr, * mpos = nullptr, * counter = nullptr;
     size_t used = 0;
     std::vector<void *> allocs;
@@ -75,6 +89,11 @@ struct Engine::Device {
         for (auto & gr : g_restore) if (gr) cudaGraphExecDestroy(gr);
         if (g_chain) cudaGraphExecDestroy(g_chain);
         for (void * p : allocs) cudaFree(p);
+        for (auto & r : ev_ar) for (auto & ev : r) if (ev) cudaEventDestroy(ev);
+        for (auto ev : ev_layer) cudaEventDestroy(ev);
+        if (ev_fork) cudaEventDestroy(ev_fork);
+        if (ev_join) cudaEventDestroy(ev_join);
+        if (stream2) cudaStreamDestroy(stream2);
         if (stream) cudaStreamDestroy(stream);
     }
 };
@@ -175,23 +194,30 @@ Engine::Engine(const std::string & model_path, const EngineOptions & opt) : opt_
         dev->id = g; dev->g = g;
         CUDA_CHECK(cudaSetDevice(g));
         CUDA_CHECK(cudaStreamCreateWithFlags(&dev->stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&dev->stream2, cudaStreamNonBlocking));
+        for (auto & r : dev->ev_ar) for (auto & ev : r) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&dev->ev_fork, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&dev->ev_join, cudaEventDisableTiming));
         devs_.push_back(std::move(dev));
     }
     const int nd = opt_.n_devices, n = cfg_.n_embd;
-    CUDA_CHECK(cudaHostAlloc(&h_embd_, (size_t) MAX_NT * n * sizeof(float), cudaHostAllocPortable));
-    CUDA_CHECK(cudaHostAlloc(&h_membd_, (size_t) MAX_NT * n * sizeof(float), cudaHostAllocPortable));
-    CUDA_CHECK(cudaHostAlloc(&h_pos_, 2 * sizeof(int), cudaHostAllocPortable));
-    CUDA_CHECK(cudaHostAlloc(&h_res_, (size_t) nd * MAX_NT * 2 * sizeof(float), cudaHostAllocPortable));
-    CUDA_CHECK(cudaHostAlloc(&h_mres_, (size_t) nd * MAX_NT * 2 * sizeof(float), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_embd_, (size_t) MAX_ROWS * n * sizeof(float), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_membd_, (size_t) MAX_ROWS * n * sizeof(float), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_pos_, 4 * sizeof(int), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_stage_, (size_t) 2 * 2 * nd * MAX_ROWS * n * sizeof(half), cudaHostAllocPortable));
+    barrier_ = std::make_unique<Barrier>(nd);
+    CUDA_CHECK(cudaHostAlloc(&h_res_, (size_t) nd * MAX_ROWS * 2 * sizeof(float), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_mres_, (size_t) nd * MAX_ROWS * 2 * sizeof(float), cudaHostAllocPortable));
     const size_t ll = (size_t) 2 * nd * MAX_NT * n / 2;
     CUDA_CHECK(cudaHostAlloc(&ar_ll_, ll * sizeof(uint2), cudaHostAllocPortable | cudaHostAllocMapped));
     memset(ar_ll_, 0xff, ll * sizeof(uint2));
+
     load_weights();
 }
 
 Engine::~Engine() {
     devs_.clear();
-    for (void * p : {(void *) h_embd_, (void *) h_membd_, (void *) h_pos_, (void *) h_res_, (void *) h_mres_, (void *) ar_ll_})
+    for (void * p : {(void *) h_embd_, (void *) h_membd_, (void *) h_pos_, (void *) h_res_, (void *) h_mres_, (void *) ar_ll_, (void *) h_stage_})
         if (p) cudaFreeHost(p);
 }
 
@@ -366,20 +392,26 @@ void Engine::load_weights() {
         const int n = c.n_embd;
         dev.big_stride = std::max<int>({c.conv_dim() + c.ssm_d_inner + 2 * c.ssm_dt_rank,
                                         2 * c.n_head * c.head_dim + 2 * c.n_head_kv * c.head_dim, 2 * c.n_ff});
-        dev.x = dev.alloc<float>((size_t) MAX_NT * n);
-        dev.part = dev.alloc<float>((size_t) MAX_NT * n);
-        dev.big0 = dev.alloc<float>((size_t) MAX_NT * dev.big_stride);
-        dev.big1 = dev.alloc<float>((size_t) MAX_NT * dev.big_stride);
-        dev.o = dev.alloc<float>((size_t) MAX_NT * std::max(c.ssm_d_inner, c.n_head * c.head_dim));
-        dev.h = dev.alloc<float>((size_t) MAX_NT * c.n_ff);
-        dev.hn = dev.alloc<float>((size_t) MAX_NT * n);
+        dev.x = dev.alloc<float>((size_t) MAX_ROWS * n);
+        dev.part = dev.alloc<float>((size_t) MAX_ROWS * n);
+        dev.big0 = dev.alloc<float>((size_t) MAX_ROWS * dev.big_stride);
+        dev.big1 = dev.alloc<float>((size_t) MAX_ROWS * dev.big_stride);
+        dev.o = dev.alloc<float>((size_t) MAX_ROWS * std::max(c.ssm_d_inner, c.n_head * c.head_dim));
+        dev.h = dev.alloc<float>((size_t) MAX_ROWS * c.n_ff);
+        dev.hn = dev.alloc<float>((size_t) MAX_ROWS * n);
         dev.mhn = dev.alloc<float>(n);
-        dev.me = dev.alloc<float>((size_t) MAX_NT * n);
-        dev.cat = dev.alloc<float>((size_t) MAX_NT * 2 * n);
-        dev.logits = dev.alloc<float>((size_t) MAX_NT * dev.output.n);
-        dev.res = dev.alloc<float>(MAX_NT * 2);
-        dev.mres = dev.alloc<float>(MAX_NT * 2);
-        dev.ss = dev.alloc<float>(MAX_NT * 64);
+        dev.me = dev.alloc<float>((size_t) MAX_ROWS * n);
+        dev.cat = dev.alloc<float>((size_t) MAX_ROWS * 2 * n);
+        dev.logits = dev.alloc<float>((size_t) MAX_ROWS * dev.output.n);
+        dev.res = dev.alloc<float>(MAX_ROWS * 2);
+        dev.mres = dev.alloc<float>(MAX_ROWS * 2);
+        dev.ss = dev.alloc<float>(MAX_ROWS * 64);
+        dev.xh = dev.alloc<half>((size_t) MAX_ROWS * std::max(c.n_ff, 2 * n));
+        dev.p16 = dev.alloc<half>((size_t) MAX_ROWS * n);
+        dev.recv = dev.alloc<half>((size_t) (nd - 1) * MAX_ROWS * n + 1);
+        dev.pos2 = dev.alloc<int>(1);
+        dev.ev_layer.resize(c.n_layer);
+        for (auto & ev : dev.ev_layer) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         dev.pos = dev.alloc<int>(1);
         dev.mpos = dev.alloc<int>(1);
         dev.counter = dev.alloc<int>(1);
@@ -401,51 +433,123 @@ void Engine::reset() {
     }
 }
 
-// ---------------- graph recording ----------------
-// Each allreduce also writes the sums of squares of the new residual, feeding the next GEMV's fused RMSNorm.
-
-void Engine::record_attn(Device & d, DevLayer & L, int nt, const int * pos, int & call) {
-    const Qwen35Config & c = cfg_;
-    cudaStream_t s = d.stream;
-    const float eps = c.rms_eps;
-    const int n = c.n_embd, nss = n / AR_SS_SPAN, bs = d.big_stride;
-    NormIn ni; ni.w = L.attn_norm; ni.ss = d.ss; ni.nss = nss; ni.eps = eps;
-    gemv_bf16(L.wqkv, d.x, n, d.big0, bs, nullptr, nt, s, ni);
-    attn_prep(d.big0, bs, L.q_norm, L.k_norm, L.kcache, L.vcache, pos, opt_.max_pos, L.n_head_l, L.n_kv_l, c.head_dim,
-              c.n_rot, c.rope_base, eps, nt, s);
-    const int ostride = L.n_head_l * c.head_dim;
-    attn_decode(d.big0, bs, L.kcache, L.vcache, d.o, ostride, pos, opt_.max_pos, L.n_head_l, L.n_kv_l, L.head_off,
-                c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), nt, s);
-    gemv_q8(L.wo, d.o, ostride, d.part, n, nullptr, nt, s);
-    allreduce_add_ll16(d.x, d.part, ar_ll_, d.g, opt_.n_devices, nt * n, d.counter, call++, s, d.ss);
+// ---------------- matmul dispatch ----------------
+// decode sizes: split-K GEMV with the norm fused from allreduce statistics; bulk (prefill): fp16 conversion
+// (+ norm computed in place) and the tiled GEMM
+template <typename W>
+static void mm(const Engine::Act & a, const W & w, const float * x, int xs, float * y, int ys, int nt, const NormIn & ni = {}) {
+    if (!a.bulk) {
+        if constexpr (std::is_same_v<W, Q8W>) gemv_q8(w, x, xs, y, ys, nullptr, nt, a.s, ni);
+        else gemv_bf16(w, x, xs, y, ys, nullptr, nt, a.s, ni);
+        return;
+    }
+    to_half(x, xs, ni.w, w.k, ni.eps, a.xh, nt, a.s);
+    if constexpr (std::is_same_v<W, Q8W>) gemm_q8(w, a.xh, nt, y, ys, nullptr, a.s);
+    else gemm_f16(w, a.xh, nt, y, ys, nullptr, a.s);
 }
 
-void Engine::record_gdn(Device & d, DevLayer & L, int nt, bool snap, int & call) {
+// ---------------- graph recording ----------------
+
+// activation view: rows [row0, row0 + nt) of the device buffers on one stream
+Engine::Act Engine::act(Device & d, int row0, int sid, cudaStream_t s, const int * pos, bool bulk) {
     const Qwen35Config & c = cfg_;
-    cudaStream_t s = d.stream;
+    const size_t n = c.n_embd;
+    Act a;
+    a.x = d.x + row0 * n; a.part = d.part + row0 * n;
+    a.big0 = d.big0 + (size_t) row0 * d.big_stride; a.big1 = d.big1 + (size_t) row0 * d.big_stride;
+    a.o = d.o + (size_t) row0 * std::max(c.ssm_d_inner, c.n_head * c.head_dim);
+    a.h = d.h + (size_t) row0 * c.n_ff;
+    a.ss = d.ss + (size_t) row0 * (n / AR_SS_SPAN);
+    a.xh = d.xh + (size_t) row0 * std::max(c.n_ff, 2 * c.n_embd);
+    a.p16 = d.p16 + row0 * n;
+    a.recv = d.recv + row0 * n;
+    a.pos = pos; a.s = s; a.sid = sid; a.bulk = bulk;
+    return a;
+}
+
+// a.x += sum over devices of a.part (nt rows). Decode: LL kernel, also refreshing a.ss for the next fused norm.
+// Bulk: fp16 parts through pinned host memory with the copy engines; peers' copies are ordered by events, which
+// is why every device's host thread meets at a barrier between recording its upload and the peers' downloads.
+void Engine::allreduce(Device & d, Act & a, int nt, int & call) {
+    const int n = nt * cfg_.n_embd, nd = opt_.n_devices;
+    if (!a.bulk) { allreduce_add_ll16(a.x, a.part, ar_ll_, d.g, nd, n, d.counter, call++, a.s, a.ss); return; }
+    const int par = call++ & 1;
+    auto stage = [&](int sid, int p, int g) { return h_stage_ + (((size_t) sid * 2 + p) * nd + g) * MAX_ROWS * cfg_.n_embd; };
+    to_half(a.part, cfg_.n_embd, nullptr, cfg_.n_embd, 0.0f, a.p16, nt, a.s);
+    CUDA_CHECK(cudaMemcpyAsync(stage(a.sid, par, d.g), a.p16, (size_t) n * sizeof(half), cudaMemcpyDeviceToHost, a.s));
+    CUDA_CHECK(cudaEventRecord(d.ev_ar[a.sid][par], a.s));
+    barrier_->wait();
+    int j = 0;
+    for (int p = 0; p < nd; ++p) {
+        if (p == d.g) continue;
+        CUDA_CHECK(cudaStreamWaitEvent(a.s, devs_[p]->ev_ar[a.sid][par], 0));
+        CUDA_CHECK(cudaMemcpyAsync(a.recv + (size_t) j * MAX_ROWS * cfg_.n_embd, stage(a.sid, par, p), (size_t) n * sizeof(half),
+                                   cudaMemcpyHostToDevice, a.s));
+        ++j;
+    }
+    add_parts(a.x, a.p16, a.recv, (size_t) MAX_ROWS * cfg_.n_embd, nd - 1, n, a.s);
+}
+
+// prefill micro-batch ordering: dep_wait (stream B) waits for what stream A recorded at the same layer
+void Engine::record_attn(Device & d, DevLayer & L, Act & a, int nt, int & call, const Dep & dep) {
+    const Qwen35Config & c = cfg_;
+    const float eps = c.rms_eps;
+    const int n = c.n_embd, nss = n / AR_SS_SPAN, bs = d.big_stride;
+    NormIn ni; ni.w = L.attn_norm; ni.ss = a.ss; ni.nss = nss; ni.eps = eps;
+    mm(a, L.wqkv, a.x, n, a.big0, bs, nt, ni);
+    attn_prep(a.big0, bs, L.q_norm, L.k_norm, L.kcache, L.vcache, a.pos, opt_.max_pos, L.n_head_l, L.n_kv_l, c.head_dim,
+              c.n_rot, c.rope_base, eps, nt, a.s);
+    if (dep.signal) CUDA_CHECK(cudaEventRecord(dep.signal, a.s));   // this micro-batch's K/V are in the cache
+    if (dep.wait) CUDA_CHECK(cudaStreamWaitEvent(a.s, dep.wait, 0));
+    const int ostride = L.n_head_l * c.head_dim;
+    attn_decode(a.big0, bs, L.kcache, L.vcache, a.o, ostride, a.pos, opt_.max_pos, L.n_head_l, L.n_kv_l, L.head_off,
+                c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), nt, a.s);
+    mm(a, L.wo, a.o, ostride, a.part, n, nt);
+    allreduce(d, a, nt, call);
+}
+
+void Engine::record_gdn(Device & d, DevLayer & L, Act & a, int nt, bool snap, int & call, const Dep & dep) {
+    const Qwen35Config & c = cfg_;
     const float eps = c.rms_eps;
     const int n = c.n_embd, nss = n / AR_SS_SPAN, bs = d.big_stride, dv = c.head_v_dim();
-    NormIn ni; ni.w = L.attn_norm; ni.ss = d.ss; ni.nss = nss; ni.eps = eps;
-    gemv_q8(L.win, d.x, n, d.big0, bs, nullptr, nt, s, ni);
+    NormIn ni; ni.w = L.attn_norm; ni.ss = a.ss; ni.nss = nss; ni.eps = eps;
+    mm(a, L.win, a.x, n, a.big0, bs, nt, ni);
     const int z_off = L.conv_ch, ab_off = L.conv_ch + L.n_v_l * dv;
-    gdn_conv(d.big0, bs, L.conv_state, snap ? L.conv_snap : nullptr, L.conv_w, L.conv_ch, c.ssm_conv, nt, s);
+    if (dep.wait) CUDA_CHECK(cudaStreamWaitEvent(a.s, dep.wait, 0));   // recurrent state after the previous micro-batch
+    gdn_conv(a.big0, bs, L.conv_state, snap ? L.conv_snap : nullptr, L.conv_w, L.conv_ch, c.ssm_conv, nt, a.s);
     const int ostride = L.n_v_l * dv;
-    gdn_step(d.big0, bs, ab_off, L.state, snap ? L.state_snap : nullptr, d.o, ostride, L.dt_bias, L.ssm_a, L.n_k_l, L.n_v_l,
-             c.ssm_d_state, dv, eps, nt, s);
-    gated_norm(d.o, ostride, d.big0 + z_off, bs, L.ssm_norm, L.n_v_l, dv, eps, nt, s);
-    gemv_q8(L.wout, d.o, ostride, d.part, n, nullptr, nt, s);
-    allreduce_add_ll16(d.x, d.part, ar_ll_, d.g, opt_.n_devices, nt * n, d.counter, call++, s, d.ss);
+    gdn_step(a.big0, bs, ab_off, L.state, snap ? L.state_snap : nullptr, a.o, ostride, L.dt_bias, L.ssm_a, L.n_k_l, L.n_v_l,
+             c.ssm_d_state, dv, eps, nt, a.s);
+    if (dep.signal) CUDA_CHECK(cudaEventRecord(dep.signal, a.s));
+    gated_norm(a.o, ostride, a.big0 + z_off, bs, L.ssm_norm, L.n_v_l, dv, eps, nt, a.s);
+    mm(a, L.wout, a.o, ostride, a.part, n, nt);
+    allreduce(d, a, nt, call);
 }
 
-void Engine::record_ffn(Device & d, DevLayer & L, int nt, int & call) {
+void Engine::record_ffn(Device & d, DevLayer & L, Act & a, int nt, int & call) {
     const Qwen35Config & c = cfg_;
-    cudaStream_t s = d.stream;
     const int n = c.n_embd, nss = n / AR_SS_SPAN, bs = d.big_stride;
-    NormIn ni; ni.w = L.post_norm; ni.ss = d.ss; ni.nss = nss; ni.eps = c.rms_eps;
-    gemv_q8(L.ffn_gu, d.x, n, d.big1, bs, nullptr, nt, s, ni);
-    silu_mul(d.big1, bs, d.h, c.n_ff, L.n_ff_l, nt, s);
-    gemv_q8(L.ffn_down, d.h, c.n_ff, d.part, n, nullptr, nt, s);
-    allreduce_add_ll16(d.x, d.part, ar_ll_, d.g, opt_.n_devices, nt * n, d.counter, call++, s, d.ss);
+    NormIn ni; ni.w = L.post_norm; ni.ss = a.ss; ni.nss = nss; ni.eps = c.rms_eps;
+    mm(a, L.ffn_gu, a.x, n, a.big1, bs, nt, ni);
+    silu_mul(a.big1, bs, a.h, c.n_ff, L.n_ff_l, nt, a.s);
+    mm(a, L.ffn_down, a.h, c.n_ff, a.part, n, nt);
+    allreduce(d, a, nt, call);
+}
+
+// transformer stack over act a; with two micro-batches (b != nullptr) both are recorded layer by layer so that
+// one stream's allreduce copies overlap the other's compute
+void Engine::record_layers(Device & d, Act & a, int nta, Act * b, int ntb, bool snap) {
+    const Qwen35Config & c = cfg_;
+    int call_a = 0, call_b = 0;
+    for (int il = 0; il < c.n_layer; ++il) {
+        DevLayer & L = d.layers[il];
+        Dep da, db;
+        if (b) { da.signal = d.ev_layer[il]; db.wait = d.ev_layer[il]; }
+        if (L.full) record_attn(d, L, a, nta, call_a, da); else record_gdn(d, L, a, nta, snap, call_a, da);
+        if (b) { if (L.full) record_attn(d, L, *b, ntb, call_b, db); else record_gdn(d, L, *b, ntb, snap, call_b, db); }
+        record_ffn(d, L, a, nta, call_a);
+        if (b) record_ffn(d, L, *b, ntb, call_b);
+    }
 }
 
 void Engine::record_main(int gi, int nt) {
@@ -453,22 +557,29 @@ void Engine::record_main(int gi, int nt) {
     Device & d = *devs_[gi];
     cudaStream_t s = d.stream;
     const int n = c.n_embd, nss = n / AR_SS_SPAN;
+    const bool bulk = nt > MAX_NT;
     CUDA_CHECK(cudaMemcpyAsync(d.pos, h_pos_, sizeof(int), cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaMemcpyAsync(d.x, h_embd_, (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
     incr_counter(d.counter, s);
     sumsq(d.x, n, n, nt, d.ss, nss, s);
-    int call = 0;
-    for (int il = 0; il < c.n_layer; ++il) {
-        DevLayer & L = d.layers[il];
-        if (L.full) record_attn(d, L, nt, d.pos, call);
-        else record_gdn(d, L, nt, opt_.mtp && nt > 1, call);
-        record_ffn(d, L, nt, call);
+    Act a = act(d, 0, 0, s, d.pos, bulk);
+    if (bulk && nt >= 2 * MIN_MICRO) {
+        const int nta = (nt / 2 + 63) / 64 * 64, ntb = nt - nta;
+        CUDA_CHECK(cudaMemcpyAsync(d.pos2, h_pos_ + 2, sizeof(int), cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaEventRecord(d.ev_fork, s));
+        CUDA_CHECK(cudaStreamWaitEvent(d.stream2, d.ev_fork, 0));
+        Act b = act(d, nta, 1, d.stream2, d.pos2, true);
+        record_layers(d, a, nta, &b, ntb, false);
+        CUDA_CHECK(cudaEventRecord(d.ev_join, d.stream2));
+        CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_join, 0));
+    } else {
+        record_layers(d, a, nt, nullptr, 0, opt_.mtp && nt > 1 && !bulk);
     }
     if (opt_.mtp) rmsnorm(d.x, n, d.output_norm, d.hn, n, n, nt, c.rms_eps, s);   // hidden fed to the MTP head
     NormIn ni; ni.w = d.output_norm; ni.ss = d.ss; ni.nss = nss; ni.eps = c.rms_eps;
-    gemv_bf16(d.output, d.x, n, d.logits, d.output.n, nullptr, nt, s, ni);
+    mm(a, d.output, d.x, n, d.logits, d.output.n, nt, ni);
     argmax_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.res, nt, s);
-    CUDA_CHECK(cudaMemcpyAsync(h_res_ + (size_t) gi * MAX_NT * 2, d.res, (size_t) nt * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(h_res_ + (size_t) gi * MAX_ROWS * 2, d.res, (size_t) nt * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
 }
 
 // chain = false: hidden rows come from the main model (hn); chain = true (nt = 1): from MTP's own last output
@@ -478,26 +589,28 @@ void Engine::record_mtp(int gi, int nt, bool chain) {
     DevLayer & L = d.mtp;
     cudaStream_t s = d.stream;
     const int n = c.n_embd, nss = n / AR_SS_SPAN;
+    Act a = act(d, 0, 0, s, d.mpos, nt > MAX_NT);
     CUDA_CHECK(cudaMemcpyAsync(d.mpos, h_pos_ + 1, sizeof(int), cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaMemcpyAsync(d.me, h_membd_, (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
     incr_counter(d.counter, s);
     // concat [rms(e) * enorm | rms(h) * hnorm] -> eh_proj (column slice) -> allreduce into a zeroed residual
     rmsnorm(d.me, n, L.enorm, d.cat, 2 * n, n, nt, c.rms_eps, s);
     rmsnorm(chain ? d.mhn : d.hn, n, L.hnorm, d.cat + n, 2 * n, n, nt, c.rms_eps, s);
-    gemv_bf16(L.eh_proj, d.cat + L.eh_c0, 2 * n, d.part, n, nullptr, nt, s);
+    mm(a, L.eh_proj, d.cat + L.eh_c0, 2 * n, d.part, n, nt);
     CUDA_CHECK(cudaMemsetAsync(d.x, 0, (size_t) nt * n * sizeof(float), s));
     int call = 0;
-    allreduce_add_ll16(d.x, d.part, ar_ll_, d.g, opt_.n_devices, nt * n, d.counter, call++, s, d.ss);
-    record_attn(d, L, nt, d.mpos, call);
-    record_ffn(d, L, nt, call);
+    allreduce(d, a, nt, call);
+    record_attn(d, L, a, nt, call, {});
+    record_ffn(d, L, a, nt, call);
     const float * hw = L.head_norm ? L.head_norm : d.output_norm;
     rmsnorm(d.x + (size_t) (nt - 1) * n, n, hw, d.mhn, n, n, 1, c.rms_eps, s);   // feeds chained drafts
-    NormIn ni; ni.w = hw; ni.ss = d.ss; ni.nss = nss; ni.eps = c.rms_eps;
-    // only the last row's draft is used: run the (Q8) head on that row alone
-    NormIn nl = ni; nl.ss = d.ss + (size_t) (nt - 1) * nss;
-    gemv_q8(d.output_q8, d.x + (size_t) (nt - 1) * n, n, d.logits, d.output.n, nullptr, 1, s, nl);
-    argmax_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.mres + (size_t) (nt - 1) * 2, 1, s);
-    CUDA_CHECK(cudaMemcpyAsync(h_mres_ + (size_t) gi * MAX_NT * 2, d.mres, (size_t) nt * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
+    // only the last row's draft is used: run the (Q8) head on that row alone, normed by its own statistics
+    sumsq(d.x + (size_t) (nt - 1) * n, n, n, 1, d.ss, nss, s);
+    NormIn nl; nl.w = hw; nl.ss = d.ss; nl.nss = nss; nl.eps = c.rms_eps;
+    Act a1 = act(d, 0, 0, s, d.mpos, false);
+    mm(a1, d.output_q8, d.x + (size_t) (nt - 1) * n, n, d.logits, d.output.n, 1, nl);
+    argmax_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.mres, 1, s);
+    CUDA_CHECK(cudaMemcpyAsync(h_mres_ + (size_t) gi * 2, d.mres, 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
 }
 
 // roll the recurrent state back to the snapshot taken after token keep-1 of the last multi-token forward
@@ -539,6 +652,25 @@ void Engine::build_graphs() {
 }
 
 void Engine::launch(int kind, int nt) {
+    if (nt > MAX_NT) {   // prefill chunk: record straight into the streams (allreduce kernels spin until all GPUs arrive)
+        if (kind != 0 && kind != 1) throw std::runtime_error("launch: bad kind for a prefill chunk");
+        std::vector<std::thread> th;
+        std::vector<std::string> err(devs_.size());
+        for (int gi = 0; gi < (int) devs_.size(); ++gi)
+            th.emplace_back([&, gi] {
+                try {
+                    CUDA_CHECK(cudaSetDevice(devs_[gi]->id));
+                    if (kind == 0) record_main(gi, nt); else record_mtp(gi, nt, false);
+                } catch (const std::exception & ex) { err[gi] = ex.what(); }
+            });
+        for (auto & t : th) t.join();
+        for (auto & m : err) if (!m.empty()) throw std::runtime_error(m);
+        for (auto & dp : devs_) {
+            CUDA_CHECK(cudaSetDevice(dp->id));
+            CUDA_CHECK(cudaStreamSynchronize(dp->stream));
+        }
+        return;
+    }
     if (!graphs_ready_) build_graphs();
     for (auto & dp : devs_) {
         CUDA_CHECK(cudaSetDevice(dp->id));
@@ -567,11 +699,11 @@ void Engine::embed(const int * tokens, int nt, float * dst) {
     }
 }
 
-static int best_of(const float * res, int ndev, int t) {
+static int best_of(const float * res, int ndev, int t, int stride) {
     float best = -INFINITY; int bi = -1;
     for (int g = 0; g < ndev; ++g) {
-        const float v = res[(size_t) g * MAX_NT * 2 + 2 * t];
-        const int idx = ((const int *) res)[(size_t) g * MAX_NT * 2 + 2 * t + 1];
+        const float v = res[(size_t) g * stride * 2 + 2 * t];
+        const int idx = ((const int *) res)[(size_t) g * stride * 2 + 2 * t + 1];
         if (v > best) { best = v; bi = idx; }
     }
     return bi;
@@ -579,27 +711,30 @@ static int best_of(const float * res, int ndev, int t) {
 
 std::vector<int> Engine::forward(const int * tokens, int nt, int pos) {
     if (pos + nt > opt_.max_pos) throw std::runtime_error("forward: position exceeds max_pos");
+    if (nt < 1 || nt > MAX_ROWS) throw std::runtime_error("forward: bad token count");
     embed(tokens, nt, h_embd_);
     h_pos_[0] = pos;
+    h_pos_[2] = pos + (nt / 2 + 63) / 64 * 64;   // second prefill micro-batch
     launch(0, nt);
     last_nt_ = nt;
     std::vector<int> out(nt);
-    for (int t = 0; t < nt; ++t) out[t] = best_of(h_res_, (int) devs_.size(), t);
+    for (int t = 0; t < nt; ++t) out[t] = best_of(h_res_, (int) devs_.size(), t, MAX_ROWS);
     return out;
 }
 
 int Engine::mtp_draft(const int * tokens, int nt, int pos) {
+    if (nt < 1 || nt > MAX_ROWS) throw std::runtime_error("mtp_draft: bad token count");
     embed(tokens, nt, h_membd_);
     h_pos_[1] = pos;
     launch(1, nt);
-    return best_of(h_mres_, (int) devs_.size(), nt - 1);
+    return best_of(h_mres_, (int) devs_.size(), 0, 1);
 }
 
 int Engine::mtp_chain(int token, int pos) {
     embed(&token, 1, h_membd_);
     h_pos_[1] = pos;
     launch(3, 1);
-    return best_of(h_mres_, (int) devs_.size(), 0);
+    return best_of(h_mres_, (int) devs_.size(), 0, 1);
 }
 
 void Engine::get_logits(int t, std::vector<float> & out) {
@@ -615,16 +750,30 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
     if (spec && !opt_.mtp) throw std::runtime_error("generate: MTP head not loaded");
     if (prompt.empty()) throw std::runtime_error("generate: empty prompt");
     reset();
-    // prompt token by token; with MTP the head also consumes (t_{q+1}, h_q) at position q
-    int next = -1;
-    for (int q = 0; q < (int) prompt.size(); ++q) {
-        if (spec && q > 0) mtp_draft(&prompt[q], 1, q - 1);
-        next = forward(&prompt[q], 1, q)[0];
-    }
-    std::vector<int> out;
-    int p = (int) prompt.size();
-    auto t0 = std::chrono::steady_clock::now();
+    // prompt in chunks of up to MAX_ROWS; with MTP the head then consumes (t_{q+1}, h_q) at position q for the
+    // chunk's rows (the last chunk's final pair uses the predicted next token and yields the first draft)
+    using clk = std::chrono::steady_clock;
+    auto since = [](clk::time_point a) { return std::chrono::duration<double>(clk::now() - a).count(); };
     GenStats st;
+    const int P = (int) prompt.size();
+    const int K = opt_.n_draft;
+    std::vector<int> drafts(K);
+    auto tp = clk::now();
+    int next = -1;
+    for (int c0 = 0; c0 < P; c0 += MAX_ROWS) {
+        const int len = std::min(MAX_ROWS, P - c0);
+        next = forward(&prompt[c0], len, c0)[len - 1];
+        if (spec) {
+            std::vector<int> mt(len);
+            for (int j = 0; j < len; ++j) mt[j] = c0 + 1 + j < P ? prompt[c0 + 1 + j] : next;
+            const int d0 = mtp_draft(mt.data(), len, c0);
+            if (c0 + len == P) drafts[0] = d0;
+        }
+    }
+    st.t_prefill = since(tp);
+    std::vector<int> out;
+    int p = P;
+    auto t0 = clk::now();
     if (!spec) {
         while ((int) out.size() < n_gen) {
             out.push_back(next);
@@ -632,17 +781,13 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
             st.steps++;
         }
     } else {
-        using clk = std::chrono::steady_clock;
-        auto since = [](clk::time_point a) { return std::chrono::duration<double>(clk::now() - a).count(); };
-        const int K = opt_.n_draft;
-        std::vector<int> drafts(K);
         auto make_drafts = [&](const int * mt, int nt, int pos) {   // first from the main hidden, the rest chained
             auto ta = clk::now();
             drafts[0] = mtp_draft(mt, nt, pos);
             for (int j = 1; j < K; ++j) drafts[j] = mtp_chain(drafts[j - 1], pos + nt - 1 + j);
             st.t_mtp += since(ta);
         };
-        make_drafts(&next, 1, p - 1);             // (t_P, h_{P-1}) at P-1 predicts t_{P+1}
+        for (int j = 1; j < K; ++j) drafts[j] = mtp_chain(drafts[j - 1], p - 1 + j);   // first draft came with the prompt
         int cur = next;                           // token at position p, not yet in the main model
         std::vector<int> in(K + 1), mt(K + 1);
         while ((int) out.size() < n_gen) {

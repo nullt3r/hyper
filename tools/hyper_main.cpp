@@ -1,6 +1,7 @@
 // hyper CLI
 //   hyper check  <model> <ref.bin>              logits vs llama.cpp reference, one token per forward
 //   hyper check2 <model> <ref.bin>              same, two tokens per forward (speculative verification path)
+//   hyper checkn <model> <ref.bin> [n]          same, n tokens per forward (n > 4: prefill GEMM path)
 //   hyper gen    <model> <ref.bin> [n_prompt] [n_gen]   greedy: plain vs MTP speculative (must match), speed
 #include "engine.h"
 
@@ -56,7 +57,7 @@ static int cmd_check(const char * model, const char * ref_path, int nt) {
     const int n = (int) toks.size() / nt * nt;
     EngineOptions opt;
     opt.max_pos = n + 16;
-    opt.mtp = nt > 1;
+    opt.mtp = nt > 1 && nt <= 4;
     Engine eng(model, opt);
     if (eng.config().n_vocab != nv) { fprintf(stderr, "vocab mismatch\n"); return 1; }
     Cmp cmp;
@@ -68,7 +69,9 @@ static int cmd_check(const char * model, const char * ref_path, int nt) {
             cmp.add(&ref[(size_t) (i + t) * nv], lg, nv);
         }
     }
-    cmp.print(nt == 1 ? "CHECK" : "CHECK2");
+    char tag[32];
+    snprintf(tag, sizeof tag, nt == 1 ? "CHECK" : "CHECK nt=%d", nt);
+    cmp.print(tag);
     return 0;
 }
 
@@ -95,6 +98,25 @@ static int cmd_gen(const char * model, const char * ref_path, int n_prompt, int 
     return 0;
 }
 
+// prefill speed: the reference tokens repeated to n_prompt, then a few decoded tokens
+static int cmd_pfbench(const char * model, const char * ref_path, int n_prompt) {
+    std::vector<int> toks; std::vector<float> ref; int nv = 0;
+    if (!read_ref(ref_path, toks, ref, nv)) return 1;
+    std::vector<int> prompt(n_prompt);
+    for (int i = 0; i < n_prompt; ++i) prompt[i] = toks[i % toks.size()];
+    EngineOptions opt;
+    opt.max_pos = n_prompt + 64;
+    Engine eng(model, opt);
+    for (int rep = 0; rep < 2; ++rep) {
+        GenStats a, b;
+        eng.generate(prompt, 16, false, &a);
+        eng.generate(prompt, 16, true, &b);
+        printf("PFBENCH n=%d  prefill %.1f t/s (%.3f s)  prefill+MTP %.1f t/s (%.3f s)  decode %.1f t/s\n", n_prompt,
+               n_prompt / a.t_prefill, a.t_prefill, n_prompt / b.t_prefill, b.t_prefill, a.tokens / a.seconds);
+    }
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: hyper check|check2 <model> <ref.bin> | hyper gen <model> <ref.bin> [n_prompt] [n_gen]\n");
@@ -104,6 +126,8 @@ int main(int argc, char ** argv) {
     try {
         if (cmd == "check") return cmd_check(argv[2], argv[3], 1);
         if (cmd == "check2") return cmd_check(argv[2], argv[3], 2);
+        if (cmd == "pfbench") return cmd_pfbench(argv[2], argv[3], argc > 4 ? atoi(argv[4]) : 2048);
+        if (cmd == "checkn") return cmd_check(argv[2], argv[3], argc > 4 ? atoi(argv[4]) : 64);
         if (cmd == "gen") return cmd_gen(argv[2], argv[3], argc > 4 ? atoi(argv[4]) : 64, argc > 5 ? atoi(argv[5]) : 256);
     } catch (const std::exception & e) {
         fprintf(stderr, "error: %s\n", e.what());

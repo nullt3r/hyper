@@ -6,6 +6,7 @@
 #include "kernels.cuh"
 #include "model.h"
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -22,10 +23,39 @@ struct GenStats {
     int tokens = 0, steps = 0, accepted = 0;
     double seconds = 0;
     double t_main = 0, t_mtp = 0, t_restore = 0;   // wall time per phase
+    double t_prefill = 0;
+};
+
+// spin barrier for the per-device recording threads
+class Barrier {
+public:
+    explicit Barrier(int n) : n_(n) {}
+    void wait() {
+        const unsigned gen = gen_.load(std::memory_order_acquire);
+        if (count_.fetch_add(1, std::memory_order_acq_rel) + 1 == n_) {
+            count_.store(0, std::memory_order_relaxed);
+            gen_.fetch_add(1, std::memory_order_acq_rel);
+        } else {
+            while (gen_.load(std::memory_order_acquire) == gen) {}
+        }
+    }
+private:
+    int n_;
+    std::atomic<int> count_{0};
+    std::atomic<unsigned> gen_{0};
 };
 
 class Engine {
 public:
+    // per-stream activation view used while recording
+    struct Act {
+        float * x, * part, * big0, * big1, * o, * h, * ss;
+        half * xh, * p16, * recv;
+        const int * pos;
+        cudaStream_t s;
+        int sid;      // bulk allreduce channel (micro-batch)
+        bool bulk;    // prefill: tiled GEMM + copy-engine allreduce
+    };
     Engine(const std::string & model_path, const EngineOptions & opt);
     ~Engine();
 
@@ -35,7 +65,7 @@ public:
     void get_logits(int t, std::vector<float> & out);
     void reset();
 
-    // greedy generation; prompt processed token by token. spec = use MTP drafts (1 per step)
+    // greedy generation; prompt processed in chunks of up to 512 tokens. spec = use MTP drafts (1 per step)
     std::vector<int> generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats);
 
     const Qwen35Config & config() const { return cfg_; }
@@ -48,9 +78,13 @@ private:
     void record_main(int gi, int nt);
     void record_mtp(int gi, int nt, bool chain);
     void record_restore(int gi, int keep);
-    void record_attn(Device & d, DevLayer & L, int nt, const int * pos, int & call);
-    void record_gdn(Device & d, DevLayer & L, int nt, bool snap, int & call);
-    void record_ffn(Device & d, DevLayer & L, int nt, int & call);
+    struct Dep { cudaEvent_t signal = nullptr, wait = nullptr; };
+    Act act(Device & d, int row0, int sid, cudaStream_t s, const int * pos, bool bulk);
+    void record_attn(Device & d, DevLayer & L, Act & a, int nt, int & call, const Dep & dep);
+    void record_gdn(Device & d, DevLayer & L, Act & a, int nt, bool snap, int & call, const Dep & dep);
+    void record_ffn(Device & d, DevLayer & L, Act & a, int nt, int & call);
+    void record_layers(Device & d, Act & a, int nta, Act * b, int ntb, bool snap);
+    void allreduce(Device & d, Act & a, int nt, int & call);
     void build_graphs();
     void launch(int kind, int nt);   // kind: 0 main, 1 mtp, 2 restore
     void embed(const int * tokens, int nt, float * dst);
@@ -63,10 +97,12 @@ private:
     std::vector<std::unique_ptr<Device>> devs_;
     float * h_embd_ = nullptr;   // pinned [MAX_NT][n_embd] main input
     float * h_membd_ = nullptr;  // pinned [MAX_NT][n_embd] MTP input
-    int * h_pos_ = nullptr;      // pinned [2]: main pos, mtp pos
+    int * h_pos_ = nullptr;      // pinned [4]: main pos, mtp pos, second micro-batch pos
     float * h_res_ = nullptr;    // pinned [ndev][MAX_NT][2] main argmax pairs
     float * h_mres_ = nullptr;   // pinned [ndev][MAX_NT][2] mtp argmax pairs
-    uint2 * ar_ll_ = nullptr;    // mapped LL slots [2][ndev][MAX_NT * n_embd / 2]
+    uint2 * ar_ll_ = nullptr;    // mapped LL slots [2][ndev][rows * n_embd / 2]
+    half * h_stage_ = nullptr;   // pinned bulk allreduce staging [micro-batch][parity][ndev][MAX_ROWS * n_embd]
+    std::unique_ptr<Barrier> barrier_;
     bool graphs_ready_ = false;
     int last_nt_ = 0;
 };

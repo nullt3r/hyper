@@ -46,3 +46,6 @@ $(BUILD)/gemvbench: tools/gemvbench.cu $(BUILD)/kernels.o
 
 $(BUILD)/mmabench: tools/mmabench.cu $(BUILD)/kernels.o
 	$(NVCC) $(NVFLAGS) tools/mmabench.cu $(BUILD)/kernels.o -o $@ $(LIBS)
+
+$(BUILD)/arbulk: tools/arbulk.cu $(BUILD)/kernels.o
+	$(NVCC) $(NVFLAGS) tools/arbulk.cu $(BUILD)/kernels.o -o $@ $(LIBS)
