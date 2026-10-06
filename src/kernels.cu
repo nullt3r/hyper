@@ -41,6 +41,18 @@ __device__ __forceinline__ float input_inv_rms(const float * __restrict__ ss, in
     return rsqrtf(t / k + eps);
 }
 
+__device__ __forceinline__ float silu_f(float x) { return x / (1.0f + __expf(-x)); }
+// GEMV input activation (NormIn::act) for the two float2 an mma lane loads at columns c0 and c0 + 8
+__device__ __forceinline__ void apply_act(const NormIn & nin, const float * xr, int c0, float2 & v0, float2 & v1) {
+    if (nin.act == 1) {
+        const float s = nin.act_scale;
+        v0.x = silu_f(v0.x * s); v0.y = silu_f(v0.y * s); v1.x = silu_f(v1.x * s); v1.y = silu_f(v1.y * s);
+    } else {
+        const float2 u0 = *(const float2 *) (xr + c0 + nin.glu_off), u1 = *(const float2 *) (xr + c0 + 8 + nin.glu_off);
+        v0.x = silu_f(v0.x) * u0.x; v0.y = silu_f(v0.y) * u0.y; v1.x = silu_f(v1.x) * u1.x; v1.y = silu_f(v1.y) * u1.y;
+    }
+}
+
 // ---- tensor-core Q8 GEMM for few tokens ----
 // two int8 (bytes of v selected by `sel`) -> half2 exactly: half(1024 + (b ^ 0x80)) - 1152
 __device__ __forceinline__ unsigned i8x2_to_h2(unsigned v, unsigned sel) {
@@ -100,6 +112,7 @@ __global__ void k_mma_q8(const uint4 * __restrict__ wq, const half * __restrict_
                     const float2 w0 = *(const float2 *) (nin.w + c0), w1 = *(const float2 *) (nin.w + c0 + 8);
                     v0.x *= inv * w0.x; v0.y *= inv * w0.y; v1.x *= inv * w1.x; v1.y *= inv * w1.y;
                 }
+                if (nin.act) apply_act(nin, xr, c0, v0, v1);
                 bb[0] = pack_h2(v0.x, v0.y);
                 bb[1] = pack_h2(v1.x, v1.y);
             }
@@ -176,6 +189,7 @@ __global__ void k_mma_f16(const uint4 * __restrict__ wq, int n, int k,
                 const float2 w0 = *(const float2 *) (nin.w + c0), w1 = *(const float2 *) (nin.w + c0 + 8);
                 v0.x *= inv * w0.x; v0.y *= inv * w0.y; v1.x *= inv * w1.x; v1.y *= inv * w1.y;
             }
+            if (nin.act) apply_act(nin, xr, c0, v0, v1);
             bb[0] = pack_h2(v0.x, v0.y);
             bb[1] = pack_h2(v1.x, v1.y);
         }
@@ -982,6 +996,40 @@ __global__ void k_add_parts(float * x, const half * __restrict__ own, const half
     xp[0] = a; xp[1] = b;
 }
 
+// LL allreduce with the hyper-connection scatter as its epilogue (see allreduce_hc_ll16)
+__global__ void k_allreduce_hc_ll16(float * res, const float * __restrict__ inj, int width, int hc, const float * __restrict__ part,
+                                    uint2 * slots, int g, int ndev, int n2, const int * counter, int call) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n2) return;
+    const unsigned seq = (unsigned) (*counter) * 1024u + (unsigned) call + 1u;
+    uint2 * buf = slots + (size_t) (call & 1) * ndev * n2;
+    const float2 mine = ((const float2 *) part)[i];
+    const __half2 mh = __floats2half2_rn(mine.x, mine.y);
+    volatile unsigned long long * dst = (volatile unsigned long long *) &buf[(size_t) g * n2 + i];
+    *dst = ((unsigned long long) seq << 32) | (unsigned long long) *(const unsigned *) &mh;
+    float2 acc = make_float2(0.0f, 0.0f);
+    for (int dd = 0; dd < ndev; ++dd) {
+        float2 f;
+        if (dd == g) f = __half22float2(mh);
+        else {
+            volatile unsigned long long * src = (volatile unsigned long long *) &buf[(size_t) dd * n2 + i];
+            unsigned long long v;
+            do { v = *src; } while ((unsigned) (v >> 32) != seq);
+            const unsigned bits = (unsigned) (v & 0xffffffffu);
+            f = __half22float2(*(const __half2 *) &bits);
+        }
+        acc.x += f.x; acc.y += f.y;
+    }
+    const int e = 2 * i, t = e / width, col = e % width;
+    for (int s = 0; s < hc; ++s) {
+        const float w = 2.0f / (1.0f + __expf(-inj[t * 4 + s] / hc));
+        float2 * rp = (float2 *) (res + ((size_t) t * hc + s) * width + col);
+        float2 r = *rp;
+        r.x += acc.x * w; r.y += acc.y * w;
+        *rp = r;
+    }
+}
+
 __global__ void k_incr(int * c) { *c += 1; }
 
 } // namespace
@@ -995,6 +1043,51 @@ __global__ void k_incr(int * c) { *c += 1; }
         case 4: { constexpr int NT = 4; CALL; } break;        \
         default: throw std::runtime_error("unsupported nt");  \
     }
+
+// small K (<= 16 Q8 blocks): one warp per 16-row tile walks all k blocks, no cross-warp reduction
+__global__ void k_mma_q8_smallk(const uint4 * __restrict__ wq, const half * __restrict__ ws, int n, int k,
+                                const float * __restrict__ x, int xs, float * __restrict__ y, int ys, int nt, NormIn nin) {
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+    const int tile = blockIdx.x * (blockDim.x >> 5) + w;
+    const int ntile = (n + 15) / 16;
+    if (tile >= ntile) return;
+    const int kb = k / 32;
+    const uint4 * tq = wq + (size_t) tile * kb * 32 + lane;
+    const half * ts = ws + (size_t) tile * kb * 16;
+    const bool tok_ok = gid < nt;
+    const int tok = tok_ok ? gid : 0;
+    const float * xr = x + (size_t) tok * xs;
+    float acc[4] = {0, 0, 0, 0};
+    for (int b = 0; b < kb; ++b) {
+        const uint4 q = __ldg(tq + (size_t) b * 32);
+        const float s_lo = __half2float(ts[(size_t) b * 16 + gid]), s_hi = __half2float(ts[(size_t) b * 16 + gid + 8]);
+        const unsigned qw[4] = {q.x, q.y, q.z, q.w};
+        float tmp[4] = {0, 0, 0, 0};
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            unsigned a[4];
+            a[0] = i8x2_to_h2(qw[2 * ks], 0x5140);
+            a[1] = i8x2_to_h2(qw[2 * ks], 0x7362);
+            a[2] = i8x2_to_h2(qw[2 * ks + 1], 0x5140);
+            a[3] = i8x2_to_h2(qw[2 * ks + 1], 0x7362);
+            const int c0 = b * 32 + ks * 16 + 2 * tig;
+            unsigned bb[2] = {0, 0};
+            if (tok_ok) {
+                float2 v0 = *(const float2 *) (xr + c0), v1 = *(const float2 *) (xr + c0 + 8);
+                if (nin.act) apply_act(nin, xr, c0, v0, v1);
+                bb[0] = pack_h2(v0.x, v0.y);
+                bb[1] = pack_h2(v1.x, v1.y);
+            }
+            mma16816(tmp, a, bb);
+        }
+        acc[0] += tmp[0] * s_lo; acc[1] += tmp[1] * s_lo;
+        acc[2] += tmp[2] * s_hi; acc[3] += tmp[3] * s_hi;
+    }
+    const int r0 = tile * 16 + gid, t0 = 2 * tig;
+    auto put = [&](int row, int t, float v) { if (row < n && t < nt) y[(size_t) t * ys + row] = v; };
+    put(r0, t0, acc[0]); put(r0, t0 + 1, acc[1]);
+    put(r0 + 8, t0, acc[2]); put(r0 + 8, t0 + 1, acc[3]);
+}
 
 // split-K scratch per device (gemv_init): tile partials and per-tile counters
 namespace { struct KSplit { float * part = nullptr; unsigned * cnt = nullptr; }; KSplit g_ksplit[16]; }
@@ -1010,6 +1103,10 @@ void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const fl
              const NormIn & nin) {
     if (nt < 1 || nt > 8) throw std::runtime_error("gemv_q8: nt must be 1..8");
     const int tiles = (W.n + 15) / 16, kb = W.k / 32;
+    if (kb <= 16 && !add && !nin.w) {   // short rows: a warp per tile
+        k_mma_q8_smallk<<<(tiles + 7) / 8, 256, 0, s>>>(W.q, W.s, W.n, W.k, x, xs, y, ys, nt, nin);
+        return;
+    }
     int P = 1;
     int dev = 0;
     cudaGetDevice(&dev);
@@ -1204,6 +1301,11 @@ void add_parts(float * x, const half * own, const half * recv, size_t stride, in
 }
 void topk_pairs(const float * x, int xs, int n, int offset, float * out, int K, int nt, cudaStream_t s) {
     k_topk<<<nt, 1024, 0, s>>>(x, xs, n, offset, out, K);
+}
+void allreduce_hc_ll16(float * res, const float * inj, int width, int hc, const float * part, uint2 * slots, int g, int ndev, int n,
+                       const int * counter, int call, cudaStream_t s) {
+    const int n2 = n / 2;
+    k_allreduce_hc_ll16<<<(n2 + 255) / 256, 256, 0, s>>>(res, inj, width, hc, part, slots, g, ndev, n2, counter, call);
 }
 void incr_counter(int * c, cudaStream_t s) { k_incr<<<1, 1, 0, s>>>(c); }
 

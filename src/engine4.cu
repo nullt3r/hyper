@@ -90,7 +90,7 @@ struct Engine4::Device {
     int vocab_off = 0;
     // activations [MAX_NT] rows
     float * x = nullptr, * res = nullptr, * xn = nullptr, * gate = nullptr, * lo = nullptr, * inj = nullptr, * mixed = nullptr;
-    float * bo = nullptr, * part = nullptr, * big0 = nullptr, * o = nullptr, * attn_part = nullptr;
+    float * bo = nullptr, * part = nullptr, * big0 = nullptr, * o = nullptr, * attn_part = nullptr, * injp = nullptr;
     float * rlog = nullptr, * wts = nullptr, * sg = nullptr, * shgu = nullptr, * shh = nullptr, * shpart = nullptr;
     float * hexp = nullptr, * yexp = nullptr, * ple_emb = nullptr, * ple_key = nullptr, * ple_val = nullptr, * ple_sc = nullptr;
     float * logits = nullptr, * res2 = nullptr;
@@ -273,7 +273,8 @@ void mmq(const Q8W & W, const float * x, int xs, float * y, int ys, int nt, cuda
 Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : opt_(opt) {
     debug_ = getenv("HYPER4_DEBUG") != nullptr;
     nocpu_ = getenv("HYPER4_NOCPU") != nullptr;
-    allrows_ = getenv("HYPER4_ALLROWS") != nullptr;   // timing experiment only: CPU experts ignored (wrong output)
+    allrows_ = getenv("HYPER4_ALLROWS") != nullptr;
+    grouped_decode_ = getenv("HYPER4_GROUPED") != nullptr;   // timing experiment only: CPU experts ignored (wrong output)
     gguf_ = std::make_unique<GGUF>(model_path);
     cfg_ = Q4Config::from_gguf(*gguf_);
     src_ = gguf_.get();
@@ -648,6 +649,7 @@ void Engine4::load_weights() {
         dev.gate = dev.alloc<float>((size_t) R * hcn);
         dev.lo = dev.alloc<float>((size_t) R * c.hc_lr);
         dev.inj = dev.alloc<float>((size_t) R * 4);
+        dev.injp = dev.alloc<float>((size_t) MAX_NT * c.hc * 4);
         dev.mixed = dev.alloc<float>((size_t) R * n);
         dev.bo = dev.alloc<float>((size_t) R * n);
         dev.part = dev.alloc<float>((size_t) R * n);
@@ -770,10 +772,10 @@ void Engine4::record_main(int gi, int nt, int kind) {
     const float eps = c.rms_eps;
     const bool bulk = nt > MAX_NT;
     // matmul: decode GEMV (split-K for few rows) or, for a prefill chunk, fp16 conversion + tiled tensor-core GEMM
-    auto mm = [&](const DW & W, const float * x, int xs, float * y, int ys, int rows) {
-        if (rows <= MAX_NT) {
-            if (W.f16) gemv_bf16(W.f, x, xs, y, ys, nullptr, rows, s, NormIn{});
-            else gemv_q8(W.q8, x, xs, y, ys, nullptr, rows, s, NormIn{});
+    auto mm = [&](const DW & W, const float * x, int xs, float * y, int ys, int rows, const NormIn & ni = NormIn{}) {
+        if (rows <= MAX_NT) {   // (ni: fused input activation; bulk callers apply it separately)
+            if (W.f16) gemv_bf16(W.f, x, xs, y, ys, nullptr, rows, s, ni);
+            else gemv_q8(W.q8, x, xs, y, ys, nullptr, rows, s, ni);
             return;
         }
         to_half(x, xs, nullptr, W.k(), 0.0f, d.xh, rows, s);
@@ -849,11 +851,17 @@ void Engine4::record_main(int gi, int nt, int kind) {
     auto hc_mix = [&](const float * norm, const DW & down, const DW & up, const float * inj, const float * res = nullptr, int rows = -1) {
         if (!res) res = R;
         if (rows < 0) rows = nt;
-        hc_norm(res, norm, d.xn, n, hc, eps, rows, s);
+        const bool finj = inj && rows <= MAX_NT;   // decode: the injection dots ride along the norm kernel
+        hc_norm(res, norm, d.xn, n, hc, eps, rows, s, finj ? inj : nullptr, d.injp, d.inj);
         mm(down, d.xn, hcn, d.lo, lr, rows);
-        silu_scale(d.lo, lr, 1.0f / hc, rows, lr, s);
-        mm(up, d.lo, lr, d.gate, hcn, rows);
-        if (inj) f32mm(inj, hc, hcn, d.xn, hcn, d.inj, 4, rows);
+        if (rows <= MAX_NT) {
+            NormIn act; act.act = 1; act.act_scale = 1.0f / hc;   // silu(lo / hc) on load
+            mm(up, d.lo, lr, d.gate, hcn, rows, act);
+        } else {
+            silu_scale(d.lo, lr, 1.0f / hc, rows, lr, s);
+            mm(up, d.lo, lr, d.gate, hcn, rows);
+        }
+        if (inj && !finj) f32mm(inj, hc, hcn, d.xn, hcn, d.inj, 4, rows);
         hc_mixed(d.xn, d.gate, d.mixed, n, hc, rows, s);
     };
     if (kind) {   // [rms(e) * enorm | rms(h_s) * hnorm_s] -> eh_proj, one row per hc stream
@@ -940,8 +948,8 @@ void Engine4::record_main(int gi, int nt, int kind) {
             mm(L.wout, d.o, ostride, d.part, n, nt);
         }
         dbg(L.full ? "attn_part" : "gdn_part", il, d.part, (size_t) nt * n);
-        allreduce();
-        hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s);
+        if (bulk) { allreduce(); hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s); }
+        else allreduce_hc_ll16(R, d.inj, n, hc, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
         // ---- MoE ----
         hc_mix(L.hcf_norm, L.hcf_down, L.hcf_up, L.hcf_inj);
         f32mm(L.router, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt);
@@ -956,8 +964,13 @@ void Engine4::record_main(int gi, int nt, int kind) {
                              d.mixed, n, n, d.ids, d.wts, K, nt, d.counter, (unsigned) il, s);
         }
         mm(L.sh_gu, d.mixed, n, d.shgu, 2 * L.n_sh_l, nt);
-        silu_mul(d.shgu, 2 * L.n_sh_l, d.shh, c.n_ff_shexp, L.n_sh_l, nt, s);
-        mm(L.sh_down, d.shh, c.n_ff_shexp, d.shpart, n, nt);
+        if (nt <= MAX_NT) {   // silu(gate) * up on load
+            NormIn glu; glu.act = 2; glu.glu_off = L.n_sh_l;
+            mm(L.sh_down, d.shgu, 2 * L.n_sh_l, d.shpart, n, nt, glu);
+        } else {
+            silu_mul(d.shgu, 2 * L.n_sh_l, d.shh, c.n_ff_shexp, L.n_sh_l, nt, s);
+            mm(L.sh_down, d.shh, c.n_ff_shexp, d.shpart, n, nt);
+        }
         if (bulk) {   // local pairs grouped by expert: consecutive blocks share the expert's weights in L2
             moe_order(L.moe, d.ids, nt * K, c.n_expert, d.order, d.order_n, s, d.egrp);
             to_half(d.mixed, n, nullptr, n, 0.0f, d.mix16, nt, s);
@@ -978,6 +991,11 @@ void Engine4::record_main(int gi, int nt, int kind) {
                 CUDA_CHECK(cudaEventRecord(d.ev_free[sb], s));
                 if (il + 2 < c.n_layer) upload_stage(d, il + 2);
             }
+        } else if (nt > 1 && grouped_decode_) {   // verification rows: each local expert read once (grouped GEMM)
+            moe_order(L.moe, d.ids, nt * K, c.n_expert, d.order, d.order_n, s, d.egrp);
+            to_half(d.mixed, n, nullptr, n, 0.0f, d.mix16, nt, s);
+            moe_gemm_gate_up(L.moe, d.mix16, n, K, d.order, d.order_n, d.egrp, c.n_expert, d.h16, s);
+            moe_gemm_down(L.moe, d.h16, d.order, d.order_n, d.egrp, c.n_expert, d.wts, d.yexp, s);
         } else {
             moe_gate_up(L.moe, d.mixed, n, d.ids, K, d.hexp, nt, s);
             moe_down(L.moe, d.hexp, d.ids, d.wts, K, d.yexp, nt, s);
@@ -988,8 +1006,8 @@ void Engine4::record_main(int gi, int nt, int kind) {
         moe_reduce(d.shpart, d.sg, d.yexp, K, d.part, n, nt, d.ids, stream ? L.owner_bulk : L.owner, d.g, CPU_OWNER, cflag,
                    bulk ? &cpu_bulk_out_->y[0][0] : &cpu_out_[il].y[0][0], d.counter, (unsigned) il, s);
         dbg("moe_part", il, d.part, (size_t) nt * n);
-        allreduce();
-        hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s);
+        if (bulk) { allreduce(); hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s); }
+        else allreduce_hc_ll16(R, d.inj, n, hc, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
         dbg("l_last", il, R, (size_t) nt * hcn);
     }
     if (kind) {   // drafts: the last row only; its residual feeds the next chained step

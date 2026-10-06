@@ -128,7 +128,7 @@ private:
     std::unique_ptr<Barrier4> barrier_;
     unsigned fwd_counter_ = 0;
     bool graphs_ready_ = false;
-    bool debug_ = false, nocpu_ = false, allrows_ = false;
+    bool debug_ = false, nocpu_ = false, allrows_ = false, grouped_decode_ = false;
     int last_nt_ = 0;
 };
 

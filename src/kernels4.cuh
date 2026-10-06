@@ -13,7 +13,9 @@ constexpr int MOE_BULK_ROWS = 2048;  // prefill chunk
 
 // ---- hyper-connections (hc streams of n) ----
 // xn[t][s*n + e] = res[t][s*n + e] * rsqrt(mean_e res[t][s*n + e]^2 + eps) * w[s*n + e]
-void hc_norm(const float * res, const float * w, float * xn, int n, int hc, float eps, int nt, cudaStream_t s);
+// inj_w (optional, fp32 [hc][hc*n]): also inj[t][j] = inj_w[j] . xn[t] (per-stream partials in injp [nt][hc][4])
+void hc_norm(const float * res, const float * w, float * xn, int n, int hc, float eps, int nt, cudaStream_t s,
+             const float * inj_w = nullptr, float * injp = nullptr, float * inj = nullptr);
 // lo = silu(lo * scale) in place
 void silu_scale(float * x, int n, float scale, int nt, int stride, cudaStream_t s);
 // mixed[t][e] = (1/hc) sum_s xn[t][s*n+e] * sigmoid(gate[t][s*n+e])

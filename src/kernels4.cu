@@ -30,14 +30,34 @@ __device__ __forceinline__ float silu4(float x) { return x / (1.0f + expf(-x)); 
 __device__ __forceinline__ float h2f(const uint8_t * p) { __half h; memcpy(&h, p, 2); return __half2float(h); }
 
 // ---------------- hyper-connections ----------------
-__global__ void k_hc_norm(const float * __restrict__ res, const float * __restrict__ w, float * __restrict__ xn, int n, int hc, float eps) {
+// optional inj: also the hc-row injection dot products restricted to this stream: injp[t][s][j] = inj_w[j][s-slice] . xn
+__global__ void k_hc_norm(const float * __restrict__ res, const float * __restrict__ w, float * __restrict__ xn, int n, int hc, float eps,
+                          const float * __restrict__ inj_w, float * __restrict__ injp) {
     const int s = blockIdx.x, t = blockIdx.y;
     const float * r = res + ((size_t) t * hc + s) * n;
     float ss = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) ss += r[i] * r[i];
     const float inv = rsqrtf(block_sum4(ss) / n + eps);
     float * o = xn + ((size_t) t * hc + s) * n;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) o[i] = r[i] * inv * w[(size_t) s * n + i];
+    float d[4] = {0, 0, 0, 0};
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = r[i] * inv * w[(size_t) s * n + i];
+        o[i] = v;
+        if (inj_w) for (int j = 0; j < hc; ++j) d[j] += inj_w[(size_t) j * hc * n + (size_t) s * n + i] * v;
+    }
+    if (inj_w)
+        for (int j = 0; j < hc; ++j) {
+            const float sum = block_sum4(d[j]);
+            if (threadIdx.x == 0) injp[((size_t) t * hc + s) * 4 + j] = sum;
+        }
+}
+// inj[t][j] = sum_s injp[t][s][j]  (stream order: deterministic)
+__global__ void k_hc_inj_sum(const float * __restrict__ injp, float * __restrict__ inj, int hc) {
+    const int t = blockIdx.x, j = threadIdx.x;
+    if (j >= hc) return;
+    float a = 0.0f;
+    for (int s = 0; s < hc; ++s) a += injp[((size_t) t * hc + s) * 4 + j];
+    inj[(size_t) t * 4 + j] = a;
 }
 __global__ void k_silu_scale(float * x, int n, float scale, int stride) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -668,8 +688,11 @@ __global__ void k_ple_apply(float * res, const float * __restrict__ value, const
 
 } // namespace
 
-void hc_norm(const float * res, const float * w, float * xn, int n, int hc, float eps, int nt, cudaStream_t s) {
-    k_hc_norm<<<dim3(hc, nt), 256, 0, s>>>(res, w, xn, n, hc, eps);
+void hc_norm(const float * res, const float * w, float * xn, int n, int hc, float eps, int nt, cudaStream_t s,
+             const float * inj_w, float * injp, float * inj) {
+    if (inj_w && hc > 4) throw std::runtime_error("hc_norm: inject fusion supports hc <= 4");
+    k_hc_norm<<<dim3(hc, nt), 256, 0, s>>>(res, w, xn, n, hc, eps, inj_w, injp);
+    if (inj_w) k_hc_inj_sum<<<nt, 32, 0, s>>>(injp, inj, hc);
 }
 void silu_scale(float * x, int n, float scale, int nt, int stride, cudaStream_t s) {
     k_silu_scale<<<dim3((n + 255) / 256, nt), 256, 0, s>>>(x, n, scale, stride);

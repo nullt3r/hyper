@@ -30,7 +30,9 @@ void repack_bf16_frag(const uint16_t * w, int n, int k, size_t row_stride, uint8
 // same from fp32 rows (dequantized K-quants etc.)
 void repack_f32_frag(const float * w, int n, int k, size_t row_stride, uint8_t * out);
 // fused input RMSNorm: x' = x * rsqrt(sum(ss[t*nss .. t*nss+nss)) / k + eps) * w   (w == nullptr: no norm)
-struct NormIn { const float * w = nullptr; const float * ss = nullptr; int nss = 0; float eps = 1e-6f; };
+// act (applied after the norm): 1 = silu(x * act_scale); 2 = silu(x[c]) * x[c + glu_off] (gated pair in one input row)
+struct NormIn { const float * w = nullptr; const float * ss = nullptr; int nss = 0; float eps = 1e-6f;
+                int act = 0; float act_scale = 1.0f; int glu_off = 0; };
 
 // y[t][r] = (add ? add[t][r] : 0) + W x[t]   for t < nt; x rows have stride xs, y/add rows stride ys.
 // Q8: tensor cores (mma m16n8k16, fp16 activations, fp32 accumulation), split-K over 8 warps per row tile.
@@ -106,6 +108,10 @@ void argmax_pairs(const float * x, int xs, int n, int offset, float * out, int n
 constexpr int AR_SS_SPAN = 512;
 void allreduce_add_ll16(float * x, const float * part, uint2 * slots, int g, int ndev, int n,
                         const int * counter, int call, cudaStream_t s, float * ss_out = nullptr);
+// hyper-connection variant: no x; the sum of row t is scattered into the hc streams of res,
+// res[t][s][e] += sum[t][e] * 2 * sigmoid(inj[t * 4 + s] / hc)   (n = nt * width, width = row length)
+void allreduce_hc_ll16(float * res, const float * inj, int width, int hc, const float * part, uint2 * slots, int g, int ndev, int n,
+                       const int * counter, int call, cudaStream_t s);
 // bulk variant (many tokens, no sum-of-squares output): data [2][ndev][n] fp16 and flags [2][ndev][n/1024]
 // in mapped host memory
 void allreduce_add_bulk(float * x, const float * part, half * data, unsigned * flags, int g, int ndev, int n,
