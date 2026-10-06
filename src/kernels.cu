@@ -38,12 +38,23 @@ __device__ __forceinline__ float softplusf(float x) { return x > 20.0f ? x : log
 constexpr int GEMV_ROWS = 8;   // warps per block, one row per warp
 
 // each warp computes R consecutive rows; one x chunk (16 floats) serves all R rows
+// optional fused RMSNorm of the input: 1/rms from nss partial sums of squares produced upstream
+__device__ __forceinline__ float input_inv_rms(const float * __restrict__ ss, int nss, int k, const float * nw, float eps) {
+    if (!nw) return 1.0f;
+    float t = 0.0f;
+    for (int i = 0; i < nss; ++i) t += ss[i];
+    return rsqrtf(t / k + eps);
+}
+
 template <int R>
 __global__ void k_gemv_q8(const int8_t * __restrict__ qs, const half * __restrict__ d, int n, int k,
-                          const float * __restrict__ x, float * __restrict__ y, const float * __restrict__ add) {
+                          const float * __restrict__ x, float * __restrict__ y, const float * __restrict__ add,
+                          const float * __restrict__ nw, const float * __restrict__ ss, int nss, float eps) {
+    const float inv = input_inv_rms(ss, nss, k, nw, eps);
     const int row0 = (blockIdx.x * GEMV_ROWS + (threadIdx.x >> 5)) * R;
     const int lane = threadIdx.x & 31;
     if (row0 >= n) return;
+    const float4 * nw4 = (const float4 *) nw;
     const float4 * x4 = (const float4 *) x;
     const int nchunk = k / 16, kb = k / 32;
     float acc[R];
@@ -60,7 +71,13 @@ __global__ void k_gemv_q8(const int8_t * __restrict__ qs, const half * __restric
         }
         float4 xv[4];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) xv[j] = __ldg(x4 + c * 4 + j);
+        for (int j = 0; j < 4; ++j) {
+            xv[j] = __ldg(x4 + c * 4 + j);
+            if (nw) {
+                const float4 wv = __ldg(nw4 + c * 4 + j);
+                xv[j].x *= inv * wv.x; xv[j].y *= inv * wv.y; xv[j].z *= inv * wv.z; xv[j].w *= inv * wv.w;
+            }
+        }
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const int8_t * b = (const int8_t *) &q[r];
@@ -80,7 +97,10 @@ __global__ void k_gemv_q8(const int8_t * __restrict__ qs, const half * __restric
 }
 
 __global__ void k_gemv_bf16(const __nv_bfloat16 * __restrict__ w, int n, int k,
-                            const float * __restrict__ x, float * __restrict__ y, const float * __restrict__ add) {
+                            const float * __restrict__ x, float * __restrict__ y, const float * __restrict__ add,
+                            const float * __restrict__ nw, const float * __restrict__ ss, int nss, float eps) {
+    const float inv = input_inv_rms(ss, nss, k, nw, eps);
+    const float4 * nw4 = (const float4 *) nw;
     const int row = blockIdx.x * GEMV_ROWS + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
     if (row >= n) return;
@@ -91,7 +111,12 @@ __global__ void k_gemv_bf16(const __nv_bfloat16 * __restrict__ w, int n, int k,
     for (int c = lane; c < nchunk; c += 32) {
         const uint4 q = __ldg(w8 + c);
         const __nv_bfloat162 * b = (const __nv_bfloat162 *) &q;
-        const float4 xa = __ldg(x4 + c * 2), xb = __ldg(x4 + c * 2 + 1);
+        float4 xa = __ldg(x4 + c * 2), xb = __ldg(x4 + c * 2 + 1);
+        if (nw) {
+            const float4 wa = __ldg(nw4 + c * 2), wb = __ldg(nw4 + c * 2 + 1);
+            xa.x *= inv * wa.x; xa.y *= inv * wa.y; xa.z *= inv * wa.z; xa.w *= inv * wa.w;
+            xb.x *= inv * wb.x; xb.y *= inv * wb.y; xb.z *= inv * wb.z; xb.w *= inv * wb.w;
+        }
         float2 f0 = __bfloat1622float2(b[0]), f1 = __bfloat1622float2(b[1]);
         float2 f2 = __bfloat1622float2(b[2]), f3 = __bfloat1622float2(b[3]);
         acc += f0.x * xa.x + f0.y * xa.y + f1.x * xa.z + f1.y * xa.w + f2.x * xb.x + f2.y * xb.y + f3.x * xb.z + f3.y * xb.w;
@@ -217,36 +242,49 @@ __global__ void k_gdn_conv(float * qkv, float * st, const float * __restrict__ w
     qkv[c] = silu(acc);
 }
 
-// block per v-head, blockDim = dv (thread j owns column j of S[i][j]); dk == dv == blockDim
+// grid (n_v, dv/32), 8 warps: block owns head h and 32 state columns; warp w sums over k-rows [w*dk/8, (w+1)*dk/8)
+// state layout S[i][j] (i: k index, j: v index) so a warp reads 128 contiguous bytes per row
 __global__ void k_gdn_step(const float * __restrict__ qkv, const float * __restrict__ ab, const float * __restrict__ dt_bias,
                            const float * __restrict__ ssm_a, float * __restrict__ state, float * __restrict__ o,
                            int n_k, int n_v, int dk, int dv, float eps) {
-    const int h = blockIdx.x, j = threadIdx.x;
+    const int h = blockIdx.x, j = blockIdx.y * 32 + (threadIdx.x & 31), w = threadIdx.x >> 5, nw = blockDim.x >> 5;
     const int hk = h % n_k;
-    __shared__ float sq[256], sk[256];
+    __shared__ float sq[256], sk[256], red[8][32];
     const float * q = qkv + (size_t) hk * dk;
     const float * k = qkv + (size_t) n_k * dk + (size_t) hk * dk;
     const float * v = qkv + (size_t) 2 * n_k * dk + (size_t) h * dv;
-    float qj = j < dk ? q[j] : 0.0f, kj = j < dk ? k[j] : 0.0f;
-    const float qn = block_sum(qj * qj);
-    const float kn = block_sum(kj * kj);
-    if (j < dk) { sq[j] = qj * rsqrtf(qn + eps); sk[j] = kj * rsqrtf(kn + eps); }
-    __syncthreads();
+    float qq = 0.0f, kk = 0.0f;
+    for (int i = threadIdx.x; i < dk; i += blockDim.x) { const float a = q[i], b = k[i]; sq[i] = a; sk[i] = b; qq += a * a; kk += b * b; }
+    qq = block_sum(qq);
+    kk = block_sum(kk);
+    const float qs = rsqrtf(qq + eps), ks = rsqrtf(kk + eps);
     const float g = softplusf(ab[h] + dt_bias[h]) * ssm_a[h];
     const float decay = expf(g);
     const float beta = sigmoidf(ab[n_v + h]);
     float * S = state + (size_t) h * dk * dv;
+    const int i0 = w * (dk / nw), i1 = i0 + dk / nw;
+    float part = 0.0f;
+    for (int i = i0; i < i1; ++i) part += S[(size_t) i * dv + j] * sk[i];
+    red[w][threadIdx.x & 31] = part * ks;
+    __syncthreads();
     float kv = 0.0f;
-    for (int i = 0; i < dk; ++i) kv += S[(size_t) i * dv + j] * sk[i];
+    for (int ww = 0; ww < nw; ++ww) kv += red[ww][threadIdx.x & 31];
     kv *= decay;
     const float delta = (v[j] - kv) * beta;
+    __syncthreads();
     float out = 0.0f;
-    for (int i = 0; i < dk; ++i) {
-        const float s = S[(size_t) i * dv + j] * decay + sk[i] * delta;
+    for (int i = i0; i < i1; ++i) {
+        const float s = S[(size_t) i * dv + j] * decay + sk[i] * ks * delta;
         S[(size_t) i * dv + j] = s;
         out += s * sq[i];
     }
-    o[(size_t) h * dv + j] = out * rsqrtf((float) dv);
+    red[w][threadIdx.x & 31] = out;
+    __syncthreads();
+    if (w == 0) {
+        float acc = 0.0f;
+        for (int ww = 0; ww < nw; ++ww) acc += red[ww][threadIdx.x & 31];
+        o[(size_t) h * dv + j] = acc * qs * rsqrtf((float) dv);
+    }
 }
 
 __global__ void k_gated_norm(float * o, const float * __restrict__ z, const float * __restrict__ w, int dh, float eps) {
@@ -344,9 +382,9 @@ __global__ void k_allreduce_add_ll(float * x, const float * __restrict__ part, u
 
 // thread per element pair: {half2(part[2i], part[2i+1]), seq} in one 8-byte packet
 __global__ void k_allreduce_add_ll16(float * x, const float * __restrict__ part, uint2 * slots, int g, int ndev, int n2,
-                                     const int * counter, int call) {
+                                     const int * counter, int call, float * ss_out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n2) return;
+    if (i >= n2) { if (ss_out) { const float t = block_sum(0.0f); if (threadIdx.x == 0) ss_out[blockIdx.x] = t; } return; }
     const unsigned seq = (unsigned) (*counter) * 1024u + (unsigned) call + 1u;
     uint2 * buf = slots + (size_t) (call & 1) * ndev * n2;
     const float2 mine = ((const float2 *) part)[i];
@@ -371,6 +409,18 @@ __global__ void k_allreduce_add_ll16(float * x, const float * __restrict__ part,
     float2 xv = x2[i];
     xv.x += acc.x; xv.y += acc.y;
     x2[i] = xv;
+    if (ss_out) {
+        const float t = block_sum(xv.x * xv.x + xv.y * xv.y);
+        if (threadIdx.x == 0) ss_out[blockIdx.x] = t;
+    }
+}
+
+// sum of squares of x into ss[0] (single block)
+__global__ void k_sumsq(const float * __restrict__ x, int n, float * ss) {
+    float t = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) t += x[i] * x[i];
+    t = block_sum(t);
+    if (threadIdx.x == 0) ss[0] = t;
 }
 
 __global__ void k_incr(int * c) { *c += 1; }
@@ -378,18 +428,18 @@ __global__ void k_incr(int * c) { *c += 1; }
 } // namespace
 
 int g_gemv_rows_per_warp = 4;
-void gemv_q8(const Q8W & W, const float * x, float * y, const float * add, cudaStream_t s) {
+void gemv_q8(const Q8W & W, const float * x, float * y, const float * add, cudaStream_t s, const NormIn & nin) {
     const int R = g_gemv_rows_per_warp;
     const int per_block = GEMV_ROWS * R;
     const int grid = (W.n + per_block - 1) / per_block;
     switch (R) {
-        case 1: k_gemv_q8<1><<<grid, GEMV_ROWS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, y, add); break;
-        case 2: k_gemv_q8<2><<<grid, GEMV_ROWS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, y, add); break;
-        default: k_gemv_q8<4><<<grid, GEMV_ROWS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, y, add); break;
+        case 1: k_gemv_q8<1><<<grid, GEMV_ROWS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, y, add, nin.w, nin.ss, nin.nss, nin.eps); break;
+        case 2: k_gemv_q8<2><<<grid, GEMV_ROWS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, y, add, nin.w, nin.ss, nin.nss, nin.eps); break;
+        default: k_gemv_q8<4><<<grid, GEMV_ROWS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, y, add, nin.w, nin.ss, nin.nss, nin.eps); break;
     }
 }
-void gemv_bf16(const BF16W & W, const float * x, float * y, const float * add, cudaStream_t s) {
-    k_gemv_bf16<<<(W.n + GEMV_ROWS - 1) / GEMV_ROWS, GEMV_ROWS * 32, 0, s>>>(W.w, W.n, W.k, x, y, add);
+void gemv_bf16(const BF16W & W, const float * x, float * y, const float * add, cudaStream_t s, const NormIn & nin) {
+    k_gemv_bf16<<<(W.n + GEMV_ROWS - 1) / GEMV_ROWS, GEMV_ROWS * 32, 0, s>>>(W.w, W.n, W.k, x, y, add, nin.w, nin.ss, nin.nss, nin.eps);
 }
 void rmsnorm(const float * x, const float * w, float * y, int n, float eps, cudaStream_t s) {
     k_rmsnorm<<<1, 1024, 0, s>>>(x, w, y, n, eps);
@@ -413,7 +463,7 @@ void gdn_conv(float * qkv, float * conv_state, const float * conv_w, int channel
 }
 void gdn_step(const float * qkv, const float * ab, const float * dt_bias, const float * ssm_a, float * state, float * o,
               int n_k, int n_v, int dk, int dv, float eps, cudaStream_t s) {
-    k_gdn_step<<<n_v, dv, 0, s>>>(qkv, ab, dt_bias, ssm_a, state, o, n_k, n_v, dk, dv, eps);
+    k_gdn_step<<<dim3(n_v, dv / 32), 256, 0, s>>>(qkv, ab, dt_bias, ssm_a, state, o, n_k, n_v, dk, dv, eps);
 }
 void gated_norm(float * o, const float * z, const float * w, int n_heads, int dh, float eps, cudaStream_t s) {
     k_gated_norm<<<n_heads, dh, 0, s>>>(o, z, w, dh, eps);
@@ -441,9 +491,11 @@ void allreduce_add_ll(float * x, const float * part, uint2 * slots, int g, int n
     k_allreduce_add_ll<<<(n + 255) / 256, 256, 0, s>>>(x, part, slots, g, ndev, n, counter, call);
 }
 void allreduce_add_ll16(float * x, const float * part, uint2 * slots, int g, int ndev, int n,
-                        const int * counter, int call, cudaStream_t s) {
+                        const int * counter, int call, cudaStream_t s, float * ss_out) {
     const int n2 = n / 2;
-    k_allreduce_add_ll16<<<(n2 + 255) / 256, 256, 0, s>>>(x, part, slots, g, ndev, n2, counter, call);
+    k_allreduce_add_ll16<<<(n2 + 255) / 256, 256, 0, s>>>(x, part, slots, g, ndev, n2, counter, call, ss_out);
 }
+int allreduce_ll16_nss(int n) { return (n / 2 + 255) / 256; }
+void sumsq(const float * x, int n, float * ss, cudaStream_t s) { k_sumsq<<<1, 1024, 0, s>>>(x, n, ss); }
 void incr_counter(int * c, cudaStream_t s) { k_incr<<<1, 1, 0, s>>>(c); }
 } // namespace hyper

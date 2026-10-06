@@ -20,8 +20,10 @@ struct BF16W {
 
 // y[n] = W x  (+ optional residual add: y[n] = add[n] + W x)
 extern int g_gemv_rows_per_warp;   // tuning knob: rows per warp in the Q8 GEMV (1, 2 or 4)
-void gemv_q8(const Q8W & W, const float * x, float * y, const float * add, cudaStream_t s);
-void gemv_bf16(const BF16W & W, const float * x, float * y, const float * add, cudaStream_t s);
+// fused input RMSNorm: x' = x * rsqrt(sum(ss[0..nss)) / k + eps) * w   (w == nullptr: no norm)
+struct NormIn { const float * w = nullptr; const float * ss = nullptr; int nss = 0; float eps = 1e-6f; };
+void gemv_q8(const Q8W & W, const float * x, float * y, const float * add, cudaStream_t s, const NormIn & nin = {});
+void gemv_bf16(const BF16W & W, const float * x, float * y, const float * add, cudaStream_t s, const NormIn & nin = {});
 
 // y = rmsnorm(x) * w   (n elements, single row)
 void rmsnorm(const float * x, const float * w, float * y, int n, float eps, cudaStream_t s);
@@ -68,8 +70,11 @@ void allreduce_add(float * x, const float * part, float * slots, unsigned long l
 void allreduce_add_ll(float * x, const float * part, uint2 * slots, int g, int ndev, int n,
                       const int * counter, int call, cudaStream_t s);
 // LL with fp16 payload: packet {half2 values, uint32 seq}; n must be even
+// ss_out (optional): per-block sums of squares of the updated x, for a downstream fused RMSNorm
 void allreduce_add_ll16(float * x, const float * part, uint2 * slots, int g, int ndev, int n,
-                        const int * counter, int call, cudaStream_t s);
+                        const int * counter, int call, cudaStream_t s, float * ss_out = nullptr);
+int allreduce_ll16_nss(int n);                   // number of partial sums written by allreduce_add_ll16
+void sumsq(const float * x, int n, float * ss, cudaStream_t s);
 // small helper kernels used inside captured graphs
 void incr_counter(int * c, cudaStream_t s);
 

@@ -46,7 +46,7 @@ struct Engine::Device {
     float * output_norm = nullptr;
     float * x = nullptr, * xn = nullptr, * part = nullptr;
     float * big0 = nullptr, * big1 = nullptr, * kbuf = nullptr, * vbuf = nullptr, * ab = nullptr, * o = nullptr, * h = nullptr;
-    float * logits = nullptr, * res = nullptr;
+    float * logits = nullptr, * res = nullptr, * ss = nullptr;
     int * pos = nullptr, * counter = nullptr;
     size_t used = 0;
     std::vector<void *> allocs;
@@ -307,6 +307,7 @@ void Engine::load_weights() {
         dev.h = dev.alloc<float>(c.n_ff);
         dev.logits = dev.alloc<float>(dev.output.n);
         dev.res = dev.alloc<float>(2);
+        dev.ss = dev.alloc<float>(64);
         dev.pos = dev.alloc<int>(1);
         dev.counter = dev.alloc<int>(1);
         fprintf(stderr, "hyper: device %d holds %.2f GiB\n", dev.id, dev.used / 1073741824.0);
@@ -338,15 +339,23 @@ void Engine::record(int gi) {
     incr_counter(d.counter, s);
     int call = 0;
     auto reduce = [&]() {
-        if (opt_.ar_mode == 2) allreduce_add_ll16(d.x, d.part, ar_ll_, g, nd, c.n_embd, d.counter, call++, s);
+        if (opt_.ar_mode == 2) allreduce_add_ll16(d.x, d.part, ar_ll_, g, nd, c.n_embd, d.counter, call++, s, d.ss);
         else if (opt_.ar_mode == 1) allreduce_add_ll(d.x, d.part, ar_ll_, g, nd, c.n_embd, d.counter, call++, s);
         else allreduce_add(d.x, d.part, ar_slots_, ar_flags_, g, nd, c.n_embd, d.counter, call++, s);
     };
+    // fused-norm input statistics: from the allreduce (ll16) or an explicit sum-of-squares kernel
+    const bool fused_stats = opt_.ar_mode == 2;
+    const int nss = fused_stats ? allreduce_ll16_nss(c.n_embd) : 1;
+    auto stats = [&]() { if (!fused_stats) sumsq(d.x, c.n_embd, d.ss, s); };
+    auto nin = [&](const float * w) { NormIn r; r.w = w; r.ss = d.ss; r.nss = nss; r.eps = eps; return r; };
+    sumsq(d.x, c.n_embd, d.ss, s);
+    if (fused_stats) {  // first layer reads ss[0..nss): zero the rest after the explicit sum
+        CUDA_CHECK(cudaMemsetAsync(d.ss + 1, 0, (nss - 1) * sizeof(float), s));
+    }
     for (int il = 0; il < c.n_layer; ++il) {
         DevLayer & L = d.layers[il];
-        rmsnorm(d.x, L.attn_norm, d.xn, c.n_embd, eps, s);
         if (L.full) {
-            gemv_bf16(L.wqkv, d.xn, d.big0, nullptr, s);
+            gemv_bf16(L.wqkv, d.x, d.big0, nullptr, s, nin(L.attn_norm));
             float * kb = d.big0 + (size_t) L.n_head_l * 2 * c.head_dim;
             float * vb = kb + (size_t) L.n_kv_l * c.head_dim;
             attn_prep(d.big0, kb, vb, L.q_norm, L.k_norm, L.kcache, L.vcache, d.pos, opt_.max_pos,
@@ -355,7 +364,7 @@ void Engine::record(int gi) {
                         c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), s);
             gemv_q8(L.wo, d.o, d.part, nullptr, s);
         } else {
-            gemv_q8(L.win, d.xn, d.big0, nullptr, s);
+            gemv_q8(L.win, d.x, d.big0, nullptr, s, nin(L.attn_norm));
             float * z = d.big0 + L.conv_ch;
             float * ab = z + (size_t) L.n_v_l * c.head_v_dim();
             gdn_conv(d.big0, L.conv_state, L.conv_w, L.conv_ch, c.ssm_conv, s);
@@ -364,14 +373,14 @@ void Engine::record(int gi) {
             gemv_q8(L.wout, d.o, d.part, nullptr, s);
         }
         reduce();
-        rmsnorm(d.x, L.post_norm, d.xn, c.n_embd, eps, s);
-        gemv_q8(L.ffn_gu, d.xn, d.big1, nullptr, s);
+        stats();
+        gemv_q8(L.ffn_gu, d.x, d.big1, nullptr, s, nin(L.post_norm));
         silu_mul(d.big1, d.h, L.n_ff_l, s);
         gemv_q8(L.ffn_down, d.h, d.part, nullptr, s);
         reduce();
+        stats();
     }
-    rmsnorm(d.x, d.output_norm, d.xn, c.n_embd, eps, s);
-    gemv_bf16(d.output, d.xn, d.logits, nullptr, s);
+    gemv_bf16(d.output, d.x, d.logits, nullptr, s, nin(d.output_norm));
     argmax_pair(d.logits, d.output.n, d.vocab_off, d.res, s);
     CUDA_CHECK(cudaMemcpyAsync(h_res_ + 2 * gi, d.res, 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
 }
