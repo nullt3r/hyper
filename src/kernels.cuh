@@ -20,6 +20,7 @@ struct BF16W {
 
 // y[n] = W x  (+ optional residual add: y[n] = add[n] + W x)
 extern int g_gemv_rows_per_warp;   // tuning knob: rows per warp in the Q8 GEMV (1, 2 or 4)
+extern int g_gemv_unroll;          // tuning knob: chunks in flight per lane (1, 2 or 4)
 // fused input RMSNorm: x' = x * rsqrt(sum(ss[0..nss)) / k + eps) * w   (w == nullptr: no norm)
 struct NormIn { const float * w = nullptr; const float * ss = nullptr; int nss = 0; float eps = 1e-6f; };
 void gemv_q8(const Q8W & W, const float * x, float * y, const float * add, cudaStream_t s, const NormIn & nin = {});

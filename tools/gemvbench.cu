@@ -12,17 +12,18 @@ int main(int argc, char ** argv) {
     const int iters = argc > 1 ? atoi(argv[1]) : 200;
     struct Shape { const char * name; int n, k; };
     const Shape shapes[] = {
-        {"ffn_gate/up (5792x5120)", 5792, 5120},
+        {"ffn gate+up (11584x5120)", 11584, 5120},
         {"ffn_down (5120x5792)", 5120, 5792},
-        {"gdn qkv (3328x5120)", 3328, 5120},
+        {"gdn in (5152x5120)", 5152, 5120},
+        {"gdn out (5120x1920)", 5120, 1920},
         {"attn_out (5120x2048)", 5120, 2048},
     };
     CK(cudaSetDevice(0));
     cudaStream_t s; CK(cudaStreamCreate(&s));
     cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
-    for (int R : {1, 2, 4}) {
-    hyper::g_gemv_rows_per_warp = R;
-    printf("-- rows per warp %d\n", R);
+    for (auto [R, U] : std::vector<std::pair<int,int>>{{1,1},{1,2},{1,4},{2,1},{2,2},{2,4},{4,1},{4,2}}) {
+    hyper::g_gemv_rows_per_warp = R; hyper::g_gemv_unroll = U;
+    printf("-- rows per warp %d, unroll %d\n", R, U);
     for (auto & sh : shapes) {
         // several distinct matrices so the working set exceeds L2 (6 MB on 3090)
         const int nmat = 8;

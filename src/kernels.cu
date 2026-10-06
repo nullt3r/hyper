@@ -37,7 +37,6 @@ __device__ __forceinline__ float softplusf(float x) { return x > 20.0f ? x : log
 // ---------------- GEMV ----------------
 constexpr int GEMV_ROWS = 8;   // warps per block, one row per warp
 
-// each warp computes R consecutive rows; one x chunk (16 floats) serves all R rows
 // optional fused RMSNorm of the input: 1/rms from nss partial sums of squares produced upstream
 __device__ __forceinline__ float input_inv_rms(const float * __restrict__ ss, int nss, int k, const float * nw, float eps) {
     if (!nw) return 1.0f;
@@ -46,7 +45,9 @@ __device__ __forceinline__ float input_inv_rms(const float * __restrict__ ss, in
     return rsqrtf(t / k + eps);
 }
 
-template <int R>
+// each warp computes R consecutive rows; one x chunk (16 floats) serves all R rows.
+// U chunks per lane per iteration are loaded before any is consumed (more memory requests in flight).
+template <int R, int U>
 __global__ void k_gemv_q8(const int8_t * __restrict__ qs, const half * __restrict__ d, int n, int k,
                           const float * __restrict__ x, float * __restrict__ y, const float * __restrict__ add,
                           const float * __restrict__ nw, const float * __restrict__ ss, int nss, float eps) {
@@ -57,35 +58,56 @@ __global__ void k_gemv_q8(const int8_t * __restrict__ qs, const half * __restric
     const float4 * nw4 = (const float4 *) nw;
     const float4 * x4 = (const float4 *) x;
     const int nchunk = k / 16, kb = k / 32;
+    const int8_t * qrow[R];
+    const half * drow[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int row = min(row0 + r, n - 1);
+        qrow[r] = qs + (size_t) row * k;
+        drow[r] = d + (size_t) row * kb;
+    }
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.0f;
-    for (int c = lane; c < nchunk; c += 32) {
-        uint4 q[R];
-        float sc[R];
+    for (int c0 = lane; c0 < nchunk; c0 += 32 * U) {
+        uint4 q[U][R];
+        float sc[U][R];
 #pragma unroll
-        for (int r = 0; r < R; ++r) {
-            const int row = min(row0 + r, n - 1);
-            q[r] = __ldg((const uint4 *) (qs + (size_t) row * k) + c);
-            sc[r] = __half2float(d[(size_t) row * kb + (c >> 1)]);
-        }
-        float4 xv[4];
+        for (int u = 0; u < U; ++u) {
+            const int c = c0 + 32 * u;
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            xv[j] = __ldg(x4 + c * 4 + j);
-            if (nw) {
-                const float4 wv = __ldg(nw4 + c * 4 + j);
-                xv[j].x *= inv * wv.x; xv[j].y *= inv * wv.y; xv[j].z *= inv * wv.z; xv[j].w *= inv * wv.w;
+            for (int r = 0; r < R; ++r) {
+                if (c < nchunk) {
+                    q[u][r] = __ldg((const uint4 *) qrow[r] + c);
+                    sc[u][r] = __half2float(drow[r][c >> 1]);
+                } else {
+                    q[u][r] = make_uint4(0, 0, 0, 0);
+                    sc[u][r] = 0.0f;
+                }
             }
         }
 #pragma unroll
-        for (int r = 0; r < R; ++r) {
-            const int8_t * b = (const int8_t *) &q[r];
-            float part = 0.0f;
+        for (int u = 0; u < U; ++u) {
+            const int c = c0 + 32 * u;
+            if (c >= nchunk) break;
+            float4 xv[4];
 #pragma unroll
-            for (int j = 0; j < 4; ++j)
-                part += xv[j].x * b[4 * j] + xv[j].y * b[4 * j + 1] + xv[j].z * b[4 * j + 2] + xv[j].w * b[4 * j + 3];
-            acc[r] += part * sc[r];
+            for (int j = 0; j < 4; ++j) {
+                xv[j] = __ldg(x4 + c * 4 + j);
+                if (nw) {
+                    const float4 wv = __ldg(nw4 + c * 4 + j);
+                    xv[j].x *= inv * wv.x; xv[j].y *= inv * wv.y; xv[j].z *= inv * wv.z; xv[j].w *= inv * wv.w;
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const int8_t * b = (const int8_t *) &q[u][r];
+                float part = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    part += xv[j].x * b[4 * j] + xv[j].y * b[4 * j + 1] + xv[j].z * b[4 * j + 2] + xv[j].w * b[4 * j + 3];
+                acc[r] += part * sc[u][r];
+            }
         }
     }
 #pragma unroll
@@ -428,15 +450,17 @@ __global__ void k_incr(int * c) { *c += 1; }
 } // namespace
 
 int g_gemv_rows_per_warp = 2;
+int g_gemv_unroll = 1;
 void gemv_q8(const Q8W & W, const float * x, float * y, const float * add, cudaStream_t s, const NormIn & nin) {
-    const int R = g_gemv_rows_per_warp;
+    const int R = g_gemv_rows_per_warp, U = g_gemv_unroll;
     const int per_block = GEMV_ROWS * R;
     const int grid = (W.n + per_block - 1) / per_block;
-    switch (R) {
-        case 1: k_gemv_q8<1><<<grid, GEMV_ROWS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, y, add, nin.w, nin.ss, nin.nss, nin.eps); break;
-        case 2: k_gemv_q8<2><<<grid, GEMV_ROWS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, y, add, nin.w, nin.ss, nin.nss, nin.eps); break;
-        default: k_gemv_q8<4><<<grid, GEMV_ROWS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, y, add, nin.w, nin.ss, nin.nss, nin.eps); break;
-    }
+#define GEMV_CASE(RR, UU) if (R == RR && U == UU) { k_gemv_q8<RR, UU><<<grid, GEMV_ROWS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, y, add, nin.w, nin.ss, nin.nss, nin.eps); return; }
+    GEMV_CASE(1, 1) GEMV_CASE(1, 2) GEMV_CASE(1, 4)
+    GEMV_CASE(2, 1) GEMV_CASE(2, 2) GEMV_CASE(2, 4)
+    GEMV_CASE(4, 1) GEMV_CASE(4, 2)
+#undef GEMV_CASE
+    throw std::runtime_error("gemv_q8: unsupported R/U");
 }
 void gemv_bf16(const BF16W & W, const float * x, float * y, const float * add, cudaStream_t s, const NormIn & nin) {
     k_gemv_bf16<<<(W.n + GEMV_ROWS - 1) / GEMV_ROWS, GEMV_ROWS * 32, 0, s>>>(W.w, W.n, W.k, x, y, add, nin.w, nin.ss, nin.nss, nin.eps);
