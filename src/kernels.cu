@@ -439,15 +439,19 @@ __global__ void k_attn_decode(const float * __restrict__ qkv, int stride, const 
 template <int HD, int G>
 __global__ void __launch_bounds__(128) k_attn_split(const float * __restrict__ qkv, int stride, const half * __restrict__ kcache,
                                                     const half * __restrict__ vcache, float * __restrict__ part, const int * pos_p,
-                                                    int max_pos, int n_head_l, int head_off, int group, int kv_off, float scale) {
+                                                    int max_pos, int n_head_l, int head_off, int group, int kv_off, float scale,
+                                                    int n_chunk) {
     static_assert(HD == 256, "lane owns 8 dims");
     constexpr int NW = 4;
-    const int hk = blockIdx.x, split = blockIdx.y, t = blockIdx.z, nsplit = gridDim.y;
+    // blockIdx.x = kv head * n_chunk + chunk of G q heads (GQA groups larger than G take several blocks)
+    const int hk = blockIdx.x / n_chunk, hchunk = blockIdx.x % n_chunk, split = blockIdx.y, t = blockIdx.z, nsplit = gridDim.y;
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const int n_pos = *pos_p + t + 1;
     const int chunk = (n_pos + nsplit - 1) / nsplit;
     const int p0 = split * chunk, p1 = min(n_pos, p0 + chunk);
-    const int h0 = max(0, (kv_off + hk) * group - head_off), h1 = min(n_head_l, (kv_off + hk + 1) * group - head_off);
+    const int hb = max(0, (kv_off + hk) * group - head_off), he = min(n_head_l, (kv_off + hk + 1) * group - head_off);
+    const int h0 = hb + hchunk * G, h1 = min(he, h0 + G);
+    if (h0 >= h1) return;
     const int ng = h1 - h0;
     float q[G][8], acc[G][8], m[G], l[G];
     const float * qrow = qkv + (size_t) t * stride;
@@ -1036,10 +1040,10 @@ void attn_split(const float * qkv, int stride, const half * kcache, const half *
                 const int * pos, int max_pos, int n_head, int n_kv, int head_off, int group, int kv_off, int hd,
                 float scale, int nt, cudaStream_t s) {
     if (hd != 256) throw std::runtime_error("attn_split: only head_dim 256 is instantiated");
-    if (group > 6) throw std::runtime_error("attn_split: GQA group > 6 not instantiated");
     const int ns = attn_nsplit(n_kv, nt);
-    k_attn_split<256, 6><<<dim3(n_kv, ns, nt), 128, 0, s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head, head_off,
-                                                           group, kv_off, scale);
+    const int n_chunk = (std::min(group, n_head) + 5) / 6;   // local q heads of one kv head <= min(group, n_head)
+    k_attn_split<256, 6><<<dim3(n_kv * n_chunk, ns, nt), 128, 0, s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head, head_off,
+                                                                     group, kv_off, scale, n_chunk);
     k_attn_combine<256><<<dim3(n_head, nt), 256, 0, s>>>(qkv, stride, part, ns, out, out_stride, n_head);
 }
 void gdn_conv(float * in, int stride, float * conv_state, float * conv_snap, const float * conv_w, int channels, int K,

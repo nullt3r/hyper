@@ -4,6 +4,8 @@
 // usage: ref <model.gguf> <prompt.txt> <out.bin> [n_gpu_layers=999] [max_tokens=0]
 // out.bin: int32 n_tokens, int32 n_vocab, int32 tokens[n_tokens], float logits[n_tokens][n_vocab]
 #include "llama.h"
+#include "ggml.h"
+#include "ggml-backend.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -11,6 +13,22 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+// REF_DUMP=regex-ish prefixes (comma separated): print the sum of every matching tensor (debugging layer by layer)
+static std::vector<std::string> g_dump;
+static bool dump_cb(struct ggml_tensor * t, bool ask, void *) {
+    const std::string name = t->name;
+    bool match = false;
+    for (auto & p : g_dump) if (name.rfind(p, 0) == 0) match = true;
+    if (ask) return match;
+    if (!match || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) return true;
+    std::vector<float> buf(ggml_nelements(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
+    double s = 0, s2 = 0;
+    for (float v : buf) { s += v; s2 += (double) v * v; }
+    fprintf(stderr, "DUMP %-24s sum %.6g  sumsq %.6g  n %lld\n", name.c_str(), s, s2, (long long) ggml_nelements(t));
+    return true;
+}
 
 int main(int argc, char ** argv) {
     if (argc < 4) {
@@ -43,6 +61,14 @@ int main(int argc, char ** argv) {
     cp.n_ctx = n + 16;
     cp.n_batch = n;
     cp.n_ubatch = n;
+    if (getenv("REF_UBATCH")) cp.n_ubatch = atoi(getenv("REF_UBATCH"));   // other kernels / numerics (noise floor)
+    if (const char * d = getenv("REF_DUMP")) {
+        std::string s = d;
+        size_t p = 0;
+        while (p != std::string::npos) { const size_t q = s.find(',', p); g_dump.push_back(s.substr(p, q == std::string::npos ? q : q - p)); p = q == std::string::npos ? q : q + 1; }
+        cp.cb_eval = dump_cb;
+        cp.cb_eval_user_data = nullptr;
+    }
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "ctx failed\n"); return 1; }
 

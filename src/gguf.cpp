@@ -5,6 +5,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cstdio>
+
 namespace hyper {
 
 const char * gtype_name(GType t) {
@@ -14,6 +16,10 @@ const char * gtype_name(GType t) {
         case GType::BF16: return "BF16";
         case GType::Q8_0: return "Q8_0";
         case GType::Q4_0: return "Q4_0";
+        case GType::Q4_1: return "Q4_1";
+        case GType::Q5_0: return "Q5_0";
+        case GType::Q5_1: return "Q5_1";
+        case GType::IQ4_NL: return "IQ4_NL";
         case GType::Q4_K: return "Q4_K";
         case GType::Q5_K: return "Q5_K";
         case GType::Q6_K: return "Q6_K";
@@ -28,6 +34,10 @@ size_t gtype_block_bytes(GType t) {
         case GType::BF16: return 2;
         case GType::Q8_0: return 34;
         case GType::Q4_0: return 18;
+        case GType::Q4_1: return 20;
+        case GType::Q5_0: return 22;
+        case GType::Q5_1: return 24;
+        case GType::IQ4_NL: return 18;
         case GType::Q4_K: return 144;
         case GType::Q5_K: return 176;
         case GType::Q6_K: return 210;
@@ -38,7 +48,7 @@ size_t gtype_block_bytes(GType t) {
 size_t gtype_block_elems(GType t) {
     switch (t) {
         case GType::F32: case GType::F16: case GType::BF16: return 1;
-        case GType::Q8_0: case GType::Q4_0: return 32;
+        case GType::Q8_0: case GType::Q4_0: case GType::Q4_1: case GType::Q5_0: case GType::Q5_1: case GType::IQ4_NL: return 32;
         case GType::Q4_K: case GType::Q5_K: case GType::Q6_K: return 256;
         default: throw std::runtime_error(std::string("unsupported tensor type ") + std::to_string((uint32_t) t));
     }
@@ -96,25 +106,47 @@ GValue read_value(Cursor & c, uint32_t t) {
 } // namespace
 
 GGUF::GGUF(const std::string & path) {
-    fd_ = open(path.c_str(), O_RDONLY);
-    if (fd_ < 0) throw std::runtime_error("gguf: cannot open " + path);
-    struct stat st; fstat(fd_, &st); size_ = st.st_size;
-    map_ = (uint8_t *) mmap(nullptr, size_, PROT_READ, MAP_SHARED, fd_, 0);
-    if (map_ == MAP_FAILED) throw std::runtime_error("gguf: mmap failed");
+    // split model: name-00001-of-0000N.gguf
+    const size_t at = path.rfind("-00001-of-");
+    if (at != std::string::npos && path.size() > at + 15) {
+        const int n = std::stoi(path.substr(at + 10, 5));
+        for (int i = 1; i <= n; ++i) {
+            char num[8];
+            snprintf(num, sizeof num, "%05d", i);
+            std::string p = path;
+            p.replace(at + 1, 5, num);
+            load_shard(p, i == 1);
+        }
+    } else {
+        load_shard(path, true);
+    }
+    arch_ = get_str("general.architecture");
+}
 
-    Cursor c{map_, map_ + size_};
+void GGUF::load_shard(const std::string & path, bool first) {
+    Map m;
+    m.fd = open(path.c_str(), O_RDONLY);
+    if (m.fd < 0) throw std::runtime_error("gguf: cannot open " + path);
+    struct stat st; fstat(m.fd, &st); m.size = st.st_size;
+    m.p = (uint8_t *) mmap(nullptr, m.size, PROT_READ, MAP_SHARED, m.fd, 0);
+    if (m.p == MAP_FAILED) throw std::runtime_error("gguf: mmap failed");
+    maps_.push_back(m);
+
+    Cursor c{m.p, m.p + m.size};
     if (c.get<uint32_t>() != 0x46554747) throw std::runtime_error("gguf: bad magic");
     uint32_t version = c.get<uint32_t>();
     if (version < 2) throw std::runtime_error("gguf: unsupported version");
     uint64_t n_tensors = c.get<uint64_t>();
     uint64_t n_kv = c.get<uint64_t>();
+    std::map<std::string, GValue> kv;
     for (uint64_t i = 0; i < n_kv; ++i) {
         std::string key = c.str();
         uint32_t t = c.get<uint32_t>();
-        kv_[key] = read_value(c, t);
+        kv[key] = read_value(c, t);
     }
-    arch_ = get_str("general.architecture");
-    size_t alignment = (size_t) get_int("general.alignment", 32);
+    size_t alignment = 32;
+    if (auto it = kv.find("general.alignment"); it != kv.end()) alignment = (size_t) std::get<int64_t>(it->second);
+    if (first) kv_ = kv;
 
     std::vector<std::pair<std::string, uint64_t>> offsets;
     for (uint64_t i = 0; i < n_tensors; ++i) {
@@ -127,18 +159,20 @@ GGUF::GGUF(const std::string & path) {
         tensors_[t.name] = t;
         offsets.emplace_back(t.name, off);
     }
-    size_t data_start = ((size_t) (c.p - map_) + alignment - 1) / alignment * alignment;
+    size_t data_start = ((size_t) (c.p - m.p) + alignment - 1) / alignment * alignment;
     for (auto & [name, off] : offsets) {
         GTensor & t = tensors_[name];
-        t.data = map_ + data_start + off;
+        t.data = m.p + data_start + off;
         t.nbytes = t.row_bytes() * (size_t) t.rows();
-        if (t.data + t.nbytes > map_ + size_) throw std::runtime_error("gguf: tensor out of bounds: " + name);
+        if (t.data + t.nbytes > m.p + m.size) throw std::runtime_error("gguf: tensor out of bounds: " + name);
     }
 }
 
 GGUF::~GGUF() {
-    if (map_ && map_ != MAP_FAILED) munmap(map_, size_);
-    if (fd_ >= 0) close(fd_);
+    for (auto & m : maps_) {
+        if (m.p && m.p != MAP_FAILED) munmap(m.p, m.size);
+        if (m.fd >= 0) close(m.fd);
+    }
 }
 
 int64_t GGUF::get_int(const std::string & key) const {

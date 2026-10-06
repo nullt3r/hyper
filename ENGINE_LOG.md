@@ -99,3 +99,25 @@ Mainline (llama-bench, -fa 1, -ub 2048): pp4096 1672 (layer) / 695 (tensor); pp2
 - Malé chunky: GEMM dlaždice 32/64/128 tokenů podle velikosti, ≤ 8 tokenů GEMV, < 48 tokenů LL allreduce místo DMA
   (DMA má fixní ~0,4 ms/volání). Chunk 5 tokenů 69 → 21 ms, 128 tokenů 109 → 78 ms.
 - Multi-turn (1,9k tokenů systém): 2. kolo cached 1858/1986, prompt 0,44 s místo 1,34 s; generace T=0,6: 94–126 t/s.
+
+# Qwen3.8-Flash-Next (qwen4exp, UD-Q4_K_XL 104 GiB) – hyper v2
+
+Záloha v1: git tag `v1-qwen27b`, `../backups/`, na hostu `~/hyper-v1-qwen27b/` + `~/run-hyper-v1.sh`.
+
+## Baseline (llama-bench, rozložení qwen-run2: experty blk 2–10 / 23–31 / 40–47 na GPU, zbytek CPU, -fa 1, -ub 1024)
+
+| | pp512 | tg128 | pp2048 @32k | tg64 @32k |
+|---|---|---|---|---|
+| ik_llama-latest (-rtr -mqkv -muge) | 530–610 | **38,4** | – (ik bench nemá -d) | – |
+| mainline d812350 | 461 | **37,8** | 584 | 36,1 |
+
+Historicky (paměť): ik qwen-run2 TG@155k 25,1 t/s.
+
+## Architektura (z GGUF + mainline src/models/qwen4exp.cpp)
+- reziduál 4 proudy × 2560 (hyper-connections, low-rank 320): před každým blokem mixer (rms per proud → down → silu(·/4)
+  → up → mean_s xn·σ(gate)), po bloku res_s += out · 2σ(inject_s/4); finální mixer = output norm
+- 36× Gated DeltaNet (jako 27B, výstupní gate sigmoid), 12× gated attention (24 q / 2 kv × 256, rot 64) + QSA indexer
+  (4 hlavy × 128, bloky po 4 buňkách, top 2048 → pod ~2k tokenů je hustá)
+- MoE 512 expertů top-10 softmax + renormalizace, sdílený expert se sigmoid gate; gate/up Q4_K (1 vrstva Q5_K),
+  down Q5_1 (5 vrstev Q8_0)
+- PLE ve vrstvě 1: n-gram hash (n=2,3; 16 hlav × 160) do 27 GB IQ4_NL tabulky, gate přes key/query, kauzální konv K=4 dil=3

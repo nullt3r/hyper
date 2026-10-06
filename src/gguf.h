@@ -1,4 +1,4 @@
-// Minimal read-only GGUF v3 reader: mmaps the file, exposes metadata and tensor views.
+// Minimal read-only GGUF v3 reader: mmaps the file (all shards of a split model), exposes metadata and tensor views.
 #pragma once
 #include <cstdint>
 #include <cstring>
@@ -38,6 +38,8 @@ using GValue = std::variant<int64_t, double, bool, std::string, std::vector<int6
 
 class GGUF {
 public:
+    // path may be the first shard of a split model (name-00001-of-0000N.gguf): every shard is mapped,
+    // metadata comes from the first one
     explicit GGUF(const std::string & path);
     ~GGUF();
     GGUF(const GGUF &) = delete;
@@ -57,9 +59,9 @@ public:
     const std::string & arch() const { return arch_; }
 
 private:
-    int fd_ = -1;
-    uint8_t * map_ = nullptr;
-    size_t size_ = 0;
+    struct Map { int fd = -1; uint8_t * p = nullptr; size_t size = 0; };
+    void load_shard(const std::string & path, bool first);
+    std::vector<Map> maps_;
     std::string arch_;
     std::map<std::string, GValue> kv_;
     std::map<std::string, GTensor> tensors_;

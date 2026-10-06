@@ -8,19 +8,20 @@ NVFLAGS  := -O3 -std=c++17 $(ARCH) -lineinfo --use_fast_math -Xcompiler "-O3 -ma
 LIBS     := -L/usr/local/cuda-12.9/lib64 -lcudart -lcublas -lcuda -lgomp -lpthread -ldl
 
 BUILD := build
-SRC   := $(wildcard src/*.cpp)
-CU    := $(wildcard src/*.cu)
-OBJ   := $(SRC:src/%.cpp=$(BUILD)/%.o) $(CU:src/%.cu=$(BUILD)/%.o)
+# v1 (qwen35 dense) objects; qwen4exp objects additionally need ggml (CPU experts)
+OBJ   := $(BUILD)/gguf.o $(BUILD)/model.o $(BUILD)/kernels.o $(BUILD)/engine.o
+OBJ4  := $(BUILD)/gguf.o $(BUILD)/model4.o $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/cpu_moe.o $(BUILD)/engine4.o
+GGML_INC := -I$(LLAMA)/ggml/include
 
 all: $(BUILD)/hyper $(BUILD)/ref $(BUILD)/arbench
 
 $(BUILD)/%.o: src/%.cpp src/*.h
 	@mkdir -p $(BUILD)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(NVCC) $(NVFLAGS) $(GGML_INC) -x cu -c $< -o $@
 
 $(BUILD)/%.o: src/%.cu src/*.h src/*.cuh
 	@mkdir -p $(BUILD)
-	$(NVCC) $(NVFLAGS) -c $< -o $@
+	$(NVCC) $(NVFLAGS) $(GGML_INC) -c $< -o $@
 
 $(BUILD)/hyper: $(OBJ) tools/hyper_main.cpp
 	$(NVCC) $(NVFLAGS) -Isrc tools/hyper_main.cpp $(OBJ) -o $@ $(LIBS)
@@ -57,3 +58,7 @@ $(BUILD)/hyper-server: $(OBJ) tools/hyper_server.cpp
 	$(NVCC) $(NVFLAGS) -Isrc -I$(LLAMA)/include -I$(LLAMA)/ggml/include -I$(LLAMA)/common -I$(LLAMA)/vendor \
 	  tools/hyper_server.cpp $(OBJ) -o $@ \
 	  -Xlinker --start-group $(COMMON_LIBS) $(LLAMA_LIBS) -Xlinker --end-group $(LIBS) -lssl -lcrypto
+
+$(BUILD)/hyper4: $(OBJ4) tools/hyper4_main.cpp
+	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) -Xlinker --export-dynamic tools/hyper4_main.cpp $(OBJ4) -o $@ \
+	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)
