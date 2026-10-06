@@ -1,4 +1,6 @@
-// hyper engine, milestone M1: single-token decode for qwen35, layers split across GPUs.
+// hyper engine M2: single-token decode for qwen35 with tensor parallelism across all GPUs.
+// Every GPU holds a slice of every layer; partial results are summed with a P2P-free allreduce
+// through mapped pinned host memory, and each token runs as one CUDA graph per GPU.
 #pragma once
 #include "gguf.h"
 #include "kernels.cuh"
@@ -12,6 +14,7 @@ namespace hyper {
 struct EngineOptions {
     int n_devices = 3;
     int max_pos = 32768;
+    bool use_graphs = true;
 };
 
 class Engine {
@@ -19,30 +22,32 @@ public:
     Engine(const std::string & model_path, const EngineOptions & opt);
     ~Engine();
 
-    // run one token at position pos; logits stay on the last device
-    void decode(int token, int pos);
-    // copy logits of the last decode to host
+    void decode(int token, int pos);          // runs one token; greedy result available via argmax_last()
     void get_logits(std::vector<float> & out);
-    int argmax_last();
-    void reset();   // clear recurrent state (KV positions are overwritten by position)
+    int argmax_last() const { return last_argmax_; }
+    void reset();
 
     const Qwen35Config & config() const { return cfg_; }
 
 private:
-    struct Layer;
+    struct DevLayer;
     struct Device;
     void load_weights();
-    void balance_layers();
+    void record(int g);                       // enqueue one token's work for device g on its stream
+    void build_graphs();
 
     EngineOptions opt_;
     std::unique_ptr<GGUF> gguf_;
     Qwen35Config cfg_;
-    std::vector<Layer> layers_;
     std::vector<std::unique_ptr<Device>> devs_;
-    std::vector<int> layer_dev_;
-    BF16W output_;
-    float * output_norm_ = nullptr;
-    float * h_embd_ = nullptr;   // pinned host staging for the token embedding
+    // host side shared buffers (pinned)
+    float * h_embd_ = nullptr;
+    int * h_pos_ = nullptr;
+    float * h_res_ = nullptr;                 // [ndev][2] argmax pairs
+    float * ar_slots_ = nullptr;              // mapped [2][ndev][n_embd]
+    unsigned long long * ar_flags_ = nullptr; // mapped [ndev][nchunk]
+    bool graphs_ready_ = false;
+    int last_argmax_ = -1;
 };
 
 } // namespace hyper

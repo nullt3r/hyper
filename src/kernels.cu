@@ -105,9 +105,10 @@ __global__ void k_embed_q8_0(const uint8_t * __restrict__ table, int64_t row_byt
 // ---------------- gated attention ----------------
 // grid: n_head + n_head_kv blocks, blockDim = hd
 __global__ void k_attn_prep(float * qg, float * k, const float * v, const float * qnorm, const float * knorm,
-                            half * kcache, half * vcache, int pos, int n_head, int n_head_kv, int hd, int n_rot,
+                            half * kcache, half * vcache, const int * pos_p, int n_head, int n_head_kv, int hd, int n_rot,
                             float rope_base, float eps, int max_pos) {
     const int b = blockIdx.x, i = threadIdx.x;
+    const int pos = *pos_p;
     const bool is_q = b < n_head;
     float * vec = is_q ? qg + (size_t) b * 2 * hd : k + (size_t) (b - n_head) * hd;
     const float * nw = is_q ? qnorm : knorm;
@@ -138,10 +139,11 @@ __global__ void k_attn_prep(float * qg, float * k, const float * v, const float 
 // one block per q head, 8 warps; each warp walks positions w, w+8, ...; lane owns hd/32 dims
 template <int HD>
 __global__ void k_attn_decode(const float * __restrict__ qg, const half * __restrict__ kcache, const half * __restrict__ vcache,
-                              float * __restrict__ out, int n_pos, int n_head, int n_head_kv, float scale, int max_pos) {
+                              float * __restrict__ out, const int * pos_p, int head_off, int group, int kv_off, float scale, int max_pos) {
     constexpr int PER = HD / 32;
     const int h = blockIdx.x, lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    const int hk = h / (n_head / n_head_kv);
+    const int hk = (head_off + h) / group - kv_off;
+    const int n_pos = *pos_p + 1;
     const float * q = qg + (size_t) h * 2 * HD;
     float qr[PER];
 #pragma unroll
@@ -260,6 +262,51 @@ __global__ void k_argmax(const float * __restrict__ x, int n, int * out) {
     if (threadIdx.x == 0) *out = si[0];
 }
 
+
+__global__ void k_argmax_pair(const float * __restrict__ x, int n, int offset, float * out2) {
+    float best = -FLT_MAX; int bi = 0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) if (x[i] > best) { best = x[i]; bi = i; }
+    __shared__ float sv[1024]; __shared__ int si[1024];
+    sv[threadIdx.x] = best; si[threadIdx.x] = bi;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s && (sv[threadIdx.x + s] > sv[threadIdx.x] ||
+            (sv[threadIdx.x + s] == sv[threadIdx.x] && si[threadIdx.x + s] < si[threadIdx.x]))) {
+            sv[threadIdx.x] = sv[threadIdx.x + s]; si[threadIdx.x] = si[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { out2[0] = sv[0]; ((int *) out2)[1] = si[0] + offset; }
+}
+
+// grid: nchunk blocks of AR_CHUNK/4 threads; block b owns elements [b*AR_CHUNK, (b+1)*AR_CHUNK)
+__global__ void k_allreduce_add(float * x, const float * __restrict__ part, float * slots, unsigned long long * flags,
+                                int g, int ndev, int n, const int * counter, int call) {
+    const int b = blockIdx.x, nchunk = gridDim.x;
+    const int i0 = b * AR_CHUNK;
+    const unsigned long long seq = (unsigned long long) (*counter) * 1024ull + (unsigned long long) call + 1ull;
+    float * buf = slots + (size_t) (call & 1) * ndev * n;
+    for (int i = i0 + threadIdx.x; i < min(i0 + AR_CHUNK, n); i += blockDim.x) buf[(size_t) g * n + i] = part[i];
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        *((volatile unsigned long long *) &flags[(size_t) g * nchunk + b]) = seq;
+        for (int d = 0; d < ndev; ++d) {
+            if (d == g) continue;
+            while (*((volatile unsigned long long *) &flags[(size_t) d * nchunk + b]) < seq) { }
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    for (int i = i0 + threadIdx.x; i < min(i0 + AR_CHUNK, n); i += blockDim.x) {
+        float acc = 0.0f;
+        for (int d = 0; d < ndev; ++d) acc += d == g ? part[i] : __ldcv(&buf[(size_t) d * n + i]);
+        x[i] += acc;
+    }
+}
+
+__global__ void k_incr(int * c) { *c += 1; }
+
 } // namespace
 
 void gemv_q8(const Q8W & W, const float * x, float * y, const float * add, cudaStream_t s) {
@@ -275,15 +322,15 @@ void embed_q8_0(const uint8_t * table, int64_t row_bytes, int token, float * y, 
     k_embed_q8_0<<<1, 1024, 0, s>>>(table, row_bytes, token, y, n);
 }
 void attn_prep(float * qg, float * k, const float * v, const float * qnorm, const float * knorm,
-               half * kcache, half * vcache, int pos, int max_pos, int n_head, int n_head_kv, int hd, int n_rot,
+               half * kcache, half * vcache, const int * pos, int max_pos, int n_head, int n_kv, int hd, int n_rot,
                float rope_base, float eps, cudaStream_t s) {
-    k_attn_prep<<<n_head + n_head_kv, hd, 0, s>>>(qg, k, v, qnorm, knorm, kcache, vcache, pos, n_head, n_head_kv,
-                                                   hd, n_rot, rope_base, eps, max_pos);
+    k_attn_prep<<<n_head + n_kv, hd, 0, s>>>(qg, k, v, qnorm, knorm, kcache, vcache, pos, n_head, n_kv,
+                                             hd, n_rot, rope_base, eps, max_pos);
 }
-void attn_decode(const float * qg, const half * kcache, const half * vcache, float * out, int n_pos, int max_pos,
-                 int n_head, int n_head_kv, int hd, float scale, cudaStream_t s) {
+void attn_decode(const float * qg, const half * kcache, const half * vcache, float * out, const int * pos, int max_pos,
+                 int n_head, int head_off, int group, int kv_off, int hd, float scale, cudaStream_t s) {
     if (hd != 256) throw std::runtime_error("attn_decode: only head_dim 256 is instantiated");
-    k_attn_decode<256><<<n_head, 256, 0, s>>>(qg, kcache, vcache, out, n_pos, n_head, n_head_kv, scale, max_pos);
+    k_attn_decode<256><<<n_head, 256, 0, s>>>(qg, kcache, vcache, out, pos, head_off, group, kv_off, scale, max_pos);
 }
 void gdn_conv(float * qkv, float * conv_state, const float * conv_w, int channels, int K, cudaStream_t s) {
     k_gdn_conv<<<(channels + 255) / 256, 256, 0, s>>>(qkv, conv_state, conv_w, channels, K);
@@ -302,4 +349,16 @@ void argmax(const float * x, int n, int * out, cudaStream_t s) {
     k_argmax<<<1, 1024, 0, s>>>(x, n, out);
 }
 
+} // namespace hyper
+
+namespace hyper {
+void argmax_pair(const float * x, int n, int offset, float * out2, cudaStream_t s) {
+    k_argmax_pair<<<1, 1024, 0, s>>>(x, n, offset, out2);
+}
+void allreduce_add(float * x, const float * part, float * slots, unsigned long long * flags, int g, int ndev, int n,
+                   const int * counter, int call, cudaStream_t s) {
+    const int nchunk = (n + AR_CHUNK - 1) / AR_CHUNK;
+    k_allreduce_add<<<nchunk, AR_CHUNK / 4, 0, s>>>(x, part, slots, flags, g, ndev, n, counter, call);
+}
+void incr_counter(int * c, cudaStream_t s) { k_incr<<<1, 1, 0, s>>>(c); }
 } // namespace hyper

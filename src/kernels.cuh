@@ -28,14 +28,15 @@ void rmsnorm(const float * x, const float * w, float * y, int n, float eps, cuda
 void embed_q8_0(const uint8_t * table, int64_t row_bytes, int token, float * y, int n, cudaStream_t s);
 
 // ---- gated attention (full-attention layers) ----
-// qg: [n_head][2*hd] (q | gate per head), k,v: [n_head_kv][hd]; normalizes q,k per head, applies
-// partial NEOX rope on the first n_rot dims, writes q (fp32) and appends k,v (fp16) to the cache at pos
+// qg: [n_head][2*hd] (q | gate per head), k,v: [n_kv][hd] (local heads); normalizes q,k per head, applies
+// partial NEOX rope on the first n_rot dims, keeps q (fp32) in qg and appends k,v (fp16) at position *pos
 void attn_prep(float * qg, float * k, const float * v, const float * qnorm, const float * knorm,
-               half * kcache, half * vcache, int pos, int max_pos, int n_head, int n_head_kv, int hd, int n_rot,
+               half * kcache, half * vcache, const int * pos, int max_pos, int n_head, int n_kv, int hd, int n_rot,
                float rope_base, float eps, cudaStream_t s);
-// out[h][hd] = softmax(q k^T * scale) V over positions [0, pos], multiplied by sigmoid(gate)
-void attn_decode(const float * qg, const half * kcache, const half * vcache, float * out, int n_pos, int max_pos,
-                 int n_head, int n_head_kv, int hd, float scale, cudaStream_t s);
+// out[h][hd] = softmax(q k^T * scale) V over positions [0, *pos], times sigmoid(gate).
+// local q head h uses local kv head (head_off + h) / group - kv_off
+void attn_decode(const float * qg, const half * kcache, const half * vcache, float * out, const int * pos, int max_pos,
+                 int n_head, int head_off, int group, int kv_off, int hd, float scale, cudaStream_t s);
 
 // ---- gated delta net (linear-attention layers) ----
 // conv1d step over [q|k|v] channels with rolling state (kernel K, state holds K-1 previous inputs), then SiLU
@@ -52,5 +53,16 @@ void gated_norm(float * o, const float * z, const float * w, int n_heads, int dh
 void silu_mul(const float * gu, float * h, int n, cudaStream_t s);
 
 void argmax(const float * x, int n, int * out, cudaStream_t s);
+// writes {max value, index + offset} as two floats/ints into out2 (float*, idx stored as int bits)
+void argmax_pair(const float * x, int n, int offset, float * out2, cudaStream_t s);
+
+// ---- multi-GPU allreduce without P2P ----
+// x[i] += sum_d part_d[i] over all devices, exchanged through mapped pinned host memory.
+// slots: host-mapped float[2][ndev][n]; flags: host-mapped uint64[ndev][nchunk]; counter: device int (token id)
+constexpr int AR_CHUNK = 512;
+void allreduce_add(float * x, const float * part, float * slots, unsigned long long * flags, int g, int ndev, int n,
+                   const int * counter, int call, cudaStream_t s);
+// small helper kernels used inside captured graphs
+void incr_counter(int * c, cudaStream_t s);
 
 } // namespace hyper
