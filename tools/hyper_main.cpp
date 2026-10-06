@@ -78,6 +78,7 @@ static int cmd_gen(const char * model, const char * ref_path, int n_prompt, int 
     if ((int) toks.size() > n_prompt) toks.resize(n_prompt);
     EngineOptions opt;
     opt.max_pos = (int) toks.size() + n_gen + 16;
+    if (getenv("HYPER_DRAFT")) opt.n_draft = atoi(getenv("HYPER_DRAFT"));
     Engine eng(model, opt);
     GenStats a, b;
     const std::vector<int> plain = eng.generate(toks, n_gen, false, &a);
@@ -85,8 +86,11 @@ static int cmd_gen(const char * model, const char * ref_path, int n_prompt, int 
     int same = 0;
     while (same < n_gen && plain[same] == spec[same]) ++same;
     printf("GEN plain: %d tokens %.2f t/s\n", a.tokens, a.tokens / a.seconds);
-    printf("GEN spec : %d tokens %.2f t/s  steps %d  draft acceptance %.1f%%  tokens/step %.2f\n", b.tokens, b.tokens / b.seconds,
-           b.steps, 100.0 * b.accepted / b.steps, (double) b.tokens / b.steps);
+    printf("GEN spec (%d drafts): %d tokens %.2f t/s  steps %d  accepted drafts/step %.2f  tokens/step %.2f\n", opt.n_draft,
+           b.tokens, b.tokens / b.seconds, b.steps, (double) b.accepted / b.steps, (double) b.tokens / b.steps);
+    printf("GEN spec per step: main %.2f ms  mtp %.2f ms  restore %.3f ms (per reject)\n", 1e3 * b.t_main / b.steps,
+           1e3 * b.t_mtp / b.steps, b.steps > b.accepted ? 1e3 * b.t_restore / (b.steps - b.accepted) : 0.0);
+    printf("GEN plain per token: %.2f ms\n", 1e3 * a.seconds / a.tokens);
     printf("GEN identical prefix %d / %d%s\n", same, n_gen, same == n_gen ? " (sequences match)" : "");
     return 0;
 }

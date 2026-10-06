@@ -43,7 +43,7 @@ struct Engine::DevLayer {
 struct Engine::Device {
     int id = 0, g = 0;
     cudaStream_t stream = nullptr;
-    cudaGraphExec_t g_main[MAX_NT + 1] = {}, g_mtp[MAX_NT + 1] = {}, g_restore[MAX_NT] = {};
+    cudaGraphExec_t g_main[MAX_NT + 1] = {}, g_mtp[MAX_NT + 1] = {}, g_restore[MAX_NT] = {}, g_chain = nullptr;
     std::vector<DevLayer> layers;
     DevLayer mtp;
     BF16W output;             // vocab slice
@@ -51,7 +51,7 @@ struct Engine::Device {
     float * output_norm = nullptr;
     // activations, MAX_NT rows each
     float * x = nullptr, * part = nullptr, * big0 = nullptr, * big1 = nullptr, * o = nullptr, * h = nullptr;
-    float * hn = nullptr, * me = nullptr, * cat = nullptr;
+    float * hn = nullptr, * mhn = nullptr, * me = nullptr, * cat = nullptr;   // mhn: MTP's last normed output
     int big_stride = 0;
     float * logits = nullptr, * res = nullptr, * mres = nullptr, * ss = nullptr;
     int * pos = nullptr, * mpos = nullptr, * counter = nullptr;
@@ -72,6 +72,7 @@ struct Engine::Device {
         for (auto & gr : g_main) if (gr) cudaGraphExecDestroy(gr);
         for (auto & gr : g_mtp) if (gr) cudaGraphExecDestroy(gr);
         for (auto & gr : g_restore) if (gr) cudaGraphExecDestroy(gr);
+        if (g_chain) cudaGraphExecDestroy(g_chain);
         for (void * p : allocs) cudaFree(p);
         if (stream) cudaStreamDestroy(stream);
     }
@@ -328,6 +329,7 @@ void Engine::load_weights() {
         dev.o = dev.alloc<float>((size_t) MAX_NT * std::max(c.ssm_d_inner, c.n_head * c.head_dim));
         dev.h = dev.alloc<float>((size_t) MAX_NT * c.n_ff);
         dev.hn = dev.alloc<float>((size_t) MAX_NT * n);
+        dev.mhn = dev.alloc<float>(n);
         dev.me = dev.alloc<float>((size_t) MAX_NT * n);
         dev.cat = dev.alloc<float>((size_t) MAX_NT * 2 * n);
         dev.logits = dev.alloc<float>((size_t) MAX_NT * dev.output.n);
@@ -425,7 +427,8 @@ void Engine::record_main(int gi, int nt) {
     CUDA_CHECK(cudaMemcpyAsync(h_res_ + (size_t) gi * MAX_NT * 2, d.res, (size_t) nt * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
 }
 
-void Engine::record_mtp(int gi, int nt) {
+// chain = false: hidden rows come from the main model (hn); chain = true (nt = 1): from MTP's own last output
+void Engine::record_mtp(int gi, int nt, bool chain) {
     const Qwen35Config & c = cfg_;
     Device & d = *devs_[gi];
     DevLayer & L = d.mtp;
@@ -436,14 +439,16 @@ void Engine::record_mtp(int gi, int nt) {
     incr_counter(d.counter, s);
     // concat [rms(e) * enorm | rms(h) * hnorm] -> eh_proj (column slice) -> allreduce into a zeroed residual
     rmsnorm(d.me, n, L.enorm, d.cat, 2 * n, n, nt, c.rms_eps, s);
-    rmsnorm(d.hn, n, L.hnorm, d.cat + n, 2 * n, n, nt, c.rms_eps, s);
+    rmsnorm(chain ? d.mhn : d.hn, n, L.hnorm, d.cat + n, 2 * n, n, nt, c.rms_eps, s);
     gemv_bf16(L.eh_proj, d.cat + L.eh_c0, 2 * n, d.part, n, nullptr, nt, s);
     CUDA_CHECK(cudaMemsetAsync(d.x, 0, (size_t) nt * n * sizeof(float), s));
     int call = 0;
     allreduce_add_ll16(d.x, d.part, ar_ll_, d.g, opt_.n_devices, nt * n, d.counter, call++, s, d.ss);
     record_attn(d, L, nt, d.mpos, call);
     record_ffn(d, L, nt, call);
-    NormIn ni; ni.w = L.head_norm ? L.head_norm : d.output_norm; ni.ss = d.ss; ni.nss = nss; ni.eps = c.rms_eps;
+    const float * hw = L.head_norm ? L.head_norm : d.output_norm;
+    rmsnorm(d.x + (size_t) (nt - 1) * n, n, hw, d.mhn, n, n, 1, c.rms_eps, s);   // feeds chained drafts
+    NormIn ni; ni.w = hw; ni.ss = d.ss; ni.nss = nss; ni.eps = c.rms_eps;
     gemv_bf16(d.output, d.x, n, d.logits, d.output.n, nullptr, nt, s, ni);
     argmax_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.mres, nt, s);
     CUDA_CHECK(cudaMemcpyAsync(h_mres_ + (size_t) gi * MAX_NT * 2, d.mres, (size_t) nt * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
@@ -473,12 +478,14 @@ void Engine::build_graphs() {
         CUDA_CHECK(cudaGraphDestroy(graph));
         return exec;
     };
-    const int max_nt = opt_.mtp ? 2 : 1;
+    const int max_nt = opt_.mtp ? opt_.n_draft + 1 : 1;
+    if (max_nt > MAX_NT) throw std::runtime_error("n_draft too large");
     for (int gi = 0; gi < (int) devs_.size(); ++gi) {
         Device & d = *devs_[gi];
         for (int nt = 1; nt <= max_nt; ++nt) d.g_main[nt] = capture(d, [&] { record_main(gi, nt); });
         if (opt_.mtp) {
-            for (int nt = 1; nt <= max_nt; ++nt) d.g_mtp[nt] = capture(d, [&] { record_mtp(gi, nt); });
+            for (int nt = 1; nt <= max_nt; ++nt) d.g_mtp[nt] = capture(d, [&] { record_mtp(gi, nt, false); });
+            d.g_chain = capture(d, [&] { record_mtp(gi, 1, true); });
             for (int keep = 1; keep < max_nt; ++keep) d.g_restore[keep] = capture(d, [&] { record_restore(gi, keep); });
         }
     }
@@ -489,7 +496,7 @@ void Engine::launch(int kind, int nt) {
     if (!graphs_ready_) build_graphs();
     for (auto & dp : devs_) {
         CUDA_CHECK(cudaSetDevice(dp->id));
-        cudaGraphExec_t ex = kind == 0 ? dp->g_main[nt] : kind == 1 ? dp->g_mtp[nt] : dp->g_restore[nt];
+        cudaGraphExec_t ex = kind == 0 ? dp->g_main[nt] : kind == 1 ? dp->g_mtp[nt] : kind == 2 ? dp->g_restore[nt] : dp->g_chain;
         if (!ex) throw std::runtime_error("launch: graph not built for nt=" + std::to_string(nt));
         CUDA_CHECK(cudaGraphLaunch(ex, dp->stream));
     }
@@ -542,6 +549,13 @@ int Engine::mtp_draft(const int * tokens, int nt, int pos) {
     return best_of(h_mres_, (int) devs_.size(), nt - 1);
 }
 
+int Engine::mtp_chain(int token, int pos) {
+    embed(&token, 1, h_membd_);
+    h_pos_[1] = pos;
+    launch(3, 1);
+    return best_of(h_mres_, (int) devs_.size(), 0);
+}
+
 void Engine::get_logits(int t, std::vector<float> & out) {
     out.resize(cfg_.n_vocab);
     for (auto & dp : devs_) {
@@ -572,26 +586,40 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
             st.steps++;
         }
     } else {
-        int draft = mtp_draft(&next, 1, p - 1);   // (t_P, h_{P-1}) at P-1 predicts t_{P+1}
+        using clk = std::chrono::steady_clock;
+        auto since = [](clk::time_point a) { return std::chrono::duration<double>(clk::now() - a).count(); };
+        const int K = opt_.n_draft;
+        std::vector<int> drafts(K);
+        auto make_drafts = [&](const int * mt, int nt, int pos) {   // first from the main hidden, the rest chained
+            auto ta = clk::now();
+            drafts[0] = mtp_draft(mt, nt, pos);
+            for (int j = 1; j < K; ++j) drafts[j] = mtp_chain(drafts[j - 1], pos + nt - 1 + j);
+            st.t_mtp += since(ta);
+        };
+        make_drafts(&next, 1, p - 1);             // (t_P, h_{P-1}) at P-1 predicts t_{P+1}
         int cur = next;                           // token at position p, not yet in the main model
+        std::vector<int> in(K + 1), mt(K + 1);
         while ((int) out.size() < n_gen) {
-            const int in[2] = {cur, draft};
-            const std::vector<int> a = forward(in, 2, p);
+            in[0] = cur;
+            for (int j = 0; j < K; ++j) in[j + 1] = drafts[j];
+            auto ta = clk::now();
+            const std::vector<int> a = forward(in.data(), K + 1, p);
+            st.t_main += since(ta);
             st.steps++;
+            int m = 0;
+            while (m < K && a[m] == drafts[m]) ++m;
+            st.accepted += m;
             out.push_back(cur);
-            if (a[0] == draft) {
-                st.accepted++;
-                out.push_back(draft);
-                const int mt[2] = {draft, a[1]};
-                draft = mtp_draft(mt, 2, p);       // positions p, p+1 with hidden rows 0, 1
-                cur = a[1];
-                p += 2;
-            } else {
-                launch(2, 1);                      // keep only token 0 of the verified pair
-                draft = mtp_draft(&a[0], 1, p);
-                cur = a[0];
-                p += 1;
+            for (int j = 0; j < m; ++j) out.push_back(drafts[j]);
+            if (m < K) {                           // keep tokens 0..m of the verified block
+                ta = clk::now();
+                launch(2, m + 1);
+                st.t_restore += since(ta);
             }
+            for (int i = 0; i <= m; ++i) mt[i] = i < m ? drafts[i] : a[m];
+            make_drafts(mt.data(), m + 1, p);      // positions p..p+m with main hidden rows 0..m
+            cur = a[m];
+            p += m + 1;
         }
         out.resize(n_gen);
     }

@@ -27,6 +27,7 @@ struct NormIn { const float * w = nullptr; const float * ss = nullptr; int nss =
 // y[t][r] = (add ? add[t][r] : 0) + W x[t]   for t < nt; x rows have stride xs, y/add rows stride ys
 void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const float * add, int nt, cudaStream_t s,
              const NormIn & nin = {});
+extern int g_gemv_r_multi;   // rows per warp in the Q8 GEMV when nt > 1 (1 or 2)
 void gemv_bf16(const BF16W & W, const float * x, int xs, float * y, int ys, const float * add, int nt, cudaStream_t s,
                const NormIn & nin = {});
 

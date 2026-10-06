@@ -15,11 +15,13 @@ struct EngineOptions {
     int n_devices = 3;
     int max_pos = 32768;
     bool mtp = true;             // load the NextN head for speculative decoding
+    int n_draft = 2;             // MTP drafts per step (chained); verification runs n_draft + 1 tokens
 };
 
 struct GenStats {
     int tokens = 0, steps = 0, accepted = 0;
     double seconds = 0;
+    double t_main = 0, t_mtp = 0, t_restore = 0;   // wall time per phase
 };
 
 class Engine {
@@ -44,7 +46,7 @@ private:
     void load_weights();
     void load_layer(Device & dev, DevLayer & L, int il, bool mtp_layer);
     void record_main(int gi, int nt);
-    void record_mtp(int gi, int nt);
+    void record_mtp(int gi, int nt, bool chain);
     void record_restore(int gi, int keep);
     void record_attn(Device & d, DevLayer & L, int nt, const int * pos, int & call);
     void record_gdn(Device & d, DevLayer & L, int nt, bool snap, int & call);
@@ -52,7 +54,8 @@ private:
     void build_graphs();
     void launch(int kind, int nt);   // kind: 0 main, 1 mtp, 2 restore
     void embed(const int * tokens, int nt, float * dst);
-    int mtp_draft(const int * tokens, int nt, int pos);   // MTP over (tokens[t], hidden of row t) at pos+t; argmax of last
+    int mtp_draft(const int * tokens, int nt, int pos);   // MTP over (tokens[t], main hidden row t) at pos+t; argmax of last
+    int mtp_chain(int token, int pos);                   // MTP over (token, MTP's own last hidden) at pos
 
     EngineOptions opt_;
     std::unique_ptr<GGUF> gguf_;

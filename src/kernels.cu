@@ -66,12 +66,15 @@ __global__ void k_gemv_q8(const int8_t * __restrict__ qs, const half * __restric
 #pragma unroll
         for (int t = 0; t < NT; ++t) acc[r][t] = 0.0f;
     for (int c = lane; c < nchunk; c += 32) {
-        uint4 q[R];
-        float sc[R];
+        // dequantize the R weight chunks once (scale folded in), then reuse them for every token
+        float wf[R][16];
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            q[r] = __ldg((const uint4 *) qrow[r] + c);
-            sc[r] = __half2float(drow[r][c >> 1]);
+            const uint4 q = __ldg((const uint4 *) qrow[r] + c);
+            const float sc = __half2float(drow[r][c >> 1]);
+            const int8_t * b = (const int8_t *) &q;
+#pragma unroll
+            for (int e = 0; e < 16; ++e) wf[r][e] = sc * (float) b[e];
         }
         float4 wv[4];
         if (nin.w) {
@@ -81,23 +84,22 @@ __global__ void k_gemv_q8(const int8_t * __restrict__ qs, const half * __restric
 #pragma unroll
         for (int t = 0; t < NT; ++t) {
             const float4 * x4 = (const float4 *) (x + (size_t) t * xs);
-            float4 xv[4];
+            float xv[16];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                xv[j] = __ldg(x4 + c * 4 + j);
+                float4 v = __ldg(x4 + c * 4 + j);
                 if (nin.w) {
                     const float f = inv[t];
-                    xv[j].x *= f * wv[j].x; xv[j].y *= f * wv[j].y; xv[j].z *= f * wv[j].z; xv[j].w *= f * wv[j].w;
+                    v.x *= f * wv[j].x; v.y *= f * wv[j].y; v.z *= f * wv[j].z; v.w *= f * wv[j].w;
                 }
+                xv[4 * j] = v.x; xv[4 * j + 1] = v.y; xv[4 * j + 2] = v.z; xv[4 * j + 3] = v.w;
             }
 #pragma unroll
             for (int r = 0; r < R; ++r) {
-                const int8_t * b = (const int8_t *) &q[r];
                 float part = 0.0f;
 #pragma unroll
-                for (int j = 0; j < 4; ++j)
-                    part += xv[j].x * b[4 * j] + xv[j].y * b[4 * j + 1] + xv[j].z * b[4 * j + 2] + xv[j].w * b[4 * j + 3];
-                acc[r][t] += part * sc[r];
+                for (int e = 0; e < 16; ++e) part = fmaf(wf[r][e], xv[e], part);
+                acc[r][t] += part;
             }
         }
     }
@@ -434,11 +436,14 @@ __global__ void k_incr(int * c) { *c += 1; }
         default: throw std::runtime_error("unsupported nt");  \
     }
 
+int g_gemv_r_multi = 4;   // rows per warp when nt > 1 (tuning knob: 1, 2 or 4)
 void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const float * add, int nt, cudaStream_t s,
              const NormIn & nin) {
-    constexpr int R = 2;
-    const int grid = (W.n + GEMV_WARPS * R - 1) / (GEMV_WARPS * R);
-    NT_SWITCH(nt, (k_gemv_q8<R, NT><<<grid, GEMV_WARPS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, xs, y, ys, add, nin)));
+    const int R = nt == 1 ? 2 : g_gemv_r_multi;
+#define GEMV_R(RR) { constexpr int R_ = RR; const int grid = (W.n + GEMV_WARPS * R_ - 1) / (GEMV_WARPS * R_); \
+        NT_SWITCH(nt, (k_gemv_q8<R_, NT><<<grid, GEMV_WARPS * 32, 0, s>>>(W.qs, W.d, W.n, W.k, x, xs, y, ys, add, nin))); }
+    if (R == 1) GEMV_R(1) else if (R == 4) GEMV_R(4) else GEMV_R(2)
+#undef GEMV_R
 }
 void gemv_bf16(const BF16W & W, const float * x, int xs, float * y, int ys, const float * add, int nt, cudaStream_t s,
                const NormIn & nin) {

@@ -1,0 +1,4 @@
+<|im_start|>user
+Write a Python function that parses an ELF file header and prints the section table. Use only the standard library and explain the important fields.<|im_end|>
+<|im_start|>assistant
+<think>

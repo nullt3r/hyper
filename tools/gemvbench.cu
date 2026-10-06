@@ -21,8 +21,9 @@ int main(int argc, char ** argv) {
     CK(cudaSetDevice(0));
     cudaStream_t s; CK(cudaStreamCreate(&s));
     cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
-    for (int nt : {1, 2}) {
-    printf("-- tokens per call %d\n", nt);
+    for (auto [nt, rm] : std::vector<std::pair<int,int>>{{1, 2}, {2, 2}, {2, 4}, {3, 2}, {3, 4}, {4, 4}}) {
+    hyper::g_gemv_r_multi = rm;
+    printf("-- tokens per call %d, rows/warp %d\n", nt, nt == 1 ? 2 : rm);
     for (auto & sh : shapes) {
         // several distinct matrices so the working set exceeds L2 (6 MB on 3090)
         const int nmat = 8;
