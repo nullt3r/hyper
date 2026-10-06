@@ -30,7 +30,7 @@ struct Engine::DevLayer {
     Q8W wqkv, wgate, wab, wout;
     float * conv_w = nullptr, * dt_bias = nullptr, * ssm_a = nullptr, * ssm_norm = nullptr;
     float * conv_state = nullptr, * state = nullptr;
-    int n_v_l = 0, conv_ch = 0;
+    int n_v_l = 0, n_k_l = 0, conv_ch = 0;
     // ffn: local slice of the hidden dimension
     Q8W ffn_gate, ffn_up, ffn_down;
     int n_ff_l = 0;
@@ -73,10 +73,14 @@ namespace {
 struct RowRange { const GTensor * t; int64_t r0, r1; };
 
 // Q8_0 rows from several tensors (same k), restricted to column blocks [cb0, cb1), repacked
-Q8W upload_q8(const std::function<void *(size_t)> & alloc, int dev, const std::vector<RowRange> & parts, int64_t cb0 = 0, int64_t cb1 = -1) {
+using ColRanges = std::vector<std::pair<int64_t, int64_t>>;   // column-block ranges [b0, b1)
+
+Q8W upload_q8(const std::function<void *(size_t)> & alloc, int dev, const std::vector<RowRange> & parts, ColRanges cols = {}) {
     const int64_t k_full = parts[0].t->ne[0];
-    if (cb1 < 0) cb1 = k_full / 32;
-    const int64_t kb = cb1 - cb0, k = kb * 32;
+    if (cols.empty()) cols.push_back({0, k_full / 32});
+    std::vector<int64_t> blocks;
+    for (auto & [b0, b1] : cols) for (int64_t b = b0; b < b1; ++b) blocks.push_back(b);
+    const int64_t kb = (int64_t) blocks.size(), k = kb * 32;
     int64_t n = 0;
     for (auto & p : parts) {
         if (p.t->type != GType::Q8_0 || p.t->ne[0] != k_full) throw std::runtime_error("upload_q8: bad tensor " + p.t->name);
@@ -91,10 +95,10 @@ Q8W upload_q8(const std::function<void *(size_t)> & alloc, int dev, const std::v
         for (int64_t r = p.r0; r < p.r1; ++r) {
             const int64_t orow = row0 + (r - p.r0);
             const uint8_t * src = p.t->data + (size_t) r * rb;
-            for (int64_t b = cb0; b < cb1; ++b) {
-                const uint8_t * blk = src + (size_t) b * 34;
-                memcpy(&d[(size_t) orow * kb + (b - cb0)], blk, 2);
-                memcpy(&qs[(size_t) orow * k + (size_t) (b - cb0) * 32], blk + 2, 32);
+            for (int64_t j = 0; j < kb; ++j) {
+                const uint8_t * blk = src + (size_t) blocks[j] * 34;
+                memcpy(&d[(size_t) orow * kb + j], blk, 2);
+                memcpy(&qs[(size_t) orow * k + (size_t) j * 32], blk + 2, 32);
             }
         }
         row0 += p.r1 - p.r0;
@@ -159,7 +163,7 @@ void Engine::load_weights() {
     const Qwen35Config & c = cfg_;
     const int nd = opt_.n_devices;
     const int dk = c.ssm_d_state, dv = c.head_v_dim(), nk = c.ssm_n_group, nv = c.ssm_dt_rank;
-    if (nv % nd || c.n_head % nd) throw std::runtime_error("head counts must divide the device count");
+    if (c.n_head % nd) throw std::runtime_error("attention head count must divide the device count");
 
     for (auto & dp : devs_) {
         Device & dev = *dp;
@@ -202,35 +206,64 @@ void Engine::load_weights() {
                 L.wv = bf16(p + "attn_v.weight", (int64_t) L.kv_off * hd, (int64_t) (L.kv_off + L.n_kv_l) * hd);
                 // attn_output: k = n_head*hd; local column blocks of the local heads
                 L.wo = upload_q8(A, dev.id, {{T(p + "attn_output.weight"), 0, c.n_embd}},
-                                 (int64_t) L.head_off * hd / 32, (int64_t) (L.head_off + L.n_head_l) * hd / 32);
+                                 {{(int64_t) L.head_off * hd / 32, (int64_t) (L.head_off + L.n_head_l) * hd / 32}});
                 L.q_norm = f32(p + "attn_q_norm.weight");
                 L.k_norm = f32(p + "attn_k_norm.weight");
                 const size_t kv = (size_t) L.n_kv_l * opt_.max_pos * hd;
                 L.kcache = dev.alloc<half>(kv);
                 L.vcache = dev.alloc<half>(kv);
             } else {
-                L.n_v_l = nv / nd;
-                const int64_t v0 = (int64_t) g * L.n_v_l * dv, v1 = v0 + (int64_t) L.n_v_l * dv;   // v channels (within v part)
-                const int64_t qk = (int64_t) 2 * nk * dk;                                         // replicated q,k channels
-                L.conv_ch = (int) (qk + (v1 - v0));
+                // head-aligned partition: v-head h reads k-head h % nk, so a GPU owning k-heads [k0, k1)
+                // takes v-heads {grp * nk + k} for k in [k0, k1); local v order is k-major per group,
+                // which keeps the kernel's local mapping (v-head hl -> k-head hl % n_k_l) valid.
+                auto [k0, k1] = split(nk, nd, g);
+                const int n_k_l = (int) (k1 - k0);
+                std::vector<int> vh;
+                for (int grp = 0; grp < nv / nk; ++grp) for (int64_t kk = k0; kk < k1; ++kk) vh.push_back(grp * nk + (int) kk);
+                L.n_k_l = n_k_l;
+                L.n_v_l = (int) vh.size();
+                const int64_t qoff = 0, koff = (int64_t) nk * dk, voff = (int64_t) 2 * nk * dk;
+                L.conv_ch = 2 * n_k_l * dk + L.n_v_l * dv;
                 const GTensor * qkv = T(p + "attn_qkv.weight");
-                L.wqkv = upload_q8(A, dev.id, {{qkv, 0, qk}, {qkv, qk + v0, qk + v1}});
-                L.wgate = upload_q8(A, dev.id, {{T(p + "attn_gate.weight"), v0, v1}});
-                L.wab = upload_q8(A, dev.id, {{T(p + "ssm_alpha.weight"), (int64_t) g * L.n_v_l, (int64_t) (g + 1) * L.n_v_l},
-                                              {T(p + "ssm_beta.weight"), (int64_t) g * L.n_v_l, (int64_t) (g + 1) * L.n_v_l}});
-                L.wout = upload_q8(A, dev.id, {{T(p + "ssm_out.weight"), 0, c.n_embd}}, v0 / 32, v1 / 32);
-                // conv weights [channel][K]: q,k channels then local v channels
+                const GTensor * zt = T(p + "attn_gate.weight");
+                std::vector<RowRange> qkv_rows = {{qkv, qoff + k0 * dk, qoff + k1 * dk}, {qkv, koff + k0 * dk, koff + k1 * dk}};
+                std::vector<RowRange> z_rows, a_rows, b_rows;
+                ColRanges out_cols;
+                std::vector<int64_t> chans;   // conv channels in local order
+                for (int64_t ch = qoff + k0 * dk; ch < qoff + k1 * dk; ++ch) chans.push_back(ch);
+                for (int64_t ch = koff + k0 * dk; ch < koff + k1 * dk; ++ch) chans.push_back(ch);
+                for (int h : vh) {
+                    qkv_rows.push_back({qkv, voff + (int64_t) h * dv, voff + (int64_t) (h + 1) * dv});
+                    z_rows.push_back({zt, (int64_t) h * dv, (int64_t) (h + 1) * dv});
+                    a_rows.push_back({T(p + "ssm_alpha.weight"), h, h + 1});
+                    b_rows.push_back({T(p + "ssm_beta.weight"), h, h + 1});
+                    out_cols.push_back({(int64_t) h * dv / 32, (int64_t) (h + 1) * dv / 32});
+                    for (int64_t ch = voff + (int64_t) h * dv; ch < voff + (int64_t) (h + 1) * dv; ++ch) chans.push_back(ch);
+                }
+                std::vector<RowRange> ab_rows = a_rows; ab_rows.insert(ab_rows.end(), b_rows.begin(), b_rows.end());
+                L.wqkv = upload_q8(A, dev.id, qkv_rows);
+                L.wgate = upload_q8(A, dev.id, z_rows);
+                L.wab = upload_q8(A, dev.id, ab_rows);
+                L.wout = upload_q8(A, dev.id, {{T(p + "ssm_out.weight"), 0, c.n_embd}}, out_cols);
                 {
                     const GTensor & cw = gguf_->need(p + "ssm_conv1d.weight");
                     const int K = c.ssm_conv;
                     std::vector<float> buf((size_t) L.conv_ch * K);
-                    memcpy(buf.data(), cw.data, (size_t) qk * K * sizeof(float));
-                    memcpy(buf.data() + qk * K, (const float *) cw.data + (qk + v0) * K, (size_t) (v1 - v0) * K * sizeof(float));
+                    for (size_t j = 0; j < chans.size(); ++j)
+                        memcpy(buf.data() + j * K, (const float *) cw.data + chans[j] * K, K * sizeof(float));
                     L.conv_w = dev.alloc<float>(buf.size());
                     CUDA_CHECK(cudaMemcpy(L.conv_w, buf.data(), buf.size() * sizeof(float), cudaMemcpyHostToDevice));
                 }
-                L.dt_bias = f32(p + "ssm_dt.bias", (int64_t) g * L.n_v_l, (int64_t) (g + 1) * L.n_v_l);
-                L.ssm_a = f32(p + "ssm_a", (int64_t) g * L.n_v_l, (int64_t) (g + 1) * L.n_v_l);
+                auto gather = [&](const std::string & name) {
+                    const GTensor & t = gguf_->need(name);
+                    std::vector<float> buf;
+                    for (int h : vh) buf.push_back(((const float *) t.data)[h]);
+                    float * pd = dev.alloc<float>(buf.size());
+                    CUDA_CHECK(cudaMemcpy(pd, buf.data(), buf.size() * sizeof(float), cudaMemcpyHostToDevice));
+                    return pd;
+                };
+                L.dt_bias = gather(p + "ssm_dt.bias");
+                L.ssm_a = gather(p + "ssm_a");
                 L.ssm_norm = f32(p + "ssm_norm.weight");
                 L.conv_state = dev.alloc<float>((size_t) (c.ssm_conv - 1) * L.conv_ch);
                 L.state = dev.alloc<float>((size_t) L.n_v_l * dk * dv);
@@ -240,7 +273,7 @@ void Engine::load_weights() {
             L.n_ff_l = (int) (f1 - f0);
             L.ffn_gate = upload_q8(A, dev.id, {{T(p + "ffn_gate.weight"), f0, f1}});
             L.ffn_up = upload_q8(A, dev.id, {{T(p + "ffn_up.weight"), f0, f1}});
-            L.ffn_down = upload_q8(A, dev.id, {{T(p + "ffn_down.weight"), 0, c.n_embd}}, f0 / 32, f1 / 32);
+            L.ffn_down = upload_q8(A, dev.id, {{T(p + "ffn_down.weight"), 0, c.n_embd}}, {{f0 / 32, f1 / 32}});
         }
         auto [o0, o1] = split(c.n_vocab, nd, g);
         dev.vocab_off = (int) o0;
@@ -312,7 +345,7 @@ void Engine::record(int gi) {
             gemv_q8(L.wgate, d.xn, d.big1, nullptr, s);
             gemv_q8(L.wab, d.xn, d.ab, nullptr, s);
             gdn_conv(d.big0, L.conv_state, L.conv_w, L.conv_ch, c.ssm_conv, s);
-            gdn_step(d.big0, d.ab, L.dt_bias, L.ssm_a, L.state, d.o, c.ssm_n_group, L.n_v_l, c.ssm_d_state, c.head_v_dim(), eps, s);
+            gdn_step(d.big0, d.ab, L.dt_bias, L.ssm_a, L.state, d.o, L.n_k_l, L.n_v_l, c.ssm_d_state, c.head_v_dim(), eps, s);
             gated_norm(d.o, d.big1, L.ssm_norm, L.n_v_l, c.head_v_dim(), eps, s);
             gemv_q8(L.wout, d.o, d.part, nullptr, s);
         }
