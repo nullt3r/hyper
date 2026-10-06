@@ -45,15 +45,43 @@ Výstup je ve všech variantách **token po tokenu identický** s obyčejným gr
 
 Úspěšnost draftu 1: 94 %, druhého (podmíněně) ~79 %. hyper K=2 vs mainline: **3,3× (TP), 4,4× (layer)**.
 
+| tensor-core Q8 GEMM (mma m16n8k16, váhy ve fragmentovém pořadí, split-K) K=1/2/3 | 105 / 128 / 137 | | | |
+| BF16 váhy (attn qkv, eh_proj, LM hlava) → fp16 fragmenty + mma, K=3 | **145,6** | 3,24 | | |
+
+## Prefill (pfbench: prompt N tokenů, chunky po 512)
+
+| Krok | 512 | 4096 | 32768 | Poznámka |
+|---|---|---|---|---|
+| token po tokenu (původně) | ~60 | | | |
+| tensor-core GEMM 128×128 (cp.async + ldmatrix), LL allreduce | 821 | 764 | | allreduce 64 % času: LL přes mapovanou RAM jen ~1,6 GB/s |
+| allreduce přes copy enginy (D2H → pinned → H2D, události mezi GPU), 2 mikro-dávky na 2 streamech (komunikace jedné překrývá výpočet druhé) | 2074 | 1676 | | host vlákno na GPU + bariéra u každého allreduce |
+| split-K GQA attention (decode i prefill) | 2100 | 1878 | 970 | |
+| tensor-core kauzální flash attention pro prefill | **2141** | **2113** | **1880** | |
+
+Mainline (llama-bench, -fa 1, -ub 2048): pp4096 1672 (layer) / 695 (tensor); pp2048 @ d32768 1080 (layer) / 648 (tensor).
+
+## Dekódování v hloubce
+
+| | @0 | @4k | @32k |
+|---|---|---|---|
+| hyper, attention grid (hlavy × tokeny) = 8 bloků | 62 | 46 | |
+| hyper, split-K GQA (blok = kv hlava × úsek pozic, sdílí K/V mezi q hlavami skupiny) | 64 | **63** | **55** |
+| mainline tensor split | 34,6 | 34,4 | 32,9 |
+
 
 ## Zjištění
 - Allreduce bez P2P: pevná latence ~3,5 µs (n=256), zbytek přenos (PCIe; GPU1 x8). LL protokol odstraní fence + flag.
 - Hash výstupu není vhodný test; správnost = top-1 + KL proti llama.cpp referenci (`build/ref`).
 - RMSNorm fúzovaný naivně (každý blok počítá normu) zpomalil GEMV o ~1 ms → statistiku počítá allreduce.
 - Unroll/pipelining GEMV nepomáhá; limit je DRAM, ne počet požadavků v letu.
+- PCIe: GPU0/2 ~25 GB/s, GPU1 (x8) ~13 GB/s každým směrem. Zero-copy čtení mapované paměti po malých kusech je pro velké
+  zprávy katastrofální (1,5 GB/s); copy enginy dosáhnou linky. Allreduce 512×5120 fp16 přes DMA ≈ 1,2 ms (limit GPU1).
+- KL proti mainline roste s délkou kontextu (64 tok.: 2,2e-4, 700 tok.: 6,5e-4) stejně pro decode i prefill cestu –
+  pravděpodobně fp16 zaokrouhlení částečných součtů v allreduce; pořád pod rozdílem Q8_0 vs BF16.
+- GEMM prefillu běží na ~65 TFLOPS (blízko fp16/fp32-acc stropu 3090) – další zisk jen fp16 akumulace (2× rychlost na
+  GeForce, ale riziko přetečení u outlierů).
 
 ## Další kroky
-1. **Tensor-core Q8 GEMM** (mma.sync, váhy přeskládané do pořadí fragmentů): multi-token ověření je dnes
-   omezené počtem instrukcí (int8→float + FMA na token); stejný kernel s velkými dlaždicemi = GEMM pro prefill.
-2. **Prefill**: tensor-core GEMM pro Q8, chunked Gated DeltaNet, flash attention prefill (dnes jen token po tokenu).
+1. ~~Tensor-core Q8 GEMM~~, ~~prefill GEMM~~, ~~flash attention prefill~~, ~~split-K decode attention~~ (hotovo).
+2. Prefill: chunked Gated DeltaNet (gdn_step je sekvenční přes tokeny, ~12 % času prefillu), gdn_conv paralelně.
 3. Heterogenní režim CPU+GPU (velké modely): CPU jako 4. „zařízení“ v TP, souběžně s GPU.
