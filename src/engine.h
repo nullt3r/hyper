@@ -85,9 +85,12 @@ public:
                               const std::function<bool(int)> & on_token = {}, const SamplingParams & sp = {});
     // token at which prompt-cache snapshots are taken (message start, e.g. <|im_start|>)
     void set_snapshot_token(int tok) { snap_token_ = tok; }
+    // called after every prefill chunk with (tokens done incl. reused, prompt length, reused tokens)
+    void set_prefill_progress(std::function<void(int, int, int)> fn) { prefill_cb_ = std::move(fn); }
     void clear_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); }
     int n_snapshots() const { return (int) snaps_.size(); }
     int max_pos() const { return opt_.max_pos; }
+    int n_draft() const { return opt_.n_draft; }
 
     const Qwen35Config & config() const { return cfg_; }
 
@@ -134,6 +137,7 @@ private:
     std::vector<Snap> snaps_;
     std::vector<std::vector<float *>> snap_pool_;
     int snap_token_ = -1;
+    std::function<void(int, int, int)> prefill_cb_;
     std::mt19937_64 rng_;
     bool graphs_ready_ = false;
     int last_nt_ = 0;

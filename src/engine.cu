@@ -932,6 +932,7 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
             if (end == P) drafts[0] = d0;
         }
         if (si < snap_at.size() && snap_at[si] == end) take_snapshot(end);
+        if (prefill_cb_) prefill_cb_(end, P, s);
         c0 = end;
     }
     hist_ = prompt;

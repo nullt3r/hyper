@@ -27,7 +27,30 @@ using namespace hyper;
 
 namespace {
 
+using clk = std::chrono::steady_clock;
+double secs(clk::time_point a, clk::time_point b) { return std::chrono::duration<double>(b - a).count(); }
+
+// live state of the running request, for the log and the /stats page
+struct Live {
+    std::mutex mu;
+    std::string phase = "idle", id;
+    int prompt_total = 0, prompt_done = 0, cached = 0, gen = 0, ctx_max = 0;
+    double prompt_tps = 0, gen_tps_now = 0, gen_tps_avg = 0;
+    clk::time_point t_start, t_gen, t_win;
+    int win_n = 0;
+    long requests = 0;
+    ojson last = nullptr;
+    ojson json() {
+        std::lock_guard<std::mutex> lk(mu);
+        return {{"phase", phase}, {"id", id}, {"prompt_total", prompt_total}, {"prompt_done", prompt_done}, {"cached", cached},
+                {"prompt_per_second", prompt_tps}, {"generated", gen}, {"gen_per_second_now", gen_tps_now},
+                {"gen_per_second_avg", gen_tps_avg}, {"ctx_used", prompt_total + gen}, {"ctx_max", ctx_max},
+                {"requests", requests}, {"last", last}};
+    }
+};
+
 struct Ctx {
+    Live live;
     SamplingParams defaults;
     Engine * eng = nullptr;
     llama_model * vm = nullptr;
@@ -101,7 +124,8 @@ struct Request {
     common_chat_parser_params pp;
     std::vector<std::string> stops;
     int max_tokens = 0;
-    bool stream = false, include_usage = true;
+    bool stream = false, include_usage = true, timings_per_token = false;
+    std::string id;
     SamplingParams sp;
 };
 
@@ -146,25 +170,65 @@ Request prepare(Ctx & c, const ojson & body) {
     if (body.contains("top_k") && body["top_k"].is_number_integer()) r.sp.top_k = body["top_k"].get<int>();
     if (body.contains("seed") && body["seed"].is_number_integer()) r.sp.seed = body["seed"].get<uint64_t>();
     r.stream = body.value("stream", false);
+    r.timings_per_token = body.value("timings_per_token", false);
     if (body.contains("stream_options") && body["stream_options"].is_object())
         r.include_usage = body["stream_options"].value("include_usage", true);
     return r;
 }
 
 // runs generation, calling on_msg(new_msg) whenever the parsed message may have changed; returns finish reason
-struct GenOut { std::string text, finish; int n_gen = 0, reused = 0; double t_prompt = 0, t_gen = 0; };
+struct GenOut { std::string text, finish; int n_gen = 0, reused = 0, steps = 0, accepted = 0; double t_prompt = 0, t_gen = 0; };
 
 GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::string &)> & on_text) {
     GenOut o;
     o.finish = "length";
     GenStats st;
-    auto t0 = std::chrono::steady_clock::now();
+    Live & lv = c.live;
+    const int P = (int) r.prompt.size();
+    auto t0 = clk::now();
+    {
+        std::lock_guard<std::mutex> lk(lv.mu);
+        lv.phase = "prompt"; lv.id = r.id; lv.prompt_total = P; lv.prompt_done = 0; lv.cached = 0; lv.gen = 0;
+        lv.prompt_tps = lv.gen_tps_now = lv.gen_tps_avg = 0; lv.t_start = t0; lv.requests++;
+    }
+    fprintf(stderr, "[%s] prompt: %d tokens, max %d new\n", r.id.c_str(), P, r.max_tokens);
+    auto t_log = t0;
+    c.eng->set_prefill_progress([&](int done, int total, int reused) {
+        const auto now = clk::now();
+        const double tps = (done - reused) / std::max(1e-9, secs(t0, now));
+        {
+            std::lock_guard<std::mutex> lk(lv.mu);
+            lv.prompt_done = done; lv.cached = reused; lv.prompt_tps = tps;
+        }
+        if (secs(t_log, now) >= 2.0 || done == total) {
+            fprintf(stderr, "[%s] prompt eval: %6d / %d (cached %d)  %.0f t/s\n", r.id.c_str(), done, total, reused, tps);
+            t_log = now;
+        }
+    });
     bool first = true;
-    std::chrono::steady_clock::time_point t1 = t0;
+    clk::time_point t1 = t0;
     c.eng->generate(r.prompt, r.max_tokens, true, &st, [&](int tok) {
-        if (first) { t1 = std::chrono::steady_clock::now(); first = false; }
+        const auto now = clk::now();
+        if (first) {
+            t1 = now; first = false; t_log = now;
+            std::lock_guard<std::mutex> lk(lv.mu);
+            lv.phase = "generating"; lv.t_gen = now; lv.t_win = now; lv.win_n = 0;
+        }
         if (llama_vocab_is_eog(c.vocab, tok)) { o.finish = "stop"; return false; }
         ++o.n_gen;
+        {
+            std::lock_guard<std::mutex> lk(lv.mu);
+            lv.gen = o.n_gen;
+            const double w = secs(lv.t_win, now);
+            if (w >= 0.5) { lv.gen_tps_now = (o.n_gen - lv.win_n) / w; lv.t_win = now; lv.win_n = o.n_gen; }
+            lv.gen_tps_avg = o.n_gen / std::max(1e-9, secs(t1, now));
+        }
+        if (secs(t_log, now) >= 2.0) {
+            std::lock_guard<std::mutex> lk(lv.mu);
+            fprintf(stderr, "[%s] generating: %6d tokens  now %.1f t/s  avg %.1f t/s  ctx %d / %d\n", r.id.c_str(), o.n_gen,
+                    lv.gen_tps_now, lv.gen_tps_avg, P + o.n_gen, lv.ctx_max);
+            t_log = now;
+        }
         o.text += piece(c.vocab, tok);
         for (const auto & s : r.stops) {
             const size_t at = o.text.find(s, o.text.size() > s.size() + 64 ? o.text.size() - s.size() - 64 : 0);
@@ -173,12 +237,72 @@ GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::strin
         if (on_text && !on_text(o.text)) { o.finish = "cancelled"; return false; }
         return true;
     }, r.sp);
-    auto t2 = std::chrono::steady_clock::now();
+    c.eng->set_prefill_progress({});
+    auto t2 = clk::now();
+    if (first) t1 = t2;
     o.reused = st.prompt_reused;
-    o.t_prompt = std::chrono::duration<double>(t1 - t0).count();
-    o.t_gen = std::chrono::duration<double>(t2 - t1).count();
+    o.steps = st.steps; o.accepted = st.accepted;
+    o.t_prompt = secs(t0, t1);
+    o.t_gen = secs(t1, t2);
+    const int n_new = P - o.reused;
+    fprintf(stderr, "[%s] prompt eval time = %10.2f ms / %6d tokens (%8.2f ms per token, %8.2f tokens per second), cached %d\n",
+            r.id.c_str(), 1e3 * o.t_prompt, n_new, 1e3 * o.t_prompt / std::max(1, n_new), n_new / std::max(1e-9, o.t_prompt), o.reused);
+    fprintf(stderr, "[%s]        eval time = %10.2f ms / %6d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
+            r.id.c_str(), 1e3 * o.t_gen, o.n_gen, 1e3 * o.t_gen / std::max(1, o.n_gen), o.n_gen / std::max(1e-9, o.t_gen));
+    fprintf(stderr, "[%s]       total time = %10.2f ms / %6d tokens, finish: %s, draft acceptance %.2f / %d per step\n",
+            r.id.c_str(), 1e3 * secs(t0, t2), n_new + o.n_gen, o.finish.c_str(), o.steps ? (double) o.accepted / o.steps : 0.0,
+            c.eng->n_draft());
+    {
+        std::lock_guard<std::mutex> lk(lv.mu);
+        lv.phase = "idle";
+        lv.last = {{"id", r.id}, {"prompt_n", n_new}, {"cached", o.reused}, {"prompt_ms", 1e3 * o.t_prompt},
+                   {"prompt_per_second", n_new / std::max(1e-9, o.t_prompt)}, {"predicted_n", o.n_gen}, {"predicted_ms", 1e3 * o.t_gen},
+                   {"predicted_per_second", o.n_gen / std::max(1e-9, o.t_gen)}, {"finish", o.finish},
+                   {"draft_acceptance", o.steps ? (double) o.accepted / o.steps : 0.0}};
+    }
     return o;
 }
+
+const char * STATS_PAGE = R"HTML(<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>hyper live</title>
+<style>
+:root{--bg:#f6f6f4;--fg:#1d1d1b;--mut:#6b6b66;--card:#fff;--line:#e2e2dd;--acc:#2f6fdf}
+@media (prefers-color-scheme:dark){:root{--bg:#141413;--fg:#ecebe6;--mut:#9a998f;--card:#1e1e1c;--line:#33332f;--acc:#6ea2ff}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif}
+main{max-width:860px;margin:0 auto;padding:20px 16px}
+h1{font-size:18px;margin:0 0 4px}.sub{color:var(--mut);margin-bottom:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
+.c{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
+.l{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.v{font-size:28px;font-variant-numeric:tabular-nums}
+.bar{height:6px;background:var(--line);border-radius:3px;margin-top:8px;overflow:hidden}.bar i{display:block;height:100%;background:var(--acc)}
+table{width:100%;border-collapse:collapse;margin-top:16px;font-variant-numeric:tabular-nums}td{padding:4px 0;border-bottom:1px solid var(--line)}td:last-child{text-align:right}
+</style></head><body><main>
+<h1>hyper live</h1><div class="sub" id="ph">…</div>
+<div class="grid">
+<div class="c"><div class="l">generation now</div><div class="v" id="g1">–</div></div>
+<div class="c"><div class="l">generation avg</div><div class="v" id="g2">–</div></div>
+<div class="c"><div class="l">prompt eval</div><div class="v" id="p1">–</div><div class="bar"><i id="pb" style="width:0"></i></div></div>
+<div class="c"><div class="l">context</div><div class="v" id="cx">–</div><div class="bar"><i id="cb" style="width:0"></i></div></div>
+</div>
+<table id="last"></table>
+</main><script>
+const f=(x,d=1)=>Number(x).toFixed(d);
+async function tick(){try{const s=await (await fetch('/stats')).json();
+document.getElementById('ph').textContent=s.phase+(s.id?' · '+s.id:'')+' · requests '+s.requests;
+const busy=s.phase!=='idle';
+document.getElementById('g1').textContent=busy&&s.phase==='generating'?f(s.gen_per_second_now)+' t/s':'–';
+document.getElementById('g2').textContent=s.generated?f(s.gen_per_second_avg)+' t/s':'–';
+document.getElementById('p1').textContent=s.prompt_total?f(s.prompt_per_second,0)+' t/s':'–';
+document.getElementById('pb').style.width=(s.prompt_total?100*s.prompt_done/s.prompt_total:0)+'%';
+document.getElementById('cx').textContent=s.ctx_used.toLocaleString()+' / '+s.ctx_max.toLocaleString();
+document.getElementById('cb').style.width=(100*s.ctx_used/s.ctx_max)+'%';
+const L=s.last;document.getElementById('last').innerHTML=L?`<tr><td colspan=2><b>last request ${L.id}</b></td></tr>
+<tr><td>prompt eval</td><td>${L.prompt_n} tokens (cached ${L.cached}) · ${f(L.prompt_ms,0)} ms · ${f(L.prompt_per_second,0)} t/s</td></tr>
+<tr><td>generation</td><td>${L.predicted_n} tokens · ${f(L.predicted_ms,0)} ms · ${f(L.predicted_per_second)} t/s</td></tr>
+<tr><td>draft acceptance</td><td>${f(L.draft_acceptance,2)} per step</td></tr><tr><td>finish</td><td>${L.finish}</td></tr>`:'';
+}catch(e){}}
+setInterval(tick,500);tick();
+</script></body></html>)HTML";
 
 ojson timings(const Request & r, const GenOut & o) {
     const int n_new = (int) r.prompt.size() - o.reused;
@@ -215,6 +339,7 @@ int main(int argc, char ** argv) {
 
     Ctx c;
     c.alias = alias;
+    c.live.ctx_max = ctx;
     c.defaults = defaults;
     llama_backend_init();
     auto mp = llama_model_default_params();
@@ -257,6 +382,8 @@ int main(int argc, char ** argv) {
         res.set_content(ojson({{"object", "list"}, {"data", ojson::array({m})}}).dump(), "application/json");
     };
     srv.Get("/v1/models", models);
+    srv.Get("/stats", [&](const httplib::Request &, httplib::Response & res) { cors(res); res.set_content(c.live.json().dump(), "application/json"); });
+    srv.Get("/", [&](const httplib::Request &, httplib::Response & res) { res.set_content(STATS_PAGE, "text/html; charset=utf-8"); });
     srv.Get("/models", models);
 
     auto chat = [&](const httplib::Request & req, httplib::Response & res) {
@@ -271,8 +398,8 @@ int main(int argc, char ** argv) {
             r = std::make_shared<Request>(prepare(c, body));
         } catch (const std::exception & e) { fail(400, e.what()); return; }
         const std::string id = random_id("chatcmpl-", c.next_id++);
+        r->id = id.substr(9, 6) + id.substr(id.size() - 4);
         const long created = (long) std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-        fprintf(stderr, "hyper-server: request %s: %zu prompt tokens, stream=%d\n", id.c_str(), r->prompt.size(), (int) r->stream);
 
         if (!r->stream) {
             std::lock_guard<std::mutex> lk(c.mu);
@@ -287,8 +414,6 @@ int main(int argc, char ** argv) {
             ojson out = {{"id", id}, {"object", "chat.completion"}, {"created", created}, {"model", c.alias},
                          {"choices", ojson::array({ojson({{"index", 0}, {"message", m}, {"finish_reason", finish}})})},
                          {"usage", usage(*r, o)}, {"timings", timings(*r, o)}};
-            fprintf(stderr, "hyper-server: %s done: %d tokens, prompt %zu (cached %d) %.0f t/s, gen %.1f t/s\n", id.c_str(), o.n_gen,
-                    r->prompt.size(), o.reused, (r->prompt.size() - o.reused) / std::max(1e-9, o.t_prompt), o.n_gen / std::max(1e-9, o.t_gen));
             res.set_content(out.dump(), "application/json");
             return;
         }
@@ -313,8 +438,16 @@ int main(int argc, char ** argv) {
                 common_chat_msg msg;
                 try { msg = common_chat_parse(text, partial, r->pp); } catch (const std::exception &) { return true; }
                 msg.set_tool_call_ids(ids, gen_id);
-                for (const auto & d : common_chat_msg_diff::compute_diffs(prev, msg))
-                    if (!send(chunk(diff_to_delta(d), nullptr))) return false;
+                for (const auto & d : common_chat_msg_diff::compute_diffs(prev, msg)) {
+                    ojson ch = chunk(diff_to_delta(d), nullptr);
+                    if (r->timings_per_token) {
+                        const ojson lj = c.live.json();
+                        ch["timings"] = {{"cache_n", lj["cached"]}, {"prompt_n", lj["prompt_total"].get<int>() - lj["cached"].get<int>()},
+                                         {"prompt_per_second", lj["prompt_per_second"]}, {"predicted_n", lj["generated"]},
+                                         {"predicted_per_second", lj["gen_per_second_avg"]}};
+                    }
+                    if (!send(ch)) return false;
+                }
                 prev = msg;
                 return true;
             };
@@ -340,9 +473,6 @@ int main(int argc, char ** argv) {
                 const std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
             }
-            fprintf(stderr, "hyper-server: %s done (%s): %d tokens, prompt %zu (cached %d) %.0f t/s, gen %.1f t/s\n", id.c_str(),
-                    o.finish.c_str(), o.n_gen, r->prompt.size(), o.reused, (r->prompt.size() - o.reused) / std::max(1e-9, o.t_prompt),
-                    o.n_gen / std::max(1e-9, o.t_gen));
             sink.done();
             return true;
         });
