@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <stdexcept>
@@ -514,8 +515,13 @@ void Engine::record_attn(Device & d, DevLayer & L, Act & a, int nt, int & call, 
     if (dep.signal) CUDA_CHECK(cudaEventRecord(dep.signal, a.s));   // this micro-batch's K/V are in the cache
     if (dep.wait) CUDA_CHECK(cudaStreamWaitEvent(a.s, dep.wait, 0));
     const int ostride = L.n_head_l * c.head_dim;
-    attn_split(a.big0, bs, L.kcache, L.vcache, a.attn_part, a.o, ostride, a.pos, opt_.max_pos, L.n_head_l, L.n_kv_l, L.head_off,
-               c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), nt, a.s);
+    const float scale = 1.0f / sqrtf((float) c.head_dim);
+    if (a.bulk && !getenv("HYPER_NO_FA"))
+        attn_prefill(a.big0, bs, L.kcache, L.vcache, a.o, ostride, a.pos, opt_.max_pos, L.n_head_l, L.head_off,
+                     c.n_head / c.n_head_kv, L.kv_off, c.head_dim, scale, nt, a.s);
+    else
+        attn_split(a.big0, bs, L.kcache, L.vcache, a.attn_part, a.o, ostride, a.pos, opt_.max_pos, L.n_head_l, L.n_kv_l,
+                   L.head_off, c.n_head / c.n_head_kv, L.kv_off, c.head_dim, scale, nt, a.s);
     mm(a, L.wo, a.o, ostride, a.part, n, nt);
     allreduce(d, a, nt, call);
 }

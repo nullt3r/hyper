@@ -57,6 +57,10 @@ void attn_prep(float * qkv, int stride, const float * qnorm, const float * knorm
 void attn_decode(const float * qkv, int stride, const half * kcache, const half * vcache, float * out, int out_stride,
                  const int * pos, int max_pos, int n_head, int n_kv, int head_off, int group, int kv_off, int hd,
                  float scale, int nt, cudaStream_t s);
+// prefill: tensor-core causal flash attention (64 query tokens x one q head per block)
+void attn_prefill(const float * qkv, int stride, const half * kcache, const half * vcache, float * out, int out_stride,
+                  const int * pos, int max_pos, int n_head, int head_off, int group, int kv_off, int hd, float scale, int nt,
+                  cudaStream_t s);
 // split-K variant: a block per (local kv head, position slice, token) serves all q heads of that kv head;
 // part: scratch of attn_part_floats(n_head, n_kv, nt, hd) floats
 int attn_nsplit(int n_kv, int nt);

@@ -528,6 +528,127 @@ __global__ void k_attn_combine(const float * __restrict__ qkv, int stride, const
     out[(size_t) t * out_stride + (size_t) h * HD + i] = (num / den) * sigmoidf(gate);
 }
 
+// tensor-core causal flash attention for prefill. Block = one local q head x 64 query tokens (4 warps x 16 rows),
+// Q (pre-scaled, fp16) stays in shared memory; K/V tiles of 32 positions stream through shared memory. S = Q K^T
+// and O += P V run on mma m16n8k16; the S accumulators become the P A-fragments directly.
+constexpr int FA_BQ = 64, FA_BK = 32, FA_LD = 256 + 8;
+template <int HD>
+__global__ void __launch_bounds__(128) k_attn_fa(const float * __restrict__ qkv, int stride, const half * __restrict__ kcache,
+                                                 const half * __restrict__ vcache, float * __restrict__ out, int out_stride,
+                                                 const int * pos_p, int max_pos, int head_off, int group, int kv_off, float scale, int nt) {
+    static_assert(HD == 256, "FA_LD assumes head_dim 256");
+    extern __shared__ __align__(16) half fa_smem[];
+    half * qs = fa_smem, * ks = qs + FA_BQ * FA_LD, * vs = ks + FA_BK * FA_LD;
+    const int h = blockIdx.y, qt0 = blockIdx.x * FA_BQ;
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+    const int hk = (head_off + h) / group - kv_off;
+    const int pos0 = *pos_p;
+    for (int i = threadIdx.x; i < FA_BQ * HD / 2; i += blockDim.x) {
+        const int r = i / (HD / 2), d = (i % (HD / 2)) * 2, t = qt0 + r;
+        float2 v = make_float2(0.0f, 0.0f);
+        if (t < nt) v = *(const float2 *) (qkv + (size_t) t * stride + (size_t) h * 2 * HD + d);
+        *(__half2 *) (qs + r * FA_LD + d) = __floats2half2_rn(v.x * scale, v.y * scale);
+    }
+    const int n_keys = pos0 + min(nt, qt0 + FA_BQ);            // keys [0, n_keys) are visible to some row of the block
+    const int wrow0 = qt0 + w * 16;                             // first token row of this warp
+    const int wlast = pos0 + min(nt - 1, wrow0 + 15);           // last visible key of the warp
+    const half * kb = kcache + (size_t) hk * max_pos * HD, * vb = vcache + (size_t) hk * max_pos * HD;
+    float o[HD / 8][4];
+#pragma unroll
+    for (int i = 0; i < HD / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+    float m[2] = {-1e30f, -1e30f}, l[2] = {0.0f, 0.0f};
+    const int qp[2] = {pos0 + wrow0 + gid, pos0 + wrow0 + gid + 8};
+    for (int kt0 = 0; kt0 < n_keys; kt0 += FA_BK) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < FA_BK * HD / 8; i += blockDim.x) {
+            const int r = i / (HD / 8), d = (i % (HD / 8)) * 8, p = kt0 + r;
+            const bool ok = p < n_keys;
+            cp_async16(ks + r * FA_LD + d, kb + (size_t) (ok ? p : 0) * HD + d, ok);
+            cp_async16(vs + r * FA_LD + d, vb + (size_t) (ok ? p : 0) * HD + d, ok);
+        }
+        cp_async_commit();
+        asm volatile("cp.async.wait_group 0;");
+        __syncthreads();
+        if (kt0 > wlast || wrow0 >= nt) continue;
+        float s[4][4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.0f;
+#pragma unroll
+        for (int kk = 0; kk < HD / 16; ++kk) {
+            unsigned a[4];
+            ldmatrix_x4(a, qs + (w * 16 + (lane & 15)) * FA_LD + kk * 16 + (lane >> 4) * 8);
+#pragma unroll
+            for (int np = 0; np < 2; ++np) {
+                unsigned r[4];
+                ldmatrix_x4(r, ks + (np * 16 + (lane & 7) + ((lane >> 4) << 3)) * FA_LD + kk * 16 + ((lane >> 3) & 1) * 8);
+                const unsigned b0[2] = {r[0], r[1]}, b1[2] = {r[2], r[3]};
+                mma16816(s[2 * np], a, b0);
+                mma16816(s[2 * np + 1], a, b1);
+            }
+        }
+        float tmax[2] = {-1e30f, -1e30f};
+#pragma unroll
+        for (int ni = 0; ni < 4; ++ni)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int key = kt0 + ni * 8 + 2 * tig + (e & 1);
+                if (key > qp[e >> 1] || key >= n_keys) s[ni][e] = -INFINITY;
+                tmax[e >> 1] = fmaxf(tmax[e >> 1], s[ni][e]);
+            }
+        float corr[2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            tmax[r] = fmaxf(tmax[r], __shfl_xor_sync(0xffffffff, tmax[r], 1));
+            tmax[r] = fmaxf(tmax[r], __shfl_xor_sync(0xffffffff, tmax[r], 2));
+            const float mn = fmaxf(m[r], tmax[r]);
+            corr[r] = __expf(m[r] - mn);
+            m[r] = mn;
+            l[r] *= corr[r];
+        }
+#pragma unroll
+        for (int ni = 0; ni < 4; ++ni)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) { s[ni][e] = __expf(s[ni][e] - m[e >> 1]); l[e >> 1] += s[ni][e]; }
+#pragma unroll
+        for (int i = 0; i < HD / 8; ++i) { o[i][0] *= corr[0]; o[i][1] *= corr[0]; o[i][2] *= corr[1]; o[i][3] *= corr[1]; }
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+            const unsigned a[4] = {pack_h2(s[2 * kk][0], s[2 * kk][1]), pack_h2(s[2 * kk][2], s[2 * kk][3]),
+                                   pack_h2(s[2 * kk + 1][0], s[2 * kk + 1][1]), pack_h2(s[2 * kk + 1][2], s[2 * kk + 1][3])};
+#pragma unroll
+            for (int dn = 0; dn < HD / 16; ++dn) {
+                unsigned r[4];
+                const half * src = vs + (kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * FA_LD + dn * 16 + (lane >> 4) * 8;
+                const unsigned sa = (unsigned) __cvta_generic_to_shared(src);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                             : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(sa));
+                const unsigned b0[2] = {r[0], r[1]}, b1[2] = {r[2], r[3]};
+                mma16816(o[2 * dn], a, b0);
+                mma16816(o[2 * dn + 1], a, b1);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        l[r] += __shfl_xor_sync(0xffffffff, l[r], 1);
+        l[r] += __shfl_xor_sync(0xffffffff, l[r], 2);
+    }
+#pragma unroll
+    for (int e2 = 0; e2 < 2; ++e2) {
+        const int t = wrow0 + gid + e2 * 8;
+        if (t >= nt) continue;
+        const float inv = 1.0f / l[e2];
+        const float * gate = qkv + (size_t) t * stride + (size_t) h * 2 * HD + HD;
+        float * dst = out + (size_t) t * out_stride + (size_t) h * HD;
+#pragma unroll
+        for (int i = 0; i < HD / 8; ++i) {
+            const int d = i * 8 + 2 * tig;
+            dst[d] = o[i][e2 * 2] * inv * sigmoidf(gate[d]);
+            dst[d + 1] = o[i][e2 * 2 + 1] * inv * sigmoidf(gate[d + 1]);
+        }
+    }
+}
+
 // ---------------- gated delta net ----------------
 // thread per channel, tokens in order; state holds the K-1 previous inputs, oldest first
 __global__ void k_gdn_conv(float * in, int stride, float * st, float * snap, const float * __restrict__ w, int channels, int K, int nt) {
@@ -852,6 +973,20 @@ void attn_decode(const float * qkv, int stride, const half * kcache, const half 
     if (hd != 256) throw std::runtime_error("attn_decode: only head_dim 256 is instantiated");
     k_attn_decode<256><<<dim3(n_head, nt), 256, 0, s>>>(qkv, stride, kcache, vcache, out, out_stride, pos, max_pos,
                                                         head_off, group, kv_off, scale);
+}
+void attn_prefill(const float * qkv, int stride, const half * kcache, const half * vcache, float * out, int out_stride,
+                  const int * pos, int max_pos, int n_head, int head_off, int group, int kv_off, int hd, float scale, int nt,
+                  cudaStream_t s) {
+    if (hd != 256) throw std::runtime_error("attn_prefill: only head_dim 256 is instantiated");
+    const size_t smem = (size_t) (FA_BQ + 2 * FA_BK) * FA_LD * sizeof(half);
+    static bool attr_set[16] = {};
+    int dev = 0; cudaGetDevice(&dev);
+    if (!attr_set[dev]) {
+        cudaFuncSetAttribute(k_attn_fa<256>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        attr_set[dev] = true;
+    }
+    k_attn_fa<256><<<dim3((nt + FA_BQ - 1) / FA_BQ, n_head), 128, smem, s>>>(qkv, stride, kcache, vcache, out, out_stride, pos, max_pos,
+                                                                           head_off, group, kv_off, scale, nt);
 }
 int attn_nsplit(int n_kv, int nt) { return std::max(1, std::min(64, 256 / (n_kv * nt))); }
 size_t attn_part_floats(int n_head, int n_kv, int nt, int hd) { return (size_t) nt * n_head * attn_nsplit(n_kv, nt) * (hd + 2); }
