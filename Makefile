@@ -49,3 +49,11 @@ $(BUILD)/mmabench: tools/mmabench.cu $(BUILD)/kernels.o
 
 $(BUILD)/arbulk: tools/arbulk.cu $(BUILD)/kernels.o
 	$(NVCC) $(NVFLAGS) tools/arbulk.cu $(BUILD)/kernels.o -o $@ $(LIBS)
+
+# OpenAI-compatible server: chat templates / tool-call parsing from mainline libcommon, vocab from libllama
+COMMON_LIBS := $(LLAMA)/build/common/libllama-common.a $(LLAMA)/build/common/libllama-common-base.a \
+               $(LLAMA)/build/vendor/cpp-httplib/libcpp-httplib.a
+$(BUILD)/hyper-server: $(OBJ) tools/hyper_server.cpp
+	$(NVCC) $(NVFLAGS) -Isrc -I$(LLAMA)/include -I$(LLAMA)/ggml/include -I$(LLAMA)/common -I$(LLAMA)/vendor \
+	  tools/hyper_server.cpp $(OBJ) -o $@ \
+	  -Xlinker --start-group $(COMMON_LIBS) $(LLAMA_LIBS) -Xlinker --end-group $(LIBS) -lssl -lcrypto

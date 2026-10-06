@@ -764,9 +764,11 @@ void Engine::get_logits(int t, std::vector<float> & out) {
     }
 }
 
-std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats) {
+std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
+                                  const std::function<bool(int)> & on_token) {
     if (spec && !opt_.mtp) throw std::runtime_error("generate: MTP head not loaded");
     if (prompt.empty()) throw std::runtime_error("generate: empty prompt");
+    if ((int) prompt.size() + 8 > opt_.max_pos) throw std::runtime_error("generate: prompt longer than the context");
     reset();
     // prompt in chunks of up to MAX_ROWS; with MTP the head then consumes (t_{q+1}, h_q) at position q for the
     // chunk's rows (the last chunk's final pair uses the predicted next token and yields the first draft)
@@ -792,9 +794,16 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
     std::vector<int> out;
     int p = P;
     auto t0 = clk::now();
+    bool stop = false;
+    auto emit = [&](int tok) {   // false once the caller wants no more tokens
+        if (stop) return false;
+        out.push_back(tok);
+        if (on_token && !on_token(tok)) stop = true;
+        if ((int) out.size() >= n_gen) stop = true;
+        return !stop;
+    };
     if (!spec) {
-        while ((int) out.size() < n_gen) {
-            out.push_back(next);
+        while (emit(next) && p + 1 < opt_.max_pos) {
             next = forward(&next, 1, p++)[0];
             st.steps++;
         }
@@ -808,7 +817,7 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
         for (int j = 1; j < K; ++j) drafts[j] = mtp_chain(drafts[j - 1], p - 1 + j);   // first draft came with the prompt
         int cur = next;                           // token at position p, not yet in the main model
         std::vector<int> in(K + 1), mt(K + 1);
-        while ((int) out.size() < n_gen) {
+        while (!stop && p + K + 1 < opt_.max_pos) {
             in[0] = cur;
             for (int j = 0; j < K; ++j) in[j + 1] = drafts[j];
             auto ta = clk::now();
@@ -818,8 +827,8 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
             int m = 0;
             while (m < K && a[m] == drafts[m]) ++m;
             st.accepted += m;
-            out.push_back(cur);
-            for (int j = 0; j < m; ++j) out.push_back(drafts[j]);
+            if (emit(cur)) for (int j = 0; j < m; ++j) if (!emit(drafts[j])) break;
+            if (stop) break;
             if (m < K) {                           // keep tokens 0..m of the verified block
                 ta = clk::now();
                 launch(2, m + 1);
@@ -830,7 +839,6 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
             cur = a[m];
             p += m + 1;
         }
-        out.resize(n_gen);
     }
     st.tokens = (int) out.size();
     st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

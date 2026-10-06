@@ -7,6 +7,7 @@
 #include "model.h"
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -67,7 +68,10 @@ public:
     void reset();
 
     // greedy generation; prompt processed in chunks of up to 512 tokens. spec = use MTP drafts (1 per step)
-    std::vector<int> generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats);
+    // on_token: called for every generated token in order; returning false stops generation
+    std::vector<int> generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
+                              const std::function<bool(int)> & on_token = {});
+    int max_pos() const { return opt_.max_pos; }
 
     const Qwen35Config & config() const { return cfg_; }
 
