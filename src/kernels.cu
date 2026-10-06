@@ -247,32 +247,32 @@ struct FragF16 {
 
 constexpr int GM_BN = 128, GM_LDS = 40;   // tokens per block, smem row stride in halfs (32 + 8 pad)
 
-template <typename Frag>
+template <typename Frag, int NI>   // NI n8 tiles per warp: block covers 2 * NI * 8 tokens
 __global__ void __launch_bounds__(256) k_gemm(const uint4 * __restrict__ wq, const half * __restrict__ ws, int n, int k,
                                               const half * __restrict__ xh, int T, float * __restrict__ y, int ys,
                                               const float * __restrict__ add) {
-    __shared__ __align__(16) half bs[2][GM_BN * GM_LDS];
+    constexpr int BN = 2 * NI * 8;
+    __shared__ __align__(16) half bs[2][BN * GM_LDS];
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
     const int wm = w & 3, wn = w >> 2;
-    const int t0 = blockIdx.x * GM_BN;
+    const int t0 = blockIdx.x * BN;
     const int ntile = (n + 15) / 16, kb = k / 32;
     const int tile0 = blockIdx.y * 8 + wm * 2;
-    // activation tile loader: 128 rows x 64 bytes = 512 16-byte chunks, 2 per thread
+    // activation tile loader: BN rows x 64 bytes = BN * 4 16-byte chunks
     auto load_b = [&](int buf, int b) {
-#pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            const int c = threadIdx.x + i * 256, row = c >> 2, part = c & 3;
+        for (int c = threadIdx.x; c < BN * 4; c += 256) {
+            const int row = c >> 2, part = c & 3;
             const int tok = t0 + row;
             const bool ok = tok < T;
             cp_async16(&bs[buf][row * GM_LDS + part * 8], xh + (size_t) (ok ? tok : 0) * k + b * 32 + part * 8, ok);
         }
         cp_async_commit();
     };
-    float acc[2][8][4];
+    float acc[2][NI][4];
 #pragma unroll
     for (int mi = 0; mi < 2; ++mi)
 #pragma unroll
-        for (int ni = 0; ni < 8; ++ni)
+        for (int ni = 0; ni < NI; ++ni)
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[mi][ni][e] = 0.0f;
     Frag fr[2];
@@ -292,11 +292,11 @@ __global__ void __launch_bounds__(256) k_gemm(const uint4 * __restrict__ wq, con
         }
         cp_async_wait1();
         __syncthreads();
-        const half * sb = bs[cur] + (wn * 64 + (lane & 7) + ((lane >> 4) << 3)) * GM_LDS + ((lane >> 3) & 1) * 8;
+        const half * sb = bs[cur] + (wn * NI * 8 + (lane & 7) + ((lane >> 4) << 3)) * GM_LDS + ((lane >> 3) & 1) * 8;
 #pragma unroll
         for (int ks = 0; ks < 2; ++ks)
 #pragma unroll
-            for (int np = 0; np < 4; ++np) {
+            for (int np = 0; np < NI / 2; ++np) {
                 unsigned r[4];
                 ldmatrix_x4(r, sb + np * 16 * GM_LDS + ks * 16);
                 const unsigned b0[2] = {r[0], r[1]}, b1[2] = {r[2], r[3]};
@@ -312,8 +312,8 @@ __global__ void __launch_bounds__(256) k_gemm(const uint4 * __restrict__ wq, con
     for (int mi = 0; mi < 2; ++mi) {
         const int r0 = (tile0 + mi) * 16 + gid;
 #pragma unroll
-        for (int ni = 0; ni < 8; ++ni) {
-            const int tk = t0 + wn * 64 + ni * 8 + 2 * tig;
+        for (int ni = 0; ni < NI; ++ni) {
+            const int tk = t0 + wn * NI * 8 + ni * 8 + 2 * tig;
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const int row = r0 + (e >> 1) * 8, t = tk + (e & 1);
@@ -768,6 +768,39 @@ __global__ void k_argmax_pairs(const float * __restrict__ x, int xs, int n, int 
     if (threadIdx.x == 0) { out[2 * blockIdx.x] = sv[0]; ((int *) out)[2 * blockIdx.x + 1] = si[0] + offset; }
 }
 
+// top-K candidates per row: radix select of the K-th largest value (orderable float keys, MSB first), then
+// gather. out[row][K] = {value, index + offset (int bits)}, unused slots {-FLT_MAX, -1}
+__device__ __forceinline__ unsigned fkey(float f) {
+    const unsigned u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__global__ void k_topk(const float * __restrict__ x, int xs, int n, int offset, float * __restrict__ out, int K) {
+    const float * xr = x + (size_t) blockIdx.x * xs;
+    float * o = out + (size_t) blockIdx.x * K * 2;
+    unsigned t = 0;
+    for (int bit = 31; bit >= 0; --bit) {
+        const unsigned cand = t | (1u << bit);
+        float cnt = 0.0f;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) cnt += fkey(xr[i]) >= cand ? 1.0f : 0.0f;
+        if (block_sum(cnt) >= (float) K) t = cand;
+    }
+    __shared__ int ngt, neq;
+    if (threadIdx.x == 0) { ngt = 0; neq = 0; }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = xr[i];
+        if (fkey(v) > t) { const int s = atomicAdd(&ngt, 1); if (s < K) { o[2 * s] = v; ((int *) o)[2 * s + 1] = i + offset; } }
+    }
+    __syncthreads();
+    const int base = min(ngt, K);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = xr[i];
+        if (fkey(v) == t) { const int s = base + atomicAdd(&neq, 1); if (s < K) { o[2 * s] = v; ((int *) o)[2 * s + 1] = i + offset; } }
+    }
+    __syncthreads();
+    for (int s = base + neq + threadIdx.x; s < K; s += blockDim.x) { o[2 * s] = -FLT_MAX; ((int *) o)[2 * s + 1] = -1; }
+}
+
 // thread per element pair: {half2(part[2i], part[2i+1]), seq} in one 8-byte packet; readers spin on packets
 __global__ void k_allreduce_add_ll16(float * x, const float * __restrict__ part, uint2 * slots, int g, int ndev, int n2,
                                      const int * counter, int call, float * ss_out) {
@@ -925,12 +958,21 @@ void gemv_bf16(const BF16W & W, const float * x, int xs, float * y, int ys, cons
 void to_half(const float * x, int xs, const float * w, int k, float eps, half * xh, int nt, cudaStream_t s) {
     k_to_half<<<nt, 256, 0, s>>>(x, xs, w, k, eps, xh);
 }
+// token tile by chunk size: padding a short chunk to 128 tokens would cost a full 128-token tile
+template <typename Frag>
+static void gemm_launch(const uint4 * q, const half * sc, int n, int k, const half * xh, int T, float * y, int ys, const float * add,
+                        cudaStream_t s) {
+    const int gy = ((n + 15) / 16 + 7) / 8;
+    if (T <= 32)      k_gemm<Frag, 2><<<dim3((T + 31) / 32, gy), 256, 0, s>>>(q, sc, n, k, xh, T, y, ys, add);
+    else if (T <= 64) k_gemm<Frag, 4><<<dim3((T + 63) / 64, gy), 256, 0, s>>>(q, sc, n, k, xh, T, y, ys, add);
+    else              k_gemm<Frag, 8><<<dim3((T + 127) / 128, gy), 256, 0, s>>>(q, sc, n, k, xh, T, y, ys, add);
+}
 void gemm_q8(const Q8W & W, const half * xh, int T, float * y, int ys, const float * add, cudaStream_t s) {
-    k_gemm<FragQ8><<<dim3((T + GM_BN - 1) / GM_BN, ((W.n + 15) / 16 + 7) / 8), 256, 0, s>>>(W.q, W.s, W.n, W.k, xh, T, y, ys, add);
+    gemm_launch<FragQ8>(W.q, W.s, W.n, W.k, xh, T, y, ys, add, s);
 }
 void gemm_f16(const BF16W & W, const half * xh, int T, float * y, int ys, const float * add, cudaStream_t s) {
     if (W.k % 32) throw std::runtime_error("gemm_f16: k must be a multiple of 32");
-    k_gemm<FragF16><<<dim3((T + GM_BN - 1) / GM_BN, ((W.n + 15) / 16 + 7) / 8), 256, 0, s>>>(W.q, nullptr, W.n, W.k, xh, T, y, ys, add);
+    gemm_launch<FragF16>(W.q, nullptr, W.n, W.k, xh, T, y, ys, add, s);
 }
 
 void repack_bf16_frag(const uint16_t * w, int n, int k, size_t row_stride, uint8_t * out) {
@@ -1036,6 +1078,9 @@ void allreduce_add_bulk(float * x, const float * part, half * data, unsigned * f
 void add_parts(float * x, const half * own, const half * recv, size_t stride, int nparts, int n, cudaStream_t s) {
     if (n % 8) throw std::runtime_error("add_parts: n must be a multiple of 8");
     k_add_parts<<<(n / 8 + 255) / 256, 256, 0, s>>>(x, own, recv, stride, nparts, n);
+}
+void topk_pairs(const float * x, int xs, int n, int offset, float * out, int K, int nt, cudaStream_t s) {
+    k_topk<<<nt, 1024, 0, s>>>(x, xs, n, offset, out, K);
 }
 void incr_counter(int * c, cudaStream_t s) { k_incr<<<1, 1, 0, s>>>(c); }
 

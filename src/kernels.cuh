@@ -88,6 +88,9 @@ void gated_norm(float * o, int o_stride, const float * z, int z_stride, const fl
 // h[t][i] = silu(gu[t][i]) * gu[t][n + i]
 void silu_mul(const float * gu, int gu_stride, float * h, int h_stride, int n, int nt, cudaStream_t s);
 
+// out[t][K] = the K largest {value, index + offset} of row t (index as int bits; unordered)
+void topk_pairs(const float * x, int xs, int n, int offset, float * out, int K, int nt, cudaStream_t s);
+constexpr int TOPK = 64;
 // out[t] = {max value, index + offset} (index stored as int bits)
 void argmax_pairs(const float * x, int xs, int n, int offset, float * out, int nt, cudaStream_t s);
 

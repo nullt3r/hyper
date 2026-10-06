@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -117,6 +118,109 @@ static int cmd_pfbench(const char * model, const char * ref_path, int n_prompt) 
     return 0;
 }
 
+// prompt cache: output with the cache must match the output computed from scratch (greedy, MTP)
+static int cmd_cachetest(const char * model, const char * ref_path) {
+    std::vector<int> toks; std::vector<float> ref; int nv = 0;
+    if (!read_ref(ref_path, toks, ref, nv)) return 1;
+    EngineOptions opt;
+    opt.max_pos = 4096;
+    opt.n_draft = 3;
+    opt.prompt_cache = true;
+    Engine eng(model, opt);
+    {   // the most frequent token of the prompt stands in for message starts
+        std::map<int, int> cnt;
+        for (int i = 0; i < 600; ++i) cnt[toks[i]]++;
+        int best = toks[0];
+        for (auto & [k, v] : cnt) if (v > cnt[best]) best = k;
+        eng.set_snapshot_token(best);
+        printf("CACHE snapshot token %d occurs %d times\n", best, cnt[best]);
+    }
+    const int n_gen = 96;
+    std::vector<int> A(toks.begin(), toks.begin() + 600);
+    auto run = [&](const std::vector<int> & prev, const std::vector<int> & B, const char * name) {
+        GenStats st;
+        eng.clear_cache();
+        if (!prev.empty()) eng.generate(prev, n_gen, true, &st);
+        const std::vector<int> cached = eng.generate(B, n_gen, true, &st);
+        const int reused = st.prompt_reused;
+        const double tp = st.t_prefill;
+        eng.clear_cache();
+        const std::vector<int> fresh = eng.generate(B, n_gen, true, &st);
+        int same = 0;
+        while (same < n_gen && cached[same] == fresh[same]) ++same;
+        printf("CACHE %-12s prompt %zu reused %d (prefill %.3f s vs %.3f s fresh)  identical %d / %d  snapshots %d\n", name,
+               B.size(), reused, tp, st.t_prefill, same, n_gen, eng.n_snapshots());
+        return cached;
+    };
+    run(A, A, "same");
+    std::vector<int> B(A.begin(), A.begin() + 450);
+    B.insert(B.end(), toks.begin() + 20, toks.begin() + 90);
+    run(A, B, "diverged");
+    GenStats st;
+    eng.clear_cache();
+    std::vector<int> outA = eng.generate(A, n_gen, true, &st);
+    std::vector<int> C = A;
+    C.insert(C.end(), outA.begin(), outA.end());
+    C.insert(C.end(), toks.begin() + 600, toks.begin() + 680);
+    run(A, C, "extended");
+    return 0;
+}
+
+// forward latency per chunk size
+static int cmd_chunkbench(const char * model, const char * ref_path) {
+    std::vector<int> toks; std::vector<float> ref; int nv = 0;
+    if (!read_ref(ref_path, toks, ref, nv)) return 1;
+    EngineOptions opt;
+    opt.max_pos = 4096;
+    opt.n_draft = 3;
+    Engine eng(model, opt);
+    for (int n : {1, 4, 5, 8, 16, 32, 64, 128, 256, 512}) {
+        eng.forward(toks.data(), n, 0);
+        auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < 5; ++r) eng.forward(toks.data(), n, 0);
+        const double ms = 1e3 * std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 5;
+        printf("CHUNK n=%3d  %.1f ms  (%.0f t/s)\n", n, ms, n / ms * 1e3);
+    }
+    return 0;
+}
+
+// sampling with speculative decoding must match plain sampling in distribution: histogram of tokens 1..3
+static int cmd_samptest(const char * model, const char * ref_path, int runs) {
+    std::vector<int> toks; std::vector<float> ref; int nv = 0;
+    if (!read_ref(ref_path, toks, ref, nv)) return 1;
+    std::vector<int> prompt(toks.begin(), toks.begin() + std::min<size_t>(40, toks.size()));
+    EngineOptions opt;
+    opt.max_pos = 256;
+    opt.n_draft = 3;
+    Engine eng(model, opt);
+    SamplingParams sp;
+    sp.temp = 1.0f; sp.top_k = 40;
+    std::vector<std::map<int, int>> hp(4), hs(4);
+    double acc = 0; int steps = 0;
+    for (int r = 0; r < runs; ++r) {
+        GenStats st;
+        sp.seed = 1000 + r;
+        auto a = eng.generate(prompt, 4, false, &st, {}, sp);
+        sp.seed = 900000 + r;
+        auto b = eng.generate(prompt, 4, true, &st, {}, sp);
+        acc += st.accepted; steps += st.steps;
+        for (int i = 0; i < 4; ++i) { hp[i][a[i]]++; hs[i][b[i]]++; }
+    }
+    for (int i = 0; i < 4; ++i) {
+        // total variation distance and the same for two plain halves would need more runs; report TV and top tokens
+        std::map<int, int> all = hp[i];
+        for (auto & [k, v] : hs[i]) all[k] += 0;
+        double tv = 0;
+        for (auto & [k, v] : all) tv += std::fabs(hp[i][k] - hs[i][k]) / (double) runs;
+        int top = -1, topc = 0;
+        for (auto & [k, v] : hp[i]) if (v > topc) { top = k; topc = v; }
+        printf("SAMP pos %d: TV %.3f  distinct plain %zu spec %zu  top token %d plain %d spec %d\n", i, tv / 2, hp[i].size(),
+               hs[i].size(), top, topc, hs[i][top]);
+    }
+    printf("SAMP accepted drafts/step %.2f\n", acc / steps);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: hyper check|check2 <model> <ref.bin> | hyper gen <model> <ref.bin> [n_prompt] [n_gen]\n");
@@ -126,6 +230,9 @@ int main(int argc, char ** argv) {
     try {
         if (cmd == "check") return cmd_check(argv[2], argv[3], 1);
         if (cmd == "check2") return cmd_check(argv[2], argv[3], 2);
+        if (cmd == "samptest") return cmd_samptest(argv[2], argv[3], argc > 4 ? atoi(argv[4]) : 300);
+        if (cmd == "chunkbench") return cmd_chunkbench(argv[2], argv[3]);
+        if (cmd == "cachetest") return cmd_cachetest(argv[2], argv[3]);
         if (cmd == "pfbench") return cmd_pfbench(argv[2], argv[3], argc > 4 ? atoi(argv[4]) : 2048);
         if (cmd == "checkn") return cmd_check(argv[2], argv[3], argc > 4 ? atoi(argv[4]) : 64);
         if (cmd == "gen") return cmd_gen(argv[2], argv[3], argc > 4 ? atoi(argv[4]) : 64, argc > 5 ? atoi(argv[5]) : 256);

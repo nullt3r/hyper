@@ -11,6 +11,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <random>
 #include <thread>
 #include <type_traits>
 
@@ -22,7 +23,8 @@ namespace hyper {
 // rows per forward: up to MAX_NT through the decode GEMV + CUDA graphs, up to MAX_ROWS (prefill chunk)
 // through the tensor-core GEMM, recorded directly
 constexpr int MAX_ROWS = 512;
-constexpr int MIN_MICRO = 64;   // prefill chunks of at least 2 * MIN_MICRO rows run as two overlapping micro-batches
+constexpr int MIN_MICRO = 64;
+constexpr int DMA_MIN = 48;     // allreduce over the copy engines from this many rows (fixed ~0.4 ms); LL below   // prefill chunks of at least 2 * MIN_MICRO rows run as two overlapping micro-batches
 
 // one GPU's slice of one layer
 struct Engine::DevLayer {
@@ -62,7 +64,7 @@ struct Engine::Device {
     float * x = nullptr, * part = nullptr, * big0 = nullptr, * big1 = nullptr, * o = nullptr, * h = nullptr;
     float * hn = nullptr, * mhn = nullptr, * me = nullptr, * cat = nullptr;   // mhn: MTP's last normed output
     int big_stride = 0;
-    float * logits = nullptr, * res = nullptr, * mres = nullptr, * ss = nullptr;
+    float * logits = nullptr, * res = nullptr, * mres = nullptr, * ss = nullptr, * topk = nullptr;
     half * xh = nullptr;      // fp16 GEMM input scratch [MAX_ROWS][max k]
     // bulk (prefill) allreduce and micro-batching
     half * p16 = nullptr, * recv = nullptr;   // own part in fp16 [MAX_ROWS][n]; peers' parts [ndev-1][MAX_ROWS][n]
@@ -210,8 +212,9 @@ Engine::Engine(const std::string & model_path, const EngineOptions & opt) : opt_
     CUDA_CHECK(cudaHostAlloc(&h_stage_, (size_t) 2 * 2 * nd * MAX_ROWS * n * sizeof(half), cudaHostAllocPortable));
     barrier_ = std::make_unique<Barrier>(nd);
     CUDA_CHECK(cudaHostAlloc(&h_res_, (size_t) nd * MAX_ROWS * 2 * sizeof(float), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_topk_, (size_t) nd * MAX_NT * TOPK * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_mres_, (size_t) nd * MAX_ROWS * 2 * sizeof(float), cudaHostAllocPortable));
-    const size_t ll = (size_t) 2 * nd * MAX_NT * n / 2;
+    const size_t ll = (size_t) 2 * nd * DMA_MIN * n / 2;
     CUDA_CHECK(cudaHostAlloc(&ar_ll_, ll * sizeof(uint2), cudaHostAllocPortable | cudaHostAllocMapped));
     memset(ar_ll_, 0xff, ll * sizeof(uint2));
 
@@ -219,8 +222,10 @@ Engine::Engine(const std::string & model_path, const EngineOptions & opt) : opt_
 }
 
 Engine::~Engine() {
+    for (auto & s : snaps_) snap_pool_.push_back(s.h);
+    for (auto & v : snap_pool_) for (float * p : v) cudaFreeHost(p);
     devs_.clear();
-    for (void * p : {(void *) h_embd_, (void *) h_membd_, (void *) h_pos_, (void *) h_res_, (void *) h_mres_, (void *) ar_ll_, (void *) h_stage_})
+    for (void * p : {(void *) h_embd_, (void *) h_membd_, (void *) h_pos_, (void *) h_res_, (void *) h_mres_, (void *) ar_ll_, (void *) h_stage_, (void *) h_topk_})
         if (p) cudaFreeHost(p);
 }
 
@@ -407,6 +412,7 @@ void Engine::load_weights() {
         dev.cat = dev.alloc<float>((size_t) MAX_ROWS * 2 * n);
         dev.logits = dev.alloc<float>((size_t) MAX_ROWS * dev.output.n);
         dev.res = dev.alloc<float>(MAX_ROWS * 2);
+        dev.topk = dev.alloc<float>(MAX_NT * TOPK * 2);
         dev.mres = dev.alloc<float>(MAX_ROWS * 2);
         dev.ss = dev.alloc<float>(MAX_ROWS * 64);
         dev.xh = dev.alloc<half>((size_t) MAX_ROWS * std::max(c.n_ff, 2 * n));
@@ -450,7 +456,7 @@ void Engine::reset() {
 // (+ norm computed in place) and the tiled GEMM
 template <typename W>
 static void mm(const Engine::Act & a, const W & w, const float * x, int xs, float * y, int ys, int nt, const NormIn & ni = {}) {
-    if (!a.bulk) {
+    if (!a.bulk || (nt <= 8 && !a.dma)) {   // the LL allreduce keeps the norm statistics the GEMV needs
         if constexpr (std::is_same_v<W, Q8W>) gemv_q8(w, x, xs, y, ys, nullptr, nt, a.s, ni);
         else gemv_bf16(w, x, xs, y, ys, nullptr, nt, a.s, ni);
         return;
@@ -476,7 +482,7 @@ Engine::Act Engine::act(Device & d, int row0, int sid, cudaStream_t s, const int
     a.p16 = d.p16 + row0 * n;
     a.recv = d.recv + row0 * n;
     a.attn_part = d.attn_part + sid * d.attn_part_sz;
-    a.pos = pos; a.s = s; a.sid = sid; a.bulk = bulk;
+    a.pos = pos; a.s = s; a.sid = sid; a.bulk = bulk; a.dma = false;
     return a;
 }
 
@@ -485,7 +491,7 @@ Engine::Act Engine::act(Device & d, int row0, int sid, cudaStream_t s, const int
 // is why every device's host thread meets at a barrier between recording its upload and the peers' downloads.
 void Engine::allreduce(Device & d, Act & a, int nt, int & call) {
     const int n = nt * cfg_.n_embd, nd = opt_.n_devices;
-    if (!a.bulk) { allreduce_add_ll16(a.x, a.part, ar_ll_, d.g, nd, n, d.counter, call++, a.s, a.ss); return; }
+    if (!a.dma) { allreduce_add_ll16(a.x, a.part, ar_ll_, d.g, nd, n, d.counter, call++, a.s, a.ss); return; }
     const int par = call++ & 1;
     auto stage = [&](int sid, int p, int g) { return h_stage_ + (((size_t) sid * 2 + p) * nd + g) * MAX_ROWS * cfg_.n_embd; };
     to_half(a.part, cfg_.n_embd, nullptr, cfg_.n_embd, 0.0f, a.p16, nt, a.s);
@@ -581,12 +587,14 @@ void Engine::record_main(int gi, int nt) {
     incr_counter(d.counter, s);
     sumsq(d.x, n, n, nt, d.ss, nss, s);
     Act a = act(d, 0, 0, s, d.pos, bulk);
+    a.dma = nt >= DMA_MIN;
     if (bulk && nt >= 2 * MIN_MICRO) {
         const int nta = (nt / 2 + 63) / 64 * 64, ntb = nt - nta;
         CUDA_CHECK(cudaMemcpyAsync(d.pos2, h_pos_ + 2, sizeof(int), cudaMemcpyHostToDevice, s));
         CUDA_CHECK(cudaEventRecord(d.ev_fork, s));
         CUDA_CHECK(cudaStreamWaitEvent(d.stream2, d.ev_fork, 0));
         Act b = act(d, nta, 1, d.stream2, d.pos2, true);
+        a.dma = b.dma = true;
         record_layers(d, a, nta, &b, ntb, false);
         CUDA_CHECK(cudaEventRecord(d.ev_join, d.stream2));
         CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_join, 0));
@@ -598,6 +606,11 @@ void Engine::record_main(int gi, int nt) {
     mm(a, d.output, d.x, n, d.logits, d.output.n, nt, ni);
     argmax_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.res, nt, s);
     CUDA_CHECK(cudaMemcpyAsync(h_res_ + (size_t) gi * MAX_ROWS * 2, d.res, (size_t) nt * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
+    // sampling candidates: every row of a decode-sized forward, the last row of a prefill chunk
+    const int tk_rows = nt <= MAX_NT ? nt : 1;
+    topk_pairs(d.logits + (size_t) (nt - tk_rows) * d.output.n, d.output.n, d.output.n, d.vocab_off, d.topk, TOPK, tk_rows, s);
+    CUDA_CHECK(cudaMemcpyAsync(h_topk_ + (size_t) gi * MAX_NT * TOPK * 2, d.topk, (size_t) tk_rows * TOPK * 2 * sizeof(float),
+                               cudaMemcpyDeviceToHost, s));
 }
 
 // chain = false: hidden rows come from the main model (hn); chain = true (nt = 1): from MTP's own last output
@@ -608,6 +621,7 @@ void Engine::record_mtp(int gi, int nt, bool chain) {
     cudaStream_t s = d.stream;
     const int n = c.n_embd, nss = n / AR_SS_SPAN;
     Act a = act(d, 0, 0, s, d.mpos, nt > MAX_NT);
+    a.dma = nt >= DMA_MIN;
     CUDA_CHECK(cudaMemcpyAsync(d.mpos, h_pos_ + 1, sizeof(int), cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaMemcpyAsync(d.me, h_membd_, (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
     incr_counter(d.counter, s);
@@ -655,8 +669,8 @@ void Engine::build_graphs() {
         CUDA_CHECK(cudaGraphDestroy(graph));
         return exec;
     };
-    const int max_nt = opt_.mtp ? opt_.n_draft + 1 : 1;
-    if (max_nt > MAX_NT) throw std::runtime_error("n_draft too large");
+    if (opt_.mtp && opt_.n_draft + 1 > MAX_NT) throw std::runtime_error("n_draft too large");
+    const int max_nt = MAX_NT;   // small prefill chunks (prompt cache) use the decode graphs too
     for (int gi = 0; gi < (int) devs_.size(); ++gi) {
         Device & d = *devs_[gi];
         for (int nt = 1; nt <= max_nt; ++nt) d.g_main[nt] = capture(d, [&] { record_main(gi, nt); });
@@ -672,6 +686,7 @@ void Engine::build_graphs() {
 void Engine::launch(int kind, int nt) {
     if (nt > MAX_NT) {   // prefill chunk: record straight into the streams (allreduce kernels spin until all GPUs arrive)
         if (kind != 0 && kind != 1) throw std::runtime_error("launch: bad kind for a prefill chunk");
+        const auto t_rec = std::chrono::steady_clock::now();
         std::vector<std::thread> th;
         std::vector<std::string> err(devs_.size());
         for (int gi = 0; gi < (int) devs_.size(); ++gi)
@@ -683,6 +698,13 @@ void Engine::launch(int kind, int nt) {
             });
         for (auto & t : th) t.join();
         for (auto & m : err) if (!m.empty()) throw std::runtime_error(m);
+        static const bool timing = getenv("HYPER_TIMING") != nullptr;
+        if (timing) {
+            const double rec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_rec).count();
+            for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->stream)); }
+            const double all = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_rec).count();
+            fprintf(stderr, "launch nt=%d: record %.1f ms, total %.1f ms\n", nt, 1e3 * rec, 1e3 * all);
+        }
         for (auto & dp : devs_) {
             CUDA_CHECK(cudaSetDevice(dp->id));
             CUDA_CHECK(cudaStreamSynchronize(dp->stream));
@@ -764,33 +786,157 @@ void Engine::get_logits(int t, std::vector<float> & out) {
     }
 }
 
+// ---------------- prompt cache: recurrent-state snapshots ----------------
+size_t Engine::snap_floats(const Device & d) const {
+    const Qwen35Config & c = cfg_;
+    size_t n = 0;
+    for (auto & L : d.layers) if (!L.full) n += (size_t) (c.ssm_conv - 1) * L.conv_ch + (size_t) L.n_v_l * c.ssm_d_state * c.head_v_dim();
+    return n;
+}
+
+// copy (to_host) or restore the GDN conv + recurrent state of every device; ordered on the device streams
+void Engine::snap_copy(Snap & sn, bool to_host) {
+    const Qwen35Config & c = cfg_;
+    for (size_t gi = 0; gi < devs_.size(); ++gi) {
+        Device & d = *devs_[gi];
+        CUDA_CHECK(cudaSetDevice(d.id));
+        float * hp = sn.h[gi];
+        for (auto & L : d.layers) {
+            if (L.full) continue;
+            const size_t cs = (size_t) (c.ssm_conv - 1) * L.conv_ch, ssz = (size_t) L.n_v_l * c.ssm_d_state * c.head_v_dim();
+            if (to_host) {
+                CUDA_CHECK(cudaMemcpyAsync(hp, L.conv_state, cs * sizeof(float), cudaMemcpyDeviceToHost, d.stream));
+                CUDA_CHECK(cudaMemcpyAsync(hp + cs, L.state, ssz * sizeof(float), cudaMemcpyDeviceToHost, d.stream));
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(L.conv_state, hp, cs * sizeof(float), cudaMemcpyHostToDevice, d.stream));
+                CUDA_CHECK(cudaMemcpyAsync(L.state, hp + cs, ssz * sizeof(float), cudaMemcpyHostToDevice, d.stream));
+            }
+            hp += cs + ssz;
+        }
+    }
+    for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->stream)); }
+}
+
+void Engine::take_snapshot(int pos) {
+    for (auto & s : snaps_) if (s.pos == pos) return;
+    if ((int) snaps_.size() >= opt_.max_snapshots) {
+        // evict the lowest position that is not a 4096 multiple (those stay as sparse anchors), else the lowest
+        auto victim = snaps_.end();
+        for (auto it = snaps_.begin(); it != snaps_.end(); ++it)
+            if (it->pos % 4096 && (victim == snaps_.end() || it->pos < victim->pos)) victim = it;
+        if (victim == snaps_.end())
+            victim = std::min_element(snaps_.begin(), snaps_.end(), [](const Snap & a, const Snap & b) { return a.pos < b.pos; });
+        snap_pool_.push_back(victim->h);
+        snaps_.erase(victim);
+    }
+    Snap sn;
+    sn.pos = pos;
+    if (!snap_pool_.empty()) { sn.h = snap_pool_.back(); snap_pool_.pop_back(); }
+    else {
+        for (auto & dp : devs_) {
+            float * p = nullptr;
+            CUDA_CHECK(cudaHostAlloc(&p, snap_floats(*dp) * sizeof(float), cudaHostAllocPortable));
+            sn.h.push_back(p);
+        }
+    }
+    snap_copy(sn, true);
+    snaps_.push_back(sn);
+}
+
+// ---------------- sampling ----------------
+// candidates of row t from every device's top-K, then temperature / top-k / min-p / top-p
+int Engine::sample_row(int t, const SamplingParams & sp) {
+    std::vector<std::pair<float, int>> cand;
+    cand.reserve(devs_.size() * TOPK);
+    for (size_t g = 0; g < devs_.size(); ++g) {
+        const float * p = h_topk_ + ((size_t) g * MAX_NT + t) * TOPK * 2;
+        for (int i = 0; i < TOPK; ++i) { const int idx = ((const int *) p)[2 * i + 1]; if (idx >= 0) cand.push_back({p[2 * i], idx}); }
+    }
+    std::sort(cand.begin(), cand.end(), [](auto & a, auto & b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+    int k = std::min<int>((int) cand.size(), sp.top_k > 0 ? std::min(sp.top_k, TOPK) : TOPK);
+    if (sp.temp <= 0.0f || k == 1) return cand[0].second;
+    std::vector<double> pr(k);
+    double z = 0;
+    for (int i = 0; i < k; ++i) { pr[i] = std::exp((cand[i].first - cand[0].first) / sp.temp); z += pr[i]; }
+    for (auto & v : pr) v /= z;
+    if (sp.min_p > 0) { int kk = 1; while (kk < k && pr[kk] >= sp.min_p * pr[0]) ++kk; k = kk; }
+    if (sp.top_p < 1.0f) { double cum = 0; int kk = 0; while (kk < k) { cum += pr[kk++]; if (cum >= sp.top_p) break; } k = kk; }
+    double tot = 0;
+    for (int i = 0; i < k; ++i) tot += pr[i];
+    double u = std::uniform_real_distribution<double>(0.0, tot)(rng_);
+    for (int i = 0; i < k; ++i) { u -= pr[i]; if (u <= 0) return cand[i].second; }
+    return cand[k - 1].second;
+}
+
 std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
-                                  const std::function<bool(int)> & on_token) {
+                                  const std::function<bool(int)> & on_token, const SamplingParams & sp) {
     if (spec && !opt_.mtp) throw std::runtime_error("generate: MTP head not loaded");
     if (prompt.empty()) throw std::runtime_error("generate: empty prompt");
     if ((int) prompt.size() + 8 > opt_.max_pos) throw std::runtime_error("generate: prompt longer than the context");
-    reset();
+    const bool sampling = sp.temp > 0.0f;
+    rng_.seed(sp.seed ? sp.seed : std::random_device{}());
+    const int P = (int) prompt.size();
+    // prompt cache: KV entries are valid for the common prefix with the last sequence; the recurrent state is
+    // restored from the latest snapshot at s <= L - 1 (MTP entry s - 1 used token s, so token s must match too)
+    int s = 0;
+    if (opt_.prompt_cache) {
+        int L = 0;
+        while (L < P && L < (int) hist_.size() && prompt[L] == hist_[L]) ++L;
+        for (size_t i = 0; i < snaps_.size();)
+            if (snaps_[i].pos > L) { snap_pool_.push_back(snaps_[i].h); snaps_.erase(snaps_.begin() + i); } else ++i;
+        const Snap * best = nullptr;
+        for (auto & sn : snaps_) if (sn.pos <= std::min(L - 1, P - 1) && (!best || sn.pos > best->pos)) best = &sn;
+        if (best) { s = best->pos; snap_copy(*const_cast<Snap *>(best), false); }
+    }
+    if (s == 0) reset();
+    hist_.assign(prompt.begin(), prompt.begin() + s);
+    // prefill chunk ends: MAX_ROWS apart, plus snapshot points (message starts in the last ~16 messages, 4096 multiples)
+    std::vector<int> snap_at;
+    if (opt_.prompt_cache) {
+        // the last two message starts always (where the next request usually diverges: re-rendered assistant
+        // turns), older ones only >= 256 tokens after the previous snapshot point, so chunks stay large
+        std::vector<int> msg;
+        for (int q = s + 1; q < P; ++q) if (prompt[q] == snap_token_) msg.push_back(q);
+        std::vector<int> pts;
+        for (int q = (s / 4096 + 1) * 4096; q < P; q += 4096) pts.push_back(q);
+        int last = s;
+        for (size_t i = 0; i < msg.size(); ++i) {
+            const bool tail = i + 2 >= msg.size();
+            if (tail || msg[i] - last >= 256) { pts.push_back(msg[i]); last = msg[i]; }
+        }
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        snap_at = pts;
+    }
     // prompt in chunks of up to MAX_ROWS; with MTP the head then consumes (t_{q+1}, h_q) at position q for the
     // chunk's rows (the last chunk's final pair uses the predicted next token and yields the first draft)
     using clk = std::chrono::steady_clock;
     auto since = [](clk::time_point a) { return std::chrono::duration<double>(clk::now() - a).count(); };
     GenStats st;
-    const int P = (int) prompt.size();
     const int K = opt_.n_draft;
     std::vector<int> drafts(K);
     auto tp = clk::now();
     int next = -1;
-    for (int c0 = 0; c0 < P; c0 += MAX_ROWS) {
-        const int len = std::min(MAX_ROWS, P - c0);
+    size_t si = 0;
+    for (int c0 = s; c0 < P;) {
+        int end = std::min(c0 + MAX_ROWS, P);
+        while (si < snap_at.size() && snap_at[si] <= c0) ++si;
+        if (si < snap_at.size() && snap_at[si] < end) end = snap_at[si];
+        const int len = end - c0;
         next = forward(&prompt[c0], len, c0)[len - 1];
+        if (sampling) next = sample_row(len <= MAX_NT ? len - 1 : 0, sp);
         if (spec) {
             std::vector<int> mt(len);
             for (int j = 0; j < len; ++j) mt[j] = c0 + 1 + j < P ? prompt[c0 + 1 + j] : next;
             const int d0 = mtp_draft(mt.data(), len, c0);
-            if (c0 + len == P) drafts[0] = d0;
+            if (end == P) drafts[0] = d0;
         }
+        if (si < snap_at.size() && snap_at[si] == end) take_snapshot(end);
+        c0 = end;
     }
+    hist_ = prompt;
     st.t_prefill = since(tp);
+    st.prompt_reused = s;
     std::vector<int> out;
     int p = P;
     auto t0 = clk::now();
@@ -805,6 +951,7 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
     if (!spec) {
         while (emit(next) && p + 1 < opt_.max_pos) {
             next = forward(&next, 1, p++)[0];
+            if (sampling) next = sample_row(0, sp);
             st.steps++;
         }
     } else {
@@ -821,11 +968,14 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
             in[0] = cur;
             for (int j = 0; j < K; ++j) in[j + 1] = drafts[j];
             auto ta = clk::now();
-            const std::vector<int> a = forward(in.data(), K + 1, p);
+            std::vector<int> a = forward(in.data(), K + 1, p);
             st.t_main += since(ta);
             st.steps++;
+            // verification: a draft is kept iff the token sampled (or argmax) at its row equals it, which
+            // reproduces plain sampling exactly; rows are sampled lazily up to the first mismatch
             int m = 0;
-            while (m < K && a[m] == drafts[m]) ++m;
+            if (sampling) { while (m < K && (a[m] = sample_row(m, sp)) == drafts[m]) ++m; if (m == K) a[K] = sample_row(K, sp); }
+            else while (m < K && a[m] == drafts[m]) ++m;
             st.accepted += m;
             if (emit(cur)) for (int j = 0; j < m; ++j) if (!emit(drafts[j])) break;
             if (stop) break;
@@ -839,6 +989,12 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
             cur = a[m];
             p += m + 1;
         }
+    }
+    {   // sequence whose KV entries are valid: positions < p
+        std::vector<int> seq = prompt;
+        seq.insert(seq.end(), out.begin(), out.end());
+        seq.resize(std::min<size_t>(seq.size(), (size_t) p));
+        hist_ = seq;
     }
     st.tokens = (int) out.size();
     st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

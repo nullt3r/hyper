@@ -1,9 +1,11 @@
 // hyper OpenAI-compatible server: /v1/chat/completions (streaming and not), /v1/models, /health.
 // Chat templates, reasoning and tool-call parsing come from mainline llama.cpp's libcommon (same code as
-// llama-server); the vocabulary is loaded with libllama (vocab only). Generation is greedy with MTP speculative
-// decoding; requests are served one at a time.
+// llama-server); the vocabulary is loaded with libllama (vocab only). Generation samples (greedy at temperature 0) with MTP speculative
+// decoding (exact: drafts are accepted when they equal the token sampled at their row), prompt cache with
+// recurrent-state snapshots; requests are served one at a time.
 //
 // usage: hyper-server <model.gguf> [--host 0.0.0.0] [--port 8080] [--ctx 262144] [--draft 3] [--alias name]
+//                     [--temp 0.6] [--top-p 0.95] [--top-k 20] [--min-p 0] [--snapshots 48]   (request fields override)
 #include "engine.h"
 
 #include "chat.h"
@@ -26,6 +28,7 @@ using namespace hyper;
 namespace {
 
 struct Ctx {
+    SamplingParams defaults;
     Engine * eng = nullptr;
     llama_model * vm = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -99,6 +102,7 @@ struct Request {
     std::vector<std::string> stops;
     int max_tokens = 0;
     bool stream = false, include_usage = true;
+    SamplingParams sp;
 };
 
 Request prepare(Ctx & c, const ojson & body) {
@@ -134,6 +138,13 @@ Request prepare(Ctx & c, const ojson & body) {
     r.max_tokens = room;
     for (const char * k : {"max_tokens", "max_completion_tokens"})
         if (body.contains(k) && body[k].is_number_integer() && body[k].get<int>() > 0) r.max_tokens = std::min(room, body[k].get<int>());
+    r.sp = c.defaults;
+    auto num = [&](const char * k, float & dst) { if (body.contains(k) && body[k].is_number()) dst = body[k].get<float>(); };
+    num("temperature", r.sp.temp);
+    num("top_p", r.sp.top_p);
+    num("min_p", r.sp.min_p);
+    if (body.contains("top_k") && body["top_k"].is_number_integer()) r.sp.top_k = body["top_k"].get<int>();
+    if (body.contains("seed") && body["seed"].is_number_integer()) r.sp.seed = body["seed"].get<uint64_t>();
     r.stream = body.value("stream", false);
     if (body.contains("stream_options") && body["stream_options"].is_object())
         r.include_usage = body["stream_options"].value("include_usage", true);
@@ -141,7 +152,7 @@ Request prepare(Ctx & c, const ojson & body) {
 }
 
 // runs generation, calling on_msg(new_msg) whenever the parsed message may have changed; returns finish reason
-struct GenOut { std::string text, finish; int n_gen = 0; double t_prompt = 0, t_gen = 0; };
+struct GenOut { std::string text, finish; int n_gen = 0, reused = 0; double t_prompt = 0, t_gen = 0; };
 
 GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::string &)> & on_text) {
     GenOut o;
@@ -161,21 +172,24 @@ GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::strin
         }
         if (on_text && !on_text(o.text)) { o.finish = "cancelled"; return false; }
         return true;
-    });
+    }, r.sp);
     auto t2 = std::chrono::steady_clock::now();
+    o.reused = st.prompt_reused;
     o.t_prompt = std::chrono::duration<double>(t1 - t0).count();
     o.t_gen = std::chrono::duration<double>(t2 - t1).count();
     return o;
 }
 
 ojson timings(const Request & r, const GenOut & o) {
-    return {{"prompt_n", (int) r.prompt.size()}, {"prompt_ms", 1e3 * o.t_prompt},
-            {"prompt_per_second", r.prompt.size() / std::max(1e-9, o.t_prompt)}, {"predicted_n", o.n_gen},
+    const int n_new = (int) r.prompt.size() - o.reused;
+    return {{"cache_n", o.reused}, {"prompt_n", n_new}, {"prompt_ms", 1e3 * o.t_prompt},
+            {"prompt_per_second", n_new / std::max(1e-9, o.t_prompt)}, {"predicted_n", o.n_gen},
             {"predicted_ms", 1e3 * o.t_gen}, {"predicted_per_second", o.n_gen / std::max(1e-9, o.t_gen)}};
 }
 
 ojson usage(const Request & r, const GenOut & o) {
     return {{"prompt_tokens", (int) r.prompt.size()}, {"completion_tokens", o.n_gen},
+            {"prompt_tokens_details", {{"cached_tokens", o.reused}}},
             {"total_tokens", (int) r.prompt.size() + o.n_gen}};
 }
 
@@ -184,11 +198,16 @@ ojson usage(const Request & r, const GenOut & o) {
 int main(int argc, char ** argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s model.gguf [--host H] [--port P] [--ctx N] [--draft K] [--alias name]\n", argv[0]); return 1; }
     std::string host = "0.0.0.0", alias;
-    int port = 8080, ctx = 262144, draft = 3;
+    int port = 8080, ctx = 262144, draft = 3, snaps = 48;
+    SamplingParams defaults;   // Qwen's recommendation for thinking mode
+    defaults.temp = 0.6f; defaults.top_p = 0.95f; defaults.top_k = 20; defaults.min_p = 0.0f;
     for (int i = 2; i + 1 < argc; i += 2) {
         const std::string k = argv[i], v = argv[i + 1];
         if (k == "--host") host = v; else if (k == "--port") port = std::stoi(v); else if (k == "--ctx") ctx = std::stoi(v);
         else if (k == "--draft") draft = std::stoi(v); else if (k == "--alias") alias = v;
+        else if (k == "--temp") defaults.temp = std::stof(v); else if (k == "--top-p") defaults.top_p = std::stof(v);
+        else if (k == "--top-k") defaults.top_k = std::stoi(v); else if (k == "--min-p") defaults.min_p = std::stof(v);
+        else if (k == "--snapshots") snaps = std::stoi(v);
         else { fprintf(stderr, "unknown option %s\n", k.c_str()); return 1; }
     }
     const std::string path = argv[1];
@@ -196,6 +215,7 @@ int main(int argc, char ** argv) {
 
     Ctx c;
     c.alias = alias;
+    c.defaults = defaults;
     llama_backend_init();
     auto mp = llama_model_default_params();
     mp.vocab_only = true;
@@ -207,8 +227,15 @@ int main(int argc, char ** argv) {
     EngineOptions opt;
     opt.max_pos = ctx;
     opt.n_draft = draft;
+    opt.prompt_cache = true;
+    opt.max_snapshots = snaps;
     Engine eng(path, opt);
     c.eng = &eng;
+    {
+        const std::vector<int> im = tokenize(c.vocab, "<|im_start|>");
+        if (im.size() == 1) eng.set_snapshot_token(im[0]);
+        else fprintf(stderr, "hyper-server: no single <|im_start|> token, prompt-cache snapshots only every 4096 tokens\n");
+    }
     {   // warm up: builds the CUDA graphs
         GenStats st;
         eng.generate(tokenize(c.vocab, "Hello"), 4, true, &st);
@@ -260,8 +287,8 @@ int main(int argc, char ** argv) {
             ojson out = {{"id", id}, {"object", "chat.completion"}, {"created", created}, {"model", c.alias},
                          {"choices", ojson::array({ojson({{"index", 0}, {"message", m}, {"finish_reason", finish}})})},
                          {"usage", usage(*r, o)}, {"timings", timings(*r, o)}};
-            fprintf(stderr, "hyper-server: %s done: %d tokens, prompt %.0f t/s, gen %.1f t/s\n", id.c_str(), o.n_gen,
-                    r->prompt.size() / std::max(1e-9, o.t_prompt), o.n_gen / std::max(1e-9, o.t_gen));
+            fprintf(stderr, "hyper-server: %s done: %d tokens, prompt %zu (cached %d) %.0f t/s, gen %.1f t/s\n", id.c_str(), o.n_gen,
+                    r->prompt.size(), o.reused, (r->prompt.size() - o.reused) / std::max(1e-9, o.t_prompt), o.n_gen / std::max(1e-9, o.t_gen));
             res.set_content(out.dump(), "application/json");
             return;
         }
@@ -313,8 +340,9 @@ int main(int argc, char ** argv) {
                 const std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
             }
-            fprintf(stderr, "hyper-server: %s done (%s): %d tokens, prompt %.0f t/s, gen %.1f t/s\n", id.c_str(), o.finish.c_str(),
-                    o.n_gen, r->prompt.size() / std::max(1e-9, o.t_prompt), o.n_gen / std::max(1e-9, o.t_gen));
+            fprintf(stderr, "hyper-server: %s done (%s): %d tokens, prompt %zu (cached %d) %.0f t/s, gen %.1f t/s\n", id.c_str(),
+                    o.finish.c_str(), o.n_gen, r->prompt.size(), o.reused, (r->prompt.size() - o.reused) / std::max(1e-9, o.t_prompt),
+                    o.n_gen / std::max(1e-9, o.t_gen));
             sink.done();
             return true;
         });

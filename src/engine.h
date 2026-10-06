@@ -9,6 +9,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <random>
 #include <vector>
 
 namespace hyper {
@@ -18,6 +19,15 @@ struct EngineOptions {
     int max_pos = 32768;
     bool mtp = true;             // load the NextN head for speculative decoding
     int n_draft = 2;             // MTP drafts per step (chained); verification runs n_draft + 1 tokens
+    bool prompt_cache = false;   // reuse the common prefix with the previous sequence (recurrent-state snapshots)
+    int max_snapshots = 48;      // pinned host snapshots (~50 MB per GPU each for the 27B model)
+};
+
+struct SamplingParams {
+    float temp = 0.0f;           // 0: greedy
+    int top_k = 0;               // 0 or > 64: the 64 best candidates
+    float top_p = 1.0f, min_p = 0.0f;
+    uint64_t seed = 0;           // 0: random
 };
 
 struct GenStats {
@@ -25,6 +35,7 @@ struct GenStats {
     double seconds = 0;
     double t_main = 0, t_mtp = 0, t_restore = 0;   // wall time per phase
     double t_prefill = 0;
+    int prompt_reused = 0;       // prompt tokens served from the prompt cache
 };
 
 // spin barrier for the per-device recording threads
@@ -56,7 +67,8 @@ public:
         const int * pos;
         cudaStream_t s;
         int sid;      // bulk allreduce channel (micro-batch)
-        bool bulk;    // prefill: tiled GEMM + copy-engine allreduce
+        bool bulk;    // prefill: tiled GEMM (and flash attention)
+        bool dma;     // allreduce over the copy engines (large chunks); else the LL kernel
     };
     Engine(const std::string & model_path, const EngineOptions & opt);
     ~Engine();
@@ -70,7 +82,11 @@ public:
     // greedy generation; prompt processed in chunks of up to 512 tokens. spec = use MTP drafts (1 per step)
     // on_token: called for every generated token in order; returning false stops generation
     std::vector<int> generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
-                              const std::function<bool(int)> & on_token = {});
+                              const std::function<bool(int)> & on_token = {}, const SamplingParams & sp = {});
+    // token at which prompt-cache snapshots are taken (message start, e.g. <|im_start|>)
+    void set_snapshot_token(int tok) { snap_token_ = tok; }
+    void clear_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); }
+    int n_snapshots() const { return (int) snaps_.size(); }
     int max_pos() const { return opt_.max_pos; }
 
     const Qwen35Config & config() const { return cfg_; }
@@ -91,7 +107,12 @@ private:
     void record_layers(Device & d, Act & a, int nta, Act * b, int ntb, bool snap);
     void allreduce(Device & d, Act & a, int nt, int & call);
     void build_graphs();
-    void launch(int kind, int nt);   // kind: 0 main, 1 mtp, 2 restore
+    void launch(int kind, int nt);
+    struct Snap { int pos; std::vector<float *> h; };
+    size_t snap_floats(const Device & d) const;
+    void snap_copy(Snap & sn, bool to_host);
+    void take_snapshot(int pos);
+    int sample_row(int t, const SamplingParams & sp);   // kind: 0 main, 1 mtp, 2 restore
     void embed(const int * tokens, int nt, float * dst);
     int mtp_draft(const int * tokens, int nt, int pos);   // MTP over (tokens[t], main hidden row t) at pos+t; argmax of last
     int mtp_chain(int token, int pos);                   // MTP over (token, MTP's own last hidden) at pos
@@ -108,6 +129,12 @@ private:
     uint2 * ar_ll_ = nullptr;    // mapped LL slots [2][ndev][rows * n_embd / 2]
     half * h_stage_ = nullptr;   // pinned bulk allreduce staging [micro-batch][parity][ndev][MAX_ROWS * n_embd]
     std::unique_ptr<Barrier> barrier_;
+    float * h_topk_ = nullptr;   // pinned [ndev][MAX_NT][TOPK][2] sampling candidates
+    std::vector<int> hist_;      // tokens whose KV entries are valid (positions < size)
+    std::vector<Snap> snaps_;
+    std::vector<std::vector<float *>> snap_pool_;
+    int snap_token_ = -1;
+    std::mt19937_64 rng_;
     bool graphs_ready_ = false;
     int last_nt_ = 0;
 };
