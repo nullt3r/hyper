@@ -83,6 +83,25 @@ namespace {
 
 struct RowRange { const GTensor * t; int64_t r0, r1; };
 
+// row-major bf16 rows (possibly several tensors / ranges, optional column window) -> fp16 fragment-ordered weight
+BF16W to_device_bf16(const std::function<void *(size_t)> & alloc, int dev, const std::vector<std::pair<const uint16_t *, int64_t>> & rows_src,
+                     int k, size_t row_stride) {
+    // gather rows into one contiguous row-major buffer, then repack
+    const int n = (int) rows_src.size();
+    std::vector<uint16_t> buf((size_t) n * k);
+    for (int r = 0; r < n; ++r) memcpy(&buf[(size_t) r * k], rows_src[r].first, (size_t) k * 2);
+    (void) row_stride;
+    const size_t ntile = (n + 15) / 16;
+    std::vector<uint8_t> fq(ntile * (k / 16) * 512);
+    repack_bf16_frag(buf.data(), n, k, (size_t) k, fq.data());
+    CUDA_CHECK(cudaSetDevice(dev));
+    BF16W w; w.n = n; w.k = k;
+    void * p = alloc(fq.size());
+    CUDA_CHECK(cudaMemcpy(p, fq.data(), fq.size(), cudaMemcpyHostToDevice));
+    w.q = (const uint4 *) p;
+    return w;
+}
+
 // row-major int8 + scales -> fragment-ordered device weight
 Q8W to_device_q8(const std::function<void *(size_t)> & alloc, int dev, const int8_t * qs, const half * d, int n, int k) {
     const size_t ntile = (n + 15) / 16, kb = k / 32;
@@ -190,18 +209,13 @@ void Engine::load_layer(Device & dev, DevLayer & L, int il, bool mtp_layer) {
         return p;
     };
     auto bf16_rows = [&](const std::vector<RowRange> & parts) {
-        BF16W w; w.k = (int) parts[0].t->ne[0]; w.n = 0;
-        for (auto & pr : parts) w.n += (int) (pr.r1 - pr.r0);
-        __nv_bfloat16 * pd = dev.alloc<__nv_bfloat16>((size_t) w.n * w.k);
-        size_t off = 0;
+        const int k = (int) parts[0].t->ne[0];
+        std::vector<std::pair<const uint16_t *, int64_t>> rows;
         for (auto & pr : parts) {
-            if (pr.t->type != GType::BF16 || pr.t->ne[0] != w.k) throw std::runtime_error("bf16_rows: bad tensor " + pr.t->name);
-            const size_t bytes = (size_t) (pr.r1 - pr.r0) * pr.t->row_bytes();
-            CUDA_CHECK(cudaMemcpy((uint8_t *) pd + off, pr.t->data + (size_t) pr.r0 * pr.t->row_bytes(), bytes, cudaMemcpyHostToDevice));
-            off += bytes;
+            if (pr.t->type != GType::BF16 || pr.t->ne[0] != k) throw std::runtime_error("bf16_rows: bad tensor " + pr.t->name);
+            for (int64_t r = pr.r0; r < pr.r1; ++r) rows.push_back({(const uint16_t *) (pr.t->data + (size_t) r * pr.t->row_bytes()), r});
         }
-        w.w = pd;
-        return w;
+        return to_device_bf16(A, dev.id, rows, k, (size_t) k);
     };
     const std::string p = "blk." + std::to_string(il) + ".";
     L.full = mtp_layer || c.is_full_attn(il);
@@ -292,12 +306,9 @@ void Engine::load_layer(Device & dev, DevLayer & L, int il, bool mtp_layer) {
         if (eh.type != GType::BF16) throw std::runtime_error("nextn.eh_proj: expected BF16");
         auto [c0, c1] = split(eh.ne[0], nd, g, 32);
         L.eh_c0 = (int) c0;
-        L.eh_proj.n = (int) eh.ne[1];
-        L.eh_proj.k = (int) (c1 - c0);
-        __nv_bfloat16 * pd = dev.alloc<__nv_bfloat16>((size_t) L.eh_proj.n * L.eh_proj.k);
-        CUDA_CHECK(cudaMemcpy2D(pd, (size_t) L.eh_proj.k * 2, eh.data + c0 * 2, (size_t) eh.ne[0] * 2, (size_t) L.eh_proj.k * 2,
-                                L.eh_proj.n, cudaMemcpyHostToDevice));
-        L.eh_proj.w = pd;
+        std::vector<std::pair<const uint16_t *, int64_t>> rows;
+        for (int64_t r = 0; r < eh.ne[1]; ++r) rows.push_back({(const uint16_t *) (eh.data + (size_t) r * eh.row_bytes()) + c0, r});
+        L.eh_proj = to_device_bf16(A, dev.id, rows, (int) (c1 - c0), (size_t) eh.ne[0]);
         L.enorm = f32(p + "nextn.enorm.weight");
         L.hnorm = f32(p + "nextn.hnorm.weight");
         L.head_norm = gguf_->tensor(p + "nextn.shared_head_norm.weight") ? f32(p + "nextn.shared_head_norm.weight") : nullptr;
@@ -319,10 +330,9 @@ void Engine::load_weights() {
         dev.vocab_off = (int) o0;
         {
             const GTensor & t = gguf_->need("output.weight");
-            dev.output.k = (int) t.ne[0]; dev.output.n = (int) (o1 - o0);
-            __nv_bfloat16 * pd = dev.alloc<__nv_bfloat16>((size_t) dev.output.n * dev.output.k);
-            CUDA_CHECK(cudaMemcpy(pd, t.data + (size_t) o0 * t.row_bytes(), (size_t) dev.output.n * t.row_bytes(), cudaMemcpyHostToDevice));
-            dev.output.w = pd;
+            std::vector<std::pair<const uint16_t *, int64_t>> rows;
+            for (int64_t r = o0; r < o1; ++r) rows.push_back({(const uint16_t *) (t.data + (size_t) r * t.row_bytes()), r});
+            dev.output = to_device_bf16([&](size_t nb) { return (void *) dev.alloc<uint8_t>(nb); }, dev.id, rows, (int) t.ne[0], (size_t) t.ne[0]);
             if (opt_.mtp) {
                 // draft head: quantize the bf16 slice to Q8_0 (absmax per 32 weights); drafts are verified
                 // against the exact bf16 head, so this only affects acceptance, never the output

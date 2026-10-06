@@ -2,6 +2,7 @@
 
 #include <cfloat>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 namespace hyper {
@@ -119,48 +120,49 @@ __global__ void k_mma_q8(const uint4 * __restrict__ wq, const half * __restrict_
     }
 }
 
-template <int NT>
-__global__ void k_gemv_bf16(const __nv_bfloat16 * __restrict__ w, int n, int k,
-                            const float * __restrict__ x, int xs, float * __restrict__ y, int ys, const float * __restrict__ add,
-                            NormIn nin) {
-    float inv[NT];
-#pragma unroll
-    for (int t = 0; t < NT; ++t) inv[t] = input_inv_rms(nin.ss + t * nin.nss, nin.nss, k, nin.w, nin.eps);
-    const float4 * nw4 = (const float4 *) nin.w;
-    const int row = blockIdx.x * GEMV_WARPS + (threadIdx.x >> 5);
-    const int lane = threadIdx.x & 31;
-    if (row >= n) return;
-    const uint4 * w8 = (const uint4 *) (w + (size_t) row * k);
-    float acc[NT];
-#pragma unroll
-    for (int t = 0; t < NT; ++t) acc[t] = 0.0f;
-    const int nchunk = k / 8;
-    for (int c = lane; c < nchunk; c += 32) {
-        const uint4 q = __ldg(w8 + c);
-        const __nv_bfloat162 * b = (const __nv_bfloat162 *) &q;
-        const float2 f0 = __bfloat1622float2(b[0]), f1 = __bfloat1622float2(b[1]);
-        const float2 f2 = __bfloat1622float2(b[2]), f3 = __bfloat1622float2(b[3]);
-        float4 wa, wb;
-        if (nin.w) { wa = __ldg(nw4 + c * 2); wb = __ldg(nw4 + c * 2 + 1); }
-#pragma unroll
-        for (int t = 0; t < NT; ++t) {
-            const float4 * x4 = (const float4 *) (x + (size_t) t * xs);
-            float4 xa = __ldg(x4 + c * 2), xb = __ldg(x4 + c * 2 + 1);
+// fp16 weights in fragment order: per k-step (16 cols) one 16-byte load per lane gives a full A fragment
+__global__ void k_mma_f16(const uint4 * __restrict__ wq, int n, int k,
+                          const float * __restrict__ x, int xs, float * __restrict__ y, int ys, const float * __restrict__ add,
+                          int nt, NormIn nin) {
+    const int tile = blockIdx.x;
+    const int w = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    const int lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+    const int nks = k / 16;
+    const uint4 * tq = wq + (size_t) tile * nks * 32 + lane;
+    const bool tok_ok = gid < nt;
+    const int tok = tok_ok ? gid : 0;
+    const float * xr = x + (size_t) tok * xs;
+    const float inv = input_inv_rms(nin.ss + tok * nin.nss, nin.nss, k, nin.w, nin.eps);
+    float acc[4] = {0, 0, 0, 0};
+    for (int ks = w; ks < nks; ks += nw) {
+        const uint4 q = __ldg(tq + (size_t) ks * 32);
+        const unsigned a[4] = {q.x, q.y, q.z, q.w};
+        const int c0 = ks * 16 + 2 * tig;
+        unsigned bb[2] = {0, 0};
+        if (tok_ok) {
+            float2 v0 = *(const float2 *) (xr + c0), v1 = *(const float2 *) (xr + c0 + 8);
             if (nin.w) {
-                const float f = inv[t];
-                xa.x *= f * wa.x; xa.y *= f * wa.y; xa.z *= f * wa.z; xa.w *= f * wa.w;
-                xb.x *= f * wb.x; xb.y *= f * wb.y; xb.z *= f * wb.z; xb.w *= f * wb.w;
+                const float2 w0 = *(const float2 *) (nin.w + c0), w1 = *(const float2 *) (nin.w + c0 + 8);
+                v0.x *= inv * w0.x; v0.y *= inv * w0.y; v1.x *= inv * w1.x; v1.y *= inv * w1.y;
             }
-            acc[t] += f0.x * xa.x + f0.y * xa.y + f1.x * xa.z + f1.y * xa.w + f2.x * xb.x + f2.y * xb.y + f3.x * xb.z + f3.y * xb.w;
+            bb[0] = pack_h2(v0.x, v0.y);
+            bb[1] = pack_h2(v1.x, v1.y);
         }
+        mma16816(acc, a, bb);
     }
+    __shared__ float red[8][32][4];
 #pragma unroll
-    for (int t = 0; t < NT; ++t) {
-        const float v = warp_sum(acc[t]);
-        if (lane == 0) {
-            const size_t o = (size_t) t * ys + row;
-            y[o] = add ? add[o] + v : v;
-        }
+    for (int i = 0; i < 4; ++i) red[w][lane][i] = acc[i];
+    __syncthreads();
+    if (w == 0) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { float t = 0; for (int ww = 0; ww < nw; ++ww) t += red[ww][lane][i]; acc[i] = t; }
+        const int r0 = tile * 16 + gid, t0 = 2 * tig;
+        auto put = [&](int row, int t, float v) {
+            if (row < n && t < nt) { const size_t o = (size_t) t * ys + row; y[o] = add ? add[o] + v : v; }
+        };
+        put(r0, t0, acc[0]); put(r0, t0 + 1, acc[1]);
+        put(r0 + 8, t0, acc[2]); put(r0 + 8, t0 + 1, acc[3]);
     }
 }
 
@@ -474,9 +476,31 @@ void repack_q8_frag(const int8_t * qs, const half * d, int n, int k, uint8_t * f
 
 void gemv_bf16(const BF16W & W, const float * x, int xs, float * y, int ys, const float * add, int nt, cudaStream_t s,
                const NormIn & nin) {
-    const int grid = (W.n + GEMV_WARPS - 1) / GEMV_WARPS;
-    NT_SWITCH(nt, (k_gemv_bf16<NT><<<grid, GEMV_WARPS * 32, 0, s>>>(W.w, W.n, W.k, x, xs, y, ys, add, nin)));
+    if (nt < 1 || nt > 8) throw std::runtime_error("gemv_bf16: nt must be 1..8");
+    k_mma_f16<<<(W.n + 15) / 16, 256, 0, s>>>(W.q, W.n, W.k, x, xs, y, ys, add, nt, nin);
 }
+
+void repack_bf16_frag(const uint16_t * w, int n, int k, size_t row_stride, uint8_t * out) {
+    const int ntile = (n + 15) / 16, nks = k / 16;
+    auto bf2h = [](uint16_t b) { uint32_t bits = (uint32_t) b << 16; float f; memcpy(&f, &bits, 4); return __float2half(f); };
+#pragma omp parallel for schedule(static)
+    for (int t = 0; t < ntile; ++t)
+        for (int ks = 0; ks < nks; ++ks) {
+            half * tile = (half *) (out + ((size_t) t * nks + ks) * 512);
+            for (int lane = 0; lane < 32; ++lane) {
+                const int gid = lane >> 2, tig = lane & 3;
+                const int cb = ks * 16 + 2 * tig;
+                const int rows[4] = {gid, gid + 8, gid, gid + 8};
+                const int cols[4] = {cb, cb, cb + 8, cb + 8};
+                for (int p = 0; p < 4; ++p)
+                    for (int e = 0; e < 2; ++e) {
+                        const int r = t * 16 + rows[p];
+                        tile[lane * 8 + p * 2 + e] = r < n ? bf2h(w[(size_t) r * row_stride + cols[p] + e]) : __float2half(0.0f);
+                    }
+            }
+        }
+}
+
 void rmsnorm(const float * x, int xs, const float * w, float * y, int ys, int n, int nt, float eps, cudaStream_t s) {
     k_rmsnorm<<<nt, 1024, 0, s>>>(x, xs, w, y, ys, n, eps);
 }

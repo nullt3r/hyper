@@ -19,11 +19,14 @@ struct Q8W {
 };
 // host: repack row-major int8 qs[n][k] + scales d[n][k/32] into fragment order (fq: ntile*kb*512 bytes, fs: ntile*kb*16)
 void repack_q8_frag(const int8_t * qs, const half * d, int n, int k, uint8_t * fq, half * fs);
-// BF16 weight [n][k] row-major
+// 16-bit float weight (stored as fp16, converted from bf16 at load), fragment order: tile = 16 rows x 16 cols
+// (one mma k-step) = 512 lane-ordered bytes, tiles ordered [row tile][k step]. Rows padded to 16.
 struct BF16W {
-    const __nv_bfloat16 * w = nullptr;
+    const uint4 * q = nullptr;
     int n = 0, k = 0;
 };
+// host: repack row-major bf16 w[n][k] into fp16 fragment tiles (out: ntile * (k/16) * 512 bytes)
+void repack_bf16_frag(const uint16_t * w, int n, int k, size_t row_stride, uint8_t * out);
 // fused input RMSNorm: x' = x * rsqrt(sum(ss[t*nss .. t*nss+nss)) / k + eps) * w   (w == nullptr: no norm)
 struct NormIn { const float * w = nullptr; const float * ss = nullptr; int nss = 0; float eps = 1e-6f; };
 
