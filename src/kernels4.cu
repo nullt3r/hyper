@@ -107,37 +107,66 @@ __global__ void k_gated_norm_sig(float * o, int o_stride, const float * __restri
 }
 
 // ---------------- routing ----------------
-// block per token, one thread per expert (ne <= 1024): softmax, then each expert's rank among the probabilities
-// (ties to the lower index) decides whether it is selected and in which slot
+// block per token (256 threads, ne <= 1024): softmax; top-k in two stages: each warp keeps the top-k of its slice
+// (k rounds of warp argmax, ties to the lower index), then warp 0 merges the 8 * k candidates the same way
 __global__ void k_moe_route(const float * __restrict__ logits, int ls, int ne, int k, int * ids, float * wts, float * sg) {
-    const int t = blockIdx.x, e = threadIdx.x;
+    const int t = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = blockDim.x >> 5;
     const float * l = logits + (size_t) t * ls;
     __shared__ float p[1024];
-    __shared__ float bv[32];
-    __shared__ float sel_w[MOE_MAX_USED];
-    const float v = e < ne ? l[e] : -FLT_MAX;
-    float mx = v;
+    __shared__ float cv[8 * MOE_MAX_USED];
+    __shared__ int ci[8 * MOE_MAX_USED];
+    float mx = -FLT_MAX;
+    for (int e = threadIdx.x; e < ne; e += blockDim.x) mx = fmaxf(mx, l[e]);
     for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
-    if ((e & 31) == 0) bv[e >> 5] = mx;
+    __shared__ float wm[8];
+    if (lane == 0) wm[w] = mx;
     __syncthreads();
-    mx = -FLT_MAX;
-    for (int w = 0; w < (int) (blockDim.x >> 5); ++w) mx = fmaxf(mx, bv[w]);
-    const float ex = e < ne ? expf(v - mx) : 0.0f;
-    const float sum = block_sum4(ex);
-    const float pe = ex / sum;
-    if (e < ne) p[e] = pe;
+    mx = wm[0];
+    for (int i = 1; i < nw; ++i) mx = fmaxf(mx, wm[i]);
+    float sum = 0.0f;
+    for (int e = threadIdx.x; e < ne; e += blockDim.x) { const float v = expf(l[e] - mx); p[e] = v; sum += v; }
+    sum = block_sum4(sum);
+    for (int e = threadIdx.x; e < ne; e += blockDim.x) p[e] /= sum;
     __syncthreads();
-    if (e < ne) {
-        int rank = 0;
-        for (int j = 0; j < ne; ++j) { const float q = p[j]; rank += q > pe || (q == pe && j < e); }
-        if (rank < k) { ids[t * k + rank] = e; sel_w[rank] = pe; }
+    // stage 1: warp w owns experts [w*span, (w+1)*span)
+    const int span = (ne + nw - 1) / nw, e0 = w * span, e1 = min(ne, e0 + span);
+    unsigned long long taken[2] = {0ull, 0ull};   // per lane: which of its (up to 4) candidates are used (bit = slot)
+    for (int j = 0; j < k; ++j) {
+        float v = -1.0f; int vi = 0x7fffffff, slot = -1;
+        for (int q = 0, e = e0 + lane; e < e1; e += 32, ++q)
+            if (!((taken[q >> 6] >> (q & 63)) & 1ull) && (p[e] > v || (p[e] == v && e < vi))) { v = p[e]; vi = e; slot = q; }
+        float bv = v; int bi = vi;
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffff, bv, o); const int oi = __shfl_xor_sync(0xffffffff, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (bi == vi && slot >= 0) taken[slot >> 6] |= 1ull << (slot & 63);
+        if (lane == 0) { cv[w * k + j] = bv; ci[w * k + j] = bi; }
     }
     __syncthreads();
-    if (e == 0) {
-        float s = 0.0f;
-        for (int j = 0; j < k; ++j) s += sel_w[j];
-        for (int j = 0; j < k; ++j) wts[t * k + j] = sel_w[j] / s;
-        sg[t] = sigm(l[ne]);
+    // stage 2: warp 0 merges nw * k candidates
+    if (w == 0) {
+        const int nc = nw * k;
+        unsigned used = 0;   // lane-local: bit q = candidate lane + 32 q taken
+        for (int j = 0; j < k; ++j) {
+            float v = -1.0f; int vi = 0x7fffffff, slot = -1;
+            for (int q = 0, c = lane; c < nc; c += 32, ++q)
+                if (!((used >> q) & 1u) && ci[c] < 0x7fffffff && (cv[c] > v || (cv[c] == v && ci[c] < vi))) { v = cv[c]; vi = ci[c]; slot = q; }
+            float bv = v; int bi = vi;
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffff, bv, o); const int oi = __shfl_xor_sync(0xffffffff, bi, o);
+                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+            }
+            if (bi == vi && slot >= 0) used |= 1u << slot;
+            if (lane == 0) { ids[t * k + j] = bi; cv[nc + j] = bv; }   // cv tail: selected probabilities
+        }
+        __syncwarp();
+        if (lane == 0) {
+            float s = 0.0f;
+            for (int j = 0; j < k; ++j) s += cv[nc + j];
+            for (int j = 0; j < k; ++j) wts[t * k + j] = cv[nc + j] / s;
+            sg[t] = sigm(l[ne]);
+        }
     }
 }
 
@@ -664,7 +693,8 @@ void gated_norm_sigmoid(float * o, int o_stride, const float * z, int z_stride, 
 }
 void moe_route(const float * logits, int ls, int n_expert, int k, int * ids, float * wts, float * sg, int nt, cudaStream_t s) {
     if (n_expert > 1024 || k > MOE_MAX_USED) throw std::runtime_error("moe_route: too many experts");
-    k_moe_route<<<nt, (n_expert + 31) / 32 * 32, 0, s>>>(logits, ls, n_expert, k, ids, wts, sg);
+    if (k * 9 > 8 * MOE_MAX_USED) throw std::runtime_error("moe_route: k too large");
+    k_moe_route<<<nt, 256, 0, s>>>(logits, ls, n_expert, k, ids, wts, sg);
 }
 
 #define MOE_TYPE_SWITCH(T, CALL)                                                  \

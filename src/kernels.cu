@@ -840,13 +840,30 @@ __device__ __forceinline__ unsigned fkey(float f) {
 __global__ void k_topk(const float * __restrict__ x, int xs, int n, int offset, float * __restrict__ out, int K) {
     const float * xr = x + (size_t) blockIdx.x * xs;
     float * o = out + (size_t) blockIdx.x * K * 2;
-    unsigned t = 0;
-    for (int bit = 31; bit >= 0; --bit) {
-        const unsigned cand = t | (1u << bit);
-        float cnt = 0.0f;
-        for (int i = threadIdx.x; i < n; i += blockDim.x) cnt += fkey(xr[i]) >= cand ? 1.0f : 0.0f;
-        if (block_sum(cnt) >= (float) K) t = cand;
+    // radix select of the K-th largest key, 8 bits per pass (4 passes)
+    __shared__ unsigned hist[256];
+    __shared__ unsigned prefix, need;
+    if (threadIdx.x == 0) { prefix = 0; need = K; }
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
+        __syncthreads();
+        const unsigned mask_hi = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+        const unsigned pre = prefix;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const unsigned key = fkey(xr[i]);
+            if ((key & mask_hi) == (pre & mask_hi)) atomicAdd(&hist[(key >> shift) & 255], 1u);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            unsigned acc = 0;
+            for (int d = 255; d >= 0; --d) {
+                if (acc + hist[d] >= need) { prefix |= (unsigned) d << shift; need -= acc; break; }
+                acc += hist[d];
+            }
+        }
+        __syncthreads();
     }
+    const unsigned t = prefix;
     __shared__ int ngt, neq;
     if (threadIdx.x == 0) { ngt = 0; neq = 0; }
     __syncthreads();
