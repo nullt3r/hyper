@@ -51,6 +51,7 @@ public:
     struct Act {
         float * x, * part, * big0, * big1, * o, * h, * ss;
         half * xh, * p16, * recv;
+        float * attn_part;
         const int * pos;
         cudaStream_t s;
         int sid;      // bulk allreduce channel (micro-batch)

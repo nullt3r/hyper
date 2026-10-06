@@ -1,5 +1,6 @@
 #include "kernels.cuh"
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstring>
@@ -432,6 +433,101 @@ __global__ void k_attn_decode(const float * __restrict__ qkv, int stride, const 
     }
 }
 
+// split-K decode attention (flash-decoding). Block = one local kv head with all of its local q heads (<= G),
+// one slice of the positions, one token; 4 warps stride over the slice, lane owns 8 dims. Unnormalized partial
+// results {acc[HD], m, l} per (token, q head, split) go to `part`; attn_combine merges them.
+template <int HD, int G>
+__global__ void __launch_bounds__(128) k_attn_split(const float * __restrict__ qkv, int stride, const half * __restrict__ kcache,
+                                                    const half * __restrict__ vcache, float * __restrict__ part, const int * pos_p,
+                                                    int max_pos, int n_head_l, int head_off, int group, int kv_off, float scale) {
+    static_assert(HD == 256, "lane owns 8 dims");
+    constexpr int NW = 4;
+    const int hk = blockIdx.x, split = blockIdx.y, t = blockIdx.z, nsplit = gridDim.y;
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int n_pos = *pos_p + t + 1;
+    const int chunk = (n_pos + nsplit - 1) / nsplit;
+    const int p0 = split * chunk, p1 = min(n_pos, p0 + chunk);
+    const int h0 = max(0, (kv_off + hk) * group - head_off), h1 = min(n_head_l, (kv_off + hk + 1) * group - head_off);
+    const int ng = h1 - h0;
+    float q[G][8], acc[G][8], m[G], l[G];
+    const float * qrow = qkv + (size_t) t * stride;
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        m[g] = -FLT_MAX; l[g] = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { acc[g][j] = 0.0f; q[g][j] = g < ng ? qrow[(size_t) (h0 + g) * 2 * HD + lane * 8 + j] * scale : 0.0f; }
+    }
+    const half * kb = kcache + (size_t) hk * max_pos * HD + lane * 8;
+    const half * vb = vcache + (size_t) hk * max_pos * HD + lane * 8;
+    for (int p = p0 + w; p < p1; p += NW) {
+        const uint4 kr = *(const uint4 *) (kb + (size_t) p * HD);
+        const uint4 vr = *(const uint4 *) (vb + (size_t) p * HD);
+        float kf[8], vf[8];
+        const __half2 * kh = (const __half2 *) &kr, * vh = (const __half2 *) &vr;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 a = __half22float2(kh[j]), b = __half22float2(vh[j]);
+            kf[2 * j] = a.x; kf[2 * j + 1] = a.y; vf[2 * j] = b.x; vf[2 * j + 1] = b.y;
+        }
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            if (g >= ng) break;
+            float s = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) s += q[g][j] * kf[j];
+            s = warp_sum(s);
+            const float mn = fmaxf(m[g], s), corr = __expf(m[g] - mn), pw = __expf(s - mn);
+            l[g] = l[g] * corr + pw;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) acc[g][j] = acc[g][j] * corr + pw * vf[j];
+            m[g] = mn;
+        }
+    }
+    __shared__ float sm[NW][G], sl[NW][G];
+    __shared__ float sacc[NW][G][HD];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        if (lane == 0) { sm[w][g] = m[g]; sl[w][g] = l[g]; }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) sacc[w][g][lane * 8 + j] = acc[g][j];
+    }
+    __syncthreads();
+    for (int g = 0; g < ng; ++g) {
+        float gm = -FLT_MAX;
+        for (int ww = 0; ww < NW; ++ww) if (sl[ww][g] > 0.0f) gm = fmaxf(gm, sm[ww][g]);
+        float * dst = part + (((size_t) t * n_head_l + h0 + g) * nsplit + split) * (HD + 2);
+        for (int i = threadIdx.x; i < HD; i += blockDim.x) {
+            float num = 0.0f;
+            for (int ww = 0; ww < NW; ++ww) if (sl[ww][g] > 0.0f) num += sacc[ww][g][i] * __expf(sm[ww][g] - gm);
+            dst[i] = num;
+        }
+        if (threadIdx.x == 0) {
+            float den = 0.0f;
+            for (int ww = 0; ww < NW; ++ww) if (sl[ww][g] > 0.0f) den += sl[ww][g] * __expf(sm[ww][g] - gm);
+            dst[HD] = gm; dst[HD + 1] = den;
+        }
+    }
+}
+
+// grid (n_head_l, nt), HD threads: merge the splits, apply the output gate
+template <int HD>
+__global__ void k_attn_combine(const float * __restrict__ qkv, int stride, const float * __restrict__ part, int nsplit,
+                               float * __restrict__ out, int out_stride, int n_head_l) {
+    const int h = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
+    const float * pp = part + ((size_t) t * n_head_l + h) * nsplit * (HD + 2);
+    float gm = -FLT_MAX;
+    for (int s = 0; s < nsplit; ++s) if (pp[s * (HD + 2) + HD + 1] > 0.0f) gm = fmaxf(gm, pp[s * (HD + 2) + HD]);
+    float num = 0.0f, den = 0.0f;
+    for (int s = 0; s < nsplit; ++s) {
+        const float * ps = pp + s * (HD + 2);
+        if (ps[HD + 1] <= 0.0f) continue;
+        const float c = __expf(ps[HD] - gm);
+        num += ps[i] * c; den += ps[HD + 1] * c;
+    }
+    const float gate = qkv[(size_t) t * stride + (size_t) h * 2 * HD + HD + i];
+    out[(size_t) t * out_stride + (size_t) h * HD + i] = (num / den) * sigmoidf(gate);
+}
+
 // ---------------- gated delta net ----------------
 // thread per channel, tokens in order; state holds the K-1 previous inputs, oldest first
 __global__ void k_gdn_conv(float * in, int stride, float * st, float * snap, const float * __restrict__ w, int channels, int K, int nt) {
@@ -756,6 +852,18 @@ void attn_decode(const float * qkv, int stride, const half * kcache, const half 
     if (hd != 256) throw std::runtime_error("attn_decode: only head_dim 256 is instantiated");
     k_attn_decode<256><<<dim3(n_head, nt), 256, 0, s>>>(qkv, stride, kcache, vcache, out, out_stride, pos, max_pos,
                                                         head_off, group, kv_off, scale);
+}
+int attn_nsplit(int n_kv, int nt) { return std::max(1, std::min(64, 256 / (n_kv * nt))); }
+size_t attn_part_floats(int n_head, int n_kv, int nt, int hd) { return (size_t) nt * n_head * attn_nsplit(n_kv, nt) * (hd + 2); }
+void attn_split(const float * qkv, int stride, const half * kcache, const half * vcache, float * part, float * out, int out_stride,
+                const int * pos, int max_pos, int n_head, int n_kv, int head_off, int group, int kv_off, int hd,
+                float scale, int nt, cudaStream_t s) {
+    if (hd != 256) throw std::runtime_error("attn_split: only head_dim 256 is instantiated");
+    if (group > 6) throw std::runtime_error("attn_split: GQA group > 6 not instantiated");
+    const int ns = attn_nsplit(n_kv, nt);
+    k_attn_split<256, 6><<<dim3(n_kv, ns, nt), 128, 0, s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head, head_off,
+                                                           group, kv_off, scale);
+    k_attn_combine<256><<<dim3(n_head, nt), 256, 0, s>>>(qkv, stride, part, ns, out, out_stride, n_head);
 }
 void gdn_conv(float * in, int stride, float * conv_state, float * conv_snap, const float * conv_w, int channels, int K,
               int nt, cudaStream_t s) {

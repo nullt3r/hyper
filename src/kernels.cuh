@@ -57,6 +57,13 @@ void attn_prep(float * qkv, int stride, const float * qnorm, const float * knorm
 void attn_decode(const float * qkv, int stride, const half * kcache, const half * vcache, float * out, int out_stride,
                  const int * pos, int max_pos, int n_head, int n_kv, int head_off, int group, int kv_off, int hd,
                  float scale, int nt, cudaStream_t s);
+// split-K variant: a block per (local kv head, position slice, token) serves all q heads of that kv head;
+// part: scratch of attn_part_floats(n_head, n_kv, nt, hd) floats
+int attn_nsplit(int n_kv, int nt);
+size_t attn_part_floats(int n_head, int n_kv, int nt, int hd);
+void attn_split(const float * qkv, int stride, const half * kcache, const half * vcache, float * part, float * out, int out_stride,
+                const int * pos, int max_pos, int n_head, int n_kv, int head_off, int group, int kv_off, int hd,
+                float scale, int nt, cudaStream_t s);
 
 // ---- gated delta net, local heads ----
 // in rows: [q n_k*dk | k n_k*dk | v n_v*dv | z n_v*dv | alpha n_v | beta n_v]  (conv runs over the first `channels`)

@@ -69,6 +69,8 @@ struct Engine::Device {
     cudaEvent_t ev_ar[2][2] = {}, ev_fork = nullptr, ev_join = nullptr;
     std::vector<cudaEvent_t> ev_layer;
     int * pos2 = nullptr;
+    float * attn_part = nullptr;   // split attention partials [2 micro-batches][attn_part_sz]
+    size_t attn_part_sz = 0;
     int * pos = nullptr, * mpos = nullptr, * counter = nullptr;
     size_t used = 0;
     std::vector<void *> allocs;
@@ -410,6 +412,15 @@ void Engine::load_weights() {
         dev.p16 = dev.alloc<half>((size_t) MAX_ROWS * n);
         dev.recv = dev.alloc<half>((size_t) (nd - 1) * MAX_ROWS * n + 1);
         dev.pos2 = dev.alloc<int>(1);
+        {   // split attention scratch per micro-batch: the largest over all row counts and layers' kv splits
+            size_t mx = 0;
+            for (auto & L : dev.layers) if (L.full)
+                for (int r = 1; r <= MAX_ROWS; ++r) mx = std::max(mx, attn_part_floats(L.n_head_l, L.n_kv_l, r, c.head_dim));
+            if (opt_.mtp) for (int r = 1; r <= MAX_ROWS; ++r)
+                mx = std::max(mx, attn_part_floats(dev.mtp.n_head_l, dev.mtp.n_kv_l, r, c.head_dim));
+            dev.attn_part_sz = mx;
+            dev.attn_part = dev.alloc<float>(2 * mx);
+        }
         dev.ev_layer.resize(c.n_layer);
         for (auto & ev : dev.ev_layer) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         dev.pos = dev.alloc<int>(1);
@@ -463,6 +474,7 @@ Engine::Act Engine::act(Device & d, int row0, int sid, cudaStream_t s, const int
     a.xh = d.xh + (size_t) row0 * std::max(c.n_ff, 2 * c.n_embd);
     a.p16 = d.p16 + row0 * n;
     a.recv = d.recv + row0 * n;
+    a.attn_part = d.attn_part + sid * d.attn_part_sz;
     a.pos = pos; a.s = s; a.sid = sid; a.bulk = bulk;
     return a;
 }
@@ -502,8 +514,8 @@ void Engine::record_attn(Device & d, DevLayer & L, Act & a, int nt, int & call, 
     if (dep.signal) CUDA_CHECK(cudaEventRecord(dep.signal, a.s));   // this micro-batch's K/V are in the cache
     if (dep.wait) CUDA_CHECK(cudaStreamWaitEvent(a.s, dep.wait, 0));
     const int ostride = L.n_head_l * c.head_dim;
-    attn_decode(a.big0, bs, L.kcache, L.vcache, a.o, ostride, a.pos, opt_.max_pos, L.n_head_l, L.n_kv_l, L.head_off,
-                c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), nt, a.s);
+    attn_split(a.big0, bs, L.kcache, L.vcache, a.attn_part, a.o, ostride, a.pos, opt_.max_pos, L.n_head_l, L.n_kv_l, L.head_off,
+               c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), nt, a.s);
     mm(a, L.wo, a.o, ostride, a.part, n, nt);
     allreduce(d, a, nt, call);
 }
