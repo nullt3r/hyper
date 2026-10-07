@@ -2,7 +2,9 @@
 //   hyper4 check <model> <ref.bin> [nt=1] [gpu_frac]   logits vs the llama.cpp reference, nt tokens per forward
 //   hyper4 bench <model> <ref.bin> [n_gen=128] [gpu_frac]   greedy decode speed after the reference prompt
 #include "engine4.h"
+#include "engine5.h"
 
+#include <cuda_profiler_api.h>
 #include <csignal>
 #include <execinfo.h>
 #include <unistd.h>
@@ -66,15 +68,12 @@ static void on_crash(int sig) {
     _exit(128 + sig);
 }
 
-int main(int argc, char ** argv) {
-    signal(SIGSEGV, on_crash);
-    signal(SIGABRT, on_crash);
-    signal(SIGBUS, on_crash);
-    if (argc < 4) { fprintf(stderr, "usage: hyper4 check|bench <model> <ref.bin> [nt|n_gen] [gpu_frac]\n"); return 1; }
+template <class Engine, class Options>
+static int run_cmd(int argc, char ** argv) {
     const std::string cmd = argv[1];
     std::vector<int> toks; std::vector<float> ref; int nv = 0;
     if (!read_ref(argv[3], toks, ref, nv)) return 1;
-    Engine4Options opt;
+    Options opt;
     opt.prompt_cache = cmd == "cachetest";
     if (getenv("HYPER4_NOSTREAM")) opt.stream_experts = false;
     if (getenv("HYPER4_STREAM")) opt.stream_experts = true;
@@ -85,7 +84,7 @@ int main(int argc, char ** argv) {
     if (getenv("HYPER_CPU_THREADS")) opt.cpu_threads = atoi(getenv("HYPER_CPU_THREADS"));
     if (getenv("HYPER_NDEV")) opt.n_devices = atoi(getenv("HYPER_NDEV"));
     try {
-        Engine4 eng(argv[2], opt);
+        Engine eng(argv[2], opt);
         if (eng.config().n_vocab != nv) { fprintf(stderr, "vocab mismatch %d vs %d\n", eng.config().n_vocab, nv); return 1; }
         if (cmd == "check") {
             const int nt = argc > 4 ? atoi(argv[4]) : 1;
@@ -223,6 +222,16 @@ int main(int argc, char ** argv) {
             const std::string out = argc > 6 ? argv[6] : "expert_stats.bin";
             eng.save_expert_stats(out);   // (loaded statistics + this run)
             printf("CALIB %d prompt + %d generated tokens -> %s\n", P, n_gen, out.c_str());
+        } else if (cmd == "tfbench") {   // decode speed on fixed content: the reference tokens fed one at a time after a 64-token prefill
+            const int pf = getenv("HYPER_TF_PF") ? atoi(getenv("HYPER_TF_PF")) : 64;   // prefilled context
+            const int n_tok = std::min<int>(argc > 4 ? atoi(argv[4]) : 256, (int) toks.size() - pf);
+            eng.reset();
+            eng.prefill(toks.data(), pf, 0);
+            if (getenv("HYPER_TF_MARK")) cudaProfilerStart();
+            auto t0 = std::chrono::steady_clock::now();
+            for (int i = pf; i < pf + n_tok; ++i) eng.forward(&toks[i], 1, i);
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            printf("TFBENCH decode %d fixed tokens: %.2f t/s (%.2f ms/token)\n", n_tok, n_tok / s, 1e3 * s / n_tok);
         } else if (cmd == "bench") {
             const int n_gen = argc > 4 ? atoi(argv[4]) : 128;
             eng.reset();
@@ -241,4 +250,15 @@ int main(int argc, char ** argv) {
         return 1;
     }
     return 0;
+}
+
+int main(int argc, char ** argv) {
+    signal(SIGSEGV, on_crash);
+    signal(SIGABRT, on_crash);
+    signal(SIGBUS, on_crash);
+    if (argc < 4) { fprintf(stderr, "usage: hyper4 check|bench <model> <ref.bin> [nt|n_gen] [gpu_frac]\n"); return 1; }
+    std::string arch;
+    try { arch = GGUF(argv[2]).arch(); } catch (const std::exception & e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
+    if (arch == "glm5-next") return run_cmd<Engine5, Engine5Options>(argc, argv);
+    return run_cmd<Engine4, Engine4Options>(argc, argv);
 }

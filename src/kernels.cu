@@ -49,7 +49,12 @@ __device__ __forceinline__ void apply_act(const NormIn & nin, const float * xr, 
         const float s = nin.act_scale;
         v0.x = silu_f(v0.x * s); v0.y = silu_f(v0.y * s); v1.x = silu_f(v1.x * s); v1.y = silu_f(v1.y * s);
     } else {
-        const float2 u0 = *(const float2 *) (xr + c0 + nin.glu_off), u1 = *(const float2 *) (xr + c0 + 8 + nin.glu_off);
+        float2 u0 = *(const float2 *) (xr + c0 + nin.glu_off), u1 = *(const float2 *) (xr + c0 + 8 + nin.glu_off);
+        if (nin.act == 3) {   // SwiGLU with limit act_scale
+            const float L = nin.act_scale;
+            v0.x = fminf(v0.x, L); v0.y = fminf(v0.y, L); v1.x = fminf(v1.x, L); v1.y = fminf(v1.y, L);
+            u0.x = fminf(fmaxf(u0.x, -L), L); u0.y = fminf(fmaxf(u0.y, -L), L); u1.x = fminf(fmaxf(u1.x, -L), L); u1.y = fminf(fmaxf(u1.y, -L), L);
+        }
         v0.x = silu_f(v0.x) * u0.x; v0.y = silu_f(v0.y) * u0.y; v1.x = silu_f(v1.x) * u1.x; v1.y = silu_f(v1.y) * u1.y;
     }
 }

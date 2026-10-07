@@ -7,8 +7,10 @@
 // usage: hyper-server <model.gguf> [--host 0.0.0.0] [--port 8080] [--ctx 262144] [--draft 3] [--alias name]
 //                     [--temp 0.6] [--top-p 0.95] [--top-k 20] [--min-p 0] [--snapshots 48]   (request fields override)
 //                     qwen4exp: [--gpu-frac 1.0] [--cpu-threads 30] [--expert-stats file] [--mtp nextn.gguf]   (context default 131072)
+//                     glm5-next: [--gpu-frac 1.0] [--cpu-threads 30] [--expert-stats file]   (context default 65536)
 #include "engine.h"
 #include "engine4.h"
+#include "engine5.h"
 
 #include "chat.h"
 #include "llama.h"
@@ -380,6 +382,21 @@ int main(int argc, char ** argv) {
         }
         draft = engine ? draft : e4->n_draft();
         engine = std::move(e4);
+    } else if (arch == "glm5-next") {
+        if (!ctx_given) ctx = 65536;
+        Engine5Options o5;
+        o5.max_pos = ctx;
+        o5.gpu_expert_frac = gpu_frac;
+        o5.cpu_threads = cpu_threads;
+        o5.prompt_cache = true;
+        o5.max_snapshots = snaps;
+        auto e5 = std::make_unique<Engine5>(path, o5);
+        if (!stats_path.empty()) {
+            Engine5 * pe = e5.get();
+            c.after_request = [pe, stats_path] { pe->save_expert_stats(stats_path); };
+        }
+        draft = 0;
+        engine = std::move(e5);
     } else {
         EngineOptions opt;
         opt.max_pos = ctx;
@@ -392,9 +409,12 @@ int main(int argc, char ** argv) {
     LLM & eng = *engine;
     c.eng = &eng;
     {
-        const std::vector<int> im = tokenize(c.vocab, "<|im_start|>");
-        if (im.size() == 1) eng.set_snapshot_token(im[0]);
-        else fprintf(stderr, "hyper-server: no single <|im_start|> token, prompt-cache snapshots only every 4096 tokens\n");
+        int n_snap = 0;   // message starts: ChatML, or GLM's role tokens (an engine keeps every token it is given)
+        for (const char * m : {"<|im_start|>", "<|assistant|>", "<|user|>", "<|observation|>"}) {
+            const std::vector<int> im = tokenize(c.vocab, m);
+            if (im.size() == 1 && (n_snap == 0 || arch == "glm5-next")) { eng.set_snapshot_token(im[0]); ++n_snap; }
+        }
+        if (!n_snap) fprintf(stderr, "hyper-server: no message-start token, prompt-cache snapshots only every 4096 tokens\n");
     }
     {   // warm up: builds the CUDA graphs
         GenStats st;

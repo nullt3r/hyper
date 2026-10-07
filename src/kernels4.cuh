@@ -45,6 +45,7 @@ struct MoeDev {
     size_t gate_bytes = 0, down_bytes = 0;   // bytes per expert matrix
     const int * slot = nullptr;              // [n_expert]
     int ff = 0, n = 0;
+    float clamp = 0.0f;                      // SwiGLU limit (0: none)
 };
 // order (optional): the local pairs sorted by expert (count in order_n), so that consecutive blocks share an expert's
 // weights in L2; without it every pair p = t*k + j is visited and non-local pairs are skipped
@@ -67,7 +68,22 @@ void moe_gemm_down(const MoeDev & m, const half * h16, const int * order, const 
 // is there, when any of token t's experts lives on the CPU: owner[e] == cpu_owner)
 void moe_reduce(const float * shexp, const float * sg, const float * y, int k, float * out, int n, int nt,
                 const int * ids, const int * owner, int g, int cpu_owner, const volatile unsigned * cpu_flag, const float * cpu_y,
-                const int * counter, unsigned seq_tag, cudaStream_t s);
+                const int * counter, unsigned seq_tag, cudaStream_t s, const float * yzc = nullptr);
+// + yzc[t*k + j] for the CPU-owned pairs (this GPU's zero-copy share of them), when given
+
+// zero-copy share of the CPU experts: hidden slice [f0, f1) (whole 256-blocks) of every CPU-owned pair, weights read from
+// the mapped compact host copy (expert e at index cslot[e]); y[p] = w[p] * down[:, f0:f1] . h[f0:f1] (0-sized slice: no-op)
+struct MoeZC {
+    const uint8_t * gate = nullptr, * up = nullptr, * down = nullptr;
+    GType tg = GType::F32, td = GType::F32;
+    size_t gate_bytes = 0, down_bytes = 0;
+    const int * cslot = nullptr;
+    int ff = 0, n = 0, f0 = 0, f1 = 0;
+    float clamp = 0.0f;
+};
+void moe_zc(const MoeZC & z, const float * x, int xs, const int * ids, const float * wts, int k, float * h, float * y, int nt,
+            cudaStream_t s);
+void moe_zc_init();   // per device: shared memory limits
 
 // CPU hand-off record in mapped host memory (one per layer)
 struct CpuMoeRec {

@@ -57,6 +57,13 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     auto mp = llama_model_default_params();
     mp.n_gpu_layers = ngl;
+    // REF_CPU_MOE=1: routed experts stay in host memory (models larger than the VRAM)
+    static llama_model_tensor_buft_override ovr[2] = {};
+    if (getenv("REF_CPU_MOE")) {
+        ovr[0].pattern = "_exps";
+        ovr[0].buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+        mp.tensor_buft_overrides = ovr;
+    }
     llama_model * model = llama_model_load_from_file(argv[1], mp);
     if (!model) { fprintf(stderr, "load failed\n"); return 1; }
     const llama_vocab * vocab = llama_model_get_vocab(model);

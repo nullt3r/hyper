@@ -10,7 +10,8 @@ LIBS     := -L/usr/local/cuda-12.9/lib64 -lcudart -lcublas -lcuda -lgomp -lpthre
 BUILD := build
 # v1 (qwen35 dense) objects; qwen4exp objects additionally need ggml (CPU experts)
 OBJ   := $(BUILD)/gguf.o $(BUILD)/model.o $(BUILD)/kernels.o $(BUILD)/engine.o
-OBJ4  := $(BUILD)/gguf.o $(BUILD)/model4.o $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/cpu_moe.o $(BUILD)/engine4.o
+OBJ4  := $(BUILD)/gguf.o $(BUILD)/model4.o $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/cpu_moe.o $(BUILD)/engine4.o \
+         $(BUILD)/model5.o $(BUILD)/kernels5.o $(BUILD)/engine5.o
 GGML_INC := -I$(LLAMA)/ggml/include
 
 all: $(BUILD)/hyper $(BUILD)/ref $(BUILD)/arbench

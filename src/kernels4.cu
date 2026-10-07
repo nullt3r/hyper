@@ -28,6 +28,11 @@ __device__ float block_sum4(float v) {
 __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + expf(-x)); }
 __device__ __forceinline__ float silu4(float x) { return x / (1.0f + expf(-x)); }
 __device__ __forceinline__ float h2f(const uint8_t * p) { __half h; memcpy(&h, p, 2); return __half2float(h); }
+// silu(g) * u, or with a limit L > 0: silu(min(g, L)) * clamp(u, -L, L)
+__device__ __forceinline__ float swiglu4(float g, float u, float L) {
+    if (L > 0.0f) { g = fminf(g, L); u = fminf(fmaxf(u, -L), L); }
+    return g / (1.0f + expf(-g)) * u;
+}
 
 // ---------------- hyper-connections ----------------
 // optional inj: also the hc-row injection dot products restricted to this stream: injp[t][s][j] = inj_w[j][s-slice] . xn
@@ -235,6 +240,116 @@ template <> __device__ __forceinline__ void deq8<GType::Q5_1>(const uint8_t * __
         v[i] = x * d + m;
     }
 }
+__device__ const uint32_t g_iq3s_grid[512] = {
+    0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
+    0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
+    0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
+    0x01010f0f, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030b,
+    0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
+    0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
+    0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
+    0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501, 0x01070505,
+    0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05, 0x01070d0f, 0x01070f03,
+    0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
+    0x01090907, 0x01090b03, 0x01090f01, 0x010b0105, 0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d,
+    0x010b0707, 0x010b0903, 0x010b090b, 0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303,
+    0x010d0307, 0x010d0703, 0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501,
+    0x010f0505, 0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
+    0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501, 0x03010505,
+    0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03, 0x03010f05, 0x03030101,
+    0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
+    0x03030903, 0x03030b01, 0x03030b05, 0x03030f01, 0x03030f0d, 0x03050101, 0x03050305, 0x0305030b,
+    0x0305030f, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01,
+    0x03050f05, 0x03070103, 0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f,
+    0x03070701, 0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
+    0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09, 0x030b0103,
+    0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03, 0x030d0501, 0x030d0509,
+    0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107, 0x030f0301, 0x030f0305, 0x030f0503,
+    0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01, 0x05010101, 0x05010103, 0x05010107, 0x0501010b,
+    0x0501010f, 0x05010301, 0x05010305, 0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f,
+    0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f,
+    0x05010f01, 0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
+    0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103, 0x05050109,
+    0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903, 0x05050b07, 0x05050b0f,
+    0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b, 0x05070303, 0x05070505, 0x05070509,
+    0x05070703, 0x05070707, 0x05070905, 0x05070b01, 0x05070d0d, 0x05090103, 0x0509010f, 0x05090501,
+    0x05090507, 0x05090705, 0x0509070b, 0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303,
+    0x050b0505, 0x050b070f, 0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f,
+    0x050d0503, 0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
+    0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505, 0x07010703,
+    0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03, 0x07010d07, 0x07010f03,
+    0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030d01,
+    0x07030f05, 0x07030f0d, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050b01,
+    0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903,
+    0x07070907, 0x0707090f, 0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505,
+    0x07090703, 0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
+    0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103, 0x070f0107,
+    0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
+    0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01, 0x09030105, 0x0903010f, 0x09030303,
+    0x09030307, 0x09030505, 0x09030701, 0x0903070b, 0x09030907, 0x09030b03, 0x09030b0b, 0x09050103,
+    0x09050107, 0x09050301, 0x0905030b, 0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05,
+    0x09050f01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b,
+    0x09090101, 0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
+    0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b, 0x090f0701,
+    0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505, 0x0b010901, 0x0b010909,
+    0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103, 0x0b030107, 0x0b03010b, 0x0b030305,
+    0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101, 0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d,
+    0x0b050b07, 0x0b070105, 0x0b07010f, 0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b,
+    0x0b070f07, 0x0b090103, 0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d,
+    0x0b0b0b03, 0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
+    0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f, 0x0d030d09,
+    0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01, 0x0d070101, 0x0d070309,
+    0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05, 0x0d0b0101, 0x0d0b0107, 0x0d0b0709,
+    0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303, 0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f,
+    0x0f010501, 0x0f010505, 0x0f01070d, 0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303,
+    0x0f030509, 0x0f030907, 0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503,
+    0x0f050701, 0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
+    0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
+};
+__device__ const int8_t g_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+// lookup tables in shared memory (divergent lookups): every kernel that dequantizes calls load_tables<T>() and syncs
+__shared__ uint32_t s_iq3s_grid[512];
+__shared__ float s_iq4nl[16];
+template <GType T> __device__ __forceinline__ void load_tables() {
+    if (T == GType::IQ3_S) for (int i = threadIdx.x; i < 512; i += blockDim.x) s_iq3s_grid[i] = g_iq3s_grid[i];
+    if (T == GType::IQ4_XS) for (int i = threadIdx.x; i < 16; i += blockDim.x) s_iq4nl[i] = g_iq4nl[i];
+}
+template <> __device__ __forceinline__ void deq8<GType::IQ4_XS>(const uint8_t * __restrict__ row, int c, float * v) {
+    const uint8_t * b = row + (size_t) (c >> 5) * 136;
+    const int o = (c & 31) * 8, ib = o >> 5, l = o & 31;
+    uint16_t sh; memcpy(&sh, b + 2, 2);
+    const int ls = ((b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 0xf) | (((sh >> (2 * ib)) & 3) << 4);
+    const float dl = h2f(b) * (ls - 32);
+    const uint8_t * q = b + 8 + ib * 16 + (l & 15);
+    const int shift = l >= 16 ? 4 : 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = dl * s_iq4nl[(q[i] >> shift) & 0xf];
+}
+template <> __device__ __forceinline__ void deq8<GType::Q6_K>(const uint8_t * __restrict__ row, int c, float * v) {
+    const uint8_t * b = row + (size_t) (c >> 5) * 210;
+    const int e = (c & 31) * 8, hf = e >> 7, qt = (e >> 5) & 3, l = e & 31;
+    const uint8_t * ql = b + hf * 64 + (qt & 1) * 32 + l;
+    const uint8_t * qh = b + 128 + hf * 32 + l;
+    const int8_t sc = (int8_t) b[192 + hf * 8 + (l >> 4) + 2 * qt];
+    const float d = h2f(b + 208) * sc;
+    const int s1 = qt >= 2 ? 4 : 0, s2 = 2 * qt;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = d * ((((ql[i] >> s1) & 0xF) | (((qh[i] >> s2) & 3) << 4)) - 32);
+}
+template <> __device__ __forceinline__ void deq8<GType::IQ3_S>(const uint8_t * __restrict__ row, int c, float * v) {
+    const uint8_t * b = row + (size_t) (c >> 5) * 110;
+    const int cc = c & 31, ib = cc >> 2, l = cc & 3;
+    const float db = h2f(b) * (1 + 2 * ((b[106 + (ib >> 1)] >> (4 * (ib & 1))) & 0xf));
+    const uint8_t * qs = b + 2 + ib * 8 + 2 * l;
+    const int qh = b[66 + ib];
+    const uint8_t sg = b[74 + ib * 4 + l];
+    const uint32_t g1 = s_iq3s_grid[qs[0] | ((qh << (8 - 2 * l)) & 256)], g2 = s_iq3s_grid[qs[1] | ((qh << (7 - 2 * l)) & 256)];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        v[j] = db * (float) ((g1 >> (8 * j)) & 0xff) * ((sg >> j) & 1 ? -1.0f : 1.0f);
+        v[4 + j] = db * (float) ((g2 >> (8 * j)) & 0xff) * ((sg >> (4 + j)) & 1 ? -1.0f : 1.0f);
+    }
+}
 template <> __device__ __forceinline__ void deq8<GType::Q8_0>(const uint8_t * __restrict__ row, int c, float * v) {
     const uint8_t * b = row + (size_t) (c >> 2) * 34;
     const float d = h2f(b);
@@ -255,7 +370,7 @@ template <GType T> __device__ __forceinline__ float dot_row(const uint8_t * __re
     return warp_sum4(acc);
 }
 
-constexpr int MOE_ROWS = 8;   // rows per block: one per warp
+constexpr int MOE_ROWS = 8;   // rows per block: MOE_ROWS / 8 per warp
 
 template <GType T>
 __global__ void k_moe_gate_up(MoeDev m, const float * __restrict__ x, int xs, const int * __restrict__ ids, int k, float * __restrict__ h, int kdim,
@@ -265,16 +380,37 @@ __global__ void k_moe_gate_up(MoeDev m, const float * __restrict__ x, int xs, co
     const int slot = m.slot[ids[p]];
     if (slot < 0) return;
     extern __shared__ float xsm[];
+    load_tables<T>();
     for (int i = threadIdx.x; i < kdim; i += blockDim.x) xsm[i] = x[(size_t) t * xs + i];
     __syncthreads();
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const size_t rb = m.gate_bytes / m.ff;
-    for (int rr = 0; rr < MOE_ROWS / 8; ++rr) {
-        const int r = blockIdx.y * MOE_ROWS + w * (MOE_ROWS / 8) + rr;
-        if (r >= m.ff) break;
-        const float g = dot_row<T>(m.gate + slot * m.gate_bytes + r * rb, xsm, kdim, lane);
-        const float u = dot_row<T>(m.up + slot * m.gate_bytes + r * rb, xsm, kdim, lane);
-        if (lane == 0) h[(size_t) p * m.ff + r] = silu4(g) * u;
+    // the warp's 4 rows of gate and up advance together: 8 independent load streams per lane
+    constexpr int RW = MOE_ROWS / 8;
+    const int r0 = blockIdx.y * MOE_ROWS + w * RW;
+    const uint8_t * gr[RW], * ur[RW];
+#pragma unroll
+    for (int rr = 0; rr < RW; ++rr) {
+        const int r = min(r0 + rr, m.ff - 1);
+        gr[rr] = m.gate + slot * m.gate_bytes + r * rb;
+        ur[rr] = m.up + slot * m.gate_bytes + r * rb;
+    }
+    float ag[RW] = {}, au[RW] = {};
+    for (int c = lane; c < kdim / 8; c += 32) {
+        const float4 x0 = *(const float4 *) (xsm + c * 8), x1 = *(const float4 *) (xsm + c * 8 + 4);
+#pragma unroll
+        for (int rr = 0; rr < RW; ++rr) {
+            float v[8], q[8];
+            deq8<T>(gr[rr], c, v);
+            deq8<T>(ur[rr], c, q);
+            ag[rr] += v[0] * x0.x + v[1] * x0.y + v[2] * x0.z + v[3] * x0.w + v[4] * x1.x + v[5] * x1.y + v[6] * x1.z + v[7] * x1.w;
+            au[rr] += q[0] * x0.x + q[1] * x0.y + q[2] * x0.z + q[3] * x0.w + q[4] * x1.x + q[5] * x1.y + q[6] * x1.z + q[7] * x1.w;
+        }
+    }
+#pragma unroll
+    for (int rr = 0; rr < RW; ++rr) {
+        const float g = warp_sum4(ag[rr]), u = warp_sum4(au[rr]);
+        if (lane == 0 && r0 + rr < m.ff) h[(size_t) p * m.ff + r0 + rr] = swiglu4(g, u, m.clamp);
     }
 }
 
@@ -294,21 +430,95 @@ __global__ void k_moe_down(MoeDev m, const float * __restrict__ h, const int * _
         return;
     }
     extern __shared__ float hsm[];
+    load_tables<T>();
     for (int i = threadIdx.x; i < m.ff; i += blockDim.x) hsm[i] = h[(size_t) p * m.ff + i];
     __syncthreads();
     const size_t rb = m.down_bytes / m.n;
     const float wt = wts[p];
-    for (int rr = 0; rr < MOE_ROWS / 8; ++rr) {
-        const int r = blockIdx.y * MOE_ROWS + w * (MOE_ROWS / 8) + rr;
-        if (r >= m.n) break;
-        const float v = dot_row<T>(m.down + slot * m.down_bytes + r * rb, hsm, m.ff, lane);
-        if (lane == 0) y[(size_t) p * m.n + r] = wt * v;
+    constexpr int RW = MOE_ROWS / 8;
+    const int r0 = blockIdx.y * MOE_ROWS + w * RW;
+    const uint8_t * dr[RW];
+#pragma unroll
+    for (int rr = 0; rr < RW; ++rr) dr[rr] = m.down + slot * m.down_bytes + min(r0 + rr, m.n - 1) * rb;
+    float acc[RW] = {};
+    for (int c = lane; c < m.ff / 8; c += 32) {
+        const float4 x0 = *(const float4 *) (hsm + c * 8), x1 = *(const float4 *) (hsm + c * 8 + 4);
+#pragma unroll
+        for (int rr = 0; rr < RW; ++rr) {
+            float v[8];
+            deq8<T>(dr[rr], c, v);
+            acc[rr] += v[0] * x0.x + v[1] * x0.y + v[2] * x0.z + v[3] * x0.w + v[4] * x1.x + v[5] * x1.y + v[6] * x1.z + v[7] * x1.w;
+        }
+    }
+#pragma unroll
+    for (int rr = 0; rr < RW; ++rr) {
+        const float v = warp_sum4(acc[rr]);
+        if (lane == 0 && r0 + rr < m.n) y[(size_t) p * m.n + r0 + rr] = wt * v;
+    }
+}
+
+// ---- zero-copy share of the CPU experts: hidden slice [f0, f1) read straight from mapped host memory ----
+// row bytes staged through shared memory with 8-byte loads (PCIe reads stay coalesced), then the usual block dot
+template <GType T>
+__global__ void __launch_bounds__(256) k_moe_zc_gate_up(MoeZC z, const float * __restrict__ x, int xs, const int * __restrict__ ids, int k,
+                                                       float * __restrict__ h, int kdim) {
+    const int p = blockIdx.x, t = p / k;
+    const int cs = z.cslot[ids[p]];
+    if (cs < 0) return;
+    extern __shared__ __align__(16) unsigned char zsm[];
+    float * xsm = (float *) zsm;
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const size_t rb = z.gate_bytes / z.ff;
+    uint2 * rows = (uint2 *) (zsm + (size_t) kdim * 4) + (size_t) w * (2 * rb / 8);
+    load_tables<T>();
+    for (int i = threadIdx.x; i < kdim; i += blockDim.x) xsm[i] = x[(size_t) t * xs + i];
+    __syncthreads();
+    for (int rr = 0; rr < 4; ++rr) {
+        const int r = z.f0 + blockIdx.y * 32 + w * 4 + rr;
+        if (r >= z.f1) break;
+        const uint2 * gsrc = (const uint2 *) (z.gate + (size_t) cs * z.gate_bytes + (size_t) r * rb);
+        const uint2 * usrc = (const uint2 *) (z.up + (size_t) cs * z.gate_bytes + (size_t) r * rb);
+        for (int i = lane; i < (int) (rb / 8); i += 32) { rows[i] = gsrc[i]; rows[rb / 8 + i] = usrc[i]; }
+        __syncwarp();
+        const float gv = dot_row<T>((const uint8_t *) rows, xsm, kdim, lane);
+        const float uv = dot_row<T>((const uint8_t *) (rows + rb / 8), xsm, kdim, lane);
+        if (lane == 0) h[(size_t) p * (z.f1 - z.f0) + (r - z.f0)] = swiglu4(gv, uv, z.clamp);
+        __syncwarp();
+    }
+}
+template <GType T>
+__global__ void __launch_bounds__(256) k_moe_zc_down(MoeZC z, const float * __restrict__ h, const int * __restrict__ ids,
+                                                    const float * __restrict__ wts, int k, float * __restrict__ y) {
+    const int p = blockIdx.x;
+    const int cs = z.cslot[ids[p]];
+    if (cs < 0) return;
+    const int len = z.f1 - z.f0;
+    extern __shared__ __align__(16) unsigned char zsm[];
+    float * hsm = (float *) zsm;
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const size_t rb = z.down_bytes / z.n;
+    const size_t seg = rb / (z.ff / 256) * (len / 256), off = rb / (z.ff / 256) * (z.f0 / 256);   // 256-wide blocks
+    uint2 * rows = (uint2 *) (zsm + (size_t) len * 4) + (size_t) w * (seg / 8);
+    load_tables<T>();
+    for (int i = threadIdx.x; i < len; i += blockDim.x) hsm[i] = h[(size_t) p * len + i];
+    __syncthreads();
+    const float wt = wts[p];
+    for (int rr = 0; rr < 4; ++rr) {
+        const int r = blockIdx.y * 32 + w * 4 + rr;
+        if (r >= z.n) break;
+        const uint2 * src = (const uint2 *) (z.down + (size_t) cs * z.down_bytes + (size_t) r * rb + off);
+        for (int i = lane; i < (int) (seg / 8); i += 32) rows[i] = src[i];
+        __syncwarp();
+        const float v = dot_row<T>((const uint8_t *) rows, hsm, len, lane);
+        if (lane == 0) y[(size_t) p * z.n + r] = wt * v;
+        __syncwarp();
     }
 }
 
 __global__ void k_moe_reduce(const float * __restrict__ shexp, const float * __restrict__ sg, const float * __restrict__ y, int k,
                              float * __restrict__ out, int n, const int * __restrict__ ids, const int * __restrict__ owner, int g, int cpu_owner,
-                             const volatile unsigned * cpu_flag, const float * cpu_y, const int * counter, unsigned seq_tag) {
+                             const volatile unsigned * cpu_flag, const float * cpu_y, const int * counter, unsigned seq_tag,
+                             const float * __restrict__ yzc) {
     const int t = blockIdx.y, r = blockIdx.x * blockDim.x + threadIdx.x;
     bool need = false;
     if (cpu_flag) for (int j = 0; j < k; ++j) need |= owner[ids[t * k + j]] == cpu_owner;
@@ -323,6 +533,7 @@ __global__ void k_moe_reduce(const float * __restrict__ shexp, const float * __r
     if (r >= n) return;
     float acc = sg[t] * shexp[(size_t) t * n + r];
     for (int j = 0; j < k; ++j) if (owner[ids[t * k + j]] == g) acc += y[(size_t) (t * k + j) * n + r];
+    if (yzc) for (int j = 0; j < k; ++j) if (owner[ids[t * k + j]] == cpu_owner) acc += yzc[(size_t) (t * k + j) * n + r];
     if (need) acc += __ldcv(cpu_y + (size_t) t * 4096 + r);
     out[(size_t) t * n + r] = acc;
 }
@@ -397,6 +608,7 @@ __global__ void __launch_bounds__(256) k_moe_gemm(MoeDev m, const half * __restr
     const size_t rb = mbytes / mrows;
     const uint8_t * W0 = (GU ? m.gate : m.down) + (size_t) slot * mbytes;
     const uint8_t * W1 = GU ? m.up + (size_t) slot * mbytes : nullptr;
+    load_tables<T>();   // (synced by the first k-step's barrier)
     for (int t0 = 0; t0 < cnt; t0 += GE_N) {
         const int nt = min(GE_N, cnt - t0);
         float acc[2][4] = {};
@@ -448,7 +660,7 @@ __global__ void __launch_bounds__(256) k_moe_gemm(MoeDev m, const half * __restr
                 const int rr = i % 32, tr = i / 32, row = r_base + rr;
                 if (row >= mrows) continue;
                 const int p = order[start + t0 + tr];
-                h16[(size_t) p * rows_out + row] = __float2half(silu4(Cs[rr][tr]) * Cs[rr + 32][tr]);
+                h16[(size_t) p * rows_out + row] = __float2half(swiglu4(Cs[rr][tr], Cs[rr + 32][tr], m.clamp));
             }
         } else {
             for (int i = threadIdx.x; i < GE_M * nt; i += blockDim.x) {
@@ -722,6 +934,9 @@ void moe_route(const float * logits, int ls, int n_expert, int k, int * ids, flo
         case GType::Q5_K: { constexpr GType TT = GType::Q5_K; CALL; } break;       \
         case GType::Q5_1: { constexpr GType TT = GType::Q5_1; CALL; } break;       \
         case GType::Q8_0: { constexpr GType TT = GType::Q8_0; CALL; } break;       \
+        case GType::Q6_K: { constexpr GType TT = GType::Q6_K; CALL; } break;       \
+        case GType::IQ4_XS: { constexpr GType TT = GType::IQ4_XS; CALL; } break;   \
+        case GType::IQ3_S: { constexpr GType TT = GType::IQ3_S; CALL; } break;     \
         default: throw std::runtime_error(std::string("moe: unsupported expert type ") + gtype_name(T)); \
     }
 
@@ -733,6 +948,24 @@ void moe_gate_up(const MoeDev & m, const float * x, int xs, const int * ids, int
 void moe_down(const MoeDev & m, const float * h, const int * ids, const float * wts, int k, float * y, int nt, cudaStream_t s,
               const int * order, const int * order_n) {
     MOE_TYPE_SWITCH(m.td, (k_moe_down<TT><<<dim3(nt * k, (m.n + MOE_ROWS - 1) / MOE_ROWS), 256, m.ff * sizeof(float), s>>>(m, h, ids, wts, k, y, order, order_n)));
+}
+void moe_zc(const MoeZC & z, const float * x, int xs, const int * ids, const float * wts, int k, float * h, float * y, int nt,
+            cudaStream_t s) {
+    const int len = z.f1 - z.f0;
+    if (len <= 0) return;
+    if (z.f0 % 256 || len % 256) throw std::runtime_error("moe_zc: slice must be whole 256-blocks");
+    const int kdim = z.n;
+    const size_t rbg = z.gate_bytes / z.ff, rbd = z.down_bytes / z.n;
+    if (rbg % 8 || rbd % 8 || (rbd / (z.ff / 256)) % 8) throw std::runtime_error("moe_zc: rows not 8-byte aligned");
+    const size_t sm1 = (size_t) kdim * 4 + 8 * 2 * rbg, sm2 = (size_t) len * 4 + 8 * (rbd / (z.ff / 256) * (len / 256));
+    MOE_TYPE_SWITCH(z.tg, (k_moe_zc_gate_up<TT><<<dim3(nt * k, (len + 31) / 32), 256, sm1, s>>>(z, x, xs, ids, k, h, kdim)));
+    MOE_TYPE_SWITCH(z.td, (k_moe_zc_down<TT><<<dim3(nt * k, (z.n + 31) / 32), 256, sm2, s>>>(z, h, ids, wts, k, y)));
+}
+void moe_zc_init() {
+    for (auto f : {(const void *) k_moe_zc_gate_up<GType::IQ3_S>, (const void *) k_moe_zc_gate_up<GType::IQ4_XS>,
+                   (const void *) k_moe_zc_gate_up<GType::Q4_K>, (const void *) k_moe_zc_gate_up<GType::Q5_K>,
+                   (const void *) k_moe_zc_gate_up<GType::Q6_K>, (const void *) k_moe_zc_gate_up<GType::Q8_0>, (const void *) k_moe_zc_gate_up<GType::Q5_1>})
+        cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
 }
 void moe_order(const MoeDev & m, const int * ids, int n_pairs, int n_expert, int * order, int * order_n, cudaStream_t s, int * egrp) {
     if (n_expert > 1024) throw std::runtime_error("moe_order: too many experts");
@@ -753,8 +986,9 @@ void moe_gemm_down(const MoeDev & m, const half * h16, const int * order, const 
 }
 void moe_reduce(const float * shexp, const float * sg, const float * y, int k, float * out, int n, int nt,
                 const int * ids, const int * owner, int g, int cpu_owner, const volatile unsigned * cpu_flag, const float * cpu_y,
-                const int * counter, unsigned seq_tag, cudaStream_t s) {
-    k_moe_reduce<<<dim3((n + 255) / 256, nt), 256, 0, s>>>(shexp, sg, y, k, out, n, ids, owner, g, cpu_owner, cpu_flag, cpu_y, counter, seq_tag);
+                const int * counter, unsigned seq_tag, cudaStream_t s, const float * yzc) {
+    k_moe_reduce<<<dim3((n + 255) / 256, nt), 256, 0, s>>>(shexp, sg, y, k, out, n, ids, owner, g, cpu_owner, cpu_flag, cpu_y, counter, seq_tag,
+                                                            yzc);
 }
 void moe_publish(volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_dst, float * x_dst, const float * x, int xs, int n,
                  const int * ids, const float * wts, int k, int nt, const int * counter, unsigned seq_tag, cudaStream_t s) {

@@ -52,6 +52,7 @@ public:
     double get_float(const std::string & key, double def) const { return has(key) ? get_float(key) : def; }
     std::string get_str(const std::string & key) const;
     std::vector<int64_t> get_int_arr(const std::string & key) const;
+    std::vector<double> get_float_arr(const std::string & key) const;   // a scalar reads as one element
 
     const GTensor * tensor(const std::string & name) const;   // nullptr if missing
     const GTensor & need(const std::string & name) const;     // throws if missing

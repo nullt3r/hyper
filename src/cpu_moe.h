@@ -31,6 +31,9 @@ public:
            CpuMoeBulk * bulk = nullptr, CpuMoeBulkOut * bulk_out = nullptr);
     ~CpuMoe();
     void set_layer(int slot, const CpuExpertLayer & l) { layers_[slot] = l; }
+    void set_clamp(float limit) { clamp_ = limit; }
+    // decode jobs of this slot compute only the hidden slice [0, a) (the GPUs take the rest, zero-copy)
+    void set_split(int slot, int a) { split_[slot] = a; }   // SwiGLU limit: silu(min(g, L)) * clamp(u, -L, L)
     // the next forward (device counter value `counter`) will publish these slots in order
     void expect(unsigned counter, const std::vector<int> & slots, bool bulk = false);
     // wait until every expected slot has been consumed
@@ -44,11 +47,15 @@ private:
     void master_loop();
     void worker_loop(int id);
     // ids/wts rows of MOE_MAX_USED, x/y rows of 4096
-    void run_layer(int slot, int nt, const int * ids, const float * wts, const float * x, float * y);
+    void run_layer(int slot, int nt, const int * ids, const float * wts, const float * x, float * y, int fa);
     // parallel for over [0, n) on the team (master participates)
     template <typename F> void parallel(int n, F && fn);
 
     int n_threads_, n_embd_, ff_, k_;
+    float clamp_ = 0.0f;
+    std::vector<int> split_;
+    bool prof_ = false;   // HYPER_CPUPROF: time / bandwidth per layer job
+    uint64_t prof_ns_ = 0, prof_bytes_ = 0, prof_jobs_ = 0, prof_experts_ = 0, prof_ph_[6] = {};
     CpuMoeRec * recs_;
     CpuMoeOut * outs_;
     std::vector<CpuExpertLayer> layers_;

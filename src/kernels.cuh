@@ -31,6 +31,7 @@ void repack_bf16_frag(const uint16_t * w, int n, int k, size_t row_stride, uint8
 void repack_f32_frag(const float * w, int n, int k, size_t row_stride, uint8_t * out);
 // fused input RMSNorm: x' = x * rsqrt(sum(ss[t*nss .. t*nss+nss)) / k + eps) * w   (w == nullptr: no norm)
 // act (applied after the norm): 1 = silu(x * act_scale); 2 = silu(x[c]) * x[c + glu_off] (gated pair in one input row)
+//   3 = as 2 with the SwiGLU limit L = act_scale: silu(min(g, L)) * clamp(u, -L, L)
 struct NormIn { const float * w = nullptr; const float * ss = nullptr; int nss = 0; float eps = 1e-6f;
                 int act = 0; float act_scale = 1.0f; int glu_off = 0; };
 

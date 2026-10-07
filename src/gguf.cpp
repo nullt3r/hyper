@@ -23,6 +23,8 @@ const char * gtype_name(GType t) {
         case GType::Q4_K: return "Q4_K";
         case GType::Q5_K: return "Q5_K";
         case GType::Q6_K: return "Q6_K";
+        case GType::IQ3_S: return "IQ3_S";
+        case GType::IQ4_XS: return "IQ4_XS";
         default:          return "?";
     }
 }
@@ -41,6 +43,8 @@ size_t gtype_block_bytes(GType t) {
         case GType::Q4_K: return 144;
         case GType::Q5_K: return 176;
         case GType::Q6_K: return 210;
+        case GType::IQ3_S: return 110;
+        case GType::IQ4_XS: return 136;
         default: throw std::runtime_error(std::string("unsupported tensor type ") + std::to_string((uint32_t) t));
     }
 }
@@ -49,7 +53,7 @@ size_t gtype_block_elems(GType t) {
     switch (t) {
         case GType::F32: case GType::F16: case GType::BF16: return 1;
         case GType::Q8_0: case GType::Q4_0: case GType::Q4_1: case GType::Q5_0: case GType::Q5_1: case GType::IQ4_NL: return 32;
-        case GType::Q4_K: case GType::Q5_K: case GType::Q6_K: return 256;
+        case GType::Q4_K: case GType::Q5_K: case GType::Q6_K: case GType::IQ3_S: case GType::IQ4_XS: return 256;
         default: throw std::runtime_error(std::string("unsupported tensor type ") + std::to_string((uint32_t) t));
     }
 }
@@ -204,6 +208,13 @@ std::vector<int64_t> GGUF::get_int_arr(const std::string & key) const {
     if (auto p = std::get_if<std::vector<int64_t>>(&it->second)) return *p;
     if (auto p = std::get_if<int64_t>(&it->second)) return {*p};
     throw std::runtime_error("gguf: key is not an int array: " + key);
+}
+
+std::vector<double> GGUF::get_float_arr(const std::string & key) const {
+    auto it = kv_.find(key);
+    if (it == kv_.end()) throw std::runtime_error("gguf: missing key " + key);
+    if (auto p = std::get_if<std::vector<double>>(&it->second)) return *p;
+    return {get_float(key)};
 }
 
 const GTensor * GGUF::tensor(const std::string & name) const {
