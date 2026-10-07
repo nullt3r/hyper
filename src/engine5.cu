@@ -1289,12 +1289,22 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
         return !stop;
     };
     auto since = [](clk::time_point a) { return std::chrono::duration<double>(clk::now() - a).count(); };
+    // generated tokens get recurrent-state snapshots too (every 1024 positions and at the end): the next request repeats this
+    // answer in its prompt and resumes close to where the re-rendered history first differs
+    int snap_mark = p / 1024;
+    bool state_ok = true;
+    auto gen_snapshot = [&] {
+        if (!opt_.prompt_cache || p / 1024 == snap_mark) return;
+        snap_mark = p / 1024;
+        take_snapshot(p);
+    };
     const int K = std::min(opt_.n_draft, MAX_NT - 1);
     if (K <= 0 || !spec_req) {
         while (emit(next) && p + 1 < opt_.max_pos) {
             next = forward(&next, 1, p++)[0];
             if (sampling) next = sample_row(0, sp);
             st.steps++;
+            gen_snapshot();
         }
     } else {
         // prompt-lookup speculation: drafts = the tokens that followed the latest earlier occurrence of the last NG tokens
@@ -1335,12 +1345,14 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
             st.accepted += m;
             if (nd > 0) acc_rate_ = 0.9 * acc_rate_ + 0.1 * ((double) m / nd);
             if (emit(cur)) for (int j = 0; j < m; ++j) { hist.push_back(in[1 + j]); if (!emit(in[1 + j])) break; }
-            if (stop) break;
+            if (stop) { state_ok = false; break; }   // (the state holds rows past the end of the output)
             if (m < nd) { ta = clk::now(); restore(m + 1); st.t_restore += since(ta); }
             cur = a[m];
             p += m + 1;
+            gen_snapshot();
         }
     }
+    if (opt_.prompt_cache && p > P && state_ok) take_snapshot(p);   // state after the last processed token
     {
         std::vector<int> sq = prompt;
         sq.insert(sq.end(), out.begin(), out.end());
