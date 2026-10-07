@@ -17,8 +17,8 @@ namespace {
 inline float silu(float x) { return x / (1.0f + std::exp(-x)); }
 inline const ggml_type_traits_cpu * traits(GType t) { return ggml_get_type_traits_cpu((ggml_type) t); }
 // spin with backoff: hot while work is flowing (a decode step's layers are ~0.5 ms apart; waking from a sleep costs
-// 50+ us), sleeps after HYPER_SPIN_US (default 5000) of nothing
-const long g_spin_us = getenv("HYPER_SPIN_US") ? atol(getenv("HYPER_SPIN_US")) : 5000;
+// 50+ us), sleeps after HYPER_SPIN_US (default 200) of nothing
+const long g_spin_us = getenv("HYPER_SPIN_US") ? atol(getenv("HYPER_SPIN_US")) : 200;
 template <typename P> void spin_until(P && ready) {
     auto t0 = std::chrono::steady_clock::now();
     int i = 0;

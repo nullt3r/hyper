@@ -57,6 +57,8 @@ private:
     void load_layer(Device & dev, DevLayer & L, int il);
     void load_experts(int il, const std::vector<int> & quota);
     void upload_stage(Device & d, int il, int sb);
+    void rebuild_stream(int il);
+    void rebalance(int max_swaps);
     void record_main(int gi, int nt);
     void build_graphs();
     void embed(const int * tokens, int nt);
@@ -97,7 +99,21 @@ private:
     bool graphs_ready_ = false;
     bool debug_ = false, nocpu_ = false;
     int last_nt_ = 0;
-    std::vector<int> zc_blocks_;   // HYPER5_ZC
+    // adaptive expert placement (HYPER5_ADAPT=0: off): host copy of every expert, current placement, routing scores
+    struct ExpertHost {
+        const uint8_t * gate = nullptr, * up = nullptr, * down = nullptr;
+        size_t gb = 0, db = 0;
+        std::vector<int> owner;               // [E]: GPU or CPU_OWNER
+        std::vector<std::vector<int>> slot;   // [ndev][E]
+        std::vector<double> score;            // decayed routing counts
+        std::vector<uint64_t> last_count;     // CPU side's counts at the last rebalance
+        bool tables_dirty = false, stream_dirty = false;
+    };
+    std::vector<ExpertHost> ehost_;
+    bool adapt_ = true, prompt_routed_ = false;
+    double adapt_decay_ = 0.95;   // per rebalance (every 32 decode steps)
+    int steps_ = 0, n_swaps_ = 0;
+    int * h_ids_ = nullptr;       // pinned [n_layer][R][K]: prefill routing from GPU 0
 };
 
 } // namespace hyper

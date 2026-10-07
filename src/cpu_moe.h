@@ -32,6 +32,7 @@ public:
     ~CpuMoe();
     void set_layer(int slot, const CpuExpertLayer & l) { layers_[slot] = l; }
     void set_clamp(float limit) { clamp_ = limit; }
+    void set_owned(int slot, int e, bool v) { layers_[slot].owned[e] = v; }   // (between jobs only)
     // decode jobs of this slot compute only the hidden slice [0, a) (the GPUs take the rest, zero-copy)
     void set_split(int slot, int a) { split_[slot] = a; }   // SwiGLU limit: silu(min(g, L)) * clamp(u, -L, L)
     // the next forward (device counter value `counter`) will publish these slots in order
