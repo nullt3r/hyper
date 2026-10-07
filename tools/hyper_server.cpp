@@ -450,6 +450,10 @@ int main(int argc, char ** argv) {
         std::shared_ptr<Request> r;
         try {
             const ojson body = ojson::parse(req.body);
+            if (const char * dump = getenv("HYPER_DUMP_REQUEST")) {   // last request body (replay for benchmarks)
+                FILE * f = fopen(dump, "wb");
+                if (f) { fwrite(req.body.data(), 1, req.body.size(), f); fclose(f); }
+            }
             r = std::make_shared<Request>(prepare(c, body));
         } catch (const std::exception & e) { fail(400, e.what()); return; }
         const std::string id = random_id("chatcmpl-", c.next_id++);

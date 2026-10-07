@@ -320,6 +320,9 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
     adapt_ = !getenv("HYPER5_ADAPT") || atoi(getenv("HYPER5_ADAPT")) != 0;
     if (getenv("HYPER5_STREAM_MIN")) stream_min_ = atoi(getenv("HYPER5_STREAM_MIN"));
     if (getenv("HYPER5_DECAY")) adapt_decay_ = atof(getenv("HYPER5_DECAY"));
+    if (getenv("HYPER5_PROMPT_W")) prompt_weight_ = atof(getenv("HYPER5_PROMPT_W"));
+    if (getenv("HYPER5_ADAPT_EVERY")) adapt_every_ = std::max(1, atoi(getenv("HYPER5_ADAPT_EVERY")));
+    if (getenv("HYPER5_ADAPT_BUDGET")) adapt_budget_ = atoi(getenv("HYPER5_ADAPT_BUDGET"));
     ehost_.resize(cfg_.n_layer);
     for (auto & H : ehost_) { H.score.assign(cfg_.n_expert, 0.0); H.last_count.assign(1024, 0); }
     load_weights();
@@ -510,6 +513,11 @@ void Engine5::load_experts(int il, const std::vector<int> & quota) {
     for (int e = 0; e < E; ++e) cl.owned[e] = owner[e] == CPU_OWNER;
     cpu_->set_layer(il, cl);
     ExpertHost & H = ehost_[il];
+    if (il < (int) stats_.size()) {   // prior: the calibration's routing shares, weighted like ~256 tokens of routing
+        double tot = 0;
+        for (int e = 0; e < E; ++e) tot += (double) stats_[il][e];
+        if (tot > 0) for (int e = 0; e < E; ++e) H.score[e] = (double) stats_[il][e] / tot * 256.0 * c.n_expert_used;
+    }
     H.gate = cl.gate; H.up = cl.up; H.down = cl.down; H.gb = gb; H.db = db;
     H.owner = owner;
     H.slot.assign(nd, std::vector<int>(E, -1));
@@ -1074,7 +1082,7 @@ std::vector<int> Engine5::forward(const int * tokens, int nt, int pos) {
     h_pos_[0] = pos;
     if (adapt_ && !bulk) {   // placement follows the routing: after a prompt, then every 32 decode steps
         if (prompt_routed_) { rebalance(1 << 20); prompt_routed_ = false; steps_ = 0; }
-        else if (++steps_ % 32 == 0) rebalance(48);
+        else if (++steps_ % adapt_every_ == 0) rebalance(adapt_budget_);
     }
     if (bulk) for (int il = 0; il < cfg_.n_layer; ++il) if (is_moe(il) && ehost_[il].stream_dirty) rebuild_stream(il);
     run(nt);
@@ -1083,7 +1091,7 @@ std::vector<int> Engine5::forward(const int * tokens, int nt, int pos) {
         for (int il = 0; il < cfg_.n_layer; ++il) {
             if (!is_moe(il)) continue;
             auto & sc = ehost_[il].score;
-            for (int i = 0; i < nt * K; ++i) { const int e = h_ids_[(size_t) il * R5 * K + i]; if (e >= 0 && e < cfg_.n_expert) sc[e] += 1.0; }
+            for (int i = 0; i < nt * K; ++i) { const int e = h_ids_[(size_t) il * R5 * K + i]; if (e >= 0 && e < cfg_.n_expert) sc[e] += prompt_weight_; }
         }
         prompt_routed_ = true;
     }

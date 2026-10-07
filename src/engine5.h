@@ -111,7 +111,9 @@ private:
     };
     std::vector<ExpertHost> ehost_;
     bool adapt_ = true, prompt_routed_ = false;
-    double adapt_decay_ = 0.95;   // per rebalance (every 32 decode steps)
+    double adapt_decay_ = 0.92;   // per rebalance (every adapt_every_ decode steps)
+    double prompt_weight_ = 0.25; // a prompt token's routing counts less than a generated one's (different content: tools, docs)
+    int adapt_every_ = 16, adapt_budget_ = 64;
     int steps_ = 0, n_swaps_ = 0;
     int stream_min_ = 280;        // prefill chunks this long stream the CPU experts to the GPUs; shorter ones use the CPU
     int * h_ids_ = nullptr;       // pinned [n_layer][R][K]: prefill routing from GPU 0
