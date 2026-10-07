@@ -318,6 +318,7 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
                                     cpu_bulk_out_);
     cpu_->set_clamp(cfg_.clamp_exp);
     adapt_ = !getenv("HYPER5_ADAPT") || atoi(getenv("HYPER5_ADAPT")) != 0;
+    if (getenv("HYPER5_STREAM_MIN")) stream_min_ = atoi(getenv("HYPER5_STREAM_MIN"));
     if (getenv("HYPER5_DECAY")) adapt_decay_ = atof(getenv("HYPER5_DECAY"));
     ehost_.resize(cfg_.n_layer);
     for (auto & H : ehost_) { H.score.assign(cfg_.n_expert, 0.0); H.last_count.assign(1024, 0); }
@@ -815,7 +816,8 @@ void Engine5::record_main(int gi, int nt) {
     CUDA_CHECK(cudaMemcpyAsync(P, h_pos_, sizeof(int), cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaMemcpyAsync(d.x, h_embd_, (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
     incr_counter(d.counter, s);
-    if (bulk && opt_.stream_experts) {
+    const bool streaming = bulk && opt_.stream_experts && nt >= stream_min_;
+    if (streaming) {
         int first = 0;
         while (first < c.n_layer && !d.layers[first].owner_bulk) ++first;
         if (first < c.n_layer) { upload_stage(d, first, 0); upload_stage(d, first, 1); }
@@ -919,7 +921,7 @@ void Engine5::record_main(int gi, int nt) {
             dbg("route_w", il, d.wts, (size_t) nt * K);
             if (bulk && d.g == 0 && adapt_)   // prompt routing for the adaptive placement
                 CUDA_CHECK(cudaMemcpyAsync(h_ids_ + (size_t) il * R5 * K, d.ids, (size_t) nt * K * sizeof(int), cudaMemcpyDeviceToHost, s));
-            const bool stream = bulk && opt_.stream_experts && L.owner_bulk;
+            const bool stream = streaming && L.owner_bulk;
             if (d.g == 0 && !stream) {
                 if (bulk) moe_publish(&cpu_bulk_->seq, &cpu_bulk_->nt, &cpu_bulk_->ids[0][0], &cpu_bulk_->wts[0][0], &cpu_bulk_->x[0][0],
                                       d.xn, n, n, d.ids, d.wts, K, nt, d.counter, (unsigned) il, s);
@@ -1024,7 +1026,7 @@ void Engine5::run(int nt) {
         build_graphs();
     }
     ++fwd_counter_;
-    if (!(bulk && opt_.stream_experts)) {
+    if (!(bulk && opt_.stream_experts && nt >= stream_min_)) {
         std::vector<int> slots;
         for (int i = 0; i < cfg_.n_layer; ++i) if (is_moe(i)) slots.push_back(i);
         cpu_->expect(fwd_counter_, slots, bulk);

@@ -113,6 +113,7 @@ private:
     bool adapt_ = true, prompt_routed_ = false;
     double adapt_decay_ = 0.95;   // per rebalance (every 32 decode steps)
     int steps_ = 0, n_swaps_ = 0;
+    int stream_min_ = 280;        // prefill chunks this long stream the CPU experts to the GPUs; shorter ones use the CPU
     int * h_ids_ = nullptr;       // pinned [n_layer][R][K]: prefill routing from GPU 0
 };
 
