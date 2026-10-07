@@ -8,6 +8,7 @@
 //                     [--temp 0.6] [--top-p 0.95] [--top-k 20] [--min-p 0] [--snapshots 48]   (request fields override)
 //                     qwen4exp: [--gpu-frac 1.0] [--cpu-threads 30] [--expert-stats file] [--mtp nextn.gguf]   (context default 131072)
 //                     glm5-next: [--gpu-frac 1.0] [--cpu-threads 30] [--expert-stats file]   (context default 65536)
+//                     [--reasoning-effort low|high|max|none]   (template default when absent; requests may override)
 #include "engine.h"
 #include "engine4.h"
 #include "engine5.h"
@@ -27,6 +28,7 @@
 #include <vector>
 
 using ojson = nlohmann::ordered_json;
+static std::string g_reasoning_effort;   // --reasoning-effort: default for requests without one
 using namespace hyper;
 
 namespace {
@@ -150,7 +152,13 @@ Request prepare(Ctx & c, const ojson & body) {
         if (body["chat_template_kwargs"].contains("enable_thinking"))
             in.enable_thinking = body["chat_template_kwargs"]["enable_thinking"].get<bool>();
     }
-    if (body.value("reasoning_effort", std::string()) == "none") in.enable_thinking = false;
+    {   // reasoning effort: the request's OpenAI field, else --reasoning-effort (GLM templates know low / high, anything else = max)
+        std::string eff = body.contains("reasoning_effort") && body["reasoning_effort"].is_string() ? body["reasoning_effort"].get<std::string>()
+                                                                                                   : g_reasoning_effort;
+        if (eff == "medium") eff = "high";
+        if (eff == "none") in.enable_thinking = false;
+        else if (!eff.empty() && !in.chat_template_kwargs.count("reasoning_effort")) in.chat_template_kwargs["reasoning_effort"] = "\"" + eff + "\"";
+    }
     const common_chat_params cp = common_chat_templates_apply(c.tmpls.get(), in);
     r.prompt = tokenize(c.vocab, cp.prompt);
     r.pp = common_chat_parser_params(cp);
@@ -212,7 +220,7 @@ GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::strin
     });
     bool first = true;
     clk::time_point t1 = t0;
-    c.eng->generate(r.prompt, r.max_tokens, c.eng->has_mtp(), &st, [&](int tok) {
+    c.eng->generate(r.prompt, r.max_tokens, c.eng->n_draft() > 0, &st, [&](int tok) {
         const auto now = clk::now();
         if (first) {
             t1 = now; first = false; t_log = now;
@@ -345,6 +353,7 @@ int main(int argc, char ** argv) {
         else if (k == "--temp") defaults.temp = std::stof(v); else if (k == "--top-p") defaults.top_p = std::stof(v);
         else if (k == "--top-k") defaults.top_k = std::stoi(v); else if (k == "--min-p") defaults.min_p = std::stof(v);
         else if (k == "--snapshots") snaps = std::stoi(v);
+        else if (k == "--reasoning-effort") g_reasoning_effort = v;
         else { fprintf(stderr, "unknown option %s\n", k.c_str()); return 1; }
     }
     const std::string path = argv[1];
@@ -390,12 +399,13 @@ int main(int argc, char ** argv) {
         o5.cpu_threads = cpu_threads;
         o5.prompt_cache = true;
         o5.max_snapshots = snaps;
+        o5.n_draft = draft;   // prompt-lookup speculation
         auto e5 = std::make_unique<Engine5>(path, o5);
         if (!stats_path.empty()) {
             Engine5 * pe = e5.get();
             c.after_request = [pe, stats_path] { pe->save_expert_stats(stats_path); };
         }
-        draft = 0;
+        draft = e5->n_draft();
         engine = std::move(e5);
     } else {
         EngineOptions opt;
@@ -418,7 +428,7 @@ int main(int argc, char ** argv) {
     }
     {   // warm up: builds the CUDA graphs
         GenStats st;
-        eng.generate(tokenize(c.vocab, "Hello"), 4, eng.has_mtp(), &st);
+        eng.generate(tokenize(c.vocab, "Hello"), 4, eng.n_draft() > 0, &st);
     }
 
     httplib::Server srv;
@@ -450,8 +460,9 @@ int main(int argc, char ** argv) {
         std::shared_ptr<Request> r;
         try {
             const ojson body = ojson::parse(req.body);
-            if (const char * dump = getenv("HYPER_DUMP_REQUEST")) {   // last request body (replay for benchmarks)
-                FILE * f = fopen(dump, "wb");
+            if (const char * dump = getenv("HYPER_DUMP_REQUEST")) {   // request bodies <dir>/<time>.json (replay for benchmarks)
+                const std::string fn = std::string(dump) + "/" + std::to_string((long long) time(nullptr)) + ".json";
+                FILE * f = fopen(fn.c_str(), "wb");
                 if (f) { fwrite(req.body.data(), 1, req.body.size(), f); fclose(f); }
             }
             r = std::make_shared<Request>(prepare(c, body));

@@ -38,6 +38,7 @@ CpuMoe::CpuMoe(int n_threads, int n_embd, int ff, int k, CpuMoeRec * recs, CpuMo
     split_.assign(n_slots, ff);
     ggml_cpu_init();
     prof_ = getenv("HYPER_CPUPROF") != nullptr;
+    old_path_ = getenv("HYPER_CPU_OLD") != nullptr;
     const int rows = bulk ? MOE_BULK_ROWS : MAX_NT, P = rows * k;
     h_.resize((size_t) P * ff);
     y_.resize((size_t) P * n_embd);
@@ -220,12 +221,70 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
     // activations to the dot product's partner type (Q8_K for k-quants, Q8_1 for Q5_1, ...)
     std::vector<int> qt;
     for (int t = 0; t < nt; ++t) if (tok[t]) qt.push_back(t);
+    const size_t g_row = L.gate_bytes / ff, d_row = L.down_bytes / n;
+    if (nt <= MAX_NT && !old_path_) {
+        // decode: one parallel phase. Tasks in claim order gu(0) gu(1) down(0) gu(2) down(1) ... down(G-1); the last gate/up
+        // task of an expert quantizes its hidden rows and releases the expert's down tasks, so the compute-bound gate/up of
+        // one expert overlaps the bandwidth-bound down projection of the previous one
+        std::vector<int> qt;
+        for (int t = 0; t < nt; ++t) if (tok[t]) qt.push_back(t);
+        for (int t : qt) from_g(x + (size_t) t * 4096, qx_.data() + t * qx_row, n);
+        static const int RG = getenv("HYPER_CPU_RG") ? atoi(getenv("HYPER_CPU_RG")) : 16, RD = getenv("HYPER_CPU_RD") ? atoi(getenv("HYPER_CPU_RD")) : 32;
+        const int gch = (fa + RG - 1) / RG, dch = (n + RD - 1) / RD;
+        if ((int) gu_left_.size() < G) { gu_left_ = std::vector<std::atomic<int>>(G + 16); ready_ = std::vector<std::atomic<int>>(G + 16); }
+        for (int g = 0; g < G; ++g) { gu_left_[g].store(gch, std::memory_order_relaxed); ready_[g].store(0, std::memory_order_relaxed); }
+        auto & order = task_order_;
+        order.clear();
+        auto add_gu = [&](int g) { for (int c = 0; c < gch; ++c) order.push_back((g << 16) | c); };
+        auto add_dn = [&](int g) { for (int c = 0; c < dch; ++c) order.push_back(0x40000000 | (g << 16) | c); };
+        add_gu(0);
+        for (int g = 1; g < G; ++g) { add_gu(g); add_dn(g - 1); }
+        add_dn(G - 1);
+        std::atomic_thread_fence(std::memory_order_release);
+        parallel((int) order.size(), [&](int i) {
+            const int code = order[i], g = (code >> 16) & 0x3fff, ch = code & 0xffff;
+            const int p0 = grp[g], p1 = grp[g + 1];
+            if (!(code & 0x40000000)) {
+                const int r0 = ch * RG, r1 = std::min(fa, r0 + RG);
+                const uint8_t * gb = L.gate + L.index(pairs[p0].e) * L.gate_bytes, * ub = L.up + L.index(pairs[p0].e) * L.gate_bytes;
+                for (int r = r0; r < r1; ++r)
+                    for (int p = p0; p < p1; ++p) {
+                        float gv, uv;
+                        const void * qx = qx_.data() + pairs[p].t * qx_row;
+                        tg->vec_dot(n, &gv, 0, gb + r * g_row, 0, qx, 0, 1);
+                        tg->vec_dot(n, &uv, 0, ub + r * g_row, 0, qx, 0, 1);
+                        if (clamp_ > 0.0f) { gv = std::min(gv, clamp_); uv = std::min(std::max(uv, -clamp_), clamp_); }
+                        h_[(size_t) p * ff + r] = silu(gv) * uv;
+                    }
+                if (gu_left_[g].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    for (int p = p0; p < p1; ++p) from_d(h_.data() + (size_t) p * ff, qh_.data() + p * qh_row, fa);
+                    ready_[g].store(1, std::memory_order_release);
+                }
+            } else {
+                while (!ready_[g].load(std::memory_order_acquire)) __builtin_ia32_pause();
+                const int r0 = ch * RD, r1 = std::min(n, r0 + RD);
+                const uint8_t * db = L.down + L.index(pairs[p0].e) * L.down_bytes;
+                for (int r = r0; r < r1; ++r)
+                    for (int p = p0; p < p1; ++p) td->vec_dot(fa, &y_[(size_t) p * n + r], 0, db + r * d_row, 0, qh_.data() + p * qh_row, 0, 1);
+            }
+        });
+        for (int t : qt) {   // weighted sum per token (pairs in expert order: deterministic)
+            float * o = yout + (size_t) t * 4096;
+            bool first = true;
+            for (int p = 0; p < P; ++p) {
+                if (pairs[p].t != t) continue;
+                const float w = pairs[p].w, * y = y_.data() + (size_t) p * n;
+                if (first) { for (int r = 0; r < n; ++r) o[r] = w * y[r]; first = false; }
+                else for (int r = 0; r < n; ++r) o[r] += w * y[r];
+            }
+        }
+        return;
+    }
     auto tp = std::chrono::steady_clock::now();
     auto lap = [&](int ph) { if (!prof_) return; auto t = std::chrono::steady_clock::now(); prof_ph_[ph] += std::chrono::duration_cast<std::chrono::nanoseconds>(t - tp).count(); tp = t; };
     lap(0);
     parallel((int) qt.size(), [&](int i) { const int t = qt[i]; from_g(x + (size_t) t * 4096, qx_.data() + t * qx_row, n); });
     lap(1);
-    const size_t g_row = L.gate_bytes / ff, d_row = L.down_bytes / n;
     constexpr int RC = 16;
     const int gu_chunks = (fa + RC - 1) / RC;
     parallel(G * gu_chunks, [&](int task) {

@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 namespace hyper {
 
@@ -172,6 +173,7 @@ struct Engine5::DevLayer {
     DW kin, kgate;
     float * conv_w = nullptr, * dt_bias = nullptr, * ssm_a = nullptr, * ssm_norm = nullptr;
     float * conv_state = nullptr, * state = nullptr;
+    float * conv_snap = nullptr, * state_snap = nullptr;   // speculative verification: state after each of the first nt-1 rows
     // MLA: min rows [q_a | kv_a | idx_k | idx_gate] on x (replicated), mq rows [q_b local | idx_q_b] on the normed q_a
     DW min, mq;
     half * wkb = nullptr, * wvb = nullptr;   // fp16 [nh][512][256], [nh][256][512]
@@ -192,7 +194,7 @@ struct Engine5::DevLayer {
 struct Engine5::Device {
     int id = 0, g = 0;
     cudaStream_t stream = nullptr;
-    cudaGraphExec_t g_main[MAX_NT + 1] = {};
+    cudaGraphExec_t g_main[MAX_NT + 1] = {}, g_restore[MAX_NT] = {};
     std::vector<DevLayer> layers;
     float * out_norm = nullptr;
     DW output;
@@ -233,6 +235,7 @@ struct Engine5::Device {
     ~Device() {
         cudaSetDevice(id);
         for (auto & gr : g_main) if (gr) cudaGraphExecDestroy(gr);
+        for (auto & gr : g_restore) if (gr) cudaGraphExecDestroy(gr);
         for (auto & ev : ev_ar) if (ev) cudaEventDestroy(ev);
         if (blas) cublasDestroy(blas);
         for (auto & ev : ev_up) if (ev) cudaEventDestroy(ev);
@@ -422,6 +425,10 @@ void Engine5::load_layer(Device & dev, DevLayer & L, int il) {
         L.ssm_norm = f32(p + "ssm_norm.weight");
         L.conv_state = dev.alloc<float>((size_t) (c.conv - 1) * 3 * nh * 128);
         L.state = dev.alloc<float>((size_t) nh * 128 * 128);
+        if (opt_.n_draft > 0) {
+            L.conv_snap = dev.alloc<float>((size_t) (c.conv - 1) * 3 * nh * 128 * (MAX_NT - 1));
+            L.state_snap = dev.alloc<float>((size_t) nh * 128 * 128 * (MAX_NT - 1));
+        }
     } else {
         L.min = upload_dense(A, dev.id, {{T(p + "attn_q_a.weight"), 0, c.q_lora}, {T(p + "attn_kv_a_mqa.weight"), 0, c.kv_lora},
                                          {T(p + "indexer.attn_k.weight"), 0, GIDX_DIM}, {T(p + "indexer_compressor_gate.weight"), 0, GIDX_DIM}});
@@ -443,7 +450,7 @@ void Engine5::load_layer(Device & dev, DevLayer & L, int il) {
         L.idx_ape = f32(p + "indexer_compressor_ape.weight");
         L.lat = dev.alloc<half>((size_t) opt_.max_pos * MLA_LAT);
         L.pooled = dev.alloc<half>((size_t) (opt_.max_pos / 4 + 1) * GIDX_DIM);
-        L.ring = dev.alloc<half>(4 * 2 * GIDX_DIM);
+        L.ring = dev.alloc<half>(8 * 2 * GIDX_DIM);
     }
     // FFN: hidden slice of the dense FFN or the shared expert
     {
@@ -624,7 +631,7 @@ void Engine5::rebalance(int max_swaps) {
         std::sort(gpu.begin(), gpu.end(), [&](int a, int b) { return H.score[a] < H.score[b]; });
         for (size_t i = 0; i < std::min(cpu.size(), gpu.size()); ++i) {
             const double si = H.score[cpu[i]], so = H.score[gpu[i]];
-            if (si < so * 1.25 + 2.0) break;
+            if (si < so * 1.5 + 6.0) break;   // (hysteresis: noise must not shuffle experts back and forth)
             cand.push_back({si - so, il, cpu[i], gpu[i], H.owner[gpu[i]]});
         }
     }
@@ -881,9 +888,11 @@ void Engine5::record_main(int gi, int nt) {
             const int fa = kda_fa(nh), fb = kda_fb(nh);
             mm(L.kin, d.xn, n, d.big0, bs, nt);
             mm(L.kgate, d.big0 + fa, bs, d.big0 + fb, bs, nt);
-            gdn_conv(d.big0, bs, L.conv_state, nullptr, L.conv_w, 3 * nh * 128, c.conv, nt, s, bulk ? d.conv_raw : nullptr);
+            const bool snap = !bulk && nt > 1 && L.conv_snap;   // verification rows: keep the state after each row
+            gdn_conv(d.big0, bs, L.conv_state, snap ? L.conv_snap : nullptr, L.conv_w, 3 * nh * 128, c.conv, nt, s, bulk ? d.conv_raw : nullptr);
             const int ostride = nh * 128;
-            kda_step(d.big0, bs, 0, nh * 128, 2 * nh * 128, fb, kda_beta(nh), L.state, nullptr, d.o, ostride, L.dt_bias, L.ssm_a, c.gate_lb, nh,
+            kda_step(d.big0, bs, 0, nh * 128, 2 * nh * 128, fb, kda_beta(nh), L.state, snap ? L.state_snap : nullptr, d.o, ostride, L.dt_bias,
+                     L.ssm_a, c.gate_lb, nh,
                      1e-6f, nt, s);
             gated_norm_sigmoid(d.o, ostride, d.big0 + fb + nh * 128, bs, L.ssm_norm, nh, 128, eps, nt, s);
             mm(L.wo, d.o, ostride, d.part, n, nt);
@@ -1001,6 +1010,27 @@ void Engine5::upload_stage(Device & d, int il, int sb) {
     CUDA_CHECK(cudaEventRecord(d.ev_up[sb], d.cstream));
 }
 
+// roll the KDA state back to the snapshot after row keep-1 of the last verification (the MLA side needs nothing: rejected rows'
+// latents / pools are rewritten when those positions are processed again)
+void Engine5::record_restore(int gi, int keep) {
+    const Glm5Config & c = cfg_;
+    Device & d = *devs_[gi];
+    for (auto & L : d.layers) {
+        if (L.mla || !L.conv_snap) continue;
+        const size_t cs = (size_t) (c.conv - 1) * 3 * L.nh * 128, ss = (size_t) L.nh * 128 * 128;
+        CUDA_CHECK(cudaMemcpyAsync(L.conv_state, L.conv_snap + (keep - 1) * cs, cs * sizeof(float), cudaMemcpyDeviceToDevice, d.stream));
+        CUDA_CHECK(cudaMemcpyAsync(L.state, L.state_snap + (keep - 1) * ss, ss * sizeof(float), cudaMemcpyDeviceToDevice, d.stream));
+    }
+}
+
+void Engine5::restore(int keep) {
+    for (auto & dp : devs_) {
+        CUDA_CHECK(cudaSetDevice(dp->id));
+        CUDA_CHECK(cudaGraphLaunch(dp->g_restore[keep], dp->stream));
+    }
+    for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->stream)); }
+}
+
 void Engine5::build_graphs() {
     for (int gi = 0; gi < (int) devs_.size(); ++gi) {
         Device & d = *devs_[gi];
@@ -1013,6 +1043,15 @@ void Engine5::build_graphs() {
             CUDA_CHECK(cudaGraphInstantiate(&d.g_main[nt], graph, 0));
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
+        if (opt_.n_draft > 0)
+            for (int keep = 1; keep < MAX_NT; ++keep) {
+                cudaGraph_t graph;
+                CUDA_CHECK(cudaStreamBeginCapture(d.stream, cudaStreamCaptureModeThreadLocal));
+                record_restore(gi, keep);
+                CUDA_CHECK(cudaStreamEndCapture(d.stream, &graph));
+                CUDA_CHECK(cudaGraphInstantiate(&d.g_restore[keep], graph, 0));
+                CUDA_CHECK(cudaGraphDestroy(graph));
+            }
     }
     graphs_ready_ = true;
 }
@@ -1115,7 +1154,7 @@ size_t Engine5::snap_floats(int gi) const {
     const Glm5Config & c = cfg_;
     size_t n = 0;
     for (auto & L : devs_[gi]->layers)
-        n += L.mla ? 4 * GIDX_DIM : (size_t) (c.conv - 1) * 3 * L.nh * 128 + (size_t) L.nh * 128 * 128;
+        n += L.mla ? 8 * GIDX_DIM : (size_t) (c.conv - 1) * 3 * L.nh * 128 + (size_t) L.nh * 128 * 128;
     return n;
 }
 
@@ -1131,7 +1170,7 @@ void Engine5::snap_copy(Snap & sn, bool to_host) {
             hp += n;
         };
         for (auto & L : d.layers) {
-            if (L.mla) cp(L.ring, 4 * GIDX_DIM);   // 8 * 128 halves
+            if (L.mla) cp(L.ring, 8 * GIDX_DIM);   // 8 cells * 256 halves
             else {
                 cp(L.conv_state, (size_t) (c.conv - 1) * 3 * L.nh * 128);
                 cp(L.state, (size_t) L.nh * 128 * 128);
@@ -1188,7 +1227,7 @@ int Engine5::sample_row(int t, const SamplingParams & sp) {
     return cand[k - 1].second;
 }
 
-std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, bool, GenStats * stats,
+std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, bool spec_req, GenStats * stats,
                                    const std::function<bool(int)> & on_token, const SamplingParams & sp) {
     if (prompt.empty()) throw std::runtime_error("generate: empty prompt");
     if ((int) prompt.size() + 8 > opt_.max_pos) throw std::runtime_error("generate: prompt longer than the context");
@@ -1249,10 +1288,58 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
         if ((int) out.size() >= n_gen) stop = true;
         return !stop;
     };
-    while (emit(next) && p + 1 < opt_.max_pos) {
-        next = forward(&next, 1, p++)[0];
-        if (sampling) next = sample_row(0, sp);
-        st.steps++;
+    auto since = [](clk::time_point a) { return std::chrono::duration<double>(clk::now() - a).count(); };
+    const int K = std::min(opt_.n_draft, MAX_NT - 1);
+    if (K <= 0 || !spec_req) {
+        while (emit(next) && p + 1 < opt_.max_pos) {
+            next = forward(&next, 1, p++)[0];
+            if (sampling) next = sample_row(0, sp);
+            st.steps++;
+        }
+    } else {
+        // prompt-lookup speculation: drafts = the tokens that followed the latest earlier occurrence of the last NG tokens
+        // (history = prompt + output); a draft is kept iff the token sampled (or argmax) at its row equals it: exact
+        constexpr int NG = 3;
+        std::vector<int> hist(prompt.begin(), prompt.end());
+        std::unordered_map<uint64_t, int> last;   // n-gram -> position after its latest occurrence
+        auto key = [&](size_t end) { uint64_t h = 1469598103934665603ull; for (size_t i = end - NG; i < end; ++i) h = (h ^ (uint32_t) hist[i]) * 1099511628211ull; return h; };
+        size_t indexed = NG;
+        auto index_upto = [&](size_t n) { for (; indexed <= n; ++indexed) last[key(indexed)] = (int) indexed; };
+        int cur = next;
+        std::vector<int> in(K + 1);
+        while (!stop && p + K + 1 < opt_.max_pos) {
+            hist.push_back(cur);
+            int nd = 0;
+            if (hist.size() > NG) {
+                auto it = last.find(key(hist.size()));
+                index_upto(hist.size() - 1);   // (the current suffix itself is indexed after the lookup)
+                if (it != last.end()) {
+                    // match length (backwards, up to 32) decides how far to trust the continuation; a poor recent
+                    // acceptance rate raises the bar (a rejected verification costs more than a plain step)
+                    const int e0 = it->second, e1 = (int) hist.size();
+                    int ml = 0;
+                    while (ml < 32 && e0 - 1 - ml >= 0 && hist[e0 - 1 - ml] == hist[e1 - 1 - ml]) ++ml;
+                    const int need = acc_rate_ < 0.35 ? 8 : 5;
+                    const int kk = ml >= need + 6 ? K : ml >= need + 2 ? std::min(K, 2) : ml >= need ? 1 : 0;
+                    for (int j = e0; j < e1 && nd < kk; ++j) in[1 + nd++] = hist[j];
+                }
+            }
+            in[0] = cur;
+            auto ta = clk::now();
+            std::vector<int> a = forward(in.data(), nd + 1, p);
+            st.t_main += since(ta);
+            st.steps++;
+            int m = 0;
+            if (sampling) { while (m < nd && (a[m] = sample_row(m, sp)) == in[1 + m]) ++m; if (m == nd) a[nd] = sample_row(nd, sp); }
+            else while (m < nd && a[m] == in[1 + m]) ++m;
+            st.accepted += m;
+            if (nd > 0) acc_rate_ = 0.9 * acc_rate_ + 0.1 * ((double) m / nd);
+            if (emit(cur)) for (int j = 0; j < m; ++j) { hist.push_back(in[1 + j]); if (!emit(in[1 + j])) break; }
+            if (stop) break;
+            if (m < nd) { ta = clk::now(); restore(m + 1); st.t_restore += since(ta); }
+            cur = a[m];
+            p += m + 1;
+        }
     }
     {
         std::vector<int> sq = prompt;

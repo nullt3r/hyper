@@ -222,6 +222,21 @@ static int run_cmd(int argc, char ** argv) {
             const std::string out = argc > 6 ? argv[6] : "expert_stats.bin";
             eng.save_expert_stats(out);   // (loaded statistics + this run)
             printf("CALIB %d prompt + %d generated tokens -> %s\n", P, n_gen, out.c_str());
+        } else if (cmd == "ntbench") {   // decode-forward cost by rows (1..4) after a prefill of HYPER_TF_PF tokens
+            const int pf = getenv("HYPER_TF_PF") ? atoi(getenv("HYPER_TF_PF")) : 256;
+            eng.reset();
+            eng.prefill(toks.data(), pf, 0);
+            for (int nt = 1; nt <= 4; ++nt) {
+                const int reps = 60;
+                double tot = 0;
+                for (int r = 0; r < reps; ++r) {
+                    const int p0 = pf + (r % 8) * 4;
+                    auto t0 = std::chrono::steady_clock::now();
+                    eng.forward(&toks[p0], nt, p0);
+                    tot += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                }
+                printf("NTBENCH nt=%d  %.2f ms per forward  (%.2f ms per row)\n", nt, 1e3 * tot / reps, 1e3 * tot / reps / nt);
+            }
         } else if (cmd == "tfbench") {   // decode speed on fixed content: the reference tokens fed one at a time after a 64-token prefill
             const int pf = getenv("HYPER_TF_PF") ? atoi(getenv("HYPER_TF_PF")) : 64;   // prefilled context
             const int n_tok = std::min<int>(argc > 4 ? atoi(argv[4]) : 256, (int) toks.size() - pf);

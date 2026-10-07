@@ -55,7 +55,9 @@ private:
     int n_threads_, n_embd_, ff_, k_;
     float clamp_ = 0.0f;
     std::vector<int> split_;
-    bool prof_ = false;   // HYPER_CPUPROF: time / bandwidth per layer job
+    bool prof_ = false, old_path_ = false;
+    std::vector<std::atomic<int>> gu_left_, ready_;   // decode path: per expert group
+    std::vector<int> task_order_;   // HYPER_CPUPROF: time / bandwidth per layer job
     uint64_t prof_ns_ = 0, prof_bytes_ = 0, prof_jobs_ = 0, prof_experts_ = 0, prof_ph_[6] = {};
     CpuMoeRec * recs_;
     CpuMoeOut * outs_;

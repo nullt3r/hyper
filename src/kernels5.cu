@@ -355,8 +355,8 @@ __global__ void k_gidx_pool(const float * __restrict__ ikraw, const float * __re
             kv[j] = __half2float(__float2half((x - mean) * rsqrtf(var + eps) * lnw[i] + lnb[i]));
             gv[j] = __half2float(__float2half(igraw[(size_t) (c - pos) * stride + i]));
         } else {
-            kv[j] = __half2float(ring[(c & 3) * 2 * GIDX_DIM + i]);
-            gv[j] = __half2float(ring[(c & 3) * 2 * GIDX_DIM + GIDX_DIM + i]);
+            kv[j] = __half2float(ring[(c & 7) * 2 * GIDX_DIM + i]);
+            gv[j] = __half2float(ring[(c & 7) * 2 * GIDX_DIM + GIDX_DIM + i]);
         }
     }
     float m = -FLT_MAX;
@@ -369,14 +369,14 @@ __global__ void k_gidx_pool(const float * __restrict__ ikraw, const float * __re
 __global__ void k_gidx_ring(const float * __restrict__ ikraw, const float * __restrict__ igraw, int stride, const float * __restrict__ lnw,
                             const float * __restrict__ lnb, float eps, half * __restrict__ ring, const int * pos_p, int nt) {
     const int pos = *pos_p, end = pos + nt, i = threadIdx.x;
-    const int c = 4 * (end / 4) + blockIdx.x;
+    const int c = end - 8 + blockIdx.x;   // the last 8 cells (a verification rollback keeps any prefix of them valid)
     if (c >= end || c < pos) return;
     const float * kr = ikraw + (size_t) (c - pos) * stride;
     const float x = kr[i];
     const float mean = bsum(x) / GIDX_DIM;
     const float var = bsum((x - mean) * (x - mean)) / GIDX_DIM;
-    ring[(c & 3) * 2 * GIDX_DIM + i] = __float2half((x - mean) * rsqrtf(var + eps) * lnw[i] + lnb[i]);
-    ring[(c & 3) * 2 * GIDX_DIM + GIDX_DIM + i] = __float2half(igraw[(size_t) (c - pos) * stride + i]);
+    ring[(c & 7) * 2 * GIDX_DIM + i] = __float2half((x - mean) * rsqrtf(var + eps) * lnw[i] + lnb[i]);
+    ring[(c & 7) * 2 * GIDX_DIM + GIDX_DIM + i] = __float2half(igraw[(size_t) (c - pos) * stride + i]);
 }
 
 // scores: grid (pool blocks of 256, rows), thread per pool
@@ -577,7 +577,7 @@ void mla_attn(const float * q, int q_stride, const half * lat, const int * pos, 
 void gidx_pool(const float * ikraw, const float * igraw, int stride, const float * lnw, const float * lnb, float eps, const float * ape,
                half * ring, half * pooled, const int * pos, int nt, cudaStream_t s) {
     k_gidx_pool<<<nt / 4 + 2, GIDX_DIM, 0, s>>>(ikraw, igraw, stride, lnw, lnb, eps, ape, ring, pooled, pos, nt);
-    k_gidx_ring<<<3, GIDX_DIM, 0, s>>>(ikraw, igraw, stride, lnw, lnb, eps, ring, pos, nt);
+    k_gidx_ring<<<8, GIDX_DIM, 0, s>>>(ikraw, igraw, stride, lnw, lnb, eps, ring, pos, nt);
 }
 void gidx_select(const float * iq, int iq_stride, const float * w, int w_stride, const half * pooled, const int * pos, int nt, int top,
                  float * scores, int score_stride, int rows, int * list, int list_stride, int * list_n, cudaStream_t s) {

@@ -23,7 +23,7 @@ struct Engine5Options {
     float gpu_expert_frac = 1.0f;
     float vram_reserve_gib = 0.8f;
     std::string mtp_path;           // (no NextN head in the GLM files yet)
-    int n_draft = 0;
+    int n_draft = 3;                // prompt-lookup (n-gram) speculation: drafted tokens per step (0: off)
     bool stream_experts = true;
     int cpu_threads = 30;
     bool prompt_cache = false;
@@ -45,7 +45,7 @@ public:
     void set_snapshot_token(int tok) override { snap_tokens_.push_back(tok); }   // every message-start token given
     void set_prefill_progress(std::function<void(int, int, int)> fn) override { prefill_cb_ = std::move(fn); }
     int max_pos() const override { return opt_.max_pos; }
-    int n_draft() const override { return 0; }
+    int n_draft() const override { return std::min(opt_.n_draft, MAX_NT - 1); }
     bool has_mtp() const override { return false; }
     void save_expert_stats(const std::string & path);
     void reset_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); }
@@ -60,6 +60,8 @@ private:
     void rebuild_stream(int il);
     void rebalance(int max_swaps);
     void record_main(int gi, int nt);
+    void record_restore(int gi, int keep);
+    void restore(int keep);   // keep the first `keep` rows of the last verification
     void build_graphs();
     void embed(const int * tokens, int nt);
     void run(int nt);
@@ -115,6 +117,7 @@ private:
     double prompt_weight_ = 0.25; // a prompt token's routing counts less than a generated one's (different content: tools, docs)
     int adapt_every_ = 16, adapt_budget_ = 64;
     int steps_ = 0, n_swaps_ = 0;
+    double acc_rate_ = 0.5;       // speculation: running fraction of drafted tokens accepted
     int stream_min_ = 280;        // prefill chunks this long stream the CPU experts to the GPUs; shorter ones use the CPU
     int * h_ids_ = nullptr;       // pinned [n_layer][R][K]: prefill routing from GPU 0
 };

@@ -51,7 +51,7 @@ void mla_attn(const float * q, int q_stride, const half * lat, const int * pos, 
               int list_stride, const int * list_n, float * part, float * o, int o_stride, cudaStream_t s);
 
 // ---- k-pool indexer ----
-// ik = layernorm(ikraw) * lnw + lnb (eps), ig = igraw; both as fp16 into the ring of the open pool's cells (ring[cell % 4] =
+// ik = layernorm(ikraw) * lnw + lnb (eps), ig = igraw; both as fp16 into the ring of the last 8 cells (ring[cell % 8] =
 // ik | ig, 256 halves); every pool b completed by these tokens: pooled[b][d] = sum_j softmax_j(ig_j[d] + ape[j][d]) ik_j[d]
 void gidx_pool(const float * ikraw, const float * igraw, int stride, const float * lnw, const float * lnb, float eps, const float * ape,
                half * ring, half * pooled, const int * pos, int nt, cudaStream_t s);
