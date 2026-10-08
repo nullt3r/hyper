@@ -5,6 +5,7 @@
 #include "gguf.h"
 #include "kernels4.cuh"
 #include "llm.h"
+#include "park.h"
 #include "model4.h"
 
 #include <atomic>
@@ -65,7 +66,7 @@ public:
     std::vector<int> generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
                               const std::function<bool(int)> & on_token = {}, const SamplingParams & sp = {}) override;
     void set_snapshot_token(int tok) override { snap_token_ = tok; }
-    void reset_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); }
+    void reset_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); park_.clear(snap_pool_); }
     void set_prefill_progress(std::function<void(int, int, int)> fn) override { prefill_cb_ = std::move(fn); }
     int max_pos() const override { return opt_.max_pos; }
     int n_draft() const override { return mtp_g_ ? opt_.n_draft : 0; }
@@ -95,6 +96,8 @@ private:
     size_t snap_floats(int gi) const;
     void snap_copy(Snap & sn, bool to_host);
     void take_snapshot(int pos);
+    std::vector<ConvPark<Snap>::Dev> park_devs() const;
+    ConvPark<Snap> park_;
     std::vector<int> hist_;
     std::vector<Snap> snaps_;
     std::vector<std::vector<float *>> snap_pool_;

@@ -120,8 +120,19 @@ static int cmd_pfbench(const char * model, const char * ref_path, int n_prompt) 
 
 // prompt cache: output with the cache must match the output computed from scratch (greedy, MTP)
 static int cmd_cachetest(const char * model, const char * ref_path) {
-    std::vector<int> toks; std::vector<float> ref; int nv = 0;
-    if (!read_ref(ref_path, toks, ref, nv)) return 1;
+    std::vector<int> toks;   // (tokens only: the reference's logits may cover just its tail)
+    {
+        FILE * f = fopen(ref_path, "rb");
+        int n = 0, nv = 0, first = 0;   // v1: n, nv, tokens; v2 ("REF2"): magic, n, nv, first logit row, tokens
+        bool ok = f && fread(&n, 4, 1, f) == 1;
+        if (ok && n == 0x32464552) ok = fread(&n, 4, 1, f) == 1 && fread(&nv, 4, 1, f) == 1 && fread(&first, 4, 1, f) == 1;
+        else if (ok) ok = fread(&nv, 4, 1, f) == 1;
+        if (!ok) { fprintf(stderr, "cannot read %s\n", ref_path); return 1; }
+        toks.resize(n);
+        ok = fread(toks.data(), 4, n, f) == (size_t) n;
+        fclose(f);
+        if (!ok) { fprintf(stderr, "cannot read %s\n", ref_path); return 1; }
+    }
     EngineOptions opt;
     opt.max_pos = 4096;
     opt.n_draft = 3;
@@ -163,6 +174,26 @@ static int cmd_cachetest(const char * model, const char * ref_path) {
     C.insert(C.end(), outA.begin(), outA.end());
     C.insert(C.end(), toks.begin() + 600, toks.begin() + 680);
     run(A, C, "extended");
+    if (toks.size() >= 3200) {   // parked conversation: long A, unrelated side request S, then A extended; must match the
+        // same continuation without the side request bit for bit (both reuse the KV written while generating A)
+        std::vector<int> LA(toks.begin(), toks.begin() + 3000), S(toks.begin() + 3000, toks.begin() + 3100);
+        auto cont = [&](bool side, int & reused) {
+            eng.clear_cache();
+            std::vector<int> out = eng.generate(LA, n_gen, true, &st);
+            if (side) eng.generate(S, 16, true, &st);
+            std::vector<int> LB = LA;
+            LB.insert(LB.end(), out.begin(), out.end());
+            LB.insert(LB.end(), toks.begin() + 3100, toks.begin() + 3150);
+            std::vector<int> r = eng.generate(LB, n_gen, true, &st);
+            reused = st.prompt_reused;
+            return r;
+        };
+        int r0 = 0, r1 = 0;
+        const std::vector<int> plain = cont(false, r0), parked = cont(true, r1);
+        int same = 0;
+        while (same < n_gen && plain[same] == parked[same]) ++same;
+        printf("CACHE %-12s reused %d (without side request %d)  identical %d / %d\n", "parked", r1, r0, same, n_gen);
+    }
     return 0;
 }
 

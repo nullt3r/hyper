@@ -166,6 +166,26 @@ static int run_cmd(int argc, char ** argv) {
             C.insert(C.end(), outA.begin(), outA.end());
             C.insert(C.end(), toks.begin() + 200, toks.begin() + 240);
             run(C, "extended");
+            if (toks.size() >= 3200) {   // parked conversation: long A, unrelated side request S, then A extended; must match the
+                // same continuation without the side request bit for bit (both reuse the KV written while generating A)
+                std::vector<int> LA(toks.begin(), toks.begin() + 3000), S(toks.begin() + 3000, toks.begin() + 3100);
+                auto cont = [&](bool side, int & reused) {
+                    eng.reset_cache();
+                    std::vector<int> out = eng.generate(LA, n_gen, false, &st);
+                    if (side) eng.generate(S, 16, false, &st);
+                    std::vector<int> LB = LA;
+                    LB.insert(LB.end(), out.begin(), out.end());
+                    LB.insert(LB.end(), toks.begin() + 3100, toks.begin() + 3150);
+                    std::vector<int> r = eng.generate(LB, n_gen, false, &st);
+                    reused = st.prompt_reused;
+                    return r;
+                };
+                int r0 = 0, r1 = 0;
+                const std::vector<int> plain = cont(false, r0), parked = cont(true, r1);
+                int same = 0;
+                while (same < n_gen && plain[same] == parked[same]) ++same;
+                printf("CACHE4 %-9s reused %d (without side request %d)  identical %d / %d\n", "parked", r1, r0, same, n_gen);
+            }
         } else if (cmd == "mtpgen") {   // HYPER4_MTP=file: greedy plain vs MTP speculative (identical output), speed
             const int n_gen = argc > 4 ? atoi(argv[4]) : 256;
             std::vector<int> prompt(toks.begin(), toks.begin() + std::min<size_t>(toks.size(), 128));

@@ -7,6 +7,7 @@
 #include "kernels4.cuh"
 #include "kernels5.cuh"
 #include "llm.h"
+#include "park.h"
 #include "model5.h"
 
 #include <atomic>
@@ -48,7 +49,7 @@ public:
     int n_draft() const override { return std::min(opt_.n_draft, MAX_NT - 1); }
     bool has_mtp() const override { return false; }
     void save_expert_stats(const std::string & path);
-    void reset_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); }
+    void reset_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); park_.clear(snap_pool_); }
 
 private:
     struct DevLayer;
@@ -71,12 +72,8 @@ private:
     size_t snap_floats(int gi) const;
     void snap_copy(Snap & sn, bool to_host);
     void take_snapshot(int pos);
-    struct HostBuf { void * p = nullptr; size_t bytes = 0; };
-    void kv_copy(std::vector<HostBuf> & set, int n, bool to_host);
-    void park();
-    void swap_parked();
-    struct Parked { std::vector<int> hist; std::vector<Snap> snaps; } parked_;
-    std::vector<HostBuf> park_host_, park_tmp_;
+    std::vector<ConvPark<Snap>::Dev> park_devs() const;
+    ConvPark<Snap> park_;
     bool is_moe(int il) const { return il >= cfg_.n_dense; }
     std::vector<int> hist_;
     std::vector<Snap> snaps_;

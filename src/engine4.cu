@@ -357,6 +357,7 @@ void * Engine4::host_huge_alloc(size_t bytes) {
 
 Engine4::~Engine4() {
     for (auto & sn : snaps_) snap_pool_.push_back(sn.h);
+    park_.release(snap_pool_);
     for (auto & v : snap_pool_) for (float * p : v) cudaFreeHost(p);
     if (h_topk_) cudaFreeHost(h_topk_);
     if (h_membd_) cudaFreeHost(h_membd_);
@@ -1269,6 +1270,30 @@ void Engine4::snap_copy(Snap & sn, bool to_host) {
     for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->stream)); }
 }
 
+// per-position GPU buffers of a conversation (parked to RAM): the attention layers' K / V (head-major, max_pos rows per
+// head), raw and pooled indexer keys, and the MTP layer's K / V
+std::vector<ConvPark<Engine4::Snap>::Dev> Engine4::park_devs() const {
+    std::vector<ConvPark<Snap>::Dev> v;
+    const size_t hd = (size_t) cfg_.head_dim;
+    for (auto & dp : devs_) {
+        ConvPark<Snap>::Dev pd;
+        pd.id = dp->id;
+        pd.stream = dp->stream;
+        auto attn = [&](const DevLayer & L) {
+            if (L.kcache && L.n_kv_l > 0) {
+                pd.spans.push_back({L.kcache, hd * sizeof(half), opt_.max_pos * hd * sizeof(half), L.n_kv_l, 1});
+                pd.spans.push_back({L.vcache, hd * sizeof(half), opt_.max_pos * hd * sizeof(half), L.n_kv_l, 1});
+            }
+            if (L.kraw) pd.spans.push_back({L.kraw, 128 * sizeof(half), 0, 1, 1});
+            if (L.kpool) pd.spans.push_back({L.kpool, 128 * sizeof(half), 0, 1, 4});
+        };
+        for (auto & L : dp->layers) attn(L);
+        attn(dp->mtp);
+        v.push_back(std::move(pd));
+    }
+    return v;
+}
+
 void Engine4::take_snapshot(int pos) {
     for (auto & s : snaps_) if (s.pos == pos) return;
     if ((int) snaps_.size() >= opt_.max_snapshots) {
@@ -1330,8 +1355,7 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
     // latest snapshot at s <= L - 1
     int s = 0;
     if (opt_.prompt_cache) {
-        int L = 0;
-        while (L < P && L < (int) hist_.size() && prompt[L] == hist_[L]) ++L;
+        const int L = park_.resolve(prompt, hist_, snaps_, snap_pool_, park_devs(), "hyper4");   // (see park.h)
         for (size_t i = 0; i < snaps_.size();)
             if (snaps_[i].pos > L) { snap_pool_.push_back(snaps_[i].h); snaps_.erase(snaps_.begin() + i); } else ++i;
         Snap * best = nullptr;

@@ -223,6 +223,7 @@ Engine::Engine(const std::string & model_path, const EngineOptions & opt) : opt_
 
 Engine::~Engine() {
     for (auto & s : snaps_) snap_pool_.push_back(s.h);
+    park_.release(snap_pool_);
     for (auto & v : snap_pool_) for (float * p : v) cudaFreeHost(p);
     devs_.clear();
     for (void * p : {(void *) h_embd_, (void *) h_membd_, (void *) h_pos_, (void *) h_res_, (void *) h_mres_, (void *) ar_ll_, (void *) h_stage_, (void *) h_topk_})
@@ -817,6 +818,27 @@ void Engine::snap_copy(Snap & sn, bool to_host) {
     for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->stream)); }
 }
 
+// per-position GPU buffers of a conversation (parked to RAM): the attention layers' K / V (head-major, max_pos rows per
+// head), including the MTP layer's
+std::vector<ConvPark<Engine::Snap>::Dev> Engine::park_devs() const {
+    std::vector<ConvPark<Snap>::Dev> v;
+    const size_t hd = (size_t) cfg_.head_dim;
+    for (auto & dp : devs_) {
+        ConvPark<Snap>::Dev pd;
+        pd.id = dp->id;
+        pd.stream = dp->stream;
+        auto attn = [&](const DevLayer & L) {
+            if (!L.kcache || L.n_kv_l <= 0) return;
+            pd.spans.push_back({L.kcache, hd * sizeof(half), opt_.max_pos * hd * sizeof(half), L.n_kv_l, 1});
+            pd.spans.push_back({L.vcache, hd * sizeof(half), opt_.max_pos * hd * sizeof(half), L.n_kv_l, 1});
+        };
+        for (auto & L : dp->layers) attn(L);
+        attn(dp->mtp);
+        v.push_back(std::move(pd));
+    }
+    return v;
+}
+
 void Engine::take_snapshot(int pos) {
     for (auto & s : snaps_) if (s.pos == pos) return;
     if ((int) snaps_.size() >= opt_.max_snapshots) {
@@ -880,8 +902,7 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
     // restored from the latest snapshot at s <= L - 1 (MTP entry s - 1 used token s, so token s must match too)
     int s = 0;
     if (opt_.prompt_cache) {
-        int L = 0;
-        while (L < P && L < (int) hist_.size() && prompt[L] == hist_[L]) ++L;
+        const int L = park_.resolve(prompt, hist_, snaps_, snap_pool_, park_devs(), "hyper");   // (see park.h)
         for (size_t i = 0; i < snaps_.size();)
             if (snaps_[i].pos > L) { snap_pool_.push_back(snaps_[i].h); snaps_.erase(snaps_.begin() + i); } else ++i;
         const Snap * best = nullptr;

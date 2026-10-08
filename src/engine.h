@@ -5,6 +5,7 @@
 #include "gguf.h"
 #include "kernels.cuh"
 #include "llm.h"
+#include "park.h"
 #include "model.h"
 
 #include <atomic>
@@ -75,7 +76,7 @@ public:
     void set_snapshot_token(int tok) override { snap_token_ = tok; }
     // called after every prefill chunk with (tokens done incl. reused, prompt length, reused tokens)
     void set_prefill_progress(std::function<void(int, int, int)> fn) override { prefill_cb_ = std::move(fn); }
-    void clear_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); }
+    void clear_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); park_.clear(snap_pool_); }
     int n_snapshots() const { return (int) snaps_.size(); }
     int max_pos() const override { return opt_.max_pos; }
     int n_draft() const override { return opt_.n_draft; }
@@ -104,6 +105,8 @@ private:
     size_t snap_floats(const Device & d) const;
     void snap_copy(Snap & sn, bool to_host);
     void take_snapshot(int pos);
+    std::vector<ConvPark<Snap>::Dev> park_devs() const;
+    ConvPark<Snap> park_;
     int sample_row(int t, const SamplingParams & sp);   // kind: 0 main, 1 mtp, 2 restore
     void embed(const int * tokens, int nt, float * dst);
     int mtp_draft(const int * tokens, int nt, int pos);   // MTP over (tokens[t], main hidden row t) at pos+t; argmax of last
