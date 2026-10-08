@@ -71,6 +71,12 @@ private:
     size_t snap_floats(int gi) const;
     void snap_copy(Snap & sn, bool to_host);
     void take_snapshot(int pos);
+    struct HostBuf { void * p = nullptr; size_t bytes = 0; };
+    void kv_copy(std::vector<HostBuf> & set, int n, bool to_host);
+    void park();
+    void swap_parked();
+    struct Parked { std::vector<int> hist; std::vector<Snap> snaps; } parked_;
+    std::vector<HostBuf> park_host_, park_tmp_;
     bool is_moe(int il) const { return il >= cfg_.n_dense; }
     std::vector<int> hist_;
     std::vector<Snap> snaps_;

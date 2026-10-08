@@ -344,6 +344,8 @@ void * Engine5::host_huge_alloc(size_t bytes) {
 
 Engine5::~Engine5() {
     for (auto & sn : snaps_) snap_pool_.push_back(sn.h);
+    for (auto & sn : parked_.snaps) snap_pool_.push_back(sn.h);
+    for (auto * set : {&park_host_, &park_tmp_}) for (auto & b : *set) if (b.p) cudaFreeHost(b.p);
     for (auto & v : snap_pool_) for (float * p : v) cudaFreeHost(p);
     if (h_topk_) cudaFreeHost(h_topk_);
     if (h_ids_) cudaFreeHost(h_ids_);
@@ -1191,6 +1193,58 @@ void Engine5::snap_copy(Snap & sn, bool to_host) {
     for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->stream)); }
 }
 
+// attention-side caches of positions [0, n): every MLA layer's latent rows and pooled indexer keys, per device to / from a
+// pinned host set (grown on demand)
+void Engine5::kv_copy(std::vector<HostBuf> & set, int n, bool to_host) {
+    if (n <= 0) return;
+    set.resize(devs_.size());
+    for (size_t gi = 0; gi < devs_.size(); ++gi) {
+        Device & d = *devs_[gi];
+        CUDA_CHECK(cudaSetDevice(d.id));
+        size_t need = 0;
+        for (auto & L : d.layers) if (L.mla) need += (size_t) n * MLA_LAT + (size_t) (n / 4 + 1) * GIDX_DIM;
+        HostBuf & hb = set[gi];
+        if (hb.bytes < need * sizeof(half)) {
+            if (hb.p) CUDA_CHECK(cudaFreeHost(hb.p));
+            hb.bytes = need * sizeof(half) * 5 / 4;
+            CUDA_CHECK(cudaHostAlloc(&hb.p, hb.bytes, cudaHostAllocPortable));
+        }
+        half * hp = (half *) hb.p;
+        auto cp = [&](half * dev, size_t cnt) {
+            if (to_host) CUDA_CHECK(cudaMemcpyAsync(hp, dev, cnt * sizeof(half), cudaMemcpyDeviceToHost, d.stream));
+            else CUDA_CHECK(cudaMemcpyAsync(dev, hp, cnt * sizeof(half), cudaMemcpyHostToDevice, d.stream));
+            hp += cnt;
+        };
+        for (auto & L : d.layers)
+            if (L.mla) { cp(L.lat, (size_t) n * MLA_LAT); cp(L.pooled, (size_t) (n / 4 + 1) * GIDX_DIM); }
+    }
+    for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->stream)); }
+}
+
+void Engine5::park() {
+    for (auto & sn : parked_.snaps) snap_pool_.push_back(sn.h);
+    parked_.snaps.clear();
+    kv_copy(park_host_, (int) hist_.size(), true);
+    parked_.hist = hist_;
+    parked_.snaps.swap(snaps_);
+    fprintf(stderr, "hyper5: parked a conversation of %zu tokens (%zu snapshots)\n", parked_.hist.size(), parked_.snaps.size());
+}
+
+void Engine5::swap_parked() {
+    const bool keep = (int) hist_.size() >= 2048;   // the current conversation is parked in turn
+    if (keep) kv_copy(park_tmp_, (int) hist_.size(), true);
+    kv_copy(park_host_, (int) parked_.hist.size(), false);
+    std::swap(park_host_, park_tmp_);
+    fprintf(stderr, "hyper5: resumed a parked conversation of %zu tokens\n", parked_.hist.size());
+    std::vector<int> h = hist_;
+    std::vector<Snap> sn;
+    sn.swap(snaps_);
+    hist_ = parked_.hist;
+    snaps_.swap(parked_.snaps);
+    if (keep) { parked_.hist = h; parked_.snaps.swap(sn); }
+    else { parked_.hist.clear(); for (auto & x : sn) snap_pool_.push_back(x.h); }
+}
+
 void Engine5::take_snapshot(int pos) {
     for (auto & s : snaps_) if (s.pos == pos) return;
     if ((int) snaps_.size() >= opt_.max_snapshots) {
@@ -1248,8 +1302,14 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
     const int P = (int) prompt.size();
     int s = 0;
     if (opt_.prompt_cache) {
-        int L = 0;
-        while (L < P && L < (int) hist_.size() && prompt[L] == hist_[L]) ++L;
+        auto common = [&](const std::vector<int> & h) { int n = 0; while (n < P && n < (int) h.size() && prompt[n] == h[n]) ++n; return n; };
+        int L = common(hist_);
+        // one parked conversation: a request from another conversation (e.g. an agent's side request for a title) parks the
+        // current one (attention caches to RAM, snapshots kept), and a later request that matches the parked one better
+        // swaps it back, so neither recomputes its prompt
+        const int Lp = parked_.hist.empty() ? -1 : common(parked_.hist);
+        if (Lp > L + 512) { swap_parked(); L = Lp; }
+        else if ((int) hist_.size() >= 2048 && L + 2048 < (int) hist_.size()) park();
         for (size_t i = 0; i < snaps_.size();)
             if (snaps_[i].pos > L) { snap_pool_.push_back(snaps_[i].h); snaps_.erase(snaps_.begin() + i); } else ++i;
         Snap * best = nullptr;
