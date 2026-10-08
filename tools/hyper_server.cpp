@@ -805,6 +805,9 @@ int main(int argc, char ** argv) {
                         acc += d.reasoning_content_delta;
                         if (!send("response.reasoning_summary_text.delta", {{"item_id", item_id}, {"output_index", out_index}, {"summary_index", 0},
                                                                             {"delta", d.reasoning_content_delta}})) return false;
+                        // the same text as raw reasoning (clients that show raw reasoning, e.g. Codex show_raw_agent_reasoning)
+                        if (!send("response.reasoning_text.delta", {{"item_id", item_id}, {"output_index", out_index}, {"content_index", 0},
+                                                                     {"delta", d.reasoning_content_delta}})) return false;
                     }
                     if (!d.content_delta.empty()) {
                         if (open != 2) {
