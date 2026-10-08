@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace hyper {
@@ -55,6 +56,45 @@ __global__ void k_hc_norm(const float * __restrict__ res, const float * __restri
             const float sum = block_sum4(d[j]);
             if (threadIdx.x == 0) injp[((size_t) t * hc + s) * 4 + j] = sum;
         }
+}
+// same, thread per float4 (n % 4 == 0, n / 4 <= 1024): no loops, one combined reduction for the injection dots
+__global__ void __launch_bounds__(1024) k_hc_norm_v(const float * __restrict__ res, const float * __restrict__ w, float * __restrict__ xn,
+                                                    int n, int hc, float eps, const float * __restrict__ inj_w, float * __restrict__ injp) {
+    const int s = blockIdx.x, t = blockIdx.y, i = threadIdx.x, lane = i & 31, wid = i >> 5, nw = blockDim.x >> 5;
+    const bool on = i < n / 4;
+    const size_t row = ((size_t) t * hc + s) * n;
+    const float4 r = on ? ((const float4 *) (res + row))[i] : make_float4(0, 0, 0, 0);
+    __shared__ float red[32][4];
+    float ss = warp_sum4(r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w);
+    if (lane == 0) red[wid][0] = ss;
+    __syncthreads();
+    ss = lane < nw ? red[lane][0] : 0.0f;
+    const float inv = rsqrtf(warp_sum4(ss) / n + eps);
+    if (!on && !inj_w) return;
+    float4 v = make_float4(0, 0, 0, 0);
+    if (on) {
+        const float4 g = ((const float4 *) (w + (size_t) s * n))[i];
+        v = make_float4(r.x * inv * g.x, r.y * inv * g.y, r.z * inv * g.z, r.w * inv * g.w);
+        ((float4 *) (xn + row))[i] = v;
+    }
+    if (!inj_w) return;
+    float d[4] = {0, 0, 0, 0};
+    if (on)
+        for (int j = 0; j < hc; ++j) {
+            const float4 q = ((const float4 *) (inj_w + (size_t) j * hc * n + (size_t) s * n))[i];
+            d[j] = q.x * v.x + q.y * v.y + q.z * v.z + q.w * v.w;
+        }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) d[j] = warp_sum4(d[j]);
+    __syncthreads();   // (red reused)
+    if (lane == 0) for (int j = 0; j < 4; ++j) red[wid][j] = d[j];
+    __syncthreads();
+    if (wid == 0) {
+        for (int j = 0; j < hc; ++j) {
+            const float x = warp_sum4(lane < nw ? red[lane][j] : 0.0f);
+            if (lane == 0) injp[((size_t) t * hc + s) * 4 + j] = x;
+        }
+    }
 }
 // inj[t][j] = sum_s injp[t][s][j]  (stream order: deterministic)
 __global__ void k_hc_inj_sum(const float * __restrict__ injp, float * __restrict__ inj, int hc) {
@@ -134,7 +174,7 @@ __global__ void k_gated_norm_sig(float * o, int o_stride, const float * __restri
 // ---------------- routing ----------------
 // block per token (256 threads, ne <= 1024): softmax; top-k in two stages: each warp keeps the top-k of its slice
 // (k rounds of warp argmax, ties to the lower index), then warp 0 merges the 8 * k candidates the same way
-__global__ void k_moe_route(const float * __restrict__ logits, int ls, int ne, int k, int * ids, float * wts, float * sg) {
+__global__ void k_moe_route(const float * __restrict__ logits, int ls, int ne, int k, int * ids, float * wts, float * sg, bool rank_sel) {
     const int t = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = blockDim.x >> 5;
     const float * l = logits + (size_t) t * ls;
     __shared__ float p[1024];
@@ -153,6 +193,22 @@ __global__ void k_moe_route(const float * __restrict__ logits, int ls, int ne, i
     sum = block_sum4(sum);
     for (int e = threadIdx.x; e < ne; e += blockDim.x) p[e] /= sum;
     __syncthreads();
+    if (rank_sel) {   // expert e is taken at rank = #experts ahead of it (greater, or equal with a lower index) if rank < k
+        for (int e = threadIdx.x; e < ne; e += blockDim.x) {
+            const float pe = p[e];
+            int ahead = 0;
+            for (int j = 0; j < ne && ahead < k; ++j) { const float q = p[j]; ahead += q > pe || (q == pe && j < e); }
+            if (ahead < k) { ci[ahead] = e; cv[ahead] = pe; }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float s = 0.0f;
+            for (int j = 0; j < k; ++j) s += cv[j];
+            for (int j = 0; j < k; ++j) { ids[t * k + j] = ci[j]; wts[t * k + j] = cv[j] / s; }
+            sg[t] = sigm(l[ne]);
+        }
+        return;
+    }
     // stage 1: warp w owns experts [w*span, (w+1)*span)
     const int span = (ne + nw - 1) / nw, e0 = w * span, e1 = min(ne, e0 + span);
     unsigned long long taken[2] = {0ull, 0ull};   // per lane: which of its (up to 4) candidates are used (bit = slot)
@@ -930,7 +986,10 @@ __global__ void k_ple_apply(float * res, const float * __restrict__ value, const
 void hc_norm(const float * res, const float * w, float * xn, int n, int hc, float eps, int nt, cudaStream_t s,
              const float * inj_w, float * injp, float * inj) {
     if (inj_w && hc > 4) throw std::runtime_error("hc_norm: inject fusion supports hc <= 4");
-    k_hc_norm<<<dim3(hc, nt), 256, 0, s>>>(res, w, xn, n, hc, eps, inj_w, injp);
+    static const bool old_norm = getenv("HYPER4_OLDNORM") != nullptr;
+    if (n % 4 == 0 && n / 4 <= 1024 && !old_norm)
+        k_hc_norm_v<<<dim3(hc, nt), (n / 4 + 31) / 32 * 32, 0, s>>>(res, w, xn, n, hc, eps, inj_w, injp);
+    else k_hc_norm<<<dim3(hc, nt), 256, 0, s>>>(res, w, xn, n, hc, eps, inj_w, injp);
     if (inj_w) k_hc_inj_sum<<<nt, 32, 0, s>>>(injp, inj, hc);
 }
 void silu_scale(float * x, int n, float scale, int nt, int stride, cudaStream_t s) {
@@ -956,7 +1015,8 @@ void gated_norm_sigmoid(float * o, int o_stride, const float * z, int z_stride, 
 void moe_route(const float * logits, int ls, int n_expert, int k, int * ids, float * wts, float * sg, int nt, cudaStream_t s) {
     if (n_expert > 1024 || k > MOE_MAX_USED) throw std::runtime_error("moe_route: too many experts");
     if (k * 9 > 8 * MOE_MAX_USED) throw std::runtime_error("moe_route: k too large");
-    k_moe_route<<<nt, 256, 0, s>>>(logits, ls, n_expert, k, ids, wts, sg);
+    static const bool old_route = getenv("HYPER4_OLDROUTE") != nullptr;
+    k_moe_route<<<nt, 256, 0, s>>>(logits, ls, n_expert, k, ids, wts, sg, !old_route);
 }
 
 #define MOE_TYPE_SWITCH(T, CALL)                                                  \

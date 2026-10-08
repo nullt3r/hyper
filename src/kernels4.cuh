@@ -123,6 +123,10 @@ void idx_pool(const half * kraw, half * pool, const float * knorm, const int * p
 // scores: scratch [score_rows][score_stride >= max_pos/4]; tokens are processed score_rows at a time
 void idx_select(const float * qn, const half * pool, const int * pos, int nt, int n_head, int top, float * scores, int score_stride,
                 int score_rows, int * list, int list_stride, int * list_n, cudaStream_t s);
+// same selection (bit for bit), scored by many blocks with a key histogram (hist: [score_rows][65536]) and selected by
+// glm5-next's histogram kernel (kernels5.cu); score_stride <= 65536 + 2048
+void idx_select_hist(const float * qn, const half * pool, const int * pos, int nt, int n_head, int top, float * scores, int score_stride,
+                     int score_rows, unsigned * hist, int * list, int list_stride, int * list_n, cudaStream_t s);
 
 // ---- MTP ----
 // ecat[t*hc + s] = [rms(x[t]) * enorm | rms(H[t][s]) * hnorm[s]] for the per-stream eh_proj (hs: H row stride, 0 = shared row;

@@ -102,6 +102,7 @@ struct Engine4::Device {
     float * topk = nullptr;                                   // sampling candidates [MAX_NT][TOPK][2]
     float * iq = nullptr, * ik = nullptr, * iqn = nullptr, * iscores = nullptr;   // QSA: projections, normed queries, scores
     int * ilist = nullptr, * ilist_n = nullptr;                                 // QSA: attended cells per token
+    unsigned * ihist = nullptr;                                                 // QSA: score key histograms [rows][65536]
     cublasHandle_t blas = nullptr;
     cudaStream_t cstream = nullptr;                           // prefill expert uploads
     cudaEvent_t ev_up[2] = {}, ev_free[2] = {};
@@ -690,6 +691,7 @@ void Engine4::load_weights() {
         dev.ik = dev.alloc<float>((size_t) R * 128);
         dev.iqn = dev.alloc<float>((size_t) R * c.idx_n_head * 128);
         dev.iscores = dev.alloc<float>((size_t) QSA_SCORE_ROWS * (opt_.max_pos / 4 + 4));
+        if (opt_.max_pos / 4 + 4 <= 65536 + 2048) dev.ihist = dev.alloc<unsigned>((size_t) QSA_SCORE_ROWS * 65536);
         dev.ilist = dev.alloc<int>((size_t) R * QSA_LIST);
         dev.ilist_n = dev.alloc<int>(R);
         dev.h16 = dev.alloc<half>((size_t) R * K * c.n_ff_exp);
@@ -909,8 +911,13 @@ void Engine4::record_main(int gi, int nt, int kind) {
                 }
                 idx_prep(d.iq, d.ik, L.idx_qn, d.iqn, L.kraw, P, c.idx_n_head, c.n_rot, c.rope_base, eps, nt, s);
                 idx_pool(L.kraw, L.kpool, L.idx_kn, P, nt, c.n_rot, c.rope_base, eps, s);
-                idx_select(d.iqn, L.kpool, P, nt, c.idx_n_head, top, d.iscores, opt_.max_pos / 4 + 4, QSA_SCORE_ROWS, d.ilist,
-                           QSA_LIST, d.ilist_n, s);
+                static const bool old_sel = getenv("HYPER4_OLDSEL") != nullptr;
+                if (d.ihist && !old_sel)
+                    idx_select_hist(d.iqn, L.kpool, P, nt, c.idx_n_head, top, d.iscores, opt_.max_pos / 4 + 4, QSA_SCORE_ROWS, d.ihist,
+                                    d.ilist, QSA_LIST, d.ilist_n, s);
+                else
+                    idx_select(d.iqn, L.kpool, P, nt, c.idx_n_head, top, d.iscores, opt_.max_pos / 4 + 4, QSA_SCORE_ROWS, d.ilist,
+                               QSA_LIST, d.ilist_n, s);
             }
             cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
             cudaStreamIsCapturing(s, &cap);

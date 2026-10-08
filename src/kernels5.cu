@@ -631,6 +631,39 @@ __global__ void __launch_bounds__(256) k_gidx_score(const float * __restrict__ i
     if (hist) atomicAdd(&hist[(size_t) tl * GHIST + (fkey(s) >> 16)], 1u);
 }
 
+// qwen4exp QSA indexer scores (same arithmetic as k_idx_select in kernels4.cu): sum_h relu(q_h . pool) / sqrt(128), n_head <= 4;
+// grid (pool blocks of 256, rows), thread per pool, plus the histogram of key >> 16
+__global__ void __launch_bounds__(256) k_qidx_score(const float * __restrict__ qn, const half * __restrict__ pool, const int * pos_p,
+                                                    int t_off, int n_head, int top, float * __restrict__ scores, int score_stride,
+                                                    unsigned * __restrict__ hist) {
+    const int tl = blockIdx.y, t = t_off + tl;
+    const int p = *pos_p + t, np = (p + 1) / 4;
+    if (np <= top) return;
+    const int b0 = blockIdx.x * 256;
+    if (b0 >= np) return;
+    __shared__ float qs[4 * 128];
+    for (int i = threadIdx.x; i < n_head * 128; i += blockDim.x) qs[i] = qn[(size_t) t * n_head * 128 + i];
+    __syncthreads();
+    const int b = b0 + threadIdx.x;
+    if (b >= np) return;
+    const half * pk = pool + (size_t) b * 128;
+    float acc[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 128; i += 8) {
+        const uint4 v = *(const uint4 *) (pk + i);
+        const __half2 * h2 = (const __half2 *) &v;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 f = __half22float2(h2[j]);
+            for (int h = 0; h < n_head; ++h) acc[h] += f.x * qs[h * 128 + i + 2 * j] + f.y * qs[h * 128 + i + 2 * j + 1];
+        }
+    }
+    float sum = 0.0f;
+    for (int h = 0; h < n_head; ++h) sum += fmaxf(acc[h], 0.0f);
+    const float sc = sum * rsqrtf(128.0f);
+    scores[(size_t) tl * score_stride + b] = sc;
+    atomicAdd(&hist[(size_t) tl * GHIST + (fkey(sc) >> 16)], 1u);
+}
+
 // block per token (1024 threads), from the score histogram: the bin B holding the top-th largest key; pools above B are
 // selected outright, B's pools (bitmap) are resolved by two 8-bit radix passes; ties at the final key go to the lower pool
 // index. Output as the old kernel: ascending cells of the selected pools, then the open pool's cells.
@@ -949,6 +982,16 @@ void gidx_pool(const float * ikraw, const float * igraw, int stride, const float
                half * ring, half * pooled, const int * pos, int nt, cudaStream_t s) {
     k_gidx_pool<<<nt / 4 + 2, GIDX_DIM, 0, s>>>(ikraw, igraw, stride, lnw, lnb, eps, ape, ring, pooled, pos, nt);
     k_gidx_ring<<<8, GIDX_DIM, 0, s>>>(ikraw, igraw, stride, lnw, lnb, eps, ring, pos, nt);
+}
+void idx_select_hist(const float * qn, const half * pool, const int * pos, int nt, int n_head, int top, float * scores, int score_stride,
+                     int score_rows, unsigned * hist, int * list, int list_stride, int * list_n, cudaStream_t s) {
+    if (n_head > 4 || score_stride > 65536 + 2048) throw std::runtime_error("idx_select_hist: sizes");
+    for (int t0 = 0; t0 < nt; t0 += score_rows) {
+        const int r = std::min(score_rows, nt - t0);
+        cudaMemsetAsync(hist, 0, (size_t) r * GHIST * sizeof(unsigned), s);
+        k_qidx_score<<<dim3((score_stride + 255) / 256, r), 256, 0, s>>>(qn, pool, pos, t0, n_head, top, scores, score_stride, hist);
+        k_gidx_select_h<<<r, 1024, 0, s>>>(scores, score_stride, hist, pos, t0, top, list, list_stride, list_n);
+    }
 }
 void gidx_select(const float * iq, int iq_stride, const float * w, int w_stride, const half * pooled, const int * pos, int nt, int top,
                  float * scores, int score_stride, int rows, int * list, int list_stride, int * list_n, cudaStream_t s, unsigned * hist) {
