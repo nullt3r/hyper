@@ -1345,17 +1345,13 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
     if (opt_.prompt_cache) {   // last two message starts always, older ones >= 256 tokens apart, every 4096 tokens
         std::vector<int> msg;
         for (int q = s + 1; q < P; ++q) if (prompt[q] == snap_token_) msg.push_back(q);
-        for (int q = (s / 4096 + 1) * 4096; q < P; q += 4096) snap_at.push_back(q);
-        // candidates: message starts and 4096 multiples; kept only >= 512 tokens after the previous kept point, so that no prefill
-        // chunk but the last one is short (every MoE chunk pays a fixed cost: one pass over the CPU-resident experts).
-        // Generation adds its own snapshots, so the end of a previous answer is covered anyway.
-        snap_at.insert(snap_at.end(), msg.begin(), msg.end());
+        // snapshots at every full-chunk boundary (prefill runs in whole R4-token chunks: every MoE chunk pays a fixed cost,
+        // one pass over the CPU-resident experts) and at the last message start (edits / regenerations resume there);
+        // generation adds its own snapshots, so the end of a previous answer is covered too
+        for (int q = s + R4; q < P; q += R4) snap_at.push_back(q);
+        if (!msg.empty() && msg.back() - s >= 64) snap_at.push_back(msg.back());
         std::sort(snap_at.begin(), snap_at.end());
         snap_at.erase(std::unique(snap_at.begin(), snap_at.end()), snap_at.end());
-        std::vector<int> kept;
-        int last = s;
-        for (int q : snap_at) if (q - last >= 512) { kept.push_back(q); last = q; }
-        snap_at.swap(kept);
     }
     GenStats st;
     const int K = opt_.n_draft;
