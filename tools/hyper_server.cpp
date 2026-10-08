@@ -218,7 +218,9 @@ struct Streamer {
                     text.swap(latest); has = false;
                 }
                 const auto t0 = clk::now();
-                const bool ok = fn(text);
+                bool ok = true;
+                try { ok = fn(text); }
+                catch (const std::exception & e) { fprintf(stderr, "stream: snapshot skipped (%s)\n", e.what()); }
                 busy_ms += 1e3 * secs(t0, clk::now());
                 ++n_parsed;
                 if (!ok) { std::lock_guard<std::mutex> lk(mu); cancelled = true; }
@@ -691,7 +693,11 @@ int main(int argc, char ** argv) {
                 common_chat_msg msg;
                 try { msg = common_chat_parse(text, partial, r->pp); } catch (const std::exception &) { return true; }
                 msg.set_tool_call_ids(ids, gen_id);
-                for (const auto & d : common_chat_msg_diff::compute_diffs(prev, msg)) {
+                // a partial parse can briefly see fewer tool calls than the previous one (a call whose arguments are
+                // still just "{"): compute_diffs throws then; skip this snapshot, a later one (or the final parse) catches up
+                std::vector<common_chat_msg_diff> diffs;
+                try { diffs = common_chat_msg_diff::compute_diffs(prev, msg); } catch (const std::exception &) { return true; }
+                for (const auto & d : diffs) {
                     ojson ch = chunk(diff_to_delta(d), nullptr);
                     if (r->timings_per_token) {
                         const ojson lj = c.live.json();
@@ -843,7 +849,11 @@ int main(int argc, char ** argv) {
                 common_chat_msg msg;
                 try { msg = common_chat_parse(text, partial, r->pp); } catch (const std::exception &) { return true; }
                 msg.set_tool_call_ids(ids, gen_id);
-                for (const auto & d : common_chat_msg_diff::compute_diffs(prev, msg)) {
+                // a partial parse can briefly see fewer tool calls than the previous one (a call whose arguments are
+                // still just "{"): compute_diffs throws then; skip this snapshot, a later one (or the final parse) catches up
+                std::vector<common_chat_msg_diff> diffs;
+                try { diffs = common_chat_msg_diff::compute_diffs(prev, msg); } catch (const std::exception &) { return true; }
+                for (const auto & d : diffs) {
                     if (!d.reasoning_content_delta.empty()) {
                         if (open != 1) {
                             close_item(msg);
