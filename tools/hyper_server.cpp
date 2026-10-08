@@ -1,4 +1,4 @@
-// hyper OpenAI-compatible server: /v1/chat/completions (streaming and not), /v1/models, /health.
+// hyper OpenAI-compatible server: /v1/chat/completions (streaming and not), /v1/models, /health; web chat at /, live stats at /live.
 // Chat templates, reasoning and tool-call parsing come from mainline llama.cpp's libcommon (same code as
 // llama-server); the vocabulary is loaded with libllama (vocab only). Generation samples (greedy at temperature 0) with MTP speculative
 // decoding (exact: drafts are accepted when they equal the token sampled at their row), prompt cache with
@@ -12,6 +12,7 @@
 #include "engine.h"
 #include "engine4.h"
 #include "engine5.h"
+#include "chat_page.h"
 
 #include "chat.h"
 #include "llama.h"
@@ -291,7 +292,7 @@ h1{font-size:18px;margin:0 0 4px}.sub{color:var(--mut);margin-bottom:16px}
 .bar{height:6px;background:var(--line);border-radius:3px;margin-top:8px;overflow:hidden}.bar i{display:block;height:100%;background:var(--acc)}
 table{width:100%;border-collapse:collapse;margin-top:16px;font-variant-numeric:tabular-nums}td{padding:4px 0;border-bottom:1px solid var(--line)}td:last-child{text-align:right}
 </style></head><body><main>
-<h1>hyper live</h1><div class="sub" id="ph">…</div>
+<h1>hyper live <a href="/" style="font-size:14px;font-weight:400;color:var(--acc)">chat</a></h1><div class="sub" id="ph">…</div>
 <div class="grid">
 <div class="c"><div class="l">generation now</div><div class="v" id="g1">–</div></div>
 <div class="c"><div class="l">generation avg</div><div class="v" id="g2">–</div></div>
@@ -448,7 +449,8 @@ int main(int argc, char ** argv) {
     };
     srv.Get("/v1/models", models);
     srv.Get("/stats", [&](const httplib::Request &, httplib::Response & res) { cors(res); res.set_content(c.live.json().dump(), "application/json"); });
-    srv.Get("/", [&](const httplib::Request &, httplib::Response & res) { res.set_content(STATS_PAGE, "text/html; charset=utf-8"); });
+    srv.Get("/", [&](const httplib::Request &, httplib::Response & res) { res.set_content(CHAT_PAGE, "text/html; charset=utf-8"); });
+    srv.Get("/live", [&](const httplib::Request &, httplib::Response & res) { res.set_content(STATS_PAGE, "text/html; charset=utf-8"); });
     srv.Get("/models", models);
 
     auto chat = [&](const httplib::Request & req, httplib::Response & res) {

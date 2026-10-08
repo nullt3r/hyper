@@ -56,7 +56,7 @@ $(BUILD)/arbulk: tools/arbulk.cu $(BUILD)/kernels.o
 COMMON_LIBS := $(LLAMA)/build/common/libllama-common.a $(LLAMA)/build/common/libllama-common-base.a \
                $(LLAMA)/build/vendor/cpp-httplib/libcpp-httplib.a
 OBJ_ALL := $(sort $(OBJ) $(OBJ4))
-$(BUILD)/hyper-server: $(OBJ_ALL) tools/hyper_server.cpp
+$(BUILD)/hyper-server: $(OBJ_ALL) tools/hyper_server.cpp tools/chat_page.h
 	$(NVCC) $(NVFLAGS) -Isrc -I$(LLAMA)/include -I$(LLAMA)/ggml/include -I$(LLAMA)/common -I$(LLAMA)/vendor \
 	  tools/hyper_server.cpp $(OBJ_ALL) -o $@ \
 	  -Xlinker --start-group $(COMMON_LIBS) $(LLAMA_LIBS) -Xlinker --end-group $(LIBS) -lssl -lcrypto
