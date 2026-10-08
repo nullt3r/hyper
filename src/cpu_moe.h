@@ -46,6 +46,7 @@ public:
 
 private:
     void master_loop();
+    void pin(int id);
     void worker_loop(int id);
     // ids/wts rows of MOE_MAX_USED, x/y rows of 4096
     void run_layer(int slot, int nt, const int * ids, const float * wts, const float * x, float * y, int fa);
@@ -58,7 +59,7 @@ private:
     bool prof_ = false, old_path_ = false;
     std::vector<std::atomic<int>> gu_left_, ready_;   // decode path: per expert group
     std::vector<int> task_order_;   // HYPER_CPUPROF: time / bandwidth per layer job
-    uint64_t prof_ns_ = 0, prof_bytes_ = 0, prof_jobs_ = 0, prof_experts_ = 0, prof_ph_[6] = {};
+    uint64_t prof_ns_ = 0, prof_bytes_ = 0, prof_jobs_ = 0, prof_experts_ = 0, prof_ph_[6] = {}, prof_wait_ns_ = 0;
     CpuMoeRec * recs_;
     CpuMoeOut * outs_;
     std::vector<CpuExpertLayer> layers_;

@@ -547,6 +547,24 @@ __global__ void k_moe_publish(int * ntp, int * ids_dst, float * wts_dst, float *
     if (i == 0) *ntp = nt;
     __threadfence_system();
 }
+// decode (nt <= MAX_NT): one block copies everything and then raises the sequence tag itself (one launch, ordered by the
+// block barrier + system fence instead of a second kernel)
+__global__ void k_moe_publish1(volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_dst, float * x_dst, const float * __restrict__ x,
+                               int xs, int n, const int * __restrict__ ids, const float * __restrict__ wts, int k, int nt, const int * counter,
+                               unsigned seq_tag) {
+    for (int i = threadIdx.x; i < nt * n / 2; i += blockDim.x) {   // (x_dst sits in a host record, 8-byte aligned only)
+        const int t = i / (n / 2), e = (i % (n / 2)) * 2;
+        *(float2 *) (x_dst + (size_t) t * 4096 + e) = *(const float2 *) (x + (size_t) t * xs + e);
+    }
+    for (int i = threadIdx.x; i < nt * k; i += blockDim.x) {
+        const int t = i / k, j = i % k;
+        ids_dst[t * MOE_MAX_USED + j] = ids[i]; wts_dst[t * MOE_MAX_USED + j] = wts[i];
+    }
+    if (threadIdx.x == 0) *ntp = nt;
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) { __threadfence_system(); *seq = (unsigned) (*counter) * 64u + seq_tag; }
+}
 __global__ void k_moe_seq(volatile unsigned * seq, const int * counter, unsigned seq_tag) {
     __threadfence_system();
     *seq = (unsigned) (*counter) * 64u + seq_tag;
@@ -596,8 +614,10 @@ __global__ void __launch_bounds__(256) k_moe_gemm(MoeDev m, const half * __restr
                                                   const int * __restrict__ egrp, const float * __restrict__ wts,
                                                   half * __restrict__ h16, float * __restrict__ y, int kdim, int rows_out) {
     if ((int) blockIdx.y >= order_n[1]) return;
+    // the dequantized weight tile serves GE_NP token passes at a time (dequantization is the expensive part)
+    constexpr int GE_NP = 2;
     __shared__ __align__(16) half As[GE_M * GE_LD];
-    __shared__ __align__(16) half Bs[GE_N * GE_LD];
+    __shared__ __align__(16) half Bs[GE_NP][GE_N * GE_LD];
     __shared__ float Cs[GE_M][GE_N + 1];
     const int e = egrp[3 * blockIdx.y], start = egrp[3 * blockIdx.y + 1], cnt = egrp[3 * blockIdx.y + 2];
     const int slot = m.slot[e];
@@ -610,9 +630,9 @@ __global__ void __launch_bounds__(256) k_moe_gemm(MoeDev m, const half * __restr
     const uint8_t * W0 = (GU ? m.gate : m.down) + (size_t) slot * mbytes;
     const uint8_t * W1 = GU ? m.up + (size_t) slot * mbytes : nullptr;
     load_tables<T>();   // (synced by the first k-step's barrier)
-    for (int t0 = 0; t0 < cnt; t0 += GE_N) {
-        const int nt = min(GE_N, cnt - t0);
-        float acc[2][4] = {};
+    for (int t0 = 0; t0 < cnt; t0 += GE_N * GE_NP) {
+        const int np = min(GE_NP, (cnt - t0 + GE_N - 1) / GE_N);
+        float acc[GE_NP][2][4] = {};
         for (int k0 = 0; k0 < kdim; k0 += GE_K) {
             __syncthreads();
             // A: 64 rows x 128 cols = 1024 chunks of 8
@@ -628,47 +648,57 @@ __global__ void __launch_bounds__(256) k_moe_gemm(MoeDev m, const half * __restr
                 for (int i = 0; i < 4; ++i) hv[i] = __floats2half2_rn(v[2 * i], v[2 * i + 1]);
                 *(uint4 *) &As[rr * GE_LD + cc * 8] = *(const uint4 *) hv;
             }
-            // B: nt token rows x 128 cols
-            for (int ci = threadIdx.x; ci < GE_N * (GE_K / 8); ci += blockDim.x) {
-                const int tr = ci / (GE_K / 8), cc = ci % (GE_K / 8);
+            // B: the token rows of the np passes x 128 cols
+            for (int ci = threadIdx.x; ci < np * GE_N * (GE_K / 8); ci += blockDim.x) {
+                const int ps = ci / (GE_N * (GE_K / 8)), rem = ci % (GE_N * (GE_K / 8)), tr = rem / (GE_K / 8), cc = rem % (GE_K / 8);
                 uint4 v = make_uint4(0, 0, 0, 0);
-                if (tr < nt) {
-                    const int p = order[start + t0 + tr];
+                const int tt = t0 + ps * GE_N + tr;
+                if (tt < cnt) {
+                    const int p = order[start + tt];
                     const int src = in_row ? in_row[p] : p / in_div;
                     v = *(const uint4 *) (in + (size_t) src * in_stride + k0 + cc * 8);
                 }
-                *(uint4 *) &Bs[tr * GE_LD + cc * 8] = v;
+                *(uint4 *) &Bs[ps][tr * GE_LD + cc * 8] = v;
             }
             __syncthreads();
 #pragma unroll
             for (int kk = 0; kk < GE_K / 16; ++kk) {
-                unsigned a[4], b[4];
+                unsigned a[4];
                 ldsm_x4(a, &As[(wm * 16 + (lane & 15)) * GE_LD + kk * 16 + (lane >> 4) * 8]);
-                ldsm_x4(b, &Bs[(wn * 16 + (lane & 7) + ((lane >> 4) << 3)) * GE_LD + kk * 16 + ((lane >> 3) & 1) * 8]);
-                const unsigned b0[2] = {b[0], b[1]}, b1[2] = {b[2], b[3]};
-                mma16816_4(acc[0], a, b0);
-                mma16816_4(acc[1], a, b1);
+#pragma unroll
+                for (int ps = 0; ps < GE_NP; ++ps) {
+                    if (ps >= np) break;
+                    unsigned b[4];
+                    ldsm_x4(b, &Bs[ps][(wn * 16 + (lane & 7) + ((lane >> 4) << 3)) * GE_LD + kk * 16 + ((lane >> 3) & 1) * 8]);
+                    const unsigned b0[2] = {b[0], b[1]}, b1[2] = {b[2], b[3]};
+                    mma16816_4(acc[ps][0], a, b0);
+                    mma16816_4(acc[ps][1], a, b1);
+                }
             }
         }
-        // results to shared memory [row][token]
+        for (int ps = 0; ps < np; ++ps) {
+            const int tb = t0 + ps * GE_N, nt = min(GE_N, cnt - tb);
+            __syncthreads();
+            // results to shared memory [row][token]
 #pragma unroll
-        for (int ni = 0; ni < 2; ++ni)
+            for (int ni = 0; ni < 2; ++ni)
 #pragma unroll
-            for (int q = 0; q < 4; ++q) Cs[wm * 16 + gid + (q >> 1) * 8][wn * 16 + ni * 8 + 2 * tig + (q & 1)] = acc[ni][q];
-        __syncthreads();
-        if (GU) {
-            for (int i = threadIdx.x; i < 32 * nt; i += blockDim.x) {
-                const int rr = i % 32, tr = i / 32, row = r_base + rr;
-                if (row >= mrows) continue;
-                const int p = order[start + t0 + tr];
-                h16[(size_t) p * rows_out + row] = __float2half(swiglu4(Cs[rr][tr], Cs[rr + 32][tr], m.clamp));
-            }
-        } else {
-            for (int i = threadIdx.x; i < GE_M * nt; i += blockDim.x) {
-                const int rr = i % GE_M, tr = i / GE_M, row = r_base + rr;
-                if (row >= mrows) continue;
-                const int p = order[start + t0 + tr];
-                y[(size_t) p * rows_out + row] = wts[p] * Cs[rr][tr];
+                for (int q = 0; q < 4; ++q) Cs[wm * 16 + gid + (q >> 1) * 8][wn * 16 + ni * 8 + 2 * tig + (q & 1)] = acc[ps][ni][q];
+            __syncthreads();
+            if (GU) {
+                for (int i = threadIdx.x; i < 32 * nt; i += blockDim.x) {
+                    const int rr = i % 32, tr = i / 32, row = r_base + rr;
+                    if (row >= mrows) continue;
+                    const int p = order[start + tb + tr];
+                    h16[(size_t) p * rows_out + row] = __float2half(swiglu4(Cs[rr][tr], Cs[rr + 32][tr], m.clamp));
+                }
+            } else {
+                for (int i = threadIdx.x; i < GE_M * nt; i += blockDim.x) {
+                    const int rr = i % GE_M, tr = i / GE_M, row = r_base + rr;
+                    if (row >= mrows) continue;
+                    const int p = order[start + tb + tr];
+                    y[(size_t) p * rows_out + row] = wts[p] * Cs[rr][tr];
+                }
             }
         }
     }
@@ -993,6 +1023,10 @@ void moe_reduce(const float * shexp, const float * sg, const float * y, int k, f
 }
 void moe_publish(volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_dst, float * x_dst, const float * x, int xs, int n,
                  const int * ids, const float * wts, int k, int nt, const int * counter, unsigned seq_tag, cudaStream_t s) {
+    if (nt <= MAX_NT && n % 2 == 0 && xs % 2 == 0) {
+        k_moe_publish1<<<1, 1024, 0, s>>>(seq, ntp, ids_dst, wts_dst, x_dst, x, xs, n, ids, wts, k, nt, counter, seq_tag);
+        return;
+    }
     const size_t tot = (size_t) nt * n;
     k_moe_publish<<<(unsigned) ((tot + 255) / 256), 256, 0, s>>>(ntp, ids_dst, wts_dst, x_dst, x, xs, n, ids, wts, k, nt);
     k_moe_seq<<<1, 1, 0, s>>>(seq, counter, seq_tag);

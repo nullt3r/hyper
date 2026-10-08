@@ -24,7 +24,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <condition_variable>
 #include <mutex>
+#include <thread>
 #include <set>
 #include <string>
 #include <vector>
@@ -194,9 +196,53 @@ Request prepare(Ctx & c, const ojson & body) {
 // runs generation, calling on_msg(new_msg) whenever the parsed message may have changed; returns finish reason
 struct GenOut { std::string text, finish; int n_gen = 0, reused = 0, steps = 0, accepted = 0; double t_prompt = 0, t_gen = 0; };
 
+// Streaming: the parse + send of each snapshot of the text runs on its own thread (parsing the whole text is O(n) per
+// token; on the generation thread it would sit between two tokens while the GPUs wait). Snapshots are coalesced: the
+// thread always takes the latest text; the generation thread only copies the string.
+struct Streamer {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::string latest;
+    bool has = false, stop = false, cancelled = false;
+    std::thread th;
+    double busy_ms = 0;
+    long n_parsed = 0;
+    void start(std::function<bool(const std::string &)> fn) {
+        th = std::thread([this, fn = std::move(fn)] {
+            for (;;) {
+                std::string text;
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv.wait(lk, [&] { return has || stop; });
+                    if (!has && stop) return;
+                    text.swap(latest); has = false;
+                }
+                const auto t0 = clk::now();
+                const bool ok = fn(text);
+                busy_ms += 1e3 * secs(t0, clk::now());
+                ++n_parsed;
+                if (!ok) { std::lock_guard<std::mutex> lk(mu); cancelled = true; }
+            }
+        });
+    }
+    bool offer(const std::string & text) {   // false once the consumer gave up
+        std::lock_guard<std::mutex> lk(mu);
+        if (cancelled) return false;
+        latest = text; has = true;
+        cv.notify_one();
+        return true;
+    }
+    void finish() {
+        { std::lock_guard<std::mutex> lk(mu); stop = true; cv.notify_one(); }
+        if (th.joinable()) th.join();
+    }
+};
+
 GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::string &)> & on_text) {
     GenOut o;
     o.finish = "length";
+    Streamer streamer;
+    if (on_text) streamer.start(on_text);
     GenStats st;
     Live & lv = c.live;
     const int P = (int) r.prompt.size();
@@ -249,9 +295,11 @@ GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::strin
             const size_t at = o.text.find(s, o.text.size() > s.size() + 64 ? o.text.size() - s.size() - 64 : 0);
             if (at != std::string::npos) { o.text.resize(at); o.finish = "stop"; return false; }
         }
-        if (on_text && !on_text(o.text)) { o.finish = "cancelled"; return false; }
+        if (on_text && !streamer.offer(o.text)) { o.finish = "cancelled"; return false; }
         return true;
     }, r.sp);
+    streamer.finish();
+    if (on_text && streamer.cancelled && o.finish != "cancelled") o.finish = "cancelled";
     c.eng->set_prefill_progress({});
     if (c.after_request) c.after_request();
     auto t2 = clk::now();
@@ -268,6 +316,8 @@ GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::strin
     fprintf(stderr, "[%s]       total time = %10.2f ms / %6d tokens, finish: %s, draft acceptance %.2f / %d per step\n",
             r.id.c_str(), 1e3 * secs(t0, t2), n_new + o.n_gen, o.finish.c_str(), o.steps ? (double) o.accepted / o.steps : 0.0,
             c.eng->n_draft());
+    if (on_text) fprintf(stderr, "[%s]  stream parse+send: %.0f ms on the stream thread (%ld snapshots of %d tokens)\n", r.id.c_str(),
+                         streamer.busy_ms, streamer.n_parsed, o.n_gen);
     {
         std::lock_guard<std::mutex> lk(lv.mu);
         lv.phase = "idle";

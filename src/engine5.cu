@@ -328,6 +328,8 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
     if (getenv("HYPER5_PROMPT_W")) prompt_weight_ = atof(getenv("HYPER5_PROMPT_W"));
     if (getenv("HYPER5_ADAPT_EVERY")) adapt_every_ = std::max(1, atoi(getenv("HYPER5_ADAPT_EVERY")));
     if (getenv("HYPER5_ADAPT_BUDGET")) adapt_budget_ = atoi(getenv("HYPER5_ADAPT_BUDGET"));
+    if (getenv("HYPER5_ADAPT_MIN")) adapt_min_ = atof(getenv("HYPER5_ADAPT_MIN"));
+    if (getenv("HYPER5_ADAPT_RATIO")) adapt_ratio_ = atof(getenv("HYPER5_ADAPT_RATIO"));
     ehost_.resize(cfg_.n_layer);
     for (auto & H : ehost_) { H.score.assign(cfg_.n_expert, 0.0); H.last_count.assign(1024, 0); }
     load_weights();
@@ -621,6 +623,7 @@ void Engine5::rebuild_stream(int il) {
 void Engine5::rebalance(int max_swaps) {
     const Glm5Config & c = cfg_;
     const int E = c.n_expert;
+    const auto t_reb = std::chrono::steady_clock::now();
     // decode routing seen by the CPU side since the last call
     for (int il = 0; il < c.n_layer; ++il) {
         if (!is_moe(il)) continue;
@@ -640,7 +643,8 @@ void Engine5::rebalance(int max_swaps) {
         std::sort(gpu.begin(), gpu.end(), [&](int a, int b) { return H.score[a] < H.score[b]; });
         for (size_t i = 0; i < std::min(cpu.size(), gpu.size()); ++i) {
             const double si = H.score[cpu[i]], so = H.score[gpu[i]];
-            if (si < so * 1.5 + 6.0) break;   // (hysteresis: noise must not shuffle experts back and forth)
+            // a swap costs ~0.5 ms of PCIe + a decode stall and pays ~0.2 ms per future hit: only clear, persistent differences
+            if (si < so * adapt_ratio_ + adapt_min_) break;
             cand.push_back({si - so, il, cpu[i], gpu[i], H.owner[gpu[i]]});
         }
     }
@@ -679,7 +683,9 @@ void Engine5::rebalance(int max_swaps) {
         H.tables_dirty = false;
     }
     n_swaps_ += (int) cand.size();
-    if (getenv("HYPER5_ADAPT_LOG")) fprintf(stderr, "hyper5: rebalance: %zu exchanges (total %d)\n", cand.size(), n_swaps_);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_reb).count();
+    t_rebalance_ += ms;
+    if (getenv("HYPER5_ADAPT_LOG")) fprintf(stderr, "hyper5: rebalance: %zu exchanges in %.1f ms (total %d, %.1f s)\n", cand.size(), ms, n_swaps_, t_rebalance_ / 1e3);
 }
 
 void Engine5::load_weights() {
@@ -883,10 +889,17 @@ void Engine5::record_main(int gi, int nt) {
         }
         add_parts(d.bo, d.p16, d.recv, (size_t) R5 * n, nd - 1, (int) N, s);
     };
+    // block output: allreduce of d.part over the GPUs, scattered into the residual streams (decode: in the allreduce epilogue)
+    static const bool old_post = getenv("HYPER5_OLDPOST") != nullptr;
+    auto block_out = [&] {
+        if (!bulk && !old_post) { allreduce_mhc_ll16(R, d.hcw, n, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s); return; }
+        allreduce();
+        mhc_post(R, d.bo, d.hcw, n, nt, s);
+    };
     // mHC pre-mix: res -> d.xn (block input after its RMS norm) and the post / comb weights
     static const bool old_mhc = getenv("HYPER5_OLDMHC") != nullptr;
     auto hc_pre = [&](const DW & fn, const uint8_t * raw, const float * scale, const float * base, const float * norm_w) {
-        if (!old_mhc) { mhc_pre_fused(R, raw, d.mixpart, scale, base, norm_w, eps, c.hc_eps, c.sinkhorn, n, d.hcw, d.xn, nt, s); return; }
+        if (!old_mhc && !bulk) { mhc_pre_fused(R, raw, d.mixpart, scale, base, norm_w, eps, c.hc_eps, c.sinkhorn, n, d.hcw, d.xn, nt, s); return; }
         mm(fn, R, hcn, d.mix, 32, nt);
         mhc_pre(R, d.mix, 32, scale, base, norm_w, eps, c.hc_eps, c.sinkhorn, n, d.hcw, d.xn, nt, s);
     };
@@ -931,8 +944,7 @@ void Engine5::record_main(int gi, int nt) {
             mm(L.wo, d.o, nh * c.v_dim, d.part, n, nt);
         }
         dbg(L.mla ? "mla_part" : "kda_part", il, d.part, (size_t) nt * n);
-        allreduce();
-        mhc_post(R, d.bo, d.hcw, n, nt, s);
+        block_out();
         dbg("attn_res", il, R, (size_t) nt * hcn);
         // ---- FFN ----
         hc_pre(L.hcf_fn, L.hcf_raw, L.hcf_scale, L.hcf_base, L.ffn_norm);
@@ -989,8 +1001,7 @@ void Engine5::record_main(int gi, int nt) {
                        bulk ? &cpu_bulk_out_->y[0][0] : &cpu_out_[il].y[0][0], d.counter, (unsigned) il, s);
         }
         dbg("ffn_part", il, d.part, (size_t) nt * n);
-        allreduce();
-        mhc_post(R, d.bo, d.hcw, n, nt, s);
+        block_out();
         dbg("l_out", il, R, (size_t) nt * hcn);
     }
     const int hr = bulk ? 1 : nt;
@@ -1133,7 +1144,7 @@ std::vector<int> Engine5::forward(const int * tokens, int nt, int pos) {
     embed(tokens, nt);
     h_pos_[0] = pos;
     if (adapt_ && !bulk) {   // placement follows the routing: after a prompt, then every 32 decode steps
-        if (prompt_routed_) { rebalance(256); prompt_routed_ = false; steps_ = 0; }   // (the rest follows in the decode rounds)
+        if (prompt_routed_) { rebalance(1 << 20); prompt_routed_ = false; steps_ = 0; }
         else if (++steps_ % adapt_every_ == 0) rebalance(adapt_budget_);
     }
     if (bulk) for (int il = 0; il < cfg_.n_layer; ++il) if (is_moe(il) && ehost_[il].stream_dirty) rebuild_stream(il);

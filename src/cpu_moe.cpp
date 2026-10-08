@@ -3,6 +3,10 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -46,8 +50,8 @@ CpuMoe::CpuMoe(int n_threads, int n_embd, int ff, int k, CpuMoeRec * recs, CpuMo
     y_.resize((size_t) P * n_embd);
     qx_.resize((size_t) rows * n_embd * 2 + 4096);
     qh_.resize((size_t) P * ff * 2 + 4096);
-    master_ = std::thread([this] { master_loop(); });
-    for (int i = 1; i < n_threads_; ++i) workers_.emplace_back([this, i] { worker_loop(i); });
+    master_ = std::thread([this] { pin(0); master_loop(); });
+    for (int i = 1; i < n_threads_; ++i) workers_.emplace_back([this, i] { pin(i); worker_loop(i); });
 }
 
 CpuMoe::~CpuMoe() {
@@ -113,6 +117,7 @@ void CpuMoe::master_loop() {
             return stop_;
         });
         std::atomic_thread_fence(std::memory_order_acquire);
+        const auto t_seen = std::chrono::steady_clock::now();
         cur_phase_ = 2;
         const int rows = job.bulk ? MOE_BULK_ROWS : MAX_NT;
         const int nt = std::min(job.bulk ? bulk_->nt : recs_[job.slot].nt, rows);
@@ -125,14 +130,16 @@ void CpuMoe::master_loop() {
             for (int t = 0; t < nt; ++t)
                 for (int j = 0; j < k_; ++j) { const int e = ids[t * MOE_MAX_USED + j]; if (e >= 0 && e < (int) cnt.size()) cnt[e]++; }
             const auto t0 = std::chrono::steady_clock::now();
+            if (prof_) prof_wait_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t0 - t_seen).count();
             run_layer(job.slot, nt, ids, wts, x, y, job.bulk ? ff_ : split_[job.slot]);
             if (prof_) {
                 prof_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
                 if (++prof_jobs_ % 2000 == 0) {
-                    fprintf(stderr, "cpu_moe: %llu jobs, %.3f ms/job, %.1f GB/s, %.2f experts/job | us: prep %.1f qx %.1f gu %.1f qh %.1f down %.1f sum %.1f\n",
+                    fprintf(stderr, "cpu_moe: %llu jobs, %.3f ms/job, %.1f GB/s, %.2f experts/job, seen->start %.1f us\n",
                             (unsigned long long) prof_jobs_, prof_ns_ / 1e6 / 2000, prof_bytes_ / (double) prof_ns_, prof_experts_ / 2000.0,
-                            prof_ph_[0] / 2e6, prof_ph_[1] / 2e6, prof_ph_[2] / 2e6, prof_ph_[3] / 2e6, prof_ph_[4] / 2e6, prof_ph_[5] / 2e6);
+                            prof_wait_ns_ / 2e6);
                     for (auto & v : prof_ph_) v = 0;
+                    prof_wait_ns_ = 0;
                     prof_ns_ = 0; prof_bytes_ = 0; prof_experts_ = 0;
                 }
             }
@@ -177,6 +184,47 @@ template <typename F> void CpuMoe::parallel(int n, F && fn) {
     gen_.store(g, std::memory_order_release);
     run_tasks(g);
     while (T.done.load(std::memory_order_acquire) < n) __builtin_ia32_pause();
+}
+
+// pin team thread i to one physical core (HYPER_CPU_PIN=1 enables): the OS otherwise lands two memory-bound threads on
+// SMT siblings of one core now and then, which halves their bandwidth; cores are taken by topology (siblings last)
+void CpuMoe::pin(int i) {
+    static const bool on = getenv("HYPER_CPU_PIN") && atoi(getenv("HYPER_CPU_PIN")) != 0;   // (measured: no gain on the 3970X)
+    if (!on) return;
+    static std::vector<int> order = [] {   // cpu ids: first sibling of every core, then the second siblings
+        std::vector<int> first, second;
+        const int n = (int) sysconf(_SC_NPROCESSORS_ONLN);
+        std::vector<char> seen(n, 0);
+        for (int c = 0; c < n; ++c) {
+            if (seen[c]) continue;
+            char path[128];
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c);
+            FILE * f = fopen(path, "r");
+            std::vector<int> sib;
+            if (f) {   // "0,32" or "0-1"
+                char buf[64] = {0};
+                if (fgets(buf, sizeof buf, f)) {
+                    for (char * q = buf; *q;) {
+                        int a = (int) strtol(q, &q, 10), b = a;
+                        if (*q == '-') b = (int) strtol(q + 1, &q, 10);
+                        for (int x = a; x <= b && x < n; ++x) sib.push_back(x);
+                        while (*q && (*q == ',' || *q == ' ')) ++q;
+                        if (*q == '\n') break;
+                    }
+                }
+                fclose(f);
+            }
+            if (sib.empty()) sib.push_back(c);
+            for (size_t k = 0; k < sib.size(); ++k) { seen[sib[k]] = 1; (k == 0 ? first : second).push_back(sib[k]); }
+        }
+        first.insert(first.end(), second.begin(), second.end());
+        return first;
+    }();
+    if (i >= (int) order.size()) return;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(order[i], &set);
+    pthread_setaffinity_np(pthread_self(), sizeof set, &set);
 }
 
 void CpuMoe::worker_loop(int) {
@@ -232,22 +280,33 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
         for (int t = 0; t < nt; ++t) if (tok[t]) qt.push_back(t);
         for (int t : qt) from_g(x + (size_t) t * 4096, qx_.data() + t * qx_row, n);
         static const int RG = getenv("HYPER_CPU_RG") ? atoi(getenv("HYPER_CPU_RG")) : 16, RD = getenv("HYPER_CPU_RD") ? atoi(getenv("HYPER_CPU_RD")) : 32;
-        const int gch = (fa + RG - 1) / RG, dch = (n + RD - 1) / RD;
+        // guided chunking: full-size row chunks, except that the last ~2 chunks per thread of a phase are split in 4 (the
+        // phase's tail, where threads idle for up to one chunk, shrinks accordingly)
+        static const int tail_mult = getenv("HYPER_CPU_TAIL") ? atoi(getenv("HYPER_CPU_TAIL")) : 0;   // (measured: smaller tail chunks lose bandwidth)
         if ((int) gu_left_.size() < G) { gu_left_ = std::vector<std::atomic<int>>(G + 16); ready_ = std::vector<std::atomic<int>>(G + 16); }
-        for (int g = 0; g < G; ++g) { gu_left_[g].store(gch, std::memory_order_relaxed); ready_[g].store(0, std::memory_order_relaxed); }
         auto & order = task_order_;
         order.clear();
-        auto add_gu = [&](int g) { for (int c = 0; c < gch; ++c) order.push_back((g << 16) | c); };
-        auto add_dn = [&](int g) { for (int c = 0; c < dch; ++c) order.push_back(0x40000000 | (g << 16) | c); };
-        add_gu(0);
-        for (int g = 1; g < G; ++g) { add_gu(g); add_dn(g - 1); }
-        add_dn(G - 1);
+        auto add = [&](int g, int rows, int R, bool dn) {   // tasks (dn flag, g, r0, r1) packed: r0/r1 in units of 4 rows
+            const int tail = std::min(rows, tail_mult * n_threads_ * R);
+            int r = 0, nt_ = 0;
+            // r0, r1 in units of 4 rows (r1 stored minus one: 4096 rows fit the 10 bits)
+            auto push = [&](int r0, int r1) { order.push_back((dn ? 0x40000000 : 0) | (g << 20) | ((r0 >> 2) << 10) | (((r1 + 3) >> 2) - 1)); ++nt_; };
+            for (; r + R <= rows - tail; r += R) push(r, r + R);
+            for (; r < rows; r += std::max(4, R / 4)) push(r, std::min(rows, r + std::max(4, R / 4)));
+            return nt_;
+        };
+        std::vector<int> gcount(G);
+        for (int g = 0; g < G; ++g) ready_[g].store(0, std::memory_order_relaxed);
+        gcount[0] = add(0, fa, RG, false);
+        for (int g = 1; g < G; ++g) { gcount[g] = add(g, fa, RG, false); add(g - 1, n, RD, true); }
+        add(G - 1, n, RD, true);
+        for (int g = 0; g < G; ++g) gu_left_[g].store(gcount[g], std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_release);
         parallel((int) order.size(), [&](int i) {
-            const int code = order[i], g = (code >> 16) & 0x3fff, ch = code & 0xffff;
+            const int code = order[i], g = (code >> 20) & 0x3ff;
             const int p0 = grp[g], p1 = grp[g + 1];
             if (!(code & 0x40000000)) {
-                const int r0 = ch * RG, r1 = std::min(fa, r0 + RG);
+                const int r0 = ((code >> 10) & 0x3ff) << 2, r1 = std::min(fa, ((code & 0x3ff) + 1) << 2);
                 const uint8_t * gb = L.gate + L.index(pairs[p0].e) * L.gate_bytes, * ub = L.up + L.index(pairs[p0].e) * L.gate_bytes;
                 for (int r = r0; r < r1; ++r)
                     for (int p = p0; p < p1; ++p) {
@@ -264,7 +323,7 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
                 }
             } else {
                 while (!ready_[g].load(std::memory_order_acquire)) __builtin_ia32_pause();
-                const int r0 = ch * RD, r1 = std::min(n, r0 + RD);
+                const int r0 = ((code >> 10) & 0x3ff) << 2, r1 = std::min(n, ((code & 0x3ff) + 1) << 2);
                 const uint8_t * db = L.down + L.index(pairs[p0].e) * L.down_bytes;
                 for (int r = r0; r < r1; ++r)
                     for (int p = p0; p < p1; ++p) td->vec_dot(fa, &y_[(size_t) p * n + r], 0, db + r * d_row, 0, qh_.data() + p * qh_row, 0, 1);

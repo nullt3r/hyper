@@ -114,6 +114,9 @@ void allreduce_add_ll16(float * x, const float * part, uint2 * slots, int g, int
 // res[t][s][e] += sum[t][e] * 2 * sigmoid(inj[t * 4 + s] / hc)   (n = nt * width, width = row length)
 void allreduce_hc_ll16(float * res, const float * inj, int width, int hc, const float * part, uint2 * slots, int g, int ndev, int n,
                        const int * counter, int call, cudaStream_t s);
+// mHC variant (glm5-next): res[t][d][e] = sum[t][e] * hcw[t][d] + sum_s hcw[t][4 + d + 4 s] * res[t][s][e]
+void allreduce_mhc_ll16(float * res, const float * hcw, int width, const float * part, uint2 * slots, int g, int ndev, int n,
+                        const int * counter, int call, cudaStream_t s);
 // bulk variant (many tokens, no sum-of-squares output): data [2][ndev][n] fp16 and flags [2][ndev][n/1024]
 // in mapped host memory
 void allreduce_add_bulk(float * x, const float * part, half * data, unsigned * flags, int g, int ndev, int n,

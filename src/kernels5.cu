@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace hyper {
@@ -399,6 +400,128 @@ __global__ void __launch_bounds__(256) k_mla_attn(const float * __restrict__ q, 
         ph[3 + d] = acc[h][1];
     }
 }
+// ---- prefill: tensor-core attention, block per token, all (<= 32) heads at once ----
+__device__ __forceinline__ void mma16816_5(float * c, const unsigned * a, const unsigned * b) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+__device__ __forceinline__ void ldsm5_x4(unsigned * r, const void * smem) {
+    const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(sa));
+}
+__device__ __forceinline__ void ldsm5_x4_t(unsigned * r, const void * smem) {
+    const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(sa));
+}
+constexpr int TC_LD = MLA_LAT + 8;   // smem row stride (halves): conflict-free ldmatrix
+constexpr int TC_KC = 32;            // cells per tile
+constexpr size_t TC_SMEM = (size_t) 32 * TC_LD * 2 * 2 + 32 * 33 * 4 + 32 * 40 * 2 + 3 * 32 * 4;
+// Token t attends its cells (list or 0..pos+t) with every head: S = Q K^T and O += P K on mma.m16n8k16, online softmax
+// per head row. Rows: the <= 32 heads (padded); K tiles of 32 cells from the fp16 latent cache.
+__global__ void __launch_bounds__(256) k_mla_attn_tc(const float * __restrict__ q, int q_stride, const half * __restrict__ lat,
+                                                     const int * pos_p, int H, float scale, const int * __restrict__ list, int list_stride,
+                                                     const int * __restrict__ list_n, float * __restrict__ o, int o_stride) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    half * Qs = (half *) smem;                       // [32][TC_LD]
+    half * Ks = Qs + 32 * TC_LD;                     // [32][TC_LD]
+    float * Ss = (float *) (Ks + 32 * TC_LD);        // [32][33]
+    half * Ps = (half *) (Ss + 32 * 33);             // [32][40]
+    float * mrow = (float *) (Ps + 32 * 40);         // [32] running max
+    float * lrow = mrow + 32;                        // [32] running sum
+    float * arow = lrow + 32;                        // [32] rescale of this tile
+    const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, gid = lane >> 2, tig = lane & 3;
+    const int p = *pos_p + t;
+    const int n = list ? list_n[t] : p + 1;
+    const int * lt = list ? list + (size_t) t * list_stride : nullptr;
+    // Q (scaled) as fp16 rows; heads >= H zero
+    for (int i = tid; i < 32 * (MLA_LAT / 8); i += blockDim.x) {
+        const int h = i / (MLA_LAT / 8), c = (i % (MLA_LAT / 8)) * 8;
+        __half2 hv[4];
+        if (h < H) {
+            const float * qr = q + (size_t) t * q_stride + (size_t) h * MLA_LAT + c;
+            const float4 a = *(const float4 *) qr, b = *(const float4 *) (qr + 4);
+            hv[0] = __floats2half2_rn(a.x * scale, a.y * scale); hv[1] = __floats2half2_rn(a.z * scale, a.w * scale);
+            hv[2] = __floats2half2_rn(b.x * scale, b.y * scale); hv[3] = __floats2half2_rn(b.z * scale, b.w * scale);
+        } else hv[0] = hv[1] = hv[2] = hv[3] = __floats2half2_rn(0.0f, 0.0f);
+        *(uint4 *) (Qs + h * TC_LD + c) = *(const uint4 *) hv;
+    }
+    if (tid < 32) { mrow[tid] = -FLT_MAX; lrow[tid] = 0.0f; }
+    const int mt = w & 1, np = w >> 1;   // S: m-tile (heads 16 mt..), cell pair of n-tiles (cells 16 np..); O: columns 128 np..
+    float acc[16][4];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) { acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f; }
+    for (int cb = 0; cb < n; cb += TC_KC) {
+        const int cnt = min(TC_KC, n - cb);
+        __syncthreads();
+        for (int i = tid; i < TC_KC * (MLA_LAT / 8); i += blockDim.x) {
+            const int j = i / (MLA_LAT / 8), c = (i % (MLA_LAT / 8)) * 8;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (j < cnt) { const int cell = lt ? lt[cb + j] : cb + j; v = *(const uint4 *) (lat + (size_t) cell * MLA_LAT + c); }
+            *(uint4 *) (Ks + j * TC_LD + c) = v;
+        }
+        __syncthreads();
+        // S tile: this warp's 16 heads x 16 cells
+        float sacc[2][4] = {};
+#pragma unroll 4
+        for (int ks = 0; ks < MLA_LAT / 16; ++ks) {
+            unsigned a[4], b[4];
+            ldsm5_x4(a, Qs + (mt * 16 + (lane & 15)) * TC_LD + ks * 16 + (lane >> 4) * 8);
+            ldsm5_x4(b, Ks + (np * 16 + (lane & 7) + ((lane >> 4) << 3)) * TC_LD + ks * 16 + ((lane >> 3) & 1) * 8);
+            const unsigned b0[2] = {b[0], b[1]}, b1[2] = {b[2], b[3]};
+            mma16816_5(sacc[0], a, b0);
+            mma16816_5(sacc[1], a, b1);
+        }
+#pragma unroll
+        for (int ni = 0; ni < 2; ++ni)
+#pragma unroll
+            for (int qd = 0; qd < 4; ++qd) {
+                const int row = mt * 16 + gid + (qd >> 1) * 8, col = np * 16 + ni * 8 + 2 * tig + (qd & 1);
+                Ss[row * 33 + col] = col < cnt ? sacc[ni][qd] : -FLT_MAX;
+            }
+        __syncthreads();
+        // online softmax: warp w owns rows 4w..4w+3, lane = column
+        for (int r = 4 * w; r < 4 * w + 4; ++r) {
+            const float v = Ss[r * 33 + lane];
+            const float mo = mrow[r], mn = fmaxf(mo, wmax(v));
+            const float e = lane < cnt ? expf(v - mn) : 0.0f;
+            const float z = wsum(e);
+            Ps[r * 40 + lane] = __float2half(e);
+            if (lane == 0) { const float al = expf(mo - mn); arow[r] = al; lrow[r] = lrow[r] * al + z; mrow[r] = mn; }
+        }
+        __syncthreads();
+        // O = O * alpha + P K : this warp's 16 heads x 128 columns
+        {
+            const float al0 = arow[mt * 16 + gid], al1 = arow[mt * 16 + gid + 8];
+#pragma unroll
+            for (int i = 0; i < 16; ++i) { acc[i][0] *= al0; acc[i][1] *= al0; acc[i][2] *= al1; acc[i][3] *= al1; }
+        }
+#pragma unroll
+        for (int kk = 0; kk < TC_KC / 16; ++kk) {
+            unsigned a[4];
+            ldsm5_x4(a, Ps + (mt * 16 + (lane & 15)) * 40 + kk * 16 + (lane >> 4) * 8);
+#pragma unroll
+            for (int pr = 0; pr < 8; ++pr) {
+                unsigned b[4];
+                ldsm5_x4_t(b, Ks + (kk * 16 + (lane & 15)) * TC_LD + np * 128 + pr * 16 + (lane >> 4) * 8);
+                const unsigned b0[2] = {b[0], b[1]}, b1[2] = {b[2], b[3]};
+                mma16816_5(acc[2 * pr], a, b0);
+                mma16816_5(acc[2 * pr + 1], a, b1);
+            }
+        }
+    }
+    __syncthreads();
+    const float il0 = lrow[mt * 16 + gid] > 0.0f ? 1.0f / lrow[mt * 16 + gid] : 0.0f;
+    const float il1 = lrow[mt * 16 + gid + 8] > 0.0f ? 1.0f / lrow[mt * 16 + gid + 8] : 0.0f;
+    const int h0 = mt * 16 + gid, h1 = h0 + 8;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int col = np * 128 + i * 8 + 2 * tig;
+        if (h0 < H) *(float2 *) (o + (size_t) t * o_stride + (size_t) h0 * MLA_LAT + col) = make_float2(acc[i][0] * il0, acc[i][1] * il0);
+        if (h1 < H) *(float2 *) (o + (size_t) t * o_stride + (size_t) h1 * MLA_LAT + col) = make_float2(acc[i][2] * il1, acc[i][3] * il1);
+    }
+}
+
 // grid (H, nt), 256 threads
 __global__ void k_mla_combine(const float * __restrict__ part, int ns, int H, float * __restrict__ o, int o_stride) {
     const int h = blockIdx.x, t = blockIdx.y;
@@ -801,7 +924,8 @@ void mla_kv(const float * kv, int kv_stride, const float * w, float eps, half * 
     k_mla_kv<<<nt, MLA_LAT, 0, s>>>(kv, kv_stride, w, eps, lat, pos);
 }
 void mla_init() {
-    if (cudaFuncSetAttribute(k_mla_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024) != cudaSuccess)
+    if (cudaFuncSetAttribute(k_mla_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024) != cudaSuccess ||
+        cudaFuncSetAttribute(k_mla_attn_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) TC_SMEM) != cudaSuccess)
         throw std::runtime_error("mla_init: shared memory limit");
 }
 size_t mla_part_floats(int H, int nt) { return (size_t) nt * MLA_SPLIT * H * (MLA_LAT + 2); }
@@ -809,6 +933,11 @@ void mla_attn(const float * q, int q_stride, const half * lat, const int * pos, 
               int list_stride, const int * list_n, float * part, float * o, int o_stride, cudaStream_t s) {
     if (H > MLA_MAXH) throw std::runtime_error("mla_attn: too many heads");
     const size_t smem = (size_t) H * MLA_LAT * 4 + (size_t) MLA_CC * MLA_LAT * 2 + (size_t) H * MLA_CC * 4 + 3 * H * 4;
+    static const bool no_tc = getenv("HYPER5_MLA_NOTC") != nullptr;
+    if (nt > MAX_NT && H <= 32 && !no_tc) {   // prefill: tensor cores, block per token
+        k_mla_attn_tc<<<nt, 256, TC_SMEM, s>>>(q, q_stride, lat, pos, H, scale, list, list_stride, list_n, o, o_stride);
+        return;
+    }
     const int ns = nt <= MAX_NT ? MLA_SPLIT : 1;
     k_mla_attn<<<dim3(ns, nt), 256, smem, s>>>(q, q_stride, lat, pos, H, scale, list, list_stride, list_n, part, o, o_stride);
     if (ns > 1) k_mla_combine<<<dim3(H, nt), 256, 0, s>>>(part, ns, H, o, o_stride);

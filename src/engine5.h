@@ -119,9 +119,13 @@ private:
     };
     std::vector<ExpertHost> ehost_;
     bool adapt_ = true, prompt_routed_ = false;
+    // measured on a 20k-prompt / 1500-token generation: the placement is worth far more than the swaps cost
+    // (15.5 t/s without adaptation, 20.9 with these settings, 27 once adapted), so swap eagerly
     double adapt_decay_ = 0.92;   // per rebalance (every adapt_every_ decode steps)
     double prompt_weight_ = 0.25; // a prompt token's routing counts less than a generated one's (different content: tools, docs)
     int adapt_every_ = 16, adapt_budget_ = 64;
+    double adapt_min_ = 6.0, adapt_ratio_ = 1.25;   // swap when score_in >= ratio * score_out + min
+    double t_rebalance_ = 0;      // ms spent in rebalance (decode stalls)
     int steps_ = 0, n_swaps_ = 0;
     double acc_rate_ = 0.5;       // speculation: running fraction of drafted tokens accepted
     int stream_min_ = 280;        // prefill chunks this long stream the CPU experts to the GPUs; shorter ones use the CPU

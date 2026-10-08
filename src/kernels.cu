@@ -1188,6 +1188,43 @@ __global__ void k_allreduce_hc_ll16(float * res, const float * __restrict__ inj,
     }
 }
 
+// mHC variant (glm5-next): the summed block output goes straight into the 4 residual streams,
+// res[t][d][e] = sum[t][e] * hcw[t][d] + sum_s hcw[t][4 + d + 4 s] * res[t][s][e]   (hcw: 20 weights per token)
+__global__ void k_allreduce_mhc_ll16(float * res, const float * __restrict__ hcw, int width, const float * __restrict__ part,
+                                     uint2 * slots, int g, int ndev, int n2, const int * counter, int call) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n2) return;
+    const unsigned seq = (unsigned) (*counter) * 1024u + (unsigned) call + 1u;
+    uint2 * buf = slots + (size_t) (call & 1) * ndev * n2;
+    const float2 mine = ((const float2 *) part)[i];
+    const __half2 mh = __floats2half2_rn(mine.x, mine.y);
+    volatile unsigned long long * dst = (volatile unsigned long long *) &buf[(size_t) g * n2 + i];
+    *dst = ((unsigned long long) seq << 32) | (unsigned long long) *(const unsigned *) &mh;
+    float2 acc = make_float2(0.0f, 0.0f);
+    for (int dd = 0; dd < ndev; ++dd) {
+        float2 f;
+        if (dd == g) f = __half22float2(mh);
+        else {
+            volatile unsigned long long * src = (volatile unsigned long long *) &buf[(size_t) dd * n2 + i];
+            unsigned long long v;
+            do { v = *src; } while ((unsigned) (v >> 32) != seq);
+            const unsigned bits = (unsigned) (v & 0xffffffffu);
+            f = __half22float2(*(const __half2 *) &bits);
+        }
+        acc.x += f.x; acc.y += f.y;
+    }
+    const int e = 2 * i, t = e / width, col = e % width;
+    const float * hw = hcw + (size_t) t * 20;
+    float2 * rp = (float2 *) (res + (size_t) t * 4 * width + col);
+    const float2 r0 = rp[0], r1 = rp[(size_t) width / 2], r2 = rp[(size_t) width], r3 = rp[(size_t) 3 * width / 2];
+#pragma unroll
+    for (int d = 0; d < 4; ++d) {
+        const float c0 = hw[4 + d], c1 = hw[8 + d], c2 = hw[12 + d], c3 = hw[16 + d], po = hw[d];
+        rp[(size_t) d * width / 2] = make_float2(acc.x * po + c0 * r0.x + c1 * r1.x + c2 * r2.x + c3 * r3.x,
+                                                acc.y * po + c0 * r0.y + c1 * r1.y + c2 * r2.y + c3 * r3.y);
+    }
+}
+
 __global__ void k_incr(int * c) { *c += 1; }
 
 } // namespace
@@ -1497,6 +1534,12 @@ void add_parts(float * x, const half * own, const half * recv, size_t stride, in
 }
 void topk_pairs(const float * x, int xs, int n, int offset, float * out, int K, int nt, cudaStream_t s) {
     k_topk<<<nt, 1024, 0, s>>>(x, xs, n, offset, out, K);
+}
+void allreduce_mhc_ll16(float * res, const float * hcw, int width, const float * part, uint2 * slots, int g, int ndev, int n,
+                        const int * counter, int call, cudaStream_t s) {
+    if (n & 1 || width & 3) throw std::runtime_error("allreduce_mhc_ll16: n must be even, width a multiple of 4");
+    const int n2 = n / 2;
+    k_allreduce_mhc_ll16<<<(n2 + 255) / 256, 256, 0, s>>>(res, hcw, width, part, slots, g, ndev, n2, counter, call);
 }
 void allreduce_hc_ll16(float * res, const float * inj, int width, int hc, const float * part, uint2 * slots, int g, int ndev, int n,
                        const int * counter, int call, cudaStream_t s) {
