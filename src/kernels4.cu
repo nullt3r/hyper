@@ -296,6 +296,21 @@ template <> __device__ __forceinline__ void deq8<GType::Q5_1>(const uint8_t * __
         v[i] = x * d + m;
     }
 }
+template <> __device__ __forceinline__ void deq8<GType::Q5_0>(const uint8_t * __restrict__ row, int c, float * v) {
+    const uint8_t * b = row + (size_t) (c >> 2) * 22;   // d, qh[4], qs[16]: x = (nibble | high bit << 4) - 16
+    const float d = h2f(b);
+    uint32_t qh; memcpy(&qh, b + 2, 4);
+    const uint8_t * qs = b + 6;
+    const int o = (c & 3) * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int jj = o + i;
+        int x;
+        if (jj < 16) x = (qs[jj] & 0xF) | (((qh >> jj) << 4) & 0x10);
+        else { const int j2 = jj - 16; x = (qs[j2] >> 4) | ((qh >> (j2 + 12)) & 0x10); }
+        v[i] = (x - 16) * d;
+    }
+}
 // IQ3_S grid and IQ4_NL values: from ggml (ggml-common.h), MIT, Copyright (c) 2023-2026 The ggml authors
 __device__ const uint32_t g_iq3s_grid[512] = {
     0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
@@ -1024,6 +1039,7 @@ void moe_route(const float * logits, int ls, int n_expert, int k, int * ids, flo
         case GType::Q4_K: { constexpr GType TT = GType::Q4_K; CALL; } break;       \
         case GType::Q5_K: { constexpr GType TT = GType::Q5_K; CALL; } break;       \
         case GType::Q5_1: { constexpr GType TT = GType::Q5_1; CALL; } break;       \
+        case GType::Q5_0: { constexpr GType TT = GType::Q5_0; CALL; } break;       \
         case GType::Q8_0: { constexpr GType TT = GType::Q8_0; CALL; } break;       \
         case GType::Q6_K: { constexpr GType TT = GType::Q6_K; CALL; } break;       \
         case GType::IQ4_XS: { constexpr GType TT = GType::IQ4_XS; CALL; } break;   \
@@ -1052,10 +1068,21 @@ void moe_zc(const MoeZC & z, const float * x, int xs, const int * ids, const flo
     MOE_TYPE_SWITCH(z.tg, (k_moe_zc_gate_up<TT><<<dim3(nt * k, (len + 31) / 32), 256, sm1, s>>>(z, x, xs, ids, k, h, kdim)));
     MOE_TYPE_SWITCH(z.td, (k_moe_zc_down<TT><<<dim3(nt * k, (z.n + 31) / 32), 256, sm2, s>>>(z, h, ids, wts, k, y)));
 }
+// test hook: one row of n elements dequantized by the expert kernels' deq8 (thread per 8 elements)
+template <GType T> __global__ void k_deq_row(const uint8_t * row, int n, float * out) {
+    load_tables<T>();
+    __syncthreads();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c * 8 < n) deq8<T>(row, c, out + c * 8);
+}
+void deq_row_test(GType t, const uint8_t * row, int n, float * out) {
+    MOE_TYPE_SWITCH(t, (k_deq_row<TT><<<(n / 8 + 255) / 256, 256>>>(row, n, out)));
+}
 void moe_zc_init() {
     for (auto f : {(const void *) k_moe_zc_gate_up<GType::IQ3_S>, (const void *) k_moe_zc_gate_up<GType::IQ4_XS>,
                    (const void *) k_moe_zc_gate_up<GType::Q4_K>, (const void *) k_moe_zc_gate_up<GType::Q5_K>,
-                   (const void *) k_moe_zc_gate_up<GType::Q6_K>, (const void *) k_moe_zc_gate_up<GType::Q8_0>, (const void *) k_moe_zc_gate_up<GType::Q5_1>})
+                   (const void *) k_moe_zc_gate_up<GType::Q6_K>, (const void *) k_moe_zc_gate_up<GType::Q8_0>, (const void *) k_moe_zc_gate_up<GType::Q5_1>,
+                   (const void *) k_moe_zc_gate_up<GType::Q5_0>})
         cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
 }
 void moe_order(const MoeDev & m, const int * ids, int n_pairs, int n_expert, int * order, int * order_n, cudaStream_t s, int * egrp) {

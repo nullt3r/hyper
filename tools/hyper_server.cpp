@@ -9,6 +9,7 @@
 //                     qwen4exp: [--gpu-frac 1.0] [--cpu-threads 30] [--expert-stats file] [--mtp nextn.gguf]   (context default 131072)
 //                     glm5-next: [--gpu-frac 1.0] [--cpu-threads 30] [--expert-stats file]   (context default 65536)
 //                     [--reasoning-effort low|high|max|none]   (template default when absent; requests may override)
+//                     [--chat-template-file t.jinja]   (instead of the GGUF's template)
 #include "engine.h"
 #include "engine4.h"
 #include "engine5.h"
@@ -25,6 +26,8 @@
 #include <cstdio>
 #include <cstring>
 #include <condition_variable>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <thread>
 #include <set>
@@ -68,6 +71,7 @@ struct Ctx {
     const llama_vocab * vocab = nullptr;
     common_chat_templates_ptr tmpls;
     std::string alias;
+    bool glm = false;   // glm5-next: its templates know reasoning effort low / high (/ max)
     std::mutex mu;
     std::atomic<long> next_id{1};
 };
@@ -156,10 +160,11 @@ Request prepare(Ctx & c, const ojson & body) {
         if (body["chat_template_kwargs"].contains("enable_thinking"))
             in.enable_thinking = body["chat_template_kwargs"]["enable_thinking"].get<bool>();
     }
-    {   // reasoning effort: the request's OpenAI field, else --reasoning-effort (GLM templates know low / high, anything else = max)
+    {   // reasoning effort: the request's OpenAI field, else --reasoning-effort (GLM templates know low / high, anything else = max;
+        // Qwen's know xhigh / medium / low, unsloth's also high)
         std::string eff = body.contains("reasoning_effort") && body["reasoning_effort"].is_string() ? body["reasoning_effort"].get<std::string>()
                                                                                                    : g_reasoning_effort;
-        if (eff == "medium") eff = "high";
+        if (c.glm && eff == "medium") eff = "high";
         if (eff == "none") in.enable_thinking = false;
         else if (!eff.empty() && !in.chat_template_kwargs.count("reasoning_effort")) in.chat_template_kwargs["reasoning_effort"] = "\"" + eff + "\"";
     }
@@ -519,6 +524,7 @@ int main(int argc, char ** argv) {
     float gpu_frac = 1.0f;
     std::string stats_path;   // qwen4exp: routing statistics, read at start and updated after every request
     std::string mtp_path;     // qwen4exp: separate NextN (MTP) GGUF for speculative decoding
+    std::string template_file;   // chat template (jinja) instead of the GGUF's
     bool ctx_given = false;
     SamplingParams defaults;   // Qwen's recommendation for thinking mode
     defaults.temp = 0.6f; defaults.top_p = 0.95f; defaults.top_k = 20; defaults.min_p = 0.0f;
@@ -533,6 +539,7 @@ int main(int argc, char ** argv) {
         else if (k == "--top-k") defaults.top_k = std::stoi(v); else if (k == "--min-p") defaults.min_p = std::stof(v);
         else if (k == "--snapshots") snaps = std::stoi(v);
         else if (k == "--reasoning-effort") g_reasoning_effort = v;
+        else if (k == "--chat-template-file") template_file = v;
         else { fprintf(stderr, "unknown option %s\n", k.c_str()); return 1; }
     }
     const std::string path = argv[1];
@@ -548,10 +555,18 @@ int main(int argc, char ** argv) {
     c.vm = llama_model_load_from_file(path.c_str(), mp);
     if (!c.vm) { fprintf(stderr, "cannot load vocabulary\n"); return 1; }
     c.vocab = llama_model_get_vocab(c.vm);
-    c.tmpls = common_chat_templates_init(c.vm, "");
+    std::string tmpl_override;
+    if (!template_file.empty()) {
+        std::ifstream tf(template_file);
+        if (!tf) { fprintf(stderr, "cannot read %s\n", template_file.c_str()); return 1; }
+        tmpl_override.assign(std::istreambuf_iterator<char>(tf), std::istreambuf_iterator<char>());
+        fprintf(stderr, "hyper-server: chat template from %s (%zu chars)\n", template_file.c_str(), tmpl_override.size());
+    }
+    c.tmpls = common_chat_templates_init(c.vm, tmpl_override);
 
     std::string arch;
     { GGUF g(path); arch = g.arch(); }
+    c.glm = arch == "glm5-next";
     std::unique_ptr<LLM> engine;
     if (arch == "qwen4exp") {
         if (!ctx_given) ctx = 131072;

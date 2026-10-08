@@ -43,6 +43,11 @@ clean:
 $(BUILD)/arbench: tools/arbench.cu $(BUILD)/kernels.o
 	$(NVCC) $(NVFLAGS) tools/arbench.cu $(BUILD)/kernels.o -o $@ $(LIBS)
 
+# expert dequantization (deq8) vs ggml's reference
+$(BUILD)/deqtest: $(OBJ4) tools/deqtest.cu
+	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/deqtest.cu $(OBJ4) -o $@ \
+	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)
+
 $(BUILD)/gemvbench: tools/gemvbench.cu $(BUILD)/kernels.o
 	$(NVCC) $(NVFLAGS) tools/gemvbench.cu $(BUILD)/kernels.o -o $@ $(LIBS)
 

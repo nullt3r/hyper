@@ -142,4 +142,7 @@ void ple_apply(float * res, const float * key, const float * value, const float 
                const float * conv_w, float * conv_state, float * conv_snap, int n, int hc, int K, int dil, float eps, int nt,
                float * scratch, cudaStream_t s);
 
+// test hook (tools/deqtest): one row dequantized on the GPU by the expert kernels' deq8
+void deq_row_test(GType t, const uint8_t * row, int n, float * out);
+
 } // namespace hyper
