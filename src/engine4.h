@@ -130,6 +130,7 @@ private:
     bool graphs_ready_ = false;
     bool debug_ = false, nocpu_ = false, allrows_ = false, grouped_decode_ = false;
     int last_nt_ = 0;
+    int stream_min_ = 256;   // prefill chunks this long stream the CPU experts to the GPUs; shorter ones use the CPU
 };
 
 } // namespace hyper

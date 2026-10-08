@@ -276,6 +276,7 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
     nocpu_ = getenv("HYPER4_NOCPU") != nullptr;
     allrows_ = getenv("HYPER4_ALLROWS") != nullptr;
     grouped_decode_ = getenv("HYPER4_GROUPED") != nullptr;   // timing experiment only: CPU experts ignored (wrong output)
+    if (getenv("HYPER4_STREAM_MIN")) stream_min_ = atoi(getenv("HYPER4_STREAM_MIN"));
     gguf_ = std::make_unique<GGUF>(model_path);
     cfg_ = Q4Config::from_gguf(*gguf_);
     src_ = gguf_.get();
@@ -804,7 +805,8 @@ void Engine4::record_main(int gi, int nt, int kind) {
     if (!kind && c.ple_layer >= 0)
         CUDA_CHECK(cudaMemcpyAsync(d.ple_emb, h_ple_, (size_t) nt * c.ple_n_heads() * c.ple_dim * sizeof(float), cudaMemcpyHostToDevice, s));
     incr_counter(d.counter, s);
-    if (bulk && opt_.stream_experts) {
+    const bool streaming = bulk && opt_.stream_experts && nt >= stream_min_;   // short chunks: the CPU computes its experts
+    if (streaming) {
         if (!kind && d.layers[0].owner_bulk) { upload_stage(d, 0); if (c.n_layer > 1) upload_stage(d, 1); }
         if (kind && d.mtp.owner_bulk) upload_stage(d, c.n_layer);
     }
@@ -958,7 +960,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
         dbg("router", il, d.rlog, (size_t) nt * (c.n_expert + 1));
         moe_route(d.rlog, c.n_expert + 1, c.n_expert, K, d.ids, d.wts, d.sg, nt, s);
         dbg("route_w", il, d.wts, (size_t) nt * K);
-        const bool stream = bulk && opt_.stream_experts && L.owner_bulk;
+        const bool stream = streaming && L.owner_bulk;
         if (d.g == 0 && !stream) {
             if (bulk) moe_publish(&cpu_bulk_->seq, &cpu_bulk_->nt, &cpu_bulk_->ids[0][0], &cpu_bulk_->wts[0][0], &cpu_bulk_->x[0][0],
                                   d.mixed, n, n, d.ids, d.wts, K, nt, d.counter, (unsigned) il, s);
@@ -1143,7 +1145,7 @@ void Engine4::run(int kind, int nt) {
     if (!graphs_ready_ && !debug_) build_graphs();
     ++fwd_counter_;
     if (kind == 3) --fwd_counter_;   // restore graphs do not count
-    if (kind <= 2 && !(bulk && opt_.stream_experts)) {
+    if (kind <= 2 && !(bulk && opt_.stream_experts && nt >= stream_min_)) {
         std::vector<int> slots;
         if (kind == 0) for (int i = 0; i < cfg_.n_layer; ++i) slots.push_back(i);
         else slots.push_back(cfg_.n_layer);
@@ -1388,11 +1390,21 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
         return !stop;
     };
     auto since = [](clk::time_point a) { return std::chrono::duration<double>(clk::now() - a).count(); };
+    // generated tokens get recurrent-state snapshots too (every 1024 positions and at the end): the next request repeats
+    // this answer in its prompt and resumes close to where the re-rendered history first differs
+    int snap_mark = p / 1024;
+    bool state_ok = true;
+    auto gen_snapshot = [&] {
+        if (!opt_.prompt_cache || p / 1024 == snap_mark) return;
+        snap_mark = p / 1024;
+        take_snapshot(p);
+    };
     if (!spec) {
         while (emit(next) && p + 1 < opt_.max_pos) {
             next = forward(&next, 1, p++)[0];
             if (sampling) next = sample_row(0, sp);
             st.steps++;
+            gen_snapshot();
         }
     } else {
         auto make_drafts = [&](const int * mt, int nt, int pos) {   // first from the main hidden rows, the rest chained
@@ -1417,7 +1429,7 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
             else while (m < K && a[m] == drafts[m]) ++m;
             st.accepted += m;
             if (emit(cur)) for (int j = 0; j < m; ++j) if (!emit(drafts[j])) break;
-            if (stop) break;
+            if (stop) { state_ok = false; break; }   // (the state holds rows past the end of the output)
             if (m < K) {                            // keep rows 0..m of the verified block
                 ta = clk::now();
                 run(3, m + 1);
@@ -1427,8 +1439,10 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
             make_drafts(mt.data(), m + 1, p);       // positions p..p+m with main hidden rows 0..m
             cur = a[m];
             p += m + 1;
+            gen_snapshot();
         }
     }
+    if (opt_.prompt_cache && p > P && state_ok) take_snapshot(p);   // state after the last processed token
     {
         std::vector<int> sq = prompt;
         sq.insert(sq.end(), out.begin(), out.end());
