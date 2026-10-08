@@ -1239,24 +1239,50 @@ __global__ void k_incr(int * c) { *c += 1; }
         default: throw std::runtime_error("unsupported nt");  \
     }
 
-// small K (<= 16 Q8 blocks): one warp per 16-row tile walks all k blocks, no cross-warp reduction
+// small K (<= 16 Q8 blocks): one warp per 16-row tile walks all k blocks, no cross-warp reduction. The block stages the
+// (activated) inputs as fp16 in shared memory first and every warp loads all its weight blocks up front: otherwise the
+// per-k-block global loads of x serialize at L2 latency, which dominated these small matrices
+__device__ __forceinline__ float2 act2(const NormIn & nin, const float * xr, int c, float2 v) {
+    if (nin.act == 1) { const float s = nin.act_scale; return make_float2(silu_f(v.x * s), silu_f(v.y * s)); }
+    float2 u = *(const float2 *) (xr + c + nin.glu_off);
+    if (nin.act == 3) {
+        const float L = nin.act_scale;
+        v.x = fminf(v.x, L); v.y = fminf(v.y, L);
+        u.x = fminf(fmaxf(u.x, -L), L); u.y = fminf(fmaxf(u.y, -L), L);
+    }
+    return make_float2(silu_f(v.x) * u.x, silu_f(v.y) * u.y);
+}
+constexpr int SMALLK_LD = 256 + 4;   // half2 per token row (k <= 512), padded against bank conflicts
 __global__ void k_mma_q8_smallk(const uint4 * __restrict__ wq, const half * __restrict__ ws, int n, int k,
                                 const float * __restrict__ x, int xs, float * __restrict__ y, int ys, int nt, NormIn nin) {
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
     const int tile = blockIdx.x * (blockDim.x >> 5) + w;
     const int ntile = (n + 15) / 16;
+    const int kb = k / 32, k2 = k / 2;
+    __shared__ unsigned xh[8 * SMALLK_LD];
+    for (int i = threadIdx.x; i < nt * k2; i += blockDim.x) {
+        const int t = i / k2, c = 2 * (i % k2);
+        const float * xr = x + (size_t) t * xs;
+        float2 v = *(const float2 *) (xr + c);
+        if (nin.act) v = act2(nin, xr, c, v);
+        xh[t * SMALLK_LD + c / 2] = pack_h2(v.x, v.y);
+    }
+    __syncthreads();
     if (tile >= ntile) return;
-    const int kb = k / 32;
     const uint4 * tq = wq + (size_t) tile * kb * 32 + lane;
     const half * ts = ws + (size_t) tile * kb * 16;
     const bool tok_ok = gid < nt;
-    const int tok = tok_ok ? gid : 0;
-    const float * xr = x + (size_t) tok * xs;
+    const unsigned * xt = xh + (tok_ok ? gid : 0) * SMALLK_LD;
+    uint4 qv[16];
+    half2 sv[16];
+#pragma unroll
+    for (int b = 0; b < 16; ++b)
+        if (b < kb) { qv[b] = __ldg(tq + (size_t) b * 32); sv[b] = __halves2half2(ts[(size_t) b * 16 + gid], ts[(size_t) b * 16 + gid + 8]); }
     float acc[4] = {0, 0, 0, 0};
-    for (int b = 0; b < kb; ++b) {
-        const uint4 q = __ldg(tq + (size_t) b * 32);
-        const float s_lo = __half2float(ts[(size_t) b * 16 + gid]), s_hi = __half2float(ts[(size_t) b * 16 + gid + 8]);
-        const unsigned qw[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+    for (int b = 0; b < 16; ++b) {
+        if (b >= kb) break;
+        const unsigned qw[4] = {qv[b].x, qv[b].y, qv[b].z, qv[b].w};
         float tmp[4] = {0, 0, 0, 0};
 #pragma unroll
         for (int ks = 0; ks < 2; ++ks) {
@@ -1265,18 +1291,13 @@ __global__ void k_mma_q8_smallk(const uint4 * __restrict__ wq, const half * __re
             a[1] = i8x2_to_h2(qw[2 * ks], 0x7362);
             a[2] = i8x2_to_h2(qw[2 * ks + 1], 0x5140);
             a[3] = i8x2_to_h2(qw[2 * ks + 1], 0x7362);
-            const int c0 = b * 32 + ks * 16 + 2 * tig;
+            const int c2 = b * 16 + ks * 8 + tig;   // half2 index of column b*32 + ks*16 + 2 tig
             unsigned bb[2] = {0, 0};
-            if (tok_ok) {
-                float2 v0 = *(const float2 *) (xr + c0), v1 = *(const float2 *) (xr + c0 + 8);
-                if (nin.act) apply_act(nin, xr, c0, v0, v1);
-                bb[0] = pack_h2(v0.x, v0.y);
-                bb[1] = pack_h2(v1.x, v1.y);
-            }
+            if (tok_ok) { bb[0] = xt[c2]; bb[1] = xt[c2 + 4]; }
             mma16816(tmp, a, bb);
         }
-        acc[0] += tmp[0] * s_lo; acc[1] += tmp[1] * s_lo;
-        acc[2] += tmp[2] * s_hi; acc[3] += tmp[3] * s_hi;
+        acc[0] += tmp[0] * __low2float(sv[b]); acc[1] += tmp[1] * __low2float(sv[b]);
+        acc[2] += tmp[2] * __high2float(sv[b]); acc[3] += tmp[3] * __high2float(sv[b]);
     }
     const int r0 = tile * 16 + gid, t0 = 2 * tig;
     auto put = [&](int row, int t, float v) { if (row < n && t < nt) y[(size_t) t * ys + row] = v; };
@@ -1289,6 +1310,8 @@ namespace { struct KSplit { float * part = nullptr; unsigned * cnt = nullptr; in
 constexpr size_t KSPLIT_CNT = 8192;   // tile counters
 constexpr int KSPLIT_TILES = 1024, KSPLIT_MAX = 16;
 // split-K target: blocks per GEMV launch (HYPER_GEMV_TARGET; 0 = only for matrices with few row tiles)
+static const int g_ksplit_blocks = getenv("HYPER_KSPLIT_BLOCKS") ? atoi(getenv("HYPER_KSPLIT_BLOCKS")) : 320;
+static const int g_ksplit_minkb = getenv("HYPER_KSPLIT_MINKB") ? atoi(getenv("HYPER_KSPLIT_MINKB")) : 16;
 static const int g_gemv_target = getenv("HYPER_GEMV_TARGET") ? atoi(getenv("HYPER_GEMV_TARGET")) : 0;
 void gemv_init(int dev) {
     if (dev < 0 || dev >= 16 || g_ksplit[dev].part) return;
@@ -1332,7 +1355,7 @@ void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const fl
         }
     }
     if (dev < 16 && g_ksplit[dev].part && tiles <= KSPLIT_TILES && tiles < 160)   // few row tiles: spread K over more SMs
-        P = std::max(1, std::min({KSPLIT_MAX, 320 / tiles, kb / 16}));
+        P = std::max(1, std::min({KSPLIT_MAX, g_ksplit_blocks / tiles, kb / g_ksplit_minkb}));
     if (g_gemv_target > 0 && dev < 16 && g_ksplit[dev].part && tiles <= KSPLIT_TILES && tiles < g_gemv_target)   // medium: enough blocks in flight
         P = std::max(P, std::min({KSPLIT_MAX, g_gemv_target / tiles, kb / 16}));
     k_mma_q8<<<dim3(tiles, P), 256, 0, s>>>(W.q, W.s, W.n, W.k, x, xs, y, ys, add, nt, nin,

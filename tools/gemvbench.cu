@@ -11,7 +11,7 @@
 int main(int argc, char ** argv) {
     const int iters = argc > 1 ? atoi(argv[1]) : 200;
     struct Shape { const char * name; int n, k; };
-    const Shape shapes[] = {
+    std::vector<Shape> shapes = {
         {"glm kda in (8341x4096)", 8341, 4096},
         {"glm kda out (4096x2688)", 4096, 2688},
         {"glm mla q_b+idx (9472x1536)", 9472, 1536},
@@ -26,7 +26,10 @@ int main(int argc, char ** argv) {
         {"27b gdn in (5152x5120)", 5152, 5120},
         {"27b gdn out (5120x1920)", 5120, 1920},
         {"27b attn out (5120x2048)", 5120, 2048},
+        {"fn hc up (10240x320)", 10240, 320},
+        {"fn hc down (320x10240)", 320, 10240},
     };
+    if (argc > 3) shapes = {{"custom", atoi(argv[2]), atoi(argv[3])}};   // gemvbench iters n k
     CK(cudaSetDevice(0));
     hyper::gemv_init(0);
     cudaStream_t s; CK(cudaStreamCreate(&s));
