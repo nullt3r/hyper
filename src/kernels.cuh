@@ -5,6 +5,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <vector>
+#include <cstdint>
 
 namespace hyper {
 
@@ -47,6 +49,31 @@ void gemv_bf16(const BF16W & W, const float * x, int xs, float * y, int ys, cons
 // y[t][r] = (add ? add : 0) + W xh[t] on tensor cores, 128 rows x 128 tokens per block
 void to_half(const float * x, int xs, const float * w, int k, float eps, half * xh, int nt, cudaStream_t s);
 void gemm_q8(const Q8W & W, const half * xh, int T, float * y, int ys, const float * add, cudaStream_t s);
+
+// K-quant dense weights (Q4_K, Q6_K) repacked at load into mma fragment order with the same bits: per (16-row tile,
+// 32-column block) and lane 16 values (lo: 4 bits each; Q6_K hi: their top 2 bits), 6-bit Q4_K scale | min << 8 (scm) or
+// Q6_K int8 scales per 16 columns (sc6), and (d, dmin) per tile row and 256-column super-block. Exact: values convert to
+// fp16 exactly, scales d * sc are exact in fp32.
+enum class KQ { Q4K = 0, Q6K = 1 };
+struct KQW {
+    KQ type = KQ::Q4K;
+    int n = 0, k = 0;
+    int dg = 8;   // 32-column blocks per (d, dmin) entry: 8 (whole super-blocks) or 1 (gathered columns)
+    const uint2 * lo = nullptr;
+    const unsigned * hi = nullptr;
+    const uint16_t * scm = nullptr;
+    const int8_t * sc6 = nullptr;
+    const half2 * d = nullptr;
+};
+struct KQHost {   // host arrays of a repacked matrix
+    std::vector<uint2> lo; std::vector<unsigned> hi; std::vector<uint16_t> scm; std::vector<int8_t> sc6; std::vector<half2> d;
+};
+// rows: n full rows of GGUF Q4_K / Q6_K super-blocks (rb bytes each); the matrix takes the 32-column source blocks kblocks
+// (in order); returns dg (8 when they form whole aligned super-blocks)
+int repack_kq(KQ type, const uint8_t * rows, size_t rb, int n, const std::vector<int> & kblocks, KQHost & out);
+void gemv_kq(const KQW & W, const float * x, int xs, float * y, int ys, int nt, cudaStream_t s, const NormIn & nin = {});
+// rows [r0, r1) (multiples of 16, r1 may be n) to fp16 row-major [r1 - r0][k]
+void deq_kq_f16(const KQW & W, int r0, int r1, half * out, cudaStream_t s);
 void gemm_f16(const BF16W & W, const half * xh, int T, float * y, int ys, const float * add, cudaStream_t s);
 
 // y[t] = rmsnorm(x[t]) * w

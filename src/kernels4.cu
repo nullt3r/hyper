@@ -1030,8 +1030,9 @@ void gated_norm_sigmoid(float * o, int o_stride, const float * z, int z_stride, 
 void moe_route(const float * logits, int ls, int n_expert, int k, int * ids, float * wts, float * sg, int nt, cudaStream_t s) {
     if (n_expert > 1024 || k > MOE_MAX_USED) throw std::runtime_error("moe_route: too many experts");
     if (k * 9 > 8 * MOE_MAX_USED) throw std::runtime_error("moe_route: k too large");
-    static const bool old_route = getenv("HYPER4_OLDROUTE") != nullptr;
-    k_moe_route<<<nt, 256, 0, s>>>(logits, ls, n_expert, k, ids, wts, sg, !old_route);
+    // rank selection (HYPER4_RANKROUTE, bit-identical): measured slower on 512 experts (52 vs ~12 us), so off
+    static const bool rank_route = getenv("HYPER4_RANKROUTE") != nullptr;
+    k_moe_route<<<nt, 256, 0, s>>>(logits, ls, n_expert, k, ids, wts, sg, rank_route);
 }
 
 #define MOE_TYPE_SWITCH(T, CALL)                                                  \

@@ -24,14 +24,20 @@ namespace hyper {
 
 constexpr int CPU_OWNER = 3;
 
-// dense weight: Q8_0 (fragment-ordered int8, the fast path) or anything else dequantized to fp16 at load (exact)
+// dense weight: Q8_0 (fragment-ordered int8, the fast path); mixed / other block types as segments of the source parts
+// (output rows from `off` on): Q8 fragments (Q8_0, and Q5_0 / Q4_0 converted exactly) or KQ (Q4_K / Q6_K, same bits in
+// fragment order); anything else dequantized to fp16 at load
+struct DWSeg { bool kq = false; Q8W q8; KQW w; int off = 0; };
 struct DW {
     Q8W q8;
     BF16W f;
     bool f16 = false;
-    int n() const { return f16 ? f.n : q8.n; }
-    int k() const { return f16 ? f.k : q8.k; }
+    std::vector<DWSeg> seg;
+    int sn = 0, sk = 0;
+    int n() const { return !seg.empty() ? sn : f16 ? f.n : q8.n; }
+    int k() const { return !seg.empty() ? sk : f16 ? f.k : q8.k; }
 };
+size_t g_kq_max_elems = 0;   // largest KQ segment (rows x k): prefill dequantization scratch
 constexpr int R4 = MOE_BULK_ROWS;   // activation rows (prefill chunk)
 constexpr int QSA_SCORE_ROWS = 64; // tokens scored at a time (scratch rows of max_pos/4 scores)
 constexpr int QSA_LIST = 2052;     // max attended cells per token: 512 pools * 4 + 3 tail cells (+1)
@@ -104,6 +110,8 @@ struct Engine4::Device {
     int * ilist = nullptr, * ilist_n = nullptr;                                 // QSA: attended cells per token
     unsigned * ihist = nullptr;                                                 // QSA: score key histograms [rows][65536]
     cublasHandle_t blas = nullptr;
+    half * ggs = nullptr;            // native dense weights: fp16 slice for prefill GEMMs
+    size_t ggs_elems = 0;
     cudaStream_t cstream = nullptr;                           // prefill expert uploads
     cudaEvent_t ev_up[2] = {}, ev_free[2] = {};
     uint8_t * stage[2] = {};                                  // staging buffers for streamed experts
@@ -231,11 +239,108 @@ DW upload_dense(const std::function<void *(size_t)> & alloc, int dev, const std:
     if (all_q8) { w.q8 = upload_q8(alloc, dev, parts, cols); return w; }
     const int64_t k_full = parts[0].t->ne[0];
     if (cols.empty()) cols.push_back({0, k_full / 32});
+    static const bool dense_f16 = getenv("HYPER4_DENSE_F16") != nullptr;
+    auto seg_type = [](GType t) {   // 0: fp16 fallback, 1: Q8 fragments, 2: KQ
+        switch (t) {
+            case GType::Q8_0: case GType::Q5_0: case GType::Q4_0: return 1;
+            case GType::Q4_K: case GType::Q6_K: return 2;
+            default: return 0;
+        }
+    };
+    bool native = !dense_f16;
+    for (auto & p : parts) {
+        if (!seg_type(p.t->type) || p.t->ne[0] != k_full) { native = false; break; }
+        // (Q8 types: blocks of 32 = the column granularity; KQ takes any 32-column blocks)
+    }
+    if (native) {   // runs of parts with one type -> one segment: the file's blocks restricted to the column ranges
+        int kk = 0;
+        for (auto & [b0, b1] : cols) kk += (int) (b1 - b0) * 32;
+        for (size_t p0 = 0; p0 < parts.size();) {
+            const GType ty = parts[p0].t->type;
+            size_t p1 = p0 + 1;
+            while (p1 < parts.size() && parts[p1].t->type == ty) ++p1;
+            const bool kq = ty == GType::Q4_K || ty == GType::Q6_K;
+            // KQ: full source rows (the repack gathers the column blocks); Q8 types: the selected blocks
+            const size_t bb = gtype_block_bytes(ty), be = gtype_block_elems(ty), rb = kq ? (size_t) k_full / be * bb : kk / be * bb;
+            int nr = 0;
+            for (size_t q = p0; q < p1; ++q) nr += (int) (parts[q].r1 - parts[q].r0);
+            std::vector<uint8_t> buf(rb * nr);
+            int rbase = 0;
+            for (size_t q = p0; q < p1; ++q) {
+                const RowRange & p = parts[q];
+                const int pr = (int) (p.r1 - p.r0);
+#pragma omp parallel for schedule(static)
+                for (int r = 0; r < pr; ++r) {
+                    uint8_t * dst = buf.data() + (size_t) (rbase + r) * rb;
+                    const uint8_t * src = p.t->data + (size_t) (p.r0 + r) * p.t->row_bytes();
+                    if (kq) { memcpy(dst, src, rb); continue; }
+                    for (auto & [b0, b1] : cols) {
+                        const size_t len = (size_t) (b1 - b0) * 32 / be * bb;
+                        memcpy(dst, src + (size_t) b0 * 32 / be * bb, len);
+                        dst += len;
+                    }
+                }
+                rbase += pr;
+            }
+            p0 = p1;
+            DWSeg sg;
+            sg.off = w.sn;
+            if (ty == GType::Q8_0 || ty == GType::Q5_0 || ty == GType::Q4_0) {   // -> int8 + fp16 scale, exactly (q - 16, q - 8 fit in int8)
+                const int kb = kk / 32;
+                std::vector<int8_t> qs((size_t) nr * kk);
+                std::vector<half> d((size_t) nr * kb);
+#pragma omp parallel for schedule(static)
+                for (int r = 0; r < nr; ++r)
+                    for (int b = 0; b < kb; ++b) {
+                        const uint8_t * blk = buf.data() + (size_t) r * rb + (size_t) b * bb;
+                        int8_t * q = qs.data() + (size_t) r * kk + b * 32;
+                        memcpy(&d[(size_t) r * kb + b], blk, 2);
+                        if (ty == GType::Q8_0) memcpy(q, blk + 2, 32);
+                        else if (ty == GType::Q4_0) for (int l = 0; l < 16; ++l) { q[l] = (int8_t) ((blk[2 + l] & 0xF) - 8); q[l + 16] = (int8_t) ((blk[2 + l] >> 4) - 8); }
+                        else {   // Q5_0: d, qh[4], qs[16]
+                            uint32_t qh; memcpy(&qh, blk + 2, 4);
+                            for (int l = 0; l < 16; ++l) {
+                                q[l] = (int8_t) (((blk[6 + l] & 0xF) | (((qh >> l) << 4) & 0x10)) - 16);
+                                q[l + 16] = (int8_t) (((blk[6 + l] >> 4) | ((qh >> (l + 12)) & 0x10)) - 16);
+                            }
+                        }
+                    }
+                sg.q8 = to_device_q8(alloc, dev, qs.data(), d.data(), nr, kk);
+            } else {
+                KQHost h;
+                const KQ kt = ty == GType::Q4_K ? KQ::Q4K : KQ::Q6K;
+                std::vector<int> kbl;
+                for (auto & [b0, b1] : cols) for (int64_t b = b0; b < b1; ++b) kbl.push_back((int) b);
+                const int dg = repack_kq(kt, buf.data(), rb, nr, kbl, h);
+                CUDA_CHECK(cudaSetDevice(dev));
+                auto up = [&](const auto & v) -> void * {
+                    if (v.empty()) return nullptr;
+                    void * pd = alloc(v.size() * sizeof(v[0]));
+                    CUDA_CHECK(cudaMemcpy(pd, v.data(), v.size() * sizeof(v[0]), cudaMemcpyHostToDevice));
+                    return pd;
+                };
+                sg.kq = true;
+                sg.w.type = kt; sg.w.n = nr; sg.w.k = kk; sg.w.dg = dg;
+                sg.w.lo = (const uint2 *) up(h.lo); sg.w.hi = (const unsigned *) up(h.hi);
+                sg.w.scm = (const uint16_t *) up(h.scm); sg.w.sc6 = (const int8_t *) up(h.sc6); sg.w.d = (const half2 *) up(h.d);
+                g_kq_max_elems = std::max(g_kq_max_elems, (size_t) nr * kk);
+            }
+            w.seg.push_back(sg);
+            w.sn += nr;
+        }
+        w.sk = kk;
+        static const bool seg_log = getenv("HYPER4_SEGLOG") != nullptr;
+        if (seg_log) fprintf(stderr, "hyper4: dense %s: %zu parts -> %zu segments (%d x %d)\n", parts[0].t->name.c_str(), parts.size(), w.seg.size(), w.sn, kk);
+        return w;
+    }
     std::vector<int64_t> cidx;
     for (auto & [b0, b1] : cols) for (int64_t c = b0 * 32; c < b1 * 32; ++c) cidx.push_back(c);
     const int k = (int) cidx.size();
     int n = 0;
     for (auto & p : parts) n += (int) (p.r1 - p.r0);
+    if (getenv("HYPER4_SEGLOG"))
+        fprintf(stderr, "hyper4: dense %s (%s, %zu parts, %zu column ranges, first [%lld, %lld)): fp16\n", parts[0].t->name.c_str(),
+                gtype_name(parts[0].t->type), parts.size(), cols.size(), (long long) cols[0].first * 32, (long long) cols[0].second * 32);
     std::vector<float> rows((size_t) n * k);
     int row0 = 0;
     for (auto & p : parts) {
@@ -679,6 +784,10 @@ void Engine4::load_weights() {
         dev.ple_sc = dev.alloc<float>((size_t) R * c.hc * 4);
         dev.logits = dev.alloc<float>((size_t) (allrows_ ? R : MAX_NT) * dev.output.n());
         dev.xh = dev.alloc<half>((size_t) R * std::max(hcn, c.n_ff_shexp));
+        if (g_kq_max_elems) {   // prefill scratch for KQ dense weights (bigger segments go in slices)
+            dev.ggs_elems = std::max<size_t>(std::min<size_t>(g_kq_max_elems, (size_t) 32 << 20), (size_t) 16 * 16384);
+            dev.ggs = dev.alloc<half>(dev.ggs_elems);
+        }
         dev.p16 = dev.alloc<half>((size_t) R * n);
         dev.recv = dev.alloc<half>((size_t) std::max(1, nd - 1) * R * n);
         dev.order = dev.alloc<int>((size_t) R * K);
@@ -779,6 +888,29 @@ void Engine4::record_main(int gi, int nt, int kind) {
     const bool bulk = nt > MAX_NT;
     // matmul: decode GEMV (split-K for few rows) or, for a prefill chunk, fp16 conversion + tiled tensor-core GEMM
     auto mm = [&](const DW & W, const float * x, int xs, float * y, int ys, int rows, const NormIn & ni = NormIn{}) {
+        if (!W.seg.empty()) {   // segments: Q8 fragments or KQ (prefill: dequantized to fp16 in slices + cuBLAS)
+            if (rows <= MAX_NT) {
+                for (auto & g : W.seg) {
+                    if (g.kq) gemv_kq(g.w, x, xs, y + g.off, ys, rows, s, ni);
+                    else gemv_q8(g.q8, x, xs, y + g.off, ys, nullptr, rows, s, ni);
+                }
+                return;
+            }
+            to_half(x, xs, nullptr, W.k(), 0.0f, d.xh, rows, s);
+            const float one = 1.0f, zero = 0.0f;
+            for (auto & g : W.seg) {
+                if (!g.kq) { gemm_q8(g.q8, d.xh, rows, y + g.off, ys, nullptr, s); continue; }
+                const int step = std::max(16, (int) (d.ggs_elems / g.w.k) / 16 * 16);
+                for (int r0 = 0; r0 < g.w.n; r0 += step) {
+                    const int r1 = std::min(g.w.n, r0 + step);
+                    deq_kq_f16(g.w, r0, r1, d.ggs, s);
+                    if (cublasGemmEx(d.blas, CUBLAS_OP_T, CUBLAS_OP_N, r1 - r0, rows, g.w.k, &one, d.ggs, CUDA_R_16F, g.w.k, d.xh, CUDA_R_16F,
+                                     g.w.k, &zero, y + g.off + r0, CUDA_R_32F, ys, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+                        throw std::runtime_error("mm: cublasGemmEx failed");
+                }
+            }
+            return;
+        }
         if (rows <= MAX_NT) {   // (ni: fused input activation; bulk callers apply it separately)
             if (W.f16) gemv_bf16(W.f, x, xs, y, ys, nullptr, rows, s, ni);
             else gemv_q8(W.q8, x, xs, y, ys, nullptr, rows, s, ni);

@@ -168,6 +168,142 @@ __global__ void k_mma_q8(const uint4 * __restrict__ wq, const half * __restrict_
     }
 }
 
+// ---- K-quant dense GEMV (KQW: Q4_K / Q6_K in fragment order, see kernels.cuh) ----
+// pair p of a lane's 8 values in word w: halves (1024 + v[2p], 1024 + v[2p+1]) (nibbles at bits 4p and 16 + 4p)
+__device__ __forceinline__ unsigned kq_nib(unsigned w, int p) { return ((w >> (4 * p)) & 0x000f000fu) | 0x64006400u; }
+// Q6_K top bits of pair P (bits 2P and 16 + 2P of h) moved to bits 4-5 of each half
+__device__ __forceinline__ unsigned kq_hi(unsigned h, int P) { return ((h >> (2 * P)) << 4) & 0x00300030u; }
+__device__ __forceinline__ unsigned h2sub(unsigned a, unsigned b) {
+    unsigned r;
+    asm("sub.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+// same structure as k_mma_q8 (block per 16-row tile, warps over k blocks, optional split-K over gridDim.y)
+template <KQ T>
+__global__ void k_mma_kq(KQW W, const float * __restrict__ x, int xs, float * __restrict__ y, int ys, int nt, NormIn nin,
+                         float * __restrict__ kpart, unsigned * kcnt) {
+    const int tile = blockIdx.x, part = blockIdx.y, P = gridDim.y;
+    const int w = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    const int lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+    const int kb = W.k / 32, nsb = kb / W.dg;
+    const bool tok_ok = gid < nt;
+    const int tok = tok_ok ? gid : 0;
+    const float * xr = x + (size_t) tok * xs;
+    float acc[4] = {0, 0, 0, 0};
+    const unsigned ones[4] = {0x3C003C00u, 0x3C003C00u, 0x3C003C00u, 0x3C003C00u};
+    const int b_end = (int) ((int64_t) (part + 1) * kb / P);
+    for (int b = (int) ((int64_t) part * kb / P) + w; b < b_end; b += nw) {
+        const size_t tb = (size_t) tile * kb + b;
+        const uint2 q = __ldg(W.lo + tb * 32 + lane);
+        const unsigned hb = T == KQ::Q6K ? __ldg(W.hi + tb * 32 + lane) : 0u;
+        const float2 dlo = __half22float2(W.d[((size_t) tile * nsb + b / W.dg) * 16 + gid]);
+        const float2 dhi = __half22float2(W.d[((size_t) tile * nsb + b / W.dg) * 16 + gid + 8]);
+        float tmp[2][4] = {}, tx[4] = {0, 0, 0, 0};
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            const unsigned wv = ks ? q.y : q.x;
+            unsigned a[4];
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                if (T == KQ::Q4K) a[p] = h2sub(kq_nib(wv, p), 0x64006400u);                              // v
+                else a[p] = h2sub(kq_nib(wv, p) | kq_hi(hb, ks * 4 + p), 0x64206420u);                  // v - 32
+            }
+            const int c0 = b * 32 + ks * 16 + 2 * tig;
+            unsigned bb[2] = {0, 0};
+            if (tok_ok) {
+                float2 v0 = *(const float2 *) (xr + c0), v1 = *(const float2 *) (xr + c0 + 8);
+                if (nin.act) apply_act(nin, xr, c0, v0, v1);
+                bb[0] = pack_h2(v0.x, v0.y);
+                bb[1] = pack_h2(v1.x, v1.y);
+            }
+            mma16816(tmp[ks], a, bb);
+            if (T == KQ::Q4K) mma16816(tx, ones, bb);   // sum of x over the block (the min term)
+        }
+        if (T == KQ::Q4K) {
+            const unsigned slo = W.scm[tb * 16 + gid], shi = W.scm[tb * 16 + gid + 8];
+            const float s_lo = dlo.x * (float) (slo & 0xff), m_lo = dlo.y * (float) (slo >> 8);
+            const float s_hi = dhi.x * (float) (shi & 0xff), m_hi = dhi.y * (float) (shi >> 8);
+            acc[0] += (tmp[0][0] + tmp[1][0]) * s_lo - tx[0] * m_lo; acc[1] += (tmp[0][1] + tmp[1][1]) * s_lo - tx[1] * m_lo;
+            acc[2] += (tmp[0][2] + tmp[1][2]) * s_hi - tx[2] * m_hi; acc[3] += (tmp[0][3] + tmp[1][3]) * s_hi - tx[3] * m_hi;
+        } else {
+#pragma unroll
+            for (int ks = 0; ks < 2; ++ks) {
+                const float s_lo = dlo.x * (float) W.sc6[(tb * 2 + ks) * 16 + gid], s_hi = dhi.x * (float) W.sc6[(tb * 2 + ks) * 16 + gid + 8];
+                acc[0] += tmp[ks][0] * s_lo; acc[1] += tmp[ks][1] * s_lo;
+                acc[2] += tmp[ks][2] * s_hi; acc[3] += tmp[ks][3] * s_hi;
+            }
+        }
+    }
+    __shared__ float red[8][32][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) red[w][lane][i] = acc[i];
+    __syncthreads();
+    if (P > 1) {
+        __shared__ unsigned ticket;
+        if (w == 0) {
+            float * dst = kpart + ((size_t) tile * P + part) * 128 + lane * 4;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { float t = 0; for (int ww = 0; ww < nw; ++ww) t += red[ww][lane][i]; dst[i] = t; }
+            __threadfence();
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) ticket = atomicAdd(&kcnt[tile], 1u);
+        __syncthreads();
+        if (ticket != (unsigned) P - 1) return;
+        __threadfence();
+        if (w == 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[i] = 0.0f;
+            for (int pp = 0; pp < P; ++pp) {
+                const float * src = kpart + ((size_t) tile * P + pp) * 128 + lane * 4;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) acc[i] += __ldcg(src + i);
+            }
+            if (lane == 0) kcnt[tile] = 0;
+        }
+    } else if (w == 0) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { float t = 0; for (int ww = 0; ww < nw; ++ww) t += red[ww][lane][i]; acc[i] = t; }
+    }
+    if (w == 0) {
+        const int r0 = tile * 16 + gid, t0 = 2 * tig;
+        auto put = [&](int row, int t, float v) { if (row < W.n && t < nt) y[(size_t) t * ys + row] = v; };
+        put(r0, t0, acc[0]); put(r0, t0 + 1, acc[1]);
+        put(r0 + 8, t0, acc[2]); put(r0 + 8, t0 + 1, acc[3]);
+    }
+}
+// thread per (tile, block, lane): its 16 values to fp16 rows [r0, r0 + rows)
+template <KQ T>
+__global__ void k_deq_kq_f16(KQW W, int tile0, int ntile, half * __restrict__ out, int rows) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int kb = W.k / 32, nsb = kb / W.dg;
+    if (i >= (size_t) ntile * kb * 32) return;
+    const int lane = (int) (i % 32), b = (int) (i / 32 % kb), tile = tile0 + (int) (i / 32 / kb);
+    const int gid = lane >> 2, tig = lane & 3;
+    const size_t tb = (size_t) tile * kb + b;
+    const uint2 q = W.lo[tb * 32 + lane];
+    const unsigned hb = T == KQ::Q6K ? W.hi[tb * 32 + lane] : 0u;
+    for (int hr = 0; hr < 2; ++hr) {
+        const int r = gid + 8 * hr, row = tile * 16 + r - tile0 * 16;
+        if (row >= rows) continue;
+        const float2 dd = __half22float2(W.d[((size_t) tile * nsb + b / W.dg) * 16 + r]);
+        for (int ks = 0; ks < 2; ++ks) {
+            float s, m = 0.0f;
+            if (T == KQ::Q4K) { const unsigned sm = W.scm[tb * 16 + r]; s = dd.x * (float) (sm & 0xff); m = dd.y * (float) (sm >> 8); }
+            else s = dd.x * (float) W.sc6[(tb * 2 + ks) * 16 + r];
+            const unsigned wv = ks ? q.y : q.x;
+            for (int p = hr; p < 4; p += 2) {   // pairs of this row: p = 0, 2 (row gid) or 1, 3 (row gid + 8)
+                for (int e = 0; e < 2; ++e) {
+                    int v = (wv >> (4 * p + 16 * e)) & 0xf;
+                    if (T == KQ::Q6K) v = (v | (((hb >> (2 * (ks * 4 + p) + 16 * e)) & 3) << 4)) - 32;
+                    const int col = b * 32 + ks * 16 + 2 * tig + (p >= 2 ? 8 : 0) + e;
+                    out[(size_t) row * W.k + col] = __float2half(s * (float) v - m);
+                }
+            }
+        }
+    }
+}
+
 // work-balanced variant for matrices with few row tiles (a block per tile would leave a partial last wave): units of
 // (tile, k-range) dealt round-robin to every warp of the grid; each unit's partial [nt][16] goes to kpart, the last warp to
 // finish a tile sums its UPT partials in unit order (deterministic) and resets the tile's counter
@@ -1362,6 +1498,93 @@ void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const fl
                                            P > 1 ? g_ksplit[dev].part : nullptr, P > 1 ? g_ksplit[dev].cnt : nullptr);
 }
 
+void gemv_kq(const KQW & W, const float * x, int xs, float * y, int ys, int nt, cudaStream_t s, const NormIn & nin) {
+    if (nt < 1 || nt > 8 || W.k % 32 || (W.k / 32) % W.dg) throw std::runtime_error("gemv_kq: sizes");
+    if (nin.w) throw std::runtime_error("gemv_kq: fused input norm unsupported");
+    const int tiles = (W.n + 15) / 16, kb = W.k / 32;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    int P = 1;   // (split-K as gemv_q8: few row tiles)
+    if (dev < 16 && g_ksplit[dev].part && tiles <= KSPLIT_TILES && tiles < 160)
+        P = std::max(1, std::min({KSPLIT_MAX, g_ksplit_blocks / tiles, kb / g_ksplit_minkb}));
+    float * kp = P > 1 ? g_ksplit[dev].part : nullptr;
+    unsigned * kc = P > 1 ? g_ksplit[dev].cnt : nullptr;
+    if (W.type == KQ::Q4K) k_mma_kq<KQ::Q4K><<<dim3(tiles, P), 256, 0, s>>>(W, x, xs, y, ys, nt, nin, kp, kc);
+    else k_mma_kq<KQ::Q6K><<<dim3(tiles, P), 256, 0, s>>>(W, x, xs, y, ys, nt, nin, kp, kc);
+}
+void deq_kq_f16(const KQW & W, int r0, int r1, half * out, cudaStream_t s) {
+    if (r0 % 16) throw std::runtime_error("deq_kq_f16: r0 must be a multiple of 16");
+    const int tile0 = r0 / 16, ntile = (r1 - r0 + 15) / 16;
+    const size_t nthr = (size_t) ntile * (W.k / 32) * 32;
+    const unsigned blocks = (unsigned) ((nthr + 255) / 256);
+    if (W.type == KQ::Q4K) k_deq_kq_f16<KQ::Q4K><<<blocks, 256, 0, s>>>(W, tile0, ntile, out, r1 - r0);
+    else k_deq_kq_f16<KQ::Q6K><<<blocks, 256, 0, s>>>(W, tile0, ntile, out, r1 - r0);
+}
+// GGUF super-block fields: Q4_K (144 B: d, dmin, scales[12], qs[128]), Q6_K (210 B: ql[128], qh[64], scales[16], d)
+static void q4k_scale_min(int j, const uint8_t * q, int & d, int & m) {
+    if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
+    else { d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+}
+int repack_kq(KQ type, const uint8_t * rows, size_t rb, int n, const std::vector<int> & kblocks, KQHost & o) {
+    const int kb = (int) kblocks.size(), k = kb * 32, ntile = (n + 15) / 16;
+    int dg = kb % 8 == 0 ? 8 : 1;   // whole aligned super-blocks: one (d, dmin) per 8 blocks
+    for (int j = 0; j < kb && dg == 8; ++j) if (kblocks[j] != kblocks[j / 8 * 8] + j % 8 || kblocks[j / 8 * 8] % 8) dg = 1;
+    const int ng = kb / dg;
+    const size_t bb = type == KQ::Q4K ? 144 : 210;
+    o.lo.assign((size_t) ntile * kb * 32, make_uint2(0, 0));
+    o.hi.assign(type == KQ::Q6K ? (size_t) ntile * kb * 32 : 0, 0u);
+    o.scm.assign(type == KQ::Q4K ? (size_t) ntile * kb * 16 : 0, 0);
+    o.sc6.assign(type == KQ::Q6K ? (size_t) ntile * kb * 32 : 0, 0);
+    o.d.assign((size_t) ntile * ng * 16, __halves2half2(__float2half(0.0f), __float2half(0.0f)));
+    // value (0..15 or 0..63, unbiased) of row r, matrix column c
+    auto val = [&](int r, int c) -> int {
+        const int sc = kblocks[c / 32] * 32 + c % 32;
+        const uint8_t * blk = rows + (size_t) r * rb + (size_t) (sc / 256) * bb;
+        const int e = sc % 256;
+        if (type == KQ::Q4K) { const int j = e / 32, l = e % 32; return (blk[16 + 32 * (j / 2) + l] >> (4 * (j % 2))) & 0xF; }
+        const int h = e / 128, rr = e % 128, qd = rr / 32, l = rr % 32;
+        const uint8_t lb = blk[h * 64 + l + (qd % 2) * 32], hb = blk[128 + h * 32 + l];
+        return (qd < 2 ? lb & 0xF : lb >> 4) | (((hb >> (2 * qd)) & 3) << 4);
+    };
+#pragma omp parallel for schedule(static)
+    for (int t = 0; t < ntile; ++t) {
+        for (int r = 0; r < 16; ++r) {   // scales
+            const int row = t * 16 + r;
+            if (row >= n) continue;
+            for (int b = 0; b < kb; ++b) {
+                const int src = kblocks[b], j = src % 8;
+                const uint8_t * blk = rows + (size_t) row * rb + (size_t) (src / 8) * bb;
+                if (b % dg == 0) {
+                    half dd, dm;
+                    if (type == KQ::Q4K) { memcpy(&dd, blk, 2); memcpy(&dm, blk + 2, 2); }
+                    else { memcpy(&dd, blk + 208, 2); dm = __float2half(0.0f); }
+                    o.d[((size_t) t * ng + b / dg) * 16 + r] = __halves2half2(dd, dm);
+                }
+                const size_t tb = (size_t) t * kb + b;
+                if (type == KQ::Q4K) { int sc, m; q4k_scale_min(j, blk + 4, sc, m); o.scm[tb * 16 + r] = (uint16_t) (sc | (m << 8)); }
+                else for (int ks = 0; ks < 2; ++ks) o.sc6[(tb * 2 + ks) * 16 + r] = (int8_t) blk[192 + j * 2 + ks];
+            }
+        }
+        for (int b = 0; b < kb; ++b)
+            for (int lane = 0; lane < 32; ++lane) {
+                const int gid = lane >> 2, tig = lane & 3;
+                unsigned wv[2] = {0, 0}, hv = 0;
+                for (int ks = 0; ks < 2; ++ks)
+                    for (int p = 0; p < 4; ++p)
+                        for (int e = 0; e < 2; ++e) {
+                            const int row = t * 16 + gid + ((p & 1) ? 8 : 0);
+                            const int col = b * 32 + ks * 16 + 2 * tig + (p >= 2 ? 8 : 0) + e;
+                            const int v = row < n ? val(row, col) : (type == KQ::Q6K ? 32 : 0);
+                            wv[ks] |= (unsigned) (v & 0xF) << (4 * p + 16 * e);
+                            if (type == KQ::Q6K) hv |= (unsigned) ((v >> 4) & 3) << (2 * (ks * 4 + p) + 16 * e);
+                        }
+                const size_t li = ((size_t) t * kb + b) * 32 + lane;
+                o.lo[li] = make_uint2(wv[0], wv[1]);
+                if (type == KQ::Q6K) o.hi[li] = hv;
+            }
+    }
+    return dg;
+}
 void repack_q8_frag(const int8_t * qs, const half * d, int n, int k, uint8_t * fq, half * fs) {
     const int ntile = (n + 15) / 16, kb = k / 32;
 #pragma omp parallel for schedule(static)
