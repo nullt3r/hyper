@@ -1131,7 +1131,7 @@ std::vector<int> Engine5::forward(const int * tokens, int nt, int pos) {
     embed(tokens, nt);
     h_pos_[0] = pos;
     if (adapt_ && !bulk) {   // placement follows the routing: after a prompt, then every 32 decode steps
-        if (prompt_routed_) { rebalance(1 << 20); prompt_routed_ = false; steps_ = 0; }
+        if (prompt_routed_) { rebalance(256); prompt_routed_ = false; steps_ = 0; }   // (the rest follows in the decode rounds)
         else if (++steps_ % adapt_every_ == 0) rebalance(adapt_budget_);
     }
     if (bulk) for (int il = 0; il < cfg_.n_layer; ++il) if (is_moe(il) && ehost_[il].stream_dirty) rebuild_stream(il);
@@ -1264,20 +1264,26 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
         for (int q = s + 1; q < P; ++q)
             if (std::find(snap_tokens_.begin(), snap_tokens_.end(), prompt[q]) != snap_tokens_.end()) msg.push_back(q);
         for (int q = (s / 4096 + 1) * 4096; q < P; q += 4096) snap_at.push_back(q);
-        int last = s;
-        for (size_t i = 0; i < msg.size(); ++i)
-            if (i + 2 >= msg.size() || msg[i] - last >= 256) { snap_at.push_back(msg[i]); last = msg[i]; }
+        // candidates: message starts and 4096 multiples; kept only >= 512 tokens after the previous kept point, so that no prefill
+        // chunk but the last one is short (every MoE chunk pays a fixed cost: one pass over the CPU-resident experts).
+        // Generation adds its own snapshots, so the end of a previous answer is covered anyway.
+        snap_at.insert(snap_at.end(), msg.begin(), msg.end());
         std::sort(snap_at.begin(), snap_at.end());
         snap_at.erase(std::unique(snap_at.begin(), snap_at.end()), snap_at.end());
+        std::vector<int> kept;
+        int last = s;
+        for (int q : snap_at) if (q - last >= 512) { kept.push_back(q); last = q; }
+        snap_at.swap(kept);
     }
     GenStats st;
     auto tp = clk::now();
     int next = -1;
     size_t si = 0;
     for (int c0 = s; c0 < P;) {
-        int end = std::min(c0 + R5, P);
+        // the stretch up to the next snapshot point in equal chunks of at most R5 (no short tail chunk inside it)
         while (si < snap_at.size() && snap_at[si] <= c0) ++si;
-        if (si < snap_at.size() && snap_at[si] < end) end = snap_at[si];
+        const int seg = (si < snap_at.size() ? snap_at[si] : P) - c0, nch = (seg + R5 - 1) / R5;
+        const int end = c0 + (seg + nch - 1) / nch;
         const int len = end - c0;
         next = forward(&prompt[c0], len, c0)[len - 1];
         if (sampling) next = sample_row(len <= MAX_NT ? len - 1 : 0, sp);

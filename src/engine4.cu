@@ -1346,11 +1346,16 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
         std::vector<int> msg;
         for (int q = s + 1; q < P; ++q) if (prompt[q] == snap_token_) msg.push_back(q);
         for (int q = (s / 4096 + 1) * 4096; q < P; q += 4096) snap_at.push_back(q);
-        int last = s;
-        for (size_t i = 0; i < msg.size(); ++i)
-            if (i + 2 >= msg.size() || msg[i] - last >= 256) { snap_at.push_back(msg[i]); last = msg[i]; }
+        // candidates: message starts and 4096 multiples; kept only >= 512 tokens after the previous kept point, so that no prefill
+        // chunk but the last one is short (every MoE chunk pays a fixed cost: one pass over the CPU-resident experts).
+        // Generation adds its own snapshots, so the end of a previous answer is covered anyway.
+        snap_at.insert(snap_at.end(), msg.begin(), msg.end());
         std::sort(snap_at.begin(), snap_at.end());
         snap_at.erase(std::unique(snap_at.begin(), snap_at.end()), snap_at.end());
+        std::vector<int> kept;
+        int last = s;
+        for (int q : snap_at) if (q - last >= 512) { kept.push_back(q); last = q; }
+        snap_at.swap(kept);
     }
     GenStats st;
     const int K = opt_.n_draft;
@@ -1359,9 +1364,10 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
     int next = -1;
     size_t si = 0;
     for (int c0 = s; c0 < P;) {
-        int end = std::min(c0 + R4, P);
+        // the stretch up to the next snapshot point in equal chunks of at most R4 (no short tail chunk inside it)
         while (si < snap_at.size() && snap_at[si] <= c0) ++si;
-        if (si < snap_at.size() && snap_at[si] < end) end = snap_at[si];
+        const int seg = (si < snap_at.size() ? snap_at[si] : P) - c0, nch = (seg + R4 - 1) / R4;
+        const int end = c0 + (seg + nch - 1) / nch;
         const int len = end - c0;
         next = forward(&prompt[c0], len, c0)[len - 1];
         if (sampling) next = sample_row(len <= MAX_NT ? len - 1 : 0, sp);
