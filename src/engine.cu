@@ -949,11 +949,21 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
         if ((int) out.size() >= n_gen) stop = true;
         return !stop;
     };
+    // generated tokens get recurrent-state snapshots too (every 1024 positions and at the end): the next request repeats
+    // this answer in its prompt and resumes close to where the re-rendered history first differs
+    int snap_mark = p / 1024;
+    bool state_ok = true;
+    auto gen_snapshot = [&] {
+        if (!opt_.prompt_cache || p / 1024 == snap_mark) return;
+        snap_mark = p / 1024;
+        take_snapshot(p);
+    };
     if (!spec) {
         while (emit(next) && p + 1 < opt_.max_pos) {
             next = forward(&next, 1, p++)[0];
             if (sampling) next = sample_row(0, sp);
             st.steps++;
+            gen_snapshot();
         }
     } else {
         auto make_drafts = [&](const int * mt, int nt, int pos) {   // first from the main hidden, the rest chained
@@ -979,7 +989,7 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
             else while (m < K && a[m] == drafts[m]) ++m;
             st.accepted += m;
             if (emit(cur)) for (int j = 0; j < m; ++j) if (!emit(drafts[j])) break;
-            if (stop) break;
+            if (stop) { state_ok = false; break; }   // (the state holds rows past the end of the output)
             if (m < K) {                           // keep tokens 0..m of the verified block
                 ta = clk::now();
                 launch(2, m + 1);
@@ -989,8 +999,10 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
             make_drafts(mt.data(), m + 1, p);      // positions p..p+m with main hidden rows 0..m
             cur = a[m];
             p += m + 1;
+            gen_snapshot();
         }
     }
+    if (opt_.prompt_cache && p > P && state_ok) take_snapshot(p);   // state after the last processed token
     {   // sequence whose KV entries are valid: positions < p
         std::vector<int> seq = prompt;
         seq.insert(seq.end(), out.begin(), out.end());
