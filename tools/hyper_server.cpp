@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -332,6 +333,131 @@ ojson usage(const Request & r, const GenOut & o) {
             {"total_tokens", (int) r.prompt.size() + o.n_gen}};
 }
 
+
+// ---------------- OpenAI Responses API (/v1/responses) on top of the chat path ----------------
+std::string part_text(const ojson & c) {   // string, or an array of content parts (input_text / output_text / text / ...)
+    if (c.is_string()) return c.get<std::string>();
+    std::string t;
+    if (c.is_array())
+        for (auto & p : c) {
+            if (p.is_string()) t += p.get<std::string>();
+            else if (p.is_object() && p.contains("text") && p["text"].is_string()) t += p["text"].get<std::string>();
+        }
+    return t;
+}
+
+// Responses request -> chat completions body; custom (freeform) tools become functions with one string argument "input"
+ojson responses_to_chat(const ojson & body, std::set<std::string> & custom_tools) {
+    ojson chat = ojson::object();
+    std::string sys = body.contains("instructions") && body["instructions"].is_string() ? body["instructions"].get<std::string>() : "";
+    ojson msgs = ojson::array();
+    std::string pending_reasoning;
+    auto assistant = [&]() -> ojson & {   // the open assistant message of this turn (created on demand)
+        if (msgs.empty() || msgs.back()["role"] != "assistant" || msgs.back().contains("closed")) {
+            ojson m = {{"role", "assistant"}, {"content", ""}};
+            msgs.push_back(m);
+        }
+        ojson & m = msgs.back();
+        if (!pending_reasoning.empty()) { m["reasoning_content"] = pending_reasoning; pending_reasoning.clear(); }
+        return m;
+    };
+    auto add_call = [&](const std::string & id, const std::string & name, const std::string & args) {
+        ojson & m = assistant();
+        if (!m.contains("tool_calls")) m["tool_calls"] = ojson::array();
+        m["tool_calls"].push_back({{"id", id}, {"type", "function"}, {"function", {{"name", name}, {"arguments", args}}}});
+    };
+    const ojson & input = body.contains("input") ? body["input"] : ojson();
+    if (input.is_string()) msgs.push_back({{"role", "user"}, {"content", input.get<std::string>()}});
+    else if (input.is_array())
+        for (const auto & it : input) {
+            if (!it.is_object()) continue;
+            const std::string type = it.value("type", it.contains("role") ? "message" : "");
+            if (type == "message") {
+                std::string role = it.value("role", "user");
+                const std::string text = part_text(it.contains("content") ? it["content"] : ojson(""));
+                if (role == "system" || role == "developer") { sys += (sys.empty() ? "" : "\n\n") + text; continue; }
+                if (role == "assistant") {
+                    ojson & m = assistant();
+                    std::string cur = m["content"].is_string() ? m["content"].get<std::string>() : "";
+                    m["content"] = cur + text;
+                    continue;
+                }
+                if (!msgs.empty() && msgs.back()["role"] == "assistant") msgs.back()["closed"] = true;
+                msgs.push_back({{"role", role}, {"content", text}});
+            } else if (type == "reasoning") {
+                std::string t = it.contains("content") ? part_text(it["content"]) : "";
+                if (t.empty() && it.contains("summary")) t = part_text(it["summary"]);
+                pending_reasoning += t;
+            } else if (type == "function_call") {
+                add_call(it.value("call_id", ""), it.value("name", ""), it.value("arguments", "{}"));
+            } else if (type == "custom_tool_call") {
+                add_call(it.value("call_id", ""), it.value("name", ""), ojson({{"input", it.value("input", "")}}).dump());
+            } else if (type == "function_call_output" || type == "custom_tool_call_output") {
+                if (!msgs.empty() && msgs.back()["role"] == "assistant") msgs.back()["closed"] = true;
+                const std::string out = it.contains("output") ? (it["output"].is_string() ? it["output"].get<std::string>()
+                                                                 : it["output"].is_object() && it["output"].contains("content")
+                                                                       ? part_text(it["output"]["content"]) : part_text(it["output"]))
+                                                              : "";
+                msgs.push_back({{"role", "tool"}, {"tool_call_id", it.value("call_id", "")}, {"content", out}});
+            }
+        }
+    for (auto & m : msgs) m.erase("closed");
+    if (!sys.empty()) msgs.insert(msgs.begin(), ojson({{"role", "system"}, {"content", sys}}));
+    chat["messages"] = msgs;
+    ojson tools = ojson::array();
+    if (body.contains("tools") && body["tools"].is_array())
+        for (const auto & t : body["tools"]) {
+            const std::string type = t.value("type", "");
+            if (type == "function") {
+                ojson fn = {{"name", t.value("name", "")}, {"description", t.value("description", "")}};
+                fn["parameters"] = t.contains("parameters") && t["parameters"].is_object() ? t["parameters"] : ojson({{"type", "object"}, {"properties", ojson::object()}});
+                tools.push_back({{"type", "function"}, {"function", fn}});
+            } else if (type == "custom") {
+                const std::string name = t.value("name", "");
+                custom_tools.insert(name);
+                std::string desc = t.value("description", "");
+                if (t.contains("format") && t["format"].is_object() && t["format"].contains("definition"))
+                    desc += "\n\nThe input must follow this grammar:\n" + t["format"].value("definition", "");
+                tools.push_back({{"type", "function"}, {"function", {{"name", name}, {"description", desc},
+                    {"parameters", {{"type", "object"}, {"properties", {{"input", {{"type", "string"}, {"description", "the raw tool input"}}}}},
+                                    {"required", ojson::array({"input"})}}}}}});
+            }
+        }
+    if (!tools.empty()) chat["tools"] = tools;
+    if (body.contains("tool_choice") && body["tool_choice"].is_string()) chat["tool_choice"] = body["tool_choice"];
+    if (body.contains("parallel_tool_calls")) chat["parallel_tool_calls"] = body["parallel_tool_calls"];
+    if (body.contains("max_output_tokens") && body["max_output_tokens"].is_number_integer()) chat["max_tokens"] = body["max_output_tokens"];
+    for (const char * k : {"temperature", "top_p", "top_k", "min_p", "seed", "chat_template_kwargs"}) if (body.contains(k) && !body[k].is_null()) chat[k] = body[k];
+    if (body.contains("reasoning") && body["reasoning"].is_object() && body["reasoning"].contains("effort") && body["reasoning"]["effort"].is_string())
+        chat["reasoning_effort"] = body["reasoning"]["effort"];
+    chat["stream"] = body.value("stream", false);
+    return chat;
+}
+
+ojson resp_usage(const Request & r, const GenOut & o) {
+    return {{"input_tokens", (int) r.prompt.size()}, {"input_tokens_details", {{"cached_tokens", o.reused}}},
+            {"output_tokens", o.n_gen}, {"output_tokens_details", {{"reasoning_tokens", 0}}},
+            {"total_tokens", (int) r.prompt.size() + o.n_gen}};
+}
+ojson tool_call_item(const common_chat_tool_call & t, const std::string & item_id, const std::set<std::string> & custom, bool done) {
+    if (custom.count(t.name)) {
+        std::string input = t.arguments;
+        try { const ojson a = ojson::parse(t.arguments); if (a.contains("input") && a["input"].is_string()) input = a["input"].get<std::string>(); } catch (...) {}
+        return {{"type", "custom_tool_call"}, {"id", item_id}, {"call_id", t.id}, {"name", t.name}, {"input", done ? input : ""},
+                {"status", done ? "completed" : "in_progress"}};
+    }
+    return {{"type", "function_call"}, {"id", item_id}, {"call_id", t.id}, {"name", t.name}, {"arguments", done ? t.arguments : ""},
+            {"status", done ? "completed" : "in_progress"}};
+}
+ojson reasoning_item(const std::string & id, const std::string & text) {
+    return {{"type", "reasoning"}, {"id", id}, {"summary", ojson::array({ojson({{"type", "summary_text"}, {"text", text}})})},
+            {"content", ojson::array({ojson({{"type", "reasoning_text"}, {"text", text}})})}};
+}
+ojson message_item(const std::string & id, const std::string & text, bool done) {
+    return {{"type", "message"}, {"id", id}, {"status", done ? "completed" : "in_progress"}, {"role", "assistant"},
+            {"content", done ? ojson::array({ojson({{"type", "output_text"}, {"text", text}, {"annotations", ojson::array()}})}) : ojson::array()}};
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -556,6 +682,183 @@ int main(int argc, char ** argv) {
     };
     srv.Post("/v1/chat/completions", chat);
     srv.Post("/chat/completions", chat);
+
+    // OpenAI Responses API (Codex & co.): translated to the chat path, output as response items / response.* events
+    auto responses = [&](const httplib::Request & req, httplib::Response & res) {
+        cors(res);
+        auto fail = [&](int code, const std::string & msg) {
+            res.status = code;
+            res.set_content(ojson({{"error", {{"message", msg}, {"type", code == 400 ? "invalid_request_error" : "server_error"}}}}).dump(), "application/json");
+        };
+        std::shared_ptr<Request> r;
+        auto custom = std::make_shared<std::set<std::string>>();
+        ojson rbody;
+        try {
+            rbody = ojson::parse(req.body);
+            if (const char * dump = getenv("HYPER_DUMP_REQUEST")) {
+                const std::string fn = std::string(dump) + "/" + std::to_string((long long) time(nullptr)) + "-responses.json";
+                FILE * f = fopen(fn.c_str(), "wb");
+                if (f) { fwrite(req.body.data(), 1, req.body.size(), f); fclose(f); }
+            }
+            r = std::make_shared<Request>(prepare(c, responses_to_chat(rbody, *custom)));
+        } catch (const std::exception & e) { fail(400, e.what()); return; }
+        const std::string rid = random_id("resp_", c.next_id++);
+        r->id = rid.substr(5, 6) + rid.substr(rid.size() - 4);
+        const long created = (long) std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        auto base = std::make_shared<ojson>(ojson({{"id", rid}, {"object", "response"}, {"created_at", created}, {"model", c.alias},
+                                                   {"parallel_tool_calls", rbody.value("parallel_tool_calls", true)},
+                                                   {"tool_choice", rbody.contains("tool_choice") ? rbody["tool_choice"] : ojson("auto")},
+                                                   {"tools", rbody.contains("tools") ? rbody["tools"] : ojson::array()}}));
+
+        auto final_output = [r, custom](const common_chat_msg & msg, long & n) {
+            ojson out = ojson::array();
+            if (!msg.reasoning_content.empty()) out.push_back(reasoning_item(random_id("rs_", n++), msg.reasoning_content));
+            if (!msg.content.empty()) out.push_back(message_item(random_id("msg_", n++), msg.content, true));
+            for (const auto & t : msg.tool_calls) out.push_back(tool_call_item(t, random_id("fc_", n++), *custom, true));
+            return out;
+        };
+        auto finish_obj = [base, r](ojson out, const GenOut & o) {
+            ojson resp = *base;
+            resp["status"] = o.finish == "length" ? "incomplete" : "completed";
+            if (o.finish == "length") resp["incomplete_details"] = {{"reason", "max_output_tokens"}};
+            resp["output"] = std::move(out);
+            resp["usage"] = resp_usage(*r, o);
+            return resp;
+        };
+
+        if (!r->stream) {
+            std::lock_guard<std::mutex> lk(c.mu);
+            GenOut o;
+            try { o = run(c, *r, {}); } catch (const std::exception & e) { fail(500, e.what()); return; }
+            common_chat_msg msg = common_chat_parse(o.text, false, r->pp);
+            long n = 0;
+            for (auto & t : msg.tool_calls) if (t.id.empty()) t.id = random_id("call_", n++);
+            res.set_content(finish_obj(final_output(msg, n), o).dump(-1, ' ', false, ojson::error_handler_t::replace), "application/json");
+            return;
+        }
+
+        res.set_header("Cache-Control", "no-cache");
+        res.set_chunked_content_provider("text/event-stream", [&c, r, custom, base, finish_obj](size_t, httplib::DataSink & sink) {
+            long seq = 0, nid = 0;
+            auto send = [&](const char * type, ojson j) {
+                j["type"] = type;
+                j["sequence_number"] = seq++;
+                const std::string s = std::string("event: ") + type + "\ndata: " + j.dump(-1, ' ', false, ojson::error_handler_t::replace) + "\n\n";
+                return sink.write(s.data(), s.size());
+            };
+            std::lock_guard<std::mutex> lk(c.mu);
+            {
+                ojson resp = *base;
+                resp["status"] = "in_progress";
+                resp["output"] = ojson::array();
+                send("response.created", {{"response", resp}});
+                send("response.in_progress", {{"response", resp}});
+            }
+            // open item state: 0 none, 1 reasoning, 2 message, 3 tool call
+            int open = 0, out_index = -1;
+            std::string item_id, acc;
+            size_t open_tool = std::string::npos;
+            ojson done_items = ojson::array();
+            common_chat_msg prev = common_chat_parse("", true, r->pp);
+            std::vector<std::string> ids;
+            long tc = 0;
+            auto gen_id = [&] { return random_id("call_", tc++); };
+            bool ok = true;
+            auto close_item = [&](const common_chat_msg & msg) {
+                if (open == 1) {
+                    send("response.reasoning_summary_text.done", {{"item_id", item_id}, {"output_index", out_index}, {"summary_index", 0}, {"text", acc}});
+                    send("response.reasoning_summary_part.done", {{"item_id", item_id}, {"output_index", out_index}, {"summary_index", 0},
+                                                                   {"part", {{"type", "summary_text"}, {"text", acc}}}});
+                    const ojson it = reasoning_item(item_id, acc);
+                    send("response.output_item.done", {{"output_index", out_index}, {"item", it}});
+                    done_items.push_back(it);
+                } else if (open == 2) {
+                    send("response.output_text.done", {{"item_id", item_id}, {"output_index", out_index}, {"content_index", 0}, {"text", acc}});
+                    send("response.content_part.done", {{"item_id", item_id}, {"output_index", out_index}, {"content_index", 0},
+                                                        {"part", {{"type", "output_text"}, {"text", acc}, {"annotations", ojson::array()}}}});
+                    const ojson it = message_item(item_id, acc, true);
+                    send("response.output_item.done", {{"output_index", out_index}, {"item", it}});
+                    done_items.push_back(it);
+                } else if (open == 3 && open_tool < msg.tool_calls.size()) {
+                    const ojson it = tool_call_item(msg.tool_calls[open_tool], item_id, *custom, true);
+                    if (it["type"] == "function_call")
+                        send("response.function_call_arguments.done", {{"item_id", item_id}, {"output_index", out_index}, {"arguments", it["arguments"]}});
+                    else send("response.custom_tool_call_input.done", {{"item_id", item_id}, {"output_index", out_index}, {"input", it["input"]}});
+                    send("response.output_item.done", {{"output_index", out_index}, {"item", it}});
+                    done_items.push_back(it);
+                }
+                open = 0; acc.clear(); open_tool = std::string::npos;
+            };
+            auto push = [&](const std::string & text, bool partial) {
+                common_chat_msg msg;
+                try { msg = common_chat_parse(text, partial, r->pp); } catch (const std::exception &) { return true; }
+                msg.set_tool_call_ids(ids, gen_id);
+                for (const auto & d : common_chat_msg_diff::compute_diffs(prev, msg)) {
+                    if (!d.reasoning_content_delta.empty()) {
+                        if (open != 1) {
+                            close_item(msg);
+                            open = 1; ++out_index; item_id = random_id("rs_", nid++);
+                            send("response.output_item.added", {{"output_index", out_index}, {"item", {{"type", "reasoning"}, {"id", item_id}, {"summary", ojson::array()}}}});
+                            send("response.reasoning_summary_part.added", {{"item_id", item_id}, {"output_index", out_index}, {"summary_index", 0},
+                                                                            {"part", {{"type", "summary_text"}, {"text", ""}}}});
+                        }
+                        acc += d.reasoning_content_delta;
+                        if (!send("response.reasoning_summary_text.delta", {{"item_id", item_id}, {"output_index", out_index}, {"summary_index", 0},
+                                                                            {"delta", d.reasoning_content_delta}})) return false;
+                    }
+                    if (!d.content_delta.empty()) {
+                        if (open != 2) {
+                            close_item(msg);
+                            open = 2; ++out_index; item_id = random_id("msg_", nid++);
+                            send("response.output_item.added", {{"output_index", out_index}, {"item", message_item(item_id, "", false)}});
+                            send("response.content_part.added", {{"item_id", item_id}, {"output_index", out_index}, {"content_index", 0},
+                                                                 {"part", {{"type", "output_text"}, {"text", ""}, {"annotations", ojson::array()}}}});
+                        }
+                        acc += d.content_delta;
+                        if (!send("response.output_text.delta", {{"item_id", item_id}, {"output_index", out_index}, {"content_index", 0},
+                                                                 {"delta", d.content_delta}})) return false;
+                    }
+                    if (d.tool_call_index != std::string::npos && d.tool_call_index < msg.tool_calls.size()) {
+                        if (open != 3 || open_tool != d.tool_call_index) {
+                            close_item(msg);
+                            open = 3; open_tool = d.tool_call_index; ++out_index; item_id = random_id("fc_", nid++);
+                            send("response.output_item.added", {{"output_index", out_index},
+                                                                {"item", tool_call_item(msg.tool_calls[open_tool], item_id, *custom, false)}});
+                        }
+                        if (!d.tool_call_delta.arguments.empty() && !custom->count(msg.tool_calls[open_tool].name))
+                            if (!send("response.function_call_arguments.delta", {{"item_id", item_id}, {"output_index", out_index},
+                                                                                  {"delta", d.tool_call_delta.arguments}})) return false;
+                    }
+                }
+                prev = msg;
+                return true;
+            };
+            GenOut o;
+            try {
+                o = run(c, *r, [&](const std::string & text) {
+                    if (!ok) return false;
+                    ok = push(text.substr(0, utf8_complete(text)), true);
+                    return ok;
+                });
+            } catch (const std::exception & e) {
+                ojson resp = *base;
+                resp["status"] = "failed";
+                resp["error"] = {{"code", "server_error"}, {"message", e.what()}};
+                send("response.failed", {{"response", resp}});
+                sink.done();
+                return false;
+            }
+            if (ok) {
+                push(o.text, false);
+                close_item(prev);
+                send("response.completed", {{"response", finish_obj(done_items, o)}});
+            }
+            sink.done();
+            return true;
+        });
+    };
+    srv.Post("/v1/responses", responses);
+    srv.Post("/responses", responses);
 
     fprintf(stderr, "hyper-server: listening on http://%s:%d (model \"%s\", context %d, %d drafts)\n", host.c_str(), port,
             c.alias.c_str(), ctx, draft);

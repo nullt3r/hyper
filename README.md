@@ -127,6 +127,7 @@ Endpoints:
 | `/` | web chat: conversations (stored in the browser), streaming with reasoning, markdown, code highlighting, math, per-message speed |
 | `/live` | live statistics: generation and prompt-eval speed, context use, last request |
 | `/v1/chat/completions` | OpenAI-compatible chat API, streaming and non-streaming, tool calls, `reasoning_content` |
+| `/v1/responses` | OpenAI Responses API (used by Codex): messages, reasoning, function / custom tool calls, streaming `response.*` events |
 | `/v1/models`, `/health`, `/stats`, `/props` | model list, health, statistics JSON, sampling defaults |
 
 Options:
