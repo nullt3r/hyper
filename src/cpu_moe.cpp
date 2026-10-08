@@ -16,16 +16,18 @@ namespace hyper {
 namespace {
 inline float silu(float x) { return x / (1.0f + std::exp(-x)); }
 inline const ggml_type_traits_cpu * traits(GType t) { return ggml_get_type_traits_cpu((ggml_type) t); }
-// spin with backoff: hot while work is flowing (a decode step's layers are ~0.5 ms apart; waking from a sleep costs
-// 50+ us), sleeps after HYPER_SPIN_US (default 200) of nothing
-const long g_spin_us = getenv("HYPER_SPIN_US") ? atol(getenv("HYPER_SPIN_US")) : 200;
+// spin with backoff: hot while work is flowing (a decode step's layers are ~0.3-0.5 ms apart; waking from a sleep costs
+// 50+ us), then real sleeps once nothing has happened for HYPER_SPIN_US (default 3000): an idle server costs no CPU
+const long g_spin_us = getenv("HYPER_SPIN_US") ? atol(getenv("HYPER_SPIN_US")) : 3000;
 template <typename P> void spin_until(P && ready) {
     auto t0 = std::chrono::steady_clock::now();
     int i = 0;
     while (!ready()) {
-        if (++i < 4096) { __builtin_ia32_pause(); continue; }
+        if (++i < 256) { __builtin_ia32_pause(); continue; }   // (~256 pauses: a few microseconds between clock reads)
         i = 0;
-        if (std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(g_spin_us)) std::this_thread::sleep_for(std::chrono::microseconds(20));
+        const auto idle = std::chrono::steady_clock::now() - t0;
+        if (idle > std::chrono::microseconds(g_spin_us))
+            std::this_thread::sleep_for(idle > std::chrono::milliseconds(100) ? std::chrono::microseconds(1000) : std::chrono::microseconds(200));
     }
 }
 } // namespace
