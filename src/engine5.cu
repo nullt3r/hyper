@@ -165,6 +165,7 @@ struct Engine5::DevLayer {
     bool mla = false, moe = false;
     // mHC (replicated): fn [24][4n], scale [3], base [24]; block norms
     DW hca_fn, hcf_fn;
+    uint8_t * hca_raw = nullptr, * hcf_raw = nullptr;   // the same rows as raw GGUF Q8_0 (fused mHC mix)
     float * hca_scale = nullptr, * hca_base = nullptr, * hcf_scale = nullptr, * hcf_base = nullptr;
     float * attn_norm = nullptr, * ffn_norm = nullptr;
     int nh = 0, h0 = 0;          // local heads (KDA or MLA)
@@ -200,7 +201,7 @@ struct Engine5::Device {
     DW output;
     int vocab_off = 0;
     // activations [R5] rows
-    float * x = nullptr, * res = nullptr, * xn = nullptr, * mix = nullptr, * hcw = nullptr, * bo = nullptr, * part = nullptr;
+    float * x = nullptr, * res = nullptr, * xn = nullptr, * mix = nullptr, * mixpart = nullptr, * hcw = nullptr, * bo = nullptr, * part = nullptr;
     float * big0 = nullptr, * o = nullptr, * qabs = nullptr, * olat = nullptr, * attn_part = nullptr;
     float * rlog = nullptr, * wts = nullptr, * sg = nullptr, * shgu = nullptr, * shh = nullptr, * shpart = nullptr;
     float * hexp = nullptr, * yexp = nullptr, * logits = nullptr, * conv_raw = nullptr, * iscores = nullptr;
@@ -375,6 +376,11 @@ void Engine5::load_layer(Device & dev, DevLayer & L, int il) {
     L.moe = is_moe(il);
     L.hca_fn = full(p + "hc_attn_fn.weight");
     L.hcf_fn = full(p + "hc_ffn_fn.weight");
+    for (auto [nm, dst] : {std::pair<const char *, uint8_t **>{"hc_attn_fn.weight", &L.hca_raw}, {"hc_ffn_fn.weight", &L.hcf_raw}}) {
+        const GTensor & t = gguf_->need(p + nm);
+        if (t.type != GType::Q8_0) throw std::runtime_error("hc_fn: expected Q8_0");
+        *dst = dev.upload(t.data, t.nbytes);
+    }
     L.hca_scale = f32(p + "hc_attn_scale.weight");
     L.hca_base = f32(p + "hc_attn_base.weight");
     L.hcf_scale = f32(p + "hc_ffn_scale.weight");
@@ -698,6 +704,7 @@ void Engine5::load_weights() {
         dev.res = dev.alloc<float>((size_t) R * hcn);
         dev.xn = dev.alloc<float>((size_t) R * n);
         dev.mix = dev.alloc<float>((size_t) R * 32);
+        dev.mixpart = dev.alloc<float>((size_t) R * (hcn / 256) * 25);
         dev.hcw = dev.alloc<float>((size_t) R * MHC_W);
         dev.bo = dev.alloc<float>((size_t) R * n);
         dev.part = dev.alloc<float>((size_t) R * n);
@@ -875,7 +882,9 @@ void Engine5::record_main(int gi, int nt) {
         add_parts(d.bo, d.p16, d.recv, (size_t) R5 * n, nd - 1, (int) N, s);
     };
     // mHC pre-mix: res -> d.xn (block input after its RMS norm) and the post / comb weights
-    auto hc_pre = [&](const DW & fn, const float * scale, const float * base, const float * norm_w) {
+    static const bool old_mhc = getenv("HYPER5_OLDMHC") != nullptr;
+    auto hc_pre = [&](const DW & fn, const uint8_t * raw, const float * scale, const float * base, const float * norm_w) {
+        if (!old_mhc) { mhc_pre_fused(R, raw, d.mixpart, scale, base, norm_w, eps, c.hc_eps, c.sinkhorn, n, d.hcw, d.xn, nt, s); return; }
         mm(fn, R, hcn, d.mix, 32, nt);
         mhc_pre(R, d.mix, 32, scale, base, norm_w, eps, c.hc_eps, c.sinkhorn, n, d.hcw, d.xn, nt, s);
     };
@@ -884,7 +893,7 @@ void Engine5::record_main(int gi, int nt) {
         DevLayer & L = d.layers[il];
         const int nh = L.nh;
         // ---- token mixer ----
-        hc_pre(L.hca_fn, L.hca_scale, L.hca_base, L.attn_norm);
+        hc_pre(L.hca_fn, L.hca_raw, L.hca_scale, L.hca_base, L.attn_norm);
         dbg("attn_in", il, d.xn, (size_t) nt * n);
         if (!L.mla) {
             const int fa = kda_fa(nh), fb = kda_fb(nh);
@@ -924,7 +933,7 @@ void Engine5::record_main(int gi, int nt) {
         mhc_post(R, d.bo, d.hcw, n, nt, s);
         dbg("attn_res", il, R, (size_t) nt * hcn);
         // ---- FFN ----
-        hc_pre(L.hcf_fn, L.hcf_scale, L.hcf_base, L.ffn_norm);
+        hc_pre(L.hcf_fn, L.hcf_raw, L.hcf_scale, L.hcf_base, L.ffn_norm);
         float * ffo = L.moe ? d.shpart : d.part;
         mm(L.gu, d.xn, n, d.shgu, 2 * L.ff_l, nt);
         if (nt <= MAX_NT) {

@@ -1175,7 +1175,9 @@ __global__ void k_mma_q8_smallk(const uint4 * __restrict__ wq, const half * __re
 
 // split-K scratch per device (gemv_init): tile partials and per-tile counters
 namespace { struct KSplit { float * part = nullptr; unsigned * cnt = nullptr; }; KSplit g_ksplit[16]; }
-constexpr int KSPLIT_TILES = 512, KSPLIT_MAX = 16;
+constexpr int KSPLIT_TILES = 1024, KSPLIT_MAX = 16;
+// split-K target: blocks per GEMV launch (HYPER_GEMV_TARGET; 0 = only for matrices with few row tiles)
+static const int g_gemv_target = getenv("HYPER_GEMV_TARGET") ? atoi(getenv("HYPER_GEMV_TARGET")) : 0;
 void gemv_init(int dev) {
     if (dev < 0 || dev >= 16 || g_ksplit[dev].part) return;
     cudaMalloc(&g_ksplit[dev].part, (size_t) KSPLIT_TILES * KSPLIT_MAX * 128 * sizeof(float));
@@ -1196,6 +1198,8 @@ void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const fl
     cudaGetDevice(&dev);
     if (dev < 16 && g_ksplit[dev].part && tiles <= KSPLIT_TILES && tiles < 160)   // few row tiles: spread K over more SMs
         P = std::max(1, std::min({KSPLIT_MAX, 320 / tiles, kb / 16}));
+    if (g_gemv_target > 0 && dev < 16 && g_ksplit[dev].part && tiles <= KSPLIT_TILES && tiles < g_gemv_target)   // medium: enough blocks in flight
+        P = std::max(P, std::min({KSPLIT_MAX, g_gemv_target / tiles, kb / 16}));
     k_mma_q8<<<dim3(tiles, P), 256, 0, s>>>(W.q, W.s, W.n, W.k, x, xs, y, ys, add, nt, nin,
                                            P > 1 ? g_ksplit[dev].part : nullptr, P > 1 ? g_ksplit[dev].cnt : nullptr);
 }

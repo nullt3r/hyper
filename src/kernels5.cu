@@ -94,6 +94,89 @@ __global__ void __launch_bounds__(1024) k_mhc_pre(const float * __restrict__ res
     for (int e = threadIdx.x; e < n; e += blockDim.x) xn[(size_t) t * n + e] = xs[e] * inv2 * norm_w[e];
 }
 
+// mixes from raw GGUF Q8_0 rows fn [24][4n] (34-byte blocks): grid (4n / 256, nt), 256 threads; partial dot products of a
+// 256-column slice and the slice's sum of squares -> part[t][slice][25]
+__global__ void __launch_bounds__(256) k_mhc_mix(const float * __restrict__ res, const uint8_t * __restrict__ fn, int n4,
+                                                 float * __restrict__ part) {
+    const int t = blockIdx.y, sl = blockIdx.x, c = sl * 256 + threadIdx.x;
+    const float x = res[(size_t) t * n4 + c];
+    const size_t rb = (size_t) n4 / 32 * 34;
+    const int blk = c >> 5, j = c & 31;
+    float acc[25];
+#pragma unroll
+    for (int r = 0; r < 24; ++r) {
+        const uint8_t * b = fn + (size_t) r * rb + (size_t) blk * 34;
+        __half d; memcpy(&d, b, 2);
+        acc[r] = __half2float(d) * (float) (int8_t) b[2 + j] * x;
+    }
+    acc[24] = x * x;
+    __shared__ float red[8][25];
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+#pragma unroll
+    for (int r = 0; r < 25; ++r) {
+        const float v = wsum(acc[r]);
+        if (lane == 0) red[w][r] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < 25) {
+        float v = 0.0f;
+        for (int ww = 0; ww < 8; ++ww) v += red[ww][threadIdx.x];
+        part[((size_t) t * gridDim.x + sl) * 25 + threadIdx.x] = v;
+    }
+}
+// block per token, 1024 threads: mixes from the partials, Sinkhorn on 16 lanes of warp 0, then as k_mhc_pre
+__global__ void __launch_bounds__(1024) k_mhc_pre2(const float * __restrict__ res, const float * __restrict__ part, int nsl,
+                                                   const float * __restrict__ scale, const float * __restrict__ base,
+                                                   const float * __restrict__ norm_w, float rms_eps, float hc_eps, int iters, int n,
+                                                   float * __restrict__ hcw, float * __restrict__ xn) {
+    const int t = blockIdx.x, tid = threadIdx.x;
+    const float * r = res + (size_t) t * MHC * n;
+    __shared__ float mx[25], pre[MHC];
+    if (tid < 25) {
+        float v = 0.0f;
+        for (int i = 0; i < nsl; ++i) v += part[((size_t) t * nsl + i) * 25 + tid];
+        mx[tid] = v;
+    }
+    __syncthreads();
+    if (tid < 32) {
+        const float inv = rsqrtf(mx[24] / (MHC * n) + rms_eps);
+        float * hw = hcw + (size_t) t * MHC_W;
+        if (tid < MHC) pre[tid] = sigm5(mx[tid] * inv * scale[0] + base[tid]) + hc_eps;
+        else if (tid < 2 * MHC) hw[tid - MHC] = 2.0f * sigm5(mx[tid] * inv * scale[1] + base[tid]);
+        // lane l < 16 holds c[d + 4 src] with d = l & 3, src = l >> 2
+        const int l = tid & 15, d = l & 3;
+        float c = tid < 16 ? mx[8 + l] * inv * scale[2] + base[8 + l] : -FLT_MAX;
+        // softmax over dst (lanes of one src: groups of 4 consecutive lanes)
+        float m = c;
+        m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, 1)); m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, 2));
+        float e = tid < 16 ? expf(c - m) : 0.0f, z = e;
+        z += __shfl_xor_sync(0xffffffff, z, 1); z += __shfl_xor_sync(0xffffffff, z, 2);
+        c = e / z + hc_eps;
+        auto sum_src = [&](float v) {   // over lanes d, d+4, d+8, d+12
+            v += __shfl_xor_sync(0xffffffff, v, 4); v += __shfl_xor_sync(0xffffffff, v, 8); return v;
+        };
+        auto sum_dst = [&](float v) { v += __shfl_xor_sync(0xffffffff, v, 1); v += __shfl_xor_sync(0xffffffff, v, 2); return v; };
+        c = c / (sum_src(tid < 16 ? c : 0.0f) + hc_eps);
+        for (int it = 1; it < iters; ++it) {
+            c = c / (sum_dst(tid < 16 ? c : 0.0f) + hc_eps);
+            c = c / (sum_src(tid < 16 ? c : 0.0f) + hc_eps);
+        }
+        (void) d;
+        if (tid < 16) hw[4 + l] = c;
+    }
+    __syncthreads();
+    __shared__ float xs[4096];
+    float s2 = 0.0f;
+    for (int e = tid; e < n; e += blockDim.x) {
+        const float x = pre[0] * r[e] + pre[1] * r[n + e] + pre[2] * r[2 * n + e] + pre[3] * r[3 * n + e];
+        xs[e] = x;
+        s2 += x * x;
+    }
+    s2 = bsum(s2);
+    const float inv2 = rsqrtf(s2 / n + rms_eps);
+    for (int e = tid; e < n; e += blockDim.x) xn[(size_t) t * n + e] = xs[e] * inv2 * norm_w[e];
+}
+
 __global__ void k_mhc_post(float * res, const float * __restrict__ out, const float * __restrict__ hcw, int n) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (e >= n) return;
@@ -688,6 +771,13 @@ void mhc_pre(const float * res, const float * mixraw, int mix_stride, const floa
              float rms_eps, float hc_eps, int iters, int n, float * hcw, float * xn, int nt, cudaStream_t s) {
     if (n > 4096) throw std::runtime_error("mhc_pre: n_embd > 4096");
     k_mhc_pre<<<nt, 1024, 0, s>>>(res, mixraw, mix_stride, scale, base, norm_w, rms_eps, hc_eps, iters, n, hcw, xn);
+}
+void mhc_pre_fused(const float * res, const uint8_t * fn_q8, float * part, const float * scale, const float * base, const float * norm_w,
+                   float rms_eps, float hc_eps, int iters, int n, float * hcw, float * xn, int nt, cudaStream_t s) {
+    if (n > 4096 || (MHC * n) % 256) throw std::runtime_error("mhc_pre_fused: n");
+    const int nsl = MHC * n / 256;
+    k_mhc_mix<<<dim3(nsl, nt), 256, 0, s>>>(res, fn_q8, MHC * n, part);
+    k_mhc_pre2<<<nt, 1024, 0, s>>>(res, part, nsl, scale, base, norm_w, rms_eps, hc_eps, iters, n, hcw, xn);
 }
 void mhc_post(float * res, const float * out, const float * hcw, int n, int nt, cudaStream_t s) {
     k_mhc_post<<<dim3((n + 255) / 256, nt), 256, 0, s>>>(res, out, hcw, n);

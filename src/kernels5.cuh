@@ -23,6 +23,9 @@ constexpr int GIDX_HEADS = 32, GIDX_DIM = 128;
 // xn[t] = rmsnorm(sum_s pre_s res[t][s]) * norm_w
 void mhc_pre(const float * res, const float * mixraw, int mix_stride, const float * scale, const float * base, const float * norm_w,
              float rms_eps, float hc_eps, int iters, int n, float * hcw, float * xn, int nt, cudaStream_t s);
+// the same from the raw GGUF Q8_0 rows of hc_fn [24][4n] (no separate GEMV): part = scratch [nt][4n/256][25]
+void mhc_pre_fused(const float * res, const uint8_t * fn_q8, float * part, const float * scale, const float * base, const float * norm_w,
+                   float rms_eps, float hc_eps, int iters, int n, float * hcw, float * xn, int nt, cudaStream_t s);
 // res[t][d][e] = out[t][e] * post[d] + sum_s comb[d][s] res[t][s][e]
 void mhc_post(float * res, const float * out, const float * hcw, int n, int nt, cudaStream_t s);
 // res[t][s][e] = x[t][e]
