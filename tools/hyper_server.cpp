@@ -798,6 +798,7 @@ int main(int argc, char ** argv) {
                         if (open != 1) {
                             close_item(msg);
                             open = 1; ++out_index; item_id = random_id("rs_", nid++);
+                            fprintf(stderr, "[%s] responses: reasoning (item %d)\n", r->id.c_str(), out_index);
                             send("response.output_item.added", {{"output_index", out_index}, {"item", {{"type", "reasoning"}, {"id", item_id}, {"summary", ojson::array()}}}});
                             send("response.reasoning_summary_part.added", {{"item_id", item_id}, {"output_index", out_index}, {"summary_index", 0},
                                                                             {"part", {{"type", "summary_text"}, {"text", ""}}}});
@@ -813,6 +814,7 @@ int main(int argc, char ** argv) {
                         if (open != 2) {
                             close_item(msg);
                             open = 2; ++out_index; item_id = random_id("msg_", nid++);
+                            fprintf(stderr, "[%s] responses: message text (item %d)\n", r->id.c_str(), out_index);
                             send("response.output_item.added", {{"output_index", out_index}, {"item", message_item(item_id, "", false)}});
                             send("response.content_part.added", {{"item_id", item_id}, {"output_index", out_index}, {"content_index", 0},
                                                                  {"part", {{"type", "output_text"}, {"text", ""}, {"annotations", ojson::array()}}}});
@@ -825,6 +827,8 @@ int main(int argc, char ** argv) {
                         if (open != 3 || open_tool != d.tool_call_index) {
                             close_item(msg);
                             open = 3; open_tool = d.tool_call_index; ++out_index; item_id = random_id("fc_", nid++);
+                            fprintf(stderr, "[%s] responses: tool call %s (item %d; clients show it when complete)\n", r->id.c_str(),
+                                    msg.tool_calls[open_tool].name.c_str(), out_index);
                             send("response.output_item.added", {{"output_index", out_index},
                                                                 {"item", tool_call_item(msg.tool_calls[open_tool], item_id, *custom, false)}});
                         }
