@@ -198,4 +198,4 @@ and CPU kernels.
 
 ## License
 
-No license has been chosen yet.
+MIT, see [LICENSE](LICENSE). The IQ3_S / IQ4_NL lookup tables in `src/kernels4.cu` come from ggml (MIT).

@@ -240,6 +240,7 @@ template <> __device__ __forceinline__ void deq8<GType::Q5_1>(const uint8_t * __
         v[i] = x * d + m;
     }
 }
+// IQ3_S grid and IQ4_NL values: from ggml (ggml-common.h), MIT, Copyright (c) 2023-2026 The ggml authors
 __device__ const uint32_t g_iq3s_grid[512] = {
     0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
     0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
