@@ -380,9 +380,15 @@ __global__ void k_gidx_ring(const float * __restrict__ ikraw, const float * __re
 }
 
 // scores: grid (pool blocks of 256, rows), thread per pool
+__device__ __forceinline__ unsigned fkey(float f) {   // order-preserving float -> unsigned
+    const unsigned u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+constexpr int GHIST = 65536;   // score histogram bins: the top 16 bits of the order-preserving key
+// hist (optional): per row, counts of key >> 16 (selection without full radix passes)
 __global__ void __launch_bounds__(256) k_gidx_score(const float * __restrict__ iq, int iq_stride, const float * __restrict__ wt, int w_stride,
                                                     const half * __restrict__ pooled, const int * pos_p, int t_off, int top,
-                                                    float * __restrict__ scores, int score_stride) {
+                                                    float * __restrict__ scores, int score_stride, unsigned * __restrict__ hist) {
     const int tl = blockIdx.y, t = t_off + tl;
     const int p = *pos_p + t, np = (p + 1) / 4;
     if (np <= top) return;
@@ -415,12 +421,155 @@ __global__ void __launch_bounds__(256) k_gidx_score(const float * __restrict__ i
 #pragma unroll
     for (int h = 0; h < GIDX_HEADS; ++h) s += ws[h] * fmaxf(acc[h], 0.0f);
     scores[(size_t) tl * score_stride + b] = s;
+    if (hist) atomicAdd(&hist[(size_t) tl * GHIST + (fkey(s) >> 16)], 1u);
 }
 
-__device__ __forceinline__ unsigned fkey(float f) {   // order-preserving float -> unsigned
-    const unsigned u = __float_as_uint(f);
-    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+// block per token (1024 threads), from the score histogram: the bin B holding the top-th largest key; pools above B are
+// selected outright, B's pools (bitmap) are resolved by two 8-bit radix passes; ties at the final key go to the lower pool
+// index. Output as the old kernel: ascending cells of the selected pools, then the open pool's cells.
+__global__ void __launch_bounds__(1024) k_gidx_select_h(const float * __restrict__ scores, int score_stride, const unsigned * __restrict__ hist,
+                                                        const int * pos_p, int t_off, int top, int * __restrict__ list, int list_stride,
+                                                        int * __restrict__ list_n) {
+    const int tl = blockIdx.x, t = t_off + tl, tid = threadIdx.x;
+    const int p = *pos_p + t, np = (p + 1) / 4;
+    int * lt = list + (size_t) t * list_stride;
+    if (np <= top) {
+        for (int i = tid; i <= p; i += blockDim.x) lt[i] = i;
+        if (tid == 0) list_n[t] = p + 1;
+        return;
+    }
+    const float * sc = scores + (size_t) tl * score_stride;
+    const unsigned * hg = hist + (size_t) tl * GHIST;
+    constexpr int MAXW = 65536 / 32 + 64;   // bitmap words (np <= 65536 + 2048)
+    __shared__ unsigned sel[MAXW], bnd[MAXW];
+    __shared__ unsigned part[1024];
+    __shared__ unsigned sB, sNeed, sThr, sNeedEq;
+    __shared__ unsigned h8[256];
+    const int nw = (np + 31) / 32;
+    for (int i = tid; i < nw; i += blockDim.x) { sel[i] = 0; bnd[i] = 0; }
+    // 1. bin B: thread i owns bins [65536 - 64 (i+1), 65536 - 64 i) (thread 0 the highest); block scan of the thread sums
+    unsigned own = 0;
+    {
+        const uint4 * hv = (const uint4 *) (hg + GHIST - 64 * (tid + 1));
+#pragma unroll
+        for (int j = 0; j < 16; ++j) { const uint4 v = hv[j]; own += v.x + v.y + v.z + v.w; }
+    }
+    part[tid] = own;
+    __syncthreads();
+    for (int off = 1; off < 1024; off <<= 1) {   // inclusive scan: part[i] = bins of threads 0..i
+        const unsigned v = tid >= off ? part[tid - off] : 0;
+        __syncthreads();
+        part[tid] += v;
+        __syncthreads();
+    }
+    {
+        const unsigned before = part[tid] - own;
+        if (before < (unsigned) top && part[tid] >= (unsigned) top) {   // the crossing is in this thread's bins (exactly one thread)
+            unsigned acc = before;
+            int bin = GHIST - 64 * tid - 1;
+            for (; bin > GHIST - 64 * (tid + 1); --bin) { const unsigned h = hg[bin]; if (acc + h >= (unsigned) top) break; acc += h; }
+            sB = (unsigned) bin;
+            sNeed = (unsigned) top - acc;
+        }
+    }
+    __syncthreads();
+    const unsigned B = sB;
+    // 2. mark: above B -> selected, B -> boundary
+    for (int b = tid; b < np; b += blockDim.x) {
+        const unsigned bin = fkey(sc[b]) >> 16;
+        if (bin > B) atomicOr(&sel[b >> 5], 1u << (b & 31));
+        else if (bin == B) atomicOr(&bnd[b >> 5], 1u << (b & 31));
+    }
+    __syncthreads();
+    // 3. boundary: radix on the low 16 bits (two 8-bit passes) over the boundary bitmap
+    if (tid == 0) { sThr = B << 16; sNeedEq = sNeed; }
+    for (int shift = 8; shift >= 0; shift -= 8) {
+        for (int i = tid; i < 256; i += blockDim.x) h8[i] = 0;
+        __syncthreads();
+        const unsigned pre = sThr, mask = shift == 8 ? 0xffff0000u : 0xffffff00u;
+        for (int w = tid; w < nw; w += blockDim.x) {
+            unsigned m = bnd[w];
+            while (m) {
+                const int bit = __ffs(m) - 1; m &= m - 1;
+                const unsigned key = fkey(sc[w * 32 + bit]);
+                if ((key & mask) == pre) atomicAdd(&h8[(key >> shift) & 255], 1u);
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            unsigned acc = 0, need = sNeedEq;
+            for (int d = 255; d >= 0; --d) {
+                if (acc + h8[d] >= need) { sThr = pre | ((unsigned) d << shift); sNeedEq = need - acc; break; }
+                acc += h8[d];
+            }
+        }
+        __syncthreads();
+    }
+    const unsigned thr = sThr;
+    for (int w = tid; w < nw; w += blockDim.x) {   // boundary pools above the threshold key
+        unsigned m = bnd[w], add = 0;
+        while (m) {
+            const int bit = __ffs(m) - 1; m &= m - 1;
+            if (fkey(sc[w * 32 + bit]) > thr) add |= 1u << bit;
+        }
+        sel[w] |= add;
+    }
+    __syncthreads();
+    {   // the first sNeedEq pools at exactly the threshold key (pool order): per-thread word ranges, prefix over the threads
+        const int per = (nw + 1023) / 1024, w0 = tid * per, w1 = min(nw, w0 + per);
+        unsigned eq = 0;
+        for (int w = w0; w < w1; ++w) {
+            unsigned m = bnd[w];
+            while (m) { const int bit = __ffs(m) - 1; m &= m - 1; eq += fkey(sc[w * 32 + bit]) == thr; }
+        }
+        part[tid] = eq;
+        __syncthreads();
+        for (int off = 1; off < 1024; off <<= 1) {
+            const unsigned v = tid >= off ? part[tid - off] : 0;
+            __syncthreads();
+            part[tid] += v;
+            __syncthreads();
+        }
+        const unsigned need = sNeedEq;
+        unsigned rank = part[tid] - eq;
+        for (int w = w0; w < w1 && rank < need; ++w) {
+            unsigned m = bnd[w], add = 0;
+            while (m && rank < need) {
+                const int bit = __ffs(m) - 1; m &= m - 1;
+                if (fkey(sc[w * 32 + bit]) == thr) { add |= 1u << bit; ++rank; }
+            }
+            if (add) atomicOr(&sel[w], add);
+        }
+    }
+    __syncthreads();
+    // 4. ascending cell list: per thread a contiguous range of words, prefix over the threads
+    const int per = (nw + 1023) / 1024, w0 = tid * per, w1 = min(nw, w0 + per);
+    unsigned cnt = 0;
+    for (int w = w0; w < w1; ++w) cnt += __popc(sel[w]);
+    part[tid] = cnt;
+    __syncthreads();
+    for (int off = 1; off < 1024; off <<= 1) {   // inclusive scan
+        const unsigned v = tid >= off ? part[tid - off] : 0;
+        __syncthreads();
+        part[tid] += v;
+        __syncthreads();
+    }
+    int o = (int) (part[tid] - cnt) * 4;
+    for (int w = w0; w < w1; ++w) {
+        unsigned m = sel[w];
+        while (m) {
+            const int bit = __ffs(m) - 1; m &= m - 1;
+            const int b = w * 32 + bit;
+            lt[o] = 4 * b; lt[o + 1] = 4 * b + 1; lt[o + 2] = 4 * b + 2; lt[o + 3] = 4 * b + 3;
+            o += 4;
+        }
+    }
+    const int nsel = (int) part[1023];
+    const int tail0 = 4 * np;
+    for (int c = tail0 + tid; c <= p; c += blockDim.x) lt[nsel * 4 + (c - tail0)] = c;
+    if (tid == 0) list_n[t] = nsel * 4 + (p - tail0 + 1);
 }
+
 // block per token (1024 threads): cell list
 __global__ void __launch_bounds__(1024) k_gidx_select(const float * __restrict__ scores, int score_stride, const int * pos_p, int t_off,
                                                       int top, int * __restrict__ list, int list_stride, int * __restrict__ list_n) {
@@ -580,12 +729,15 @@ void gidx_pool(const float * ikraw, const float * igraw, int stride, const float
     k_gidx_ring<<<8, GIDX_DIM, 0, s>>>(ikraw, igraw, stride, lnw, lnb, eps, ring, pos, nt);
 }
 void gidx_select(const float * iq, int iq_stride, const float * w, int w_stride, const half * pooled, const int * pos, int nt, int top,
-                 float * scores, int score_stride, int rows, int * list, int list_stride, int * list_n, cudaStream_t s) {
+                 float * scores, int score_stride, int rows, int * list, int list_stride, int * list_n, cudaStream_t s, unsigned * hist) {
+    if (hist && score_stride > 65536 + 2048) hist = nullptr;   // (bitmaps sized for 262k cells)
     for (int t0 = 0; t0 < nt; t0 += rows) {
         const int r = std::min(rows, nt - t0);
+        if (hist) cudaMemsetAsync(hist, 0, (size_t) r * GHIST * sizeof(unsigned), s);
         k_gidx_score<<<dim3((score_stride + 255) / 256, r), 256, 0, s>>>(iq, iq_stride, w, w_stride, pooled, pos, t0, top, scores,
-                                                                       score_stride);
-        k_gidx_select<<<r, 1024, 0, s>>>(scores, score_stride, pos, t0, top, list, list_stride, list_n);
+                                                                       score_stride, hist);
+        if (hist) k_gidx_select_h<<<r, 1024, 0, s>>>(scores, score_stride, hist, pos, t0, top, list, list_stride, list_n);
+        else k_gidx_select<<<r, 1024, 0, s>>>(scores, score_stride, pos, t0, top, list, list_stride, list_n);
     }
 }
 void moe_route_sig(const float * logits, int ls, const float * bias, int n_expert, int k, float scale, int * ids, float * wts,

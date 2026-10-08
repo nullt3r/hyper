@@ -13,7 +13,7 @@ constexpr int MHC = 4;            // residual streams
 constexpr int MHC_W = 20;         // per-token mixing weights: post[4] | comb[4][4] (comb[dst + 4 * src])
 constexpr int MLA_LAT = 512;      // latent width (kv_lora_rank)
 constexpr int MLA_MAXH = 24;      // local MLA heads per GPU
-constexpr int MLA_SPLIT = 32;     // decode: cell slices per token
+constexpr int MLA_SPLIT = 48;     // decode: cell slices per token
 constexpr int GIDX_HEADS = 32, GIDX_DIM = 128;
 
 // ---- mHC ----
@@ -58,7 +58,8 @@ void gidx_pool(const float * ikraw, const float * igraw, int stride, const float
 // per token (rows of `rows` at a time through the score scratch [rows][score_stride]): np = (p + 1) / 4 complete pools; np <= top:
 // every cell 0..p; else the `top` pools with the largest sum_h w[t][h] relu(iq[t][h] . pooled[b]) (ascending cells) + the tail
 void gidx_select(const float * iq, int iq_stride, const float * w, int w_stride, const half * pooled, const int * pos, int nt, int top,
-                 float * scores, int score_stride, int rows, int * list, int list_stride, int * list_n, cudaStream_t s);
+                 float * scores, int score_stride, int rows, int * list, int list_stride, int * list_n, cudaStream_t s,
+                 unsigned * hist = nullptr);   // hist: [rows][65536] scratch: one-pass selection (else radix passes)
 
 // ---- MoE ----
 // p = sigmoid(logits); the k experts with the largest p + bias (ties to the lower index); wts = p / max(sum, 6.1e-5) * scale;

@@ -206,6 +206,7 @@ struct Engine5::Device {
     float * hexp = nullptr, * yexp = nullptr, * logits = nullptr, * conv_raw = nullptr, * iscores = nullptr;
     int * ids = nullptr, * pos = nullptr, * counter = nullptr, * order = nullptr, * order_n = nullptr, * egrp = nullptr;
     int * ilist = nullptr, * ilist_n = nullptr;
+    unsigned * ihist = nullptr;   // indexer score histograms [GSCORE_ROWS][65536]
     half * xh = nullptr, * p16 = nullptr, * recv = nullptr, * mix16 = nullptr, * h16 = nullptr;
     float * topk = nullptr;
     int big_stride = 0;
@@ -728,6 +729,7 @@ void Engine5::load_weights() {
         dev.iscores = dev.alloc<float>((size_t) GSCORE_ROWS * (opt_.max_pos / 4 + 4));
         dev.ilist = dev.alloc<int>((size_t) R * GLIST);
         dev.ilist_n = dev.alloc<int>(R);
+        dev.ihist = dev.alloc<unsigned>((size_t) GSCORE_ROWS * 65536);
         dev.pos = dev.alloc<int>(1);
         dev.counter = dev.alloc<int>(1);
     }
@@ -909,7 +911,7 @@ void Engine5::record_main(int gi, int nt) {
             const bool dense_chunk = (pos_host + nt) / 4 <= top;   // every token attends to all of its cells
             if (!dense_chunk || !bulk)
                 gidx_select(d.big0 + qo + nh * c.qk_dim, bs, d.big0 + wq, bs, L.pooled, P, nt, top, d.iscores, opt_.max_pos / 4 + 4,
-                            GSCORE_ROWS, d.ilist, GLIST, d.ilist_n, s);
+                            GSCORE_ROWS, d.ilist, GLIST, d.ilist_n, s, getenv("HYPER5_OLDSEL") ? nullptr : d.ihist);
             hmm(L.wkb, nh, MLA_LAT, c.qk_dim, d.big0 + qo, bs, d.qabs, nh * MLA_LAT, nt);
             const bool use_list = !(bulk && dense_chunk);
             mla_attn(d.qabs, nh * MLA_LAT, L.lat, P, nh, 1.0f / sqrtf((float) c.qk_dim), nt, use_list ? d.ilist : nullptr, GLIST,

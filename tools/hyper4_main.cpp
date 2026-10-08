@@ -239,6 +239,10 @@ static int run_cmd(int argc, char ** argv) {
             }
         } else if (cmd == "tfbench") {   // decode speed on fixed content: the reference tokens fed one at a time after a 64-token prefill
             const int pf = getenv("HYPER_TF_PF") ? atoi(getenv("HYPER_TF_PF")) : 64;   // prefilled context
+            if (getenv("HYPER_TF_REPEAT")) {   // context longer than the reference: its tokens repeated
+                const size_t n0 = toks.size(), need = (size_t) pf + (argc > 4 ? atoi(argv[4]) : 256);
+                for (size_t i = n0; i < need; ++i) toks.push_back(toks[i % n0]);
+            }
             const int n_tok = std::min<int>(argc > 4 ? atoi(argv[4]) : 256, (int) toks.size() - pf);
             eng.reset();
             eng.prefill(toks.data(), pf, 0);
