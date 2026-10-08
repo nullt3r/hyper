@@ -448,6 +448,11 @@ int main(int argc, char ** argv) {
         res.set_content(ojson({{"object", "list"}, {"data", ojson::array({m})}}).dump(), "application/json");
     };
     srv.Get("/v1/models", models);
+    srv.Get("/props", [&](const httplib::Request &, httplib::Response & res) {   // (web UI: the server's sampling defaults)
+        cors(res);
+        res.set_content(ojson({{"model", c.alias}, {"sampling", {{"temp", defaults.temp}, {"top_p", defaults.top_p}, {"top_k", defaults.top_k},
+                                                                  {"min_p", defaults.min_p}}}}).dump(), "application/json");
+    });
     srv.Get("/stats", [&](const httplib::Request &, httplib::Response & res) { cors(res); res.set_content(c.live.json().dump(), "application/json"); });
     srv.Get("/", [&](const httplib::Request &, httplib::Response & res) { res.set_content(CHAT_PAGE, "text/html; charset=utf-8"); });
     srv.Get("/live", [&](const httplib::Request &, httplib::Response & res) { res.set_content(STATS_PAGE, "text/html; charset=utf-8"); });
