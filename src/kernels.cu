@@ -168,6 +168,80 @@ __global__ void k_mma_q8(const uint4 * __restrict__ wq, const half * __restrict_
     }
 }
 
+// work-balanced variant for matrices with few row tiles (a block per tile would leave a partial last wave): units of
+// (tile, k-range) dealt round-robin to every warp of the grid; each unit's partial [nt][16] goes to kpart, the last warp to
+// finish a tile sums its UPT partials in unit order (deterministic) and resets the tile's counter
+__global__ void __launch_bounds__(256) k_mma_q8_bal(const uint4 * __restrict__ wq, const half * __restrict__ ws, int n, int k,
+                                                   const float * __restrict__ x, int xs, float * __restrict__ y, int ys,
+                                                   const float * __restrict__ add, int nt, NormIn nin, int upt,
+                                                   float * __restrict__ kpart, unsigned * kcnt) {
+    const int lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+    const int gw = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), GW = gridDim.x * (blockDim.x >> 5);
+    const int kb = k / 32, tiles = (n + 15) / 16, units = tiles * upt;
+    const bool tok_ok = gid < nt;
+    const int tok = tok_ok ? gid : 0;
+    const float * xr = x + (size_t) tok * xs;
+    const float inv = input_inv_rms(nin.ss + tok * nin.nss, nin.nss, k, nin.w, nin.eps);
+    for (int u = gw; u < units; u += GW) {
+        const int tile = u / upt, kc = u % upt;
+        const uint4 * tq = wq + (size_t) tile * kb * 32 + lane;
+        const half * ts = ws + (size_t) tile * kb * 16;
+        float acc[4] = {0, 0, 0, 0};
+        const int b0 = (int) ((int64_t) kc * kb / upt), b1 = (int) ((int64_t) (kc + 1) * kb / upt);
+#pragma unroll 2
+        for (int b = b0; b < b1; ++b) {
+            const uint4 q = __ldg(tq + (size_t) b * 32);
+            const float s_lo = __half2float(ts[(size_t) b * 16 + gid]), s_hi = __half2float(ts[(size_t) b * 16 + gid + 8]);
+            const unsigned qw[4] = {q.x, q.y, q.z, q.w};
+            float tmp[4] = {0, 0, 0, 0};
+#pragma unroll
+            for (int ks = 0; ks < 2; ++ks) {
+                unsigned a[4];
+                a[0] = i8x2_to_h2(qw[2 * ks], 0x5140);
+                a[1] = i8x2_to_h2(qw[2 * ks], 0x7362);
+                a[2] = i8x2_to_h2(qw[2 * ks + 1], 0x5140);
+                a[3] = i8x2_to_h2(qw[2 * ks + 1], 0x7362);
+                const int c0 = b * 32 + ks * 16 + 2 * tig;
+                unsigned bb[2] = {0, 0};
+                if (tok_ok) {
+                    float2 v0 = *(const float2 *) (xr + c0), v1 = *(const float2 *) (xr + c0 + 8);
+                    if (nin.w) {
+                        const float2 w0 = *(const float2 *) (nin.w + c0), w1 = *(const float2 *) (nin.w + c0 + 8);
+                        v0.x *= inv * w0.x; v0.y *= inv * w0.y; v1.x *= inv * w1.x; v1.y *= inv * w1.y;
+                    }
+                    if (nin.act) apply_act(nin, xr, c0, v0, v1);
+                    bb[0] = pack_h2(v0.x, v0.y);
+                    bb[1] = pack_h2(v1.x, v1.y);
+                }
+                mma16816(tmp, a, bb);
+            }
+            acc[0] += tmp[0] * s_lo; acc[1] += tmp[1] * s_lo;
+            acc[2] += tmp[2] * s_hi; acc[3] += tmp[3] * s_hi;
+        }
+        // partial: kpart[u][t][r] for tokens t = 2 tig, 2 tig + 1 (< nt) and rows gid, gid + 8
+        float * dst = kpart + (size_t) u * 128;
+        const int t0 = 2 * tig;
+        if (t0 < nt) { dst[t0 * 16 + gid] = acc[0]; dst[t0 * 16 + gid + 8] = acc[2]; }
+        if (t0 + 1 < nt) { dst[(t0 + 1) * 16 + gid] = acc[1]; dst[(t0 + 1) * 16 + gid + 8] = acc[3]; }
+        __threadfence();
+        __syncwarp();
+        unsigned ticket = 0;
+        if (lane == 0) ticket = atomicAdd(&kcnt[tile], 1u);
+        ticket = __shfl_sync(0xffffffff, ticket, 0);
+        if (ticket != (unsigned) upt - 1) continue;
+        __threadfence();
+        // last unit of the tile: sum the partials in unit order; lane = (token, row pair)
+        for (int e = lane; e < nt * 16; e += 32) {
+            const int t = e / 16, r = e % 16;
+            float v = 0.0f;
+            for (int c = 0; c < upt; ++c) v += __ldcg(kpart + ((size_t) tile * upt + c) * 128 + t * 16 + r);
+            const int row = tile * 16 + r;
+            if (row < n) { const size_t o = (size_t) t * ys + row; y[o] = add ? add[o] + v : v; }
+        }
+        if (lane == 0) kcnt[tile] = 0;
+    }
+}
+
 // fp16 weights in fragment order: per k-step (16 cols) one 16-byte load per lane gives a full A fragment
 __global__ void k_mma_f16(const uint4 * __restrict__ wq, int n, int k,
                           const float * __restrict__ x, int xs, float * __restrict__ y, int ys, const float * __restrict__ add,
@@ -1174,15 +1248,20 @@ __global__ void k_mma_q8_smallk(const uint4 * __restrict__ wq, const half * __re
 }
 
 // split-K scratch per device (gemv_init): tile partials and per-tile counters
-namespace { struct KSplit { float * part = nullptr; unsigned * cnt = nullptr; }; KSplit g_ksplit[16]; }
+namespace { struct KSplit { float * part = nullptr; unsigned * cnt = nullptr; int gw = 0; }; KSplit g_ksplit[16]; }
+constexpr size_t KSPLIT_CNT = 8192;   // tile counters
 constexpr int KSPLIT_TILES = 1024, KSPLIT_MAX = 16;
 // split-K target: blocks per GEMV launch (HYPER_GEMV_TARGET; 0 = only for matrices with few row tiles)
 static const int g_gemv_target = getenv("HYPER_GEMV_TARGET") ? atoi(getenv("HYPER_GEMV_TARGET")) : 0;
 void gemv_init(int dev) {
     if (dev < 0 || dev >= 16 || g_ksplit[dev].part) return;
     cudaMalloc(&g_ksplit[dev].part, (size_t) KSPLIT_TILES * KSPLIT_MAX * 128 * sizeof(float));
-    cudaMalloc(&g_ksplit[dev].cnt, KSPLIT_TILES * sizeof(unsigned));
-    cudaMemset(g_ksplit[dev].cnt, 0, KSPLIT_TILES * sizeof(unsigned));
+    cudaMalloc(&g_ksplit[dev].cnt, KSPLIT_CNT * sizeof(unsigned));
+    cudaMemset(g_ksplit[dev].cnt, 0, KSPLIT_CNT * sizeof(unsigned));
+    int nb = 0, sms = 0;   // resident warps of the balanced GEMV
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_mma_q8_bal, 256, 0);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    g_ksplit[dev].gw = nb * sms * 8;
 }
 
 void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const float * add, int nt, cudaStream_t s,
@@ -1196,6 +1275,24 @@ void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const fl
     int P = 1;
     int dev = 0;
     cudaGetDevice(&dev);
+    static const bool no_bal = getenv("HYPER_GEMV_NOBAL") != nullptr;
+    if (!no_bal && dev < 16 && g_ksplit[dev].part && g_ksplit[dev].gw > 0) {
+        // balanced units when a block per tile would leave a large partial wave (resident blocks: g_ksplit[dev].gw / 8)
+        const int resident = g_ksplit[dev].gw / 8;
+        const double waves = (double) tiles / resident;
+        const double eff = waves / std::ceil(waves);
+        if (eff < 0.85 && waves < 8.0 && tiles >= 160 && (waves >= 1.0 || kb >= 128)) {   // (measured: gemvbench)
+            static const int minkb = getenv("HYPER_BAL_MINKB") ? atoi(getenv("HYPER_BAL_MINKB")) : 8;
+            static const double rounds = getenv("HYPER_BAL_ROUNDS") ? atof(getenv("HYPER_BAL_ROUNDS")) : 1.0;
+            int upt = std::max(1, std::min({32, kb / std::max(1, minkb), (int) ((rounds * g_ksplit[dev].gw) / tiles)}));
+            while (upt > 1 && (size_t) tiles * upt > (size_t) KSPLIT_TILES * KSPLIT_MAX) --upt;
+            if ((size_t) tiles <= KSPLIT_CNT && upt >= 3) {   // (short rows: units too small to pay for the partials)
+                const int units = tiles * upt, blocks = std::min(resident, (units + 7) / 8);
+                k_mma_q8_bal<<<blocks, 256, 0, s>>>(W.q, W.s, W.n, W.k, x, xs, y, ys, add, nt, nin, upt, g_ksplit[dev].part, g_ksplit[dev].cnt);
+                return;
+            }
+        }
+    }
     if (dev < 16 && g_ksplit[dev].part && tiles <= KSPLIT_TILES && tiles < 160)   // few row tiles: spread K over more SMs
         P = std::max(1, std::min({KSPLIT_MAX, 320 / tiles, kb / 16}));
     if (g_gemv_target > 0 && dev < 16 && g_ksplit[dev].part && tiles <= KSPLIT_TILES && tiles < g_gemv_target)   // medium: enough blocks in flight
