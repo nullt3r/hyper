@@ -840,7 +840,7 @@ void Engine5::record_main(int gi, int nt) {
         const float one = 1.0f, zero = 0.0f;
         if (cublasGemmStridedBatchedEx(d.blas, CUBLAS_OP_T, CUBLAS_OP_N, R, nr, C, &one, W, CUDA_R_16F, C, (long long) R * C, d.xh, CUDA_R_16F,
                                        H * C, C, &zero, y, CUDA_R_32F, ys, R, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
-            throw std::runtime_error("cublasGemmStridedBatchedEx failed");
+            throw std::runtime_error(std::string("cublasGemmStridedBatchedEx failed (device: ") + cudaGetErrorString(cudaDeviceSynchronize()) + ")");
     };
     float * R = d.res;
     int * P = d.pos;

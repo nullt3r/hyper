@@ -416,7 +416,7 @@ __device__ __forceinline__ void ldsm5_x4_t(unsigned * r, const void * smem) {
 }
 constexpr int TC_LD = MLA_LAT + 8;   // smem row stride (halves): conflict-free ldmatrix
 constexpr int TC_KC = 32;            // cells per tile
-constexpr size_t TC_SMEM = (size_t) 32 * TC_LD * 2 * 2 + 32 * 33 * 4 + 32 * 40 * 2 + 3 * 32 * 4;
+constexpr size_t TC_SMEM = (size_t) 32 * TC_LD * 2 * 2 + 2 * 32 * 33 * 4 + 32 * 40 * 2 + 3 * 32 * 4;
 // Token t attends its cells (list or 0..pos+t) with every head: S = Q K^T and O += P K on mma.m16n8k16, online softmax
 // per head row. Rows: the <= 32 heads (padded); K tiles of 32 cells from the fp16 latent cache.
 __global__ void __launch_bounds__(256) k_mla_attn_tc(const float * __restrict__ q, int q_stride, const half * __restrict__ lat,
@@ -425,8 +425,8 @@ __global__ void __launch_bounds__(256) k_mla_attn_tc(const float * __restrict__ 
     extern __shared__ __align__(16) unsigned char smem[];
     half * Qs = (half *) smem;                       // [32][TC_LD]
     half * Ks = Qs + 32 * TC_LD;                     // [32][TC_LD]
-    float * Ss = (float *) (Ks + 32 * TC_LD);        // [32][33]
-    half * Ps = (half *) (Ss + 32 * 33);             // [32][40]
+    float * Ss = (float *) (Ks + 32 * TC_LD);        // [2][32][33]: partial scores of the two halves of the latent dim
+    half * Ps = (half *) (Ss + 2 * 32 * 33);         // [32][40]
     float * mrow = (float *) (Ps + 32 * 40);         // [32] running max
     float * lrow = mrow + 32;                        // [32] running sum
     float * arow = lrow + 32;                        // [32] rescale of this tile
@@ -447,7 +447,8 @@ __global__ void __launch_bounds__(256) k_mla_attn_tc(const float * __restrict__ 
         *(uint4 *) (Qs + h * TC_LD + c) = *(const uint4 *) hv;
     }
     if (tid < 32) { mrow[tid] = -FLT_MAX; lrow[tid] = 0.0f; }
-    const int mt = w & 1, np = w >> 1;   // S: m-tile (heads 16 mt..), cell pair of n-tiles (cells 16 np..); O: columns 128 np..
+    // S: warp = (m-tile of 16 heads, pair of n-tiles = 16 cells, half of the latent dim); O: (m-tile, 128 output columns)
+    const int mt = w & 1, np = w >> 1, nps = (w >> 1) & 1, kh = w >> 2;
     float acc[16][4];
 #pragma unroll
     for (int i = 0; i < 16; ++i) { acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f; }
@@ -464,10 +465,10 @@ __global__ void __launch_bounds__(256) k_mla_attn_tc(const float * __restrict__ 
         // S tile: this warp's 16 heads x 16 cells
         float sacc[2][4] = {};
 #pragma unroll 4
-        for (int ks = 0; ks < MLA_LAT / 16; ++ks) {
+        for (int ks = kh * (MLA_LAT / 32); ks < (kh + 1) * (MLA_LAT / 32); ++ks) {
             unsigned a[4], b[4];
             ldsm5_x4(a, Qs + (mt * 16 + (lane & 15)) * TC_LD + ks * 16 + (lane >> 4) * 8);
-            ldsm5_x4(b, Ks + (np * 16 + (lane & 7) + ((lane >> 4) << 3)) * TC_LD + ks * 16 + ((lane >> 3) & 1) * 8);
+            ldsm5_x4(b, Ks + (nps * 16 + (lane & 7) + ((lane >> 4) << 3)) * TC_LD + ks * 16 + ((lane >> 3) & 1) * 8);
             const unsigned b0[2] = {b[0], b[1]}, b1[2] = {b[2], b[3]};
             mma16816_5(sacc[0], a, b0);
             mma16816_5(sacc[1], a, b1);
@@ -476,13 +477,13 @@ __global__ void __launch_bounds__(256) k_mla_attn_tc(const float * __restrict__ 
         for (int ni = 0; ni < 2; ++ni)
 #pragma unroll
             for (int qd = 0; qd < 4; ++qd) {
-                const int row = mt * 16 + gid + (qd >> 1) * 8, col = np * 16 + ni * 8 + 2 * tig + (qd & 1);
-                Ss[row * 33 + col] = col < cnt ? sacc[ni][qd] : -FLT_MAX;
+                const int row = mt * 16 + gid + (qd >> 1) * 8, col = nps * 16 + ni * 8 + 2 * tig + (qd & 1);
+                Ss[(kh * 32 + row) * 33 + col] = sacc[ni][qd];
             }
         __syncthreads();
         // online softmax: warp w owns rows 4w..4w+3, lane = column
         for (int r = 4 * w; r < 4 * w + 4; ++r) {
-            const float v = Ss[r * 33 + lane];
+            const float v = lane < cnt ? Ss[r * 33 + lane] + Ss[(32 + r) * 33 + lane] : -FLT_MAX;
             const float mo = mrow[r], mn = fmaxf(mo, wmax(v));
             const float e = lane < cnt ? expf(v - mn) : 0.0f;
             const float z = wsum(e);
@@ -936,6 +937,8 @@ void mla_attn(const float * q, int q_stride, const half * lat, const int * pos, 
     static const bool no_tc = getenv("HYPER5_MLA_NOTC") != nullptr;
     if (nt > MAX_NT && H <= 32 && !no_tc) {   // prefill: tensor cores, block per token
         k_mla_attn_tc<<<nt, 256, TC_SMEM, s>>>(q, q_stride, lat, pos, H, scale, list, list_stride, list_n, o, o_stride);
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) throw std::runtime_error(std::string("mla_attn_tc launch: ") + cudaGetErrorString(e));
         return;
     }
     const int ns = nt <= MAX_NT ? MLA_SPLIT : 1;
