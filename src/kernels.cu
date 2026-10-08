@@ -1318,7 +1318,8 @@ void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const fl
         const int resident = g_ksplit[dev].gw / 8;
         const double waves = (double) tiles / resident;
         const double eff = waves / std::ceil(waves);
-        if (eff < 0.85 && waves < 8.0 && tiles >= 160 && (waves >= 1.0 || kb >= 128)) {   // (measured: gemvbench)
+        // (measured: gemvbench on the GLM / 27B shapes, k >= 4096; shorter rows make the units too small to pay for the partials)
+        if (eff < 0.85 && waves < 8.0 && tiles >= 160 && kb >= 128) {
             static const int minkb = getenv("HYPER_BAL_MINKB") ? atoi(getenv("HYPER_BAL_MINKB")) : 8;
             static const double rounds = getenv("HYPER_BAL_ROUNDS") ? atof(getenv("HYPER_BAL_ROUNDS")) : 1.0;
             int upt = std::max(1, std::min({32, kb / std::max(1, minkb), (int) ((rounds * g_ksplit[dev].gw) / tiles)}));
