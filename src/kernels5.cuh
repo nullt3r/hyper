@@ -44,6 +44,9 @@ void kda_step(const float * in, int stride, int q_off, int k_off, int v_off, int
 // ---- MLA ----
 // y[t][h * R + r] = sum_c W[h][r][c] x[t][h * C + c]  (fp16 W [H][R][C]); decode (nt <= MAX_NT)
 void head_gemv(const half * W, int H, int R, int C, const float * x, int xs, float * y, int ys, int nt, cudaStream_t s);
+// the same on Q8_0 rows as int8 Q [H][R][C] + fp16 scales S [H][R][C/32] (exact); n elements of such rows -> fp32 (exact)
+void head_gemv_q8(const int8_t * Q, const half * S, int H, int R, int C, const float * x, int xs, float * y, int ys, int nt, cudaStream_t s);
+void q8_rows_f32(const int8_t * Q, const half * S, size_t n, float * out, cudaStream_t s);
 // lat[pos + t] = half(rmsnorm(kv[t]) * w)  (512 wide)
 void mla_kv(const float * kv, int kv_stride, const float * w, float eps, half * lat, const int * pos, int nt, cudaStream_t s);
 // o[t][h] = sum_j softmax_j(scale * q[t][h] . lat[c_j]) lat[c_j] over the token's cells c_j: list[t][0..list_n[t]) or, without a

@@ -179,7 +179,9 @@ struct Engine5::DevLayer {
     float * conv_snap = nullptr, * state_snap = nullptr;   // speculative verification: state after each of the first nt-1 rows
     // MLA: min rows [q_a | kv_a | idx_k | idx_gate] on x (replicated), mq rows [q_b local | idx_q_b] on the normed q_a
     DW min, mq;
-    half * wkb = nullptr, * wvb = nullptr;   // fp16 [nh][512][256], [nh][256][512]
+    half * wkb = nullptr, * wvb = nullptr;   // fp16 [nh][512][256], [nh][256][512] (sources not Q8_0, or HYPER5_HEAD_F16)
+    int8_t * wkb_q = nullptr, * wvb_q = nullptr;   // Q8_0 sources as they are: int8 values + fp16 scales per 32
+    half * wkb_s = nullptr, * wvb_s = nullptr;
     float * q_a_norm = nullptr, * kv_a_norm = nullptr, * idx_proj = nullptr, * idx_lnw = nullptr, * idx_lnb = nullptr, * idx_ape = nullptr;
     half * lat = nullptr, * pooled = nullptr, * ring = nullptr;
     // FFN: dense layer or the shared expert (local hidden slice)
@@ -211,6 +213,8 @@ struct Engine5::Device {
     int * ilist = nullptr, * ilist_n = nullptr;
     unsigned * ihist = nullptr;   // indexer score histograms [GSCORE_ROWS][65536]
     half * xh = nullptr, * p16 = nullptr, * recv = nullptr, * mix16 = nullptr, * h16 = nullptr;
+    float * hf32 = nullptr;          // prefill: one layer's Q8_0 per-head matrix as exact fp32
+    size_t hf32_n = 0;
     float * topk = nullptr;
     int big_stride = 0;
     cublasHandle_t blas = nullptr;
@@ -446,8 +450,29 @@ void Engine5::load_layer(Device & dev, DevLayer & L, int il) {
                                          {T(p + "indexer.attn_k.weight"), 0, GIDX_DIM}, {T(p + "indexer_compressor_gate.weight"), 0, GIDX_DIM}});
         L.mq = upload_dense(A, dev.id, {{T(p + "attn_q_b.weight"), h0 * c.qk_dim, h1 * c.qk_dim},
                                         {T(p + "indexer.attn_q_b.weight"), 0, GIDX_HEADS * GIDX_DIM}});
-        L.wkb = fp16_rows(p + "attn_k_b.weight", h0 * c.kv_lora, h1 * c.kv_lora);
-        L.wvb = fp16_rows(p + "attn_v_b.weight", h0 * c.v_dim, h1 * c.v_dim);
+        static const bool head_f16 = getenv("HYPER5_HEAD_F16") != nullptr;
+        auto q8_rows = [&](const std::string & name, int64_t r0, int64_t r1, int8_t ** q, half ** sc) {
+            const GTensor & t = gguf_->need(name);
+            const int64_t C = t.ne[0], kb = C / 32, nr = r1 - r0;
+            std::vector<int8_t> qs((size_t) nr * C);
+            std::vector<half> d((size_t) nr * kb);
+            for (int64_t r = 0; r < nr; ++r)
+                for (int64_t b = 0; b < kb; ++b) {
+                    const uint8_t * blk = t.data + (size_t) (r0 + r) * t.row_bytes() + (size_t) b * 34;
+                    memcpy(&d[(size_t) r * kb + b], blk, 2);
+                    memcpy(&qs[(size_t) r * C + b * 32], blk + 2, 32);
+                }
+            *q = dev.upload(qs.data(), qs.size());
+            *sc = dev.upload(d.data(), d.size());
+        };
+        const bool hq = !head_f16 && gguf_->need(p + "attn_k_b.weight").type == GType::Q8_0 && gguf_->need(p + "attn_v_b.weight").type == GType::Q8_0;
+        if (hq) {
+            q8_rows(p + "attn_k_b.weight", h0 * c.kv_lora, h1 * c.kv_lora, &L.wkb_q, &L.wkb_s);
+            q8_rows(p + "attn_v_b.weight", h0 * c.v_dim, h1 * c.v_dim, &L.wvb_q, &L.wvb_s);
+        } else {
+            L.wkb = fp16_rows(p + "attn_k_b.weight", h0 * c.kv_lora, h1 * c.kv_lora);
+            L.wvb = fp16_rows(p + "attn_v_b.weight", h0 * c.v_dim, h1 * c.v_dim);
+        }
         L.wo = upload_dense(A, dev.id, {{T(p + "attn_output.weight"), 0, n}}, {{h0 * c.v_dim / 32, h1 * c.v_dim / 32}});
         L.q_a_norm = f32(p + "attn_q_a_norm.weight");
         L.kv_a_norm = f32(p + "attn_kv_a_norm.weight");
@@ -755,6 +780,8 @@ void Engine5::load_weights() {
         dev.yexp = dev.alloc<float>((size_t) R * K * n);
         dev.logits = dev.alloc<float>((size_t) MAX_NT * dev.output.n());
         dev.xh = dev.alloc<half>((size_t) R * std::max({hcn, ffl, nh_max * MLA_LAT}));
+        dev.hf32_n = (size_t) nh_max * MLA_LAT * std::max(c.qk_dim, c.v_dim);   // (one layer's wkb or wvb as fp32, prefill)
+        dev.hf32 = dev.alloc<float>(dev.hf32_n);
         dev.p16 = dev.alloc<half>((size_t) R * n);
         dev.recv = dev.alloc<half>((size_t) std::max(1, nd - 1) * R * n);
         dev.order = dev.alloc<int>((size_t) R * K);
@@ -870,6 +897,17 @@ void Engine5::record_main(int gi, int nt) {
                                        H * C, C, &zero, y, CUDA_R_32F, ys, R, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
             throw std::runtime_error(std::string("cublasGemmStridedBatchedEx failed (device: ") + cudaGetErrorString(cudaDeviceSynchronize()) + ")");
     };
+    // Q8_0 per-head matrices: GEMV on int8 + scales; prefill: exact fp32 copy + fp32 batched GEMM (no rounding to fp16)
+    auto hmmq = [&](const int8_t * Q, const half * S, int H, int Rr, int C, const float * x, int xs, float * y, int ys, int nr) {
+        if (nr <= MAX_NT) { head_gemv_q8(Q, S, H, Rr, C, x, xs, y, ys, nr, s); return; }
+        const size_t ne = (size_t) H * Rr * C;
+        if (ne > d.hf32_n) throw std::runtime_error("hmmq: scratch too small");
+        q8_rows_f32(Q, S, ne, d.hf32, s);
+        const float one = 1.0f, zero = 0.0f;
+        if (cublasSgemmStridedBatched(d.blas, CUBLAS_OP_T, CUBLAS_OP_N, Rr, nr, C, &one, d.hf32, C, (long long) Rr * C, x, xs, C, &zero,
+                                      y, ys, Rr, H) != CUBLAS_STATUS_SUCCESS)
+            throw std::runtime_error("cublasSgemmStridedBatched failed");
+    };
     float * R = d.res;
     int * P = d.pos;
     const int pos_host = h_pos_[0];
@@ -964,11 +1002,13 @@ void Engine5::record_main(int gi, int nt) {
             if (!dense_chunk || !bulk)
                 gidx_select(d.big0 + qo + nh * c.qk_dim, bs, d.big0 + wq, bs, L.pooled, P, nt, top, d.iscores, opt_.max_pos / 4 + 4,
                             GSCORE_ROWS, d.ilist, GLIST, d.ilist_n, s, getenv("HYPER5_OLDSEL") ? nullptr : d.ihist);
-            hmm(L.wkb, nh, MLA_LAT, c.qk_dim, d.big0 + qo, bs, d.qabs, nh * MLA_LAT, nt);
+            if (L.wkb_q) hmmq(L.wkb_q, L.wkb_s, nh, MLA_LAT, c.qk_dim, d.big0 + qo, bs, d.qabs, nh * MLA_LAT, nt);
+            else hmm(L.wkb, nh, MLA_LAT, c.qk_dim, d.big0 + qo, bs, d.qabs, nh * MLA_LAT, nt);
             const bool use_list = !(bulk && dense_chunk);
             mla_attn(d.qabs, nh * MLA_LAT, L.lat, P, nh, 1.0f / sqrtf((float) c.qk_dim), nt, use_list ? d.ilist : nullptr, GLIST,
                      use_list ? d.ilist_n : nullptr, d.attn_part, d.olat, nh * MLA_LAT, s);
-            hmm(L.wvb, nh, c.v_dim, MLA_LAT, d.olat, nh * MLA_LAT, d.o, nh * c.v_dim, nt);
+            if (L.wvb_q) hmmq(L.wvb_q, L.wvb_s, nh, c.v_dim, MLA_LAT, d.olat, nh * MLA_LAT, d.o, nh * c.v_dim, nt);
+            else hmm(L.wvb, nh, c.v_dim, MLA_LAT, d.olat, nh * MLA_LAT, d.o, nh * c.v_dim, nt);
             mm(L.wo, d.o, nh * c.v_dim, d.part, n, nt);
         }
         dbg(L.mla ? "mla_part" : "kda_part", il, d.part, (size_t) nt * n);

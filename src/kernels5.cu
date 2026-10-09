@@ -283,6 +283,37 @@ __global__ void k_head_gemv(const half * __restrict__ W, int H, int R, int C, co
         if (lane == 0) y[(size_t) t * ys + (size_t) h * R + r] = v;
     }
 }
+// the same on Q8_0 rows kept as int8 + fp16 scale per 32 (exact: scale * q in fp32)
+__global__ void k_head_gemv_q8(const int8_t * __restrict__ Q, const half * __restrict__ S, int H, int R, int C, const float * __restrict__ x,
+                               int xs, float * __restrict__ y, int ys, int nt) {
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= H * R) return;
+    const int h = row / R, r = row % R;
+    const int8_t * qr = Q + (size_t) row * C;
+    const half * sr = S + (size_t) row * (C / 32);
+    float acc[MAX_NT] = {};
+    for (int c = lane * 8; c < C; c += 256) {
+        const int2 qv = *(const int2 *) (qr + c);
+        const int8_t * q8 = (const int8_t *) &qv;
+        const float sc = __half2float(sr[c / 32]);
+        float wf[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) wf[i] = sc * (float) q8[i];
+        for (int t = 0; t < nt; ++t) {
+            const float * xr = x + (size_t) t * xs + (size_t) h * C + c;
+            const float4 a = *(const float4 *) xr, b = *(const float4 *) (xr + 4);
+            acc[t] += wf[0] * a.x + wf[1] * a.y + wf[2] * a.z + wf[3] * a.w + wf[4] * b.x + wf[5] * b.y + wf[6] * b.z + wf[7] * b.w;
+        }
+    }
+    for (int t = 0; t < nt; ++t) {
+        const float v = wsum(acc[t]);
+        if (lane == 0) y[(size_t) t * ys + (size_t) h * R + r] = v;
+    }
+}
+__global__ void k_q8_rows_f32(const int8_t * __restrict__ Q, const half * __restrict__ S, size_t n, float * __restrict__ out) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half2float(S[i / 32]) * (float) Q[i];
+}
 __global__ void k_mla_kv(const float * __restrict__ kv, int kv_stride, const float * __restrict__ w, float eps, half * __restrict__ lat,
                          const int * pos_p) {
     const int t = blockIdx.x, i = threadIdx.x;
@@ -949,6 +980,13 @@ void kda_step(const float * in, int stride, int q_off, int k_off, int v_off, int
               float * o, int o_stride, const float * dt_bias, const float * A, float lb, int n_head, float eps, int nt, cudaStream_t s) {
     k_kda_step<<<dim3(n_head, 16), 256, 0, s>>>(in, stride, q_off, k_off, v_off, fb_off, b_off, state, snap, o, o_stride, dt_bias, A, lb,
                                                 n_head, eps, nt);
+}
+void head_gemv_q8(const int8_t * Q, const half * S, int H, int R, int C, const float * x, int xs, float * y, int ys, int nt, cudaStream_t s) {
+    if (C % 256 || nt > MAX_NT) throw std::runtime_error("head_gemv_q8: C % 256 / nt");
+    k_head_gemv_q8<<<(H * R + 7) / 8, 256, 0, s>>>(Q, S, H, R, C, x, xs, y, ys, nt);
+}
+void q8_rows_f32(const int8_t * Q, const half * S, size_t n, float * out, cudaStream_t s) {
+    k_q8_rows_f32<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(Q, S, n, out);
 }
 void head_gemv(const half * W, int H, int R, int C, const float * x, int xs, float * y, int ys, int nt, cudaStream_t s) {
     if (C % 256 || nt > MAX_NT) throw std::runtime_error("head_gemv: C % 256 / nt");
