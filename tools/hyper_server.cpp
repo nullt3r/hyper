@@ -144,6 +144,9 @@ struct Request {
     SamplingParams sp;
 };
 
+bool is_image_part(const ojson & p);
+std::string part_text(const ojson & c);
+
 // tool-call arguments must be a JSON object: a call cut off mid-arguments ("{", a truncated command) becomes "{}" (not
 // completed: a truncated shell command must not run as something else); the client reports the error to the model
 std::string valid_args(const std::string & a, const char * where = nullptr) {
@@ -156,6 +159,13 @@ Request prepare(Ctx & c, const ojson & body) {
     Request r;
     common_chat_templates_inputs in;
     ojson msgs_in = body.at("messages");   // (broken tool-call arguments in the history: repaired, not rejected)
+    if (msgs_in.is_array())
+        for (auto & m : msgs_in)   // image parts (text-only engines): the content becomes text with a note per image
+            if (m.is_object() && m.contains("content") && m["content"].is_array()) {
+                bool img = false;
+                for (auto & p : m["content"]) img |= is_image_part(p);
+                if (img) { m["content"] = part_text(m["content"]); fprintf(stderr, "request: image(s) replaced by a text note (text-only)\n"); }
+            }
     if (msgs_in.is_array())
         for (auto & m : msgs_in)
             if (m.is_object() && m.contains("tool_calls") && m["tool_calls"].is_array())
@@ -408,12 +418,21 @@ ojson usage(const Request & r, const GenOut & o) {
 
 
 // ---------------- OpenAI Responses API (/v1/responses) on top of the chat path ----------------
+// the engines are text-only: an image becomes this note (instead of vanishing, after which models describe what they
+// "saw")
+const char * kImageNote = "[image not shown: this model server is text-only and cannot see images]";
+bool is_image_part(const ojson & p) {
+    if (!p.is_object()) return false;
+    const std::string ty = p.value("type", "");
+    return ty == "input_image" || ty == "image_url" || ty == "image" || (ty == "input_file" && p.contains("image_url"));
+}
 std::string part_text(const ojson & c) {   // string, or an array of content parts (input_text / output_text / text / ...)
     if (c.is_string()) return c.get<std::string>();
     std::string t;
     if (c.is_array())
         for (auto & p : c) {
             if (p.is_string()) t += p.get<std::string>();
+            else if (is_image_part(p)) { if (!t.empty() && t.back() != '\n') t += "\n"; t += kImageNote; t += "\n"; }
             else if (p.is_object() && p.contains("text") && p["text"].is_string()) t += p["text"].get<std::string>();
         }
     return t;
