@@ -15,14 +15,19 @@
 
 using namespace hyper;
 
+static int g_ref_first = 0;   // v2 references ("REF2"): logits for positions g_ref_first.. only
 static bool read_ref(const char * path, std::vector<int> & toks, std::vector<float> & logits, int & nv) {
     FILE * f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); return false; }
     int n = 0;
-    if (fread(&n, 4, 1, f) != 1 || fread(&nv, 4, 1, f) != 1) return false;
+    if (fread(&n, 4, 1, f) != 1) return false;
+    const bool v2 = n == 0x32464552;
+    if (v2 && fread(&n, 4, 1, f) != 1) return false;
+    if (fread(&nv, 4, 1, f) != 1) return false;
+    if (v2 && fread(&g_ref_first, 4, 1, f) != 1) return false;
     toks.resize(n);
     if (fread(toks.data(), 4, n, f) != (size_t) n) return false;
-    logits.resize((size_t) n * nv);
+    logits.resize((size_t) (n - g_ref_first) * nv);
     if (fread(logits.data(), 4, logits.size(), f) != logits.size()) return false;
     fclose(f);
     return true;

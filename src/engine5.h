@@ -37,6 +37,9 @@ public:
     ~Engine5();
 
     std::vector<int> forward(const int * tokens, int nt, int pos);
+    // several consecutive prefill chunks (each <= MOE_BULK_ROWS, all streaming) layer by layer: a layer's streamed CPU
+    // experts cross PCIe once for all of them; result: the last chunk's next token (as forward)
+    int forward_multi(const int * tokens, const int * lens, int nck, int pos);
     int prefill(const int * tokens, int n, int pos);
     void get_logits(int t, std::vector<float> & out);
     void reset();
@@ -64,7 +67,7 @@ private:
     void record_restore(int gi, int keep);
     void restore(int keep);   // keep the first `keep` rows of the last verification
     void build_graphs();
-    void embed(const int * tokens, int nt);
+    void embed(const int * tokens, int nt, int chunk = 0);
     void run(int nt);
     void * host_huge_alloc(size_t bytes);
     int sample_row(int t, const SamplingParams & sp);
@@ -104,6 +107,8 @@ private:
     bool graphs_ready_ = false;
     bool debug_ = false, nocpu_ = false;
     int last_nt_ = 0;
+    int mc_max_ = 4;               // prefill chunks per layer pass (HYPER5_MC; 1: one at a time)
+    int mc_n_ = 1, mc_nt_[8] = {}, mc_pos_[8] = {};   // the chunks of the current bulk forward
     // adaptive expert placement (HYPER5_ADAPT=0: off): host copy of every expert, current placement, routing scores
     struct ExpertHost {
         const uint8_t * gate = nullptr, * up = nullptr, * down = nullptr;

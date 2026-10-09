@@ -4,7 +4,7 @@ CXX      ?= g++
 LLAMA    ?= $(HOME)/llama.cpp-src
 ARCH     := -gencode arch=compute_86,code=sm_86
 CXXFLAGS := -O3 -march=native -std=c++17 -Wall -Wno-unused-function -fopenmp
-NVFLAGS  := -O3 -std=c++17 $(ARCH) -lineinfo --use_fast_math -Xcompiler "-O3 -march=native -fopenmp"
+NVFLAGS  := -O3 -std=c++17 $(ARCH) -lineinfo --use_fast_math -Xcompiler "-O3 -march=native -fopenmp" $(EXTRA)
 LIBS     := -L/usr/local/cuda-12.9/lib64 -lcudart -lcublas -lcuda -lgomp -lpthread -ldl
 
 BUILD := build

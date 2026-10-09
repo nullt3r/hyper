@@ -206,6 +206,8 @@ struct Engine5::Device {
     int vocab_off = 0;
     // activations [R5] rows
     float * x = nullptr, * res = nullptr, * xn = nullptr, * mix = nullptr, * mixpart = nullptr, * hcw = nullptr, * bo = nullptr, * part = nullptr;
+    std::vector<float *> res_x;      // residual rows of the further chunks of a multi-chunk prefill pass
+    int * pos_x = nullptr;           // their positions
     float * big0 = nullptr, * o = nullptr, * qabs = nullptr, * olat = nullptr, * attn_part = nullptr;
     float * rlog = nullptr, * wts = nullptr, * sg = nullptr, * shgu = nullptr, * shh = nullptr, * shpart = nullptr;
     float * hexp = nullptr, * yexp = nullptr, * logits = nullptr, * conv_raw = nullptr, * iscores = nullptr;
@@ -294,17 +296,18 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
         devs_.push_back(std::move(dev));
     }
     const int nd = opt_.n_devices, n = cfg_.n_embd;
-    CUDA_CHECK(cudaHostAlloc(&h_embd_, (size_t) R5 * n * sizeof(float), cudaHostAllocPortable));
+    if (getenv("HYPER5_MC")) mc_max_ = std::max(1, std::min(8, atoi(getenv("HYPER5_MC"))));
+    CUDA_CHECK(cudaHostAlloc(&h_embd_, (size_t) mc_max_ * R5 * n * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_stage_, (size_t) 2 * nd * R5 * n * sizeof(half), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&cpu_bulk_, sizeof(CpuMoeBulk), cudaHostAllocPortable | cudaHostAllocMapped));
     CUDA_CHECK(cudaHostAlloc(&cpu_bulk_out_, sizeof(CpuMoeBulkOut), cudaHostAllocPortable | cudaHostAllocMapped));
     memset((void *) cpu_bulk_, 0, sizeof(CpuMoeBulk));
     memset((void *) cpu_bulk_out_, 0, sizeof(CpuMoeBulkOut));
     barrier_ = std::make_unique<Barrier4>(nd);
-    CUDA_CHECK(cudaHostAlloc(&h_pos_, 4 * sizeof(int), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_pos_, 8 * sizeof(int), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_res_, (size_t) nd * MAX_NT * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_topk_, (size_t) nd * MAX_NT * TOPK * 2 * sizeof(float), cudaHostAllocPortable));
-    CUDA_CHECK(cudaHostAlloc(&h_ids_, (size_t) cfg_.n_layer * R5 * cfg_.n_expert_used * sizeof(int), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_ids_, (size_t) cfg_.n_layer * mc_max_ * R5 * cfg_.n_expert_used * sizeof(int), cudaHostAllocPortable));
     const size_t ll = (size_t) 2 * nd * MAX_NT * n / 2;
     CUDA_CHECK(cudaHostAlloc(&ar_ll_, ll * sizeof(uint2), cudaHostAllocPortable | cudaHostAllocMapped));
     memset(ar_ll_, 0xff, ll * sizeof(uint2));
@@ -758,6 +761,10 @@ void Engine5::load_weights() {
         for (auto & L : dev.layers) ffl = std::max(ffl, L.ff_l);
         dev.x = dev.alloc<float>((size_t) R * n);
         dev.res = dev.alloc<float>((size_t) R * hcn);
+        // (HYPER5_MC_ALLOC: buffers for more chunks than used: equal VRAM, so the expert placement matches another setting)
+        const int mc_alloc = std::max(mc_max_, getenv("HYPER5_MC_ALLOC") ? atoi(getenv("HYPER5_MC_ALLOC")) : 0);
+        for (int ci = 1; ci < mc_alloc; ++ci) dev.res_x.push_back(dev.alloc<float>((size_t) R * hcn));
+        dev.pos_x = dev.alloc<int>(8);
         dev.xn = dev.alloc<float>((size_t) R * n);
         dev.mix = dev.alloc<float>((size_t) R * 32);
         dev.mixpart = dev.alloc<float>((size_t) R * (hcn / 256) * 25);
@@ -908,11 +915,25 @@ void Engine5::record_main(int gi, int nt) {
                                       y, ys, Rr, H) != CUBLAS_STATUS_SUCCESS)
             throw std::runtime_error("cublasSgemmStridedBatched failed");
     };
+    // chunks of this pass (a multi-chunk prefill runs each layer for all of them before the next layer): residual rows,
+    // positions and embeddings per chunk; everything else is per-layer scratch
+    struct Ck { int nt; float * R; int * P; int pos; };
+    const int nck = bulk ? mc_n_ : 1;
+    std::vector<Ck> ck(nck);
+    for (int ci = 0; ci < nck; ++ci) {
+        ck[ci].nt = ci == 0 ? nt : mc_nt_[ci];
+        ck[ci].R = ci == 0 ? d.res : d.res_x[ci - 1];
+        ck[ci].P = ci == 0 ? d.pos : d.pos_x + ci;
+        ck[ci].pos = ci == 0 ? h_pos_[0] : mc_pos_[ci];
+    }
     float * R = d.res;
     int * P = d.pos;
-    const int pos_host = h_pos_[0];
-    CUDA_CHECK(cudaMemcpyAsync(P, h_pos_, sizeof(int), cudaMemcpyHostToDevice, s));
-    CUDA_CHECK(cudaMemcpyAsync(d.x, h_embd_, (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
+    int pos_host = h_pos_[0];
+    for (int ci = 0; ci < nck; ++ci) {
+        CUDA_CHECK(cudaMemcpyAsync(ck[ci].P, h_pos_ + ci, sizeof(int), cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(d.x, h_embd_ + (size_t) ci * R5 * n, (size_t) ck[ci].nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
+        mhc_init(ck[ci].R, d.x, n, ck[ci].nt, s);
+    }
     incr_counter(d.counter, s);
     const bool streaming = bulk && opt_.stream_experts && nt >= stream_min_;
     if (streaming) {
@@ -920,7 +941,6 @@ void Engine5::record_main(int gi, int nt) {
         while (first < c.n_layer && !d.layers[first].owner_bulk) ++first;
         if (first < c.n_layer) { upload_stage(d, first, 0); upload_stage(d, first, 1); }
     }
-    mhc_init(R, d.x, n, nt, s);
     int call = 0;
     auto dbg = [&](const char * what, int il, const float * buf, size_t cnt) {
         if (!debug_) return;
@@ -932,7 +952,7 @@ void Engine5::record_main(int gi, int nt) {
         for (float v : h) { if (!std::isfinite(v)) ++bad; else { mx = std::max(mx, (double) std::fabs(v)); sum += v; sq += (double) v * v; } }
         if (bad || err != cudaSuccess || (il < 4 && !getenv("HYPER4_SUMS")))
             fprintf(stderr, "dbg L%d %-12s err=%s nonfinite=%d max|x|=%.3g\n", il, what, cudaGetErrorString(err), bad, mx);
-        if (getenv("HYPER4_SUMS")) fprintf(stderr, "SUMS %d %s %.6g %.6g\n", il, what, sum, sq);
+        if (getenv("HYPER4_SUMS")) fprintf(stderr, "SUMS %d %s %.17g %.17g\n", il, what, sum, sq);
         if (bad || err != cudaSuccess) throw std::runtime_error("debug stop");
     };
     int dcall = 0;
@@ -970,7 +990,10 @@ void Engine5::record_main(int gi, int nt) {
         mhc_pre(R, d.mix, 32, scale, base, norm_w, eps, c.hc_eps, c.sinkhorn, n, d.hcw, d.xn, nt, s);
     };
     dbg("embed", -1, R, (size_t) nt * hcn);
-    for (int il = 0; il < c.n_layer; ++il) {
+    for (int il = 0; il < c.n_layer; ++il)
+    for (int ci = 0; ci < nck; ++ci) {
+        nt = ck[ci].nt; R = ck[ci].R; P = ck[ci].P; pos_host = ck[ci].pos;
+        const bool last_ck = ci == nck - 1;   // (the streamed experts' staging is released after the last chunk)
         DevLayer & L = d.layers[il];
         const int nh = L.nh;
         // ---- token mixer ----
@@ -1030,7 +1053,7 @@ void Engine5::record_main(int gi, int nt) {
             moe_route_sig(d.rlog, c.n_expert, L.exp_bias, c.n_expert, K, c.w_scale, d.ids, d.wts, d.sg, nt, s);
             dbg("route_w", il, d.wts, (size_t) nt * K);
             if (bulk && d.g == 0 && adapt_)   // prompt routing for the adaptive placement
-                CUDA_CHECK(cudaMemcpyAsync(h_ids_ + (size_t) il * R5 * K, d.ids, (size_t) nt * K * sizeof(int), cudaMemcpyDeviceToHost, s));
+                CUDA_CHECK(cudaMemcpyAsync(h_ids_ + ((size_t) il * mc_max_ + ci) * R5 * K, d.ids, (size_t) nt * K * sizeof(int), cudaMemcpyDeviceToHost, s));
             const bool stream = streaming && L.owner_bulk;
             if (d.g == 0 && !stream) {
                 if (bulk) moe_publish(&cpu_bulk_->seq, &cpu_bulk_->nt, &cpu_bulk_->ids[0][0], &cpu_bulk_->wts[0][0], &cpu_bulk_->x[0][0],
@@ -1055,6 +1078,7 @@ void Engine5::record_main(int gi, int nt) {
                         moe_order(ms, d.ids, nt * K, c.n_expert, d.order, d.order_n, s, d.egrp);
                         moe_gemm_gate_up(ms, d.mix16, n, K, d.order, d.order_n, d.egrp, c.n_expert, d.h16, s);
                         moe_gemm_down(ms, d.h16, d.order, d.order_n, d.egrp, c.n_expert, d.wts, d.yexp, s);
+                        if (!last_ck) continue;
                         CUDA_CHECK(cudaEventRecord(d.ev_free[sb], s));
                         int nx = il + 1;
                         while (nx < c.n_layer && !d.layers[nx].owner_bulk) ++nx;
@@ -1148,12 +1172,12 @@ void Engine5::build_graphs() {
     graphs_ready_ = true;
 }
 
-void Engine5::embed(const int * tokens, int nt) {
+void Engine5::embed(const int * tokens, int nt, int chunk) {
     const GTensor & te = gguf_->need("token_embd.weight");
     const auto * te_tr = ggml_get_type_traits((ggml_type) te.type);
     for (int t = 0; t < nt; ++t) {
         const uint8_t * row = te.data + (size_t) tokens[t] * te.row_bytes();
-        float * out = h_embd_ + (size_t) t * cfg_.n_embd;
+        float * out = h_embd_ + ((size_t) chunk * R5 + t) * cfg_.n_embd;
         if (te.type == GType::F32) memcpy(out, row, cfg_.n_embd * sizeof(float));
         else te_tr->to_float(row, out, cfg_.n_embd);
     }
@@ -1222,7 +1246,7 @@ std::vector<int> Engine5::forward(const int * tokens, int nt, int pos) {
         for (int il = 0; il < cfg_.n_layer; ++il) {
             if (!is_moe(il)) continue;
             auto & sc = ehost_[il].score;
-            for (int i = 0; i < nt * K; ++i) { const int e = h_ids_[(size_t) il * R5 * K + i]; if (e >= 0 && e < cfg_.n_expert) sc[e] += prompt_weight_; }
+            for (int i = 0; i < nt * K; ++i) { const int e = h_ids_[(size_t) il * mc_max_ * R5 * K + i]; if (e >= 0 && e < cfg_.n_expert) sc[e] += prompt_weight_; }
         }
         prompt_routed_ = true;
     }
@@ -1363,7 +1387,7 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
         // snapshots at every full-chunk boundary (prefill runs in whole R5-token chunks: every MoE chunk pays a fixed cost,
         // one pass over the CPU-resident experts) and at the last message start (edits / regenerations resume there);
         // generation adds its own snapshots, so the end of a previous answer is covered too
-        for (int q = s + R5; q < P; q += R5) snap_at.push_back(q);
+        for (int q = s + R5 * mc_max_; q < P; q += R5 * mc_max_) snap_at.push_back(q);   // (a multi-chunk pass per snapshot)
         if (!msg.empty() && msg.back() - s >= 64) snap_at.push_back(msg.back());
         std::sort(snap_at.begin(), snap_at.end());
         snap_at.erase(std::unique(snap_at.begin(), snap_at.end()), snap_at.end());
@@ -1376,9 +1400,14 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
         // the stretch up to the next snapshot point in equal chunks of at most R5 (no short tail chunk inside it)
         while (si < snap_at.size() && snap_at[si] <= c0) ++si;
         const int seg = (si < snap_at.size() ? snap_at[si] : P) - c0, nch = (seg + R5 - 1) / R5;
-        const int end = c0 + (seg + nch - 1) / nch;
-        const int len = end - c0;
-        next = forward(&prompt[c0], len, c0)[len - 1];
+        const int L = (seg + nch - 1) / nch;
+        int lens[8], nk = 0, tot = 0;   // up to mc_max_ of the stretch's chunks in one layer-by-layer pass
+        while (nk < mc_max_ && tot < seg) { lens[nk] = std::min(L, seg - tot); tot += lens[nk++]; }
+        bool multi = nk > 1;
+        for (int i = 0; i < nk && multi; ++i) multi = lens[i] >= stream_min_ && lens[i] > MAX_NT;
+        if (!multi) { nk = 1; tot = lens[0]; }
+        const int end = c0 + tot, len = lens[nk - 1];
+        next = multi ? forward_multi(&prompt[c0], lens, nk, c0) : forward(&prompt[c0], len, c0)[len - 1];
         if (sampling) next = sample_row(len <= MAX_NT ? len - 1 : 0, sp);
         if (si < snap_at.size() && snap_at[si] == end) take_snapshot(end);
         if (prefill_cb_) prefill_cb_(end, P, s);
@@ -1492,13 +1521,58 @@ void Engine5::save_expert_stats(const std::string & path) {
     rename(tmp.c_str(), path.c_str());
 }
 
+int Engine5::forward_multi(const int * tokens, const int * lens, int nck, int pos) {
+    bool ok = nck > 1 && nck <= mc_max_ && opt_.stream_experts;
+    for (int ci = 0; ci < nck && ok; ++ci) ok = lens[ci] >= stream_min_ && lens[ci] <= R5 && lens[ci] > MAX_NT;
+    if (!ok) {   // one chunk at a time
+        int next = -1, off = 0;
+        for (int ci = 0; ci < nck; ++ci) { next = forward(tokens + off, lens[ci], pos + off)[lens[ci] - 1]; off += lens[ci]; }
+        return next;
+    }
+    int off = 0;
+    for (int ci = 0; ci < nck; ++ci) {
+        embed(tokens + off, lens[ci], ci);
+        mc_nt_[ci] = lens[ci];
+        mc_pos_[ci] = pos + off;
+        h_pos_[ci] = pos + off;
+        off += lens[ci];
+    }
+    if (pos + off > opt_.max_pos) throw std::runtime_error("forward_multi: position exceeds max_pos");
+    for (int il = 0; il < cfg_.n_layer; ++il) if (is_moe(il) && ehost_[il].stream_dirty) rebuild_stream(il);
+    mc_n_ = nck;
+    try { run(lens[0]); } catch (...) { mc_n_ = 1; throw; }
+    mc_n_ = 1;
+    if (adapt_) {
+        const int K = cfg_.n_expert_used;
+        for (int il = 0; il < cfg_.n_layer; ++il) {
+            if (!is_moe(il)) continue;
+            auto & sc = ehost_[il].score;
+            for (int ci = 0; ci < nck; ++ci)
+                for (int i = 0; i < lens[ci] * K; ++i) {
+                    const int e = h_ids_[((size_t) il * mc_max_ + ci) * R5 * K + i];
+                    if (e >= 0 && e < cfg_.n_expert) sc[e] += prompt_weight_;
+                }
+        }
+        prompt_routed_ = true;
+    }
+    last_nt_ = lens[nck - 1];
+    float best = -INFINITY; int bi = -1;   // the last chunk's last row
+    for (size_t g = 0; g < devs_.size(); ++g) {
+        const float v = h_res_[(g * MAX_NT) * 2];
+        const int idx = ((const int *) h_res_)[(g * MAX_NT) * 2 + 1];
+        if (v > best) { best = v; bi = idx; }
+    }
+    return bi;
+}
+
 int Engine5::prefill(const int * tokens, int n, int pos) {
     int next = -1;
     static const int chunk = getenv("HYPER4_CHUNK") ? std::max(1, std::min(R5, atoi(getenv("HYPER4_CHUNK")))) : R5;
-    for (int c0 = 0; c0 < n;) {
-        const int len = std::min(chunk, n - c0);
-        next = forward(tokens + c0, len, pos + c0)[len - 1];
-        c0 += len;
+    for (int c0 = 0; c0 < n;) {   // up to mc_max_ chunks per layer pass
+        int lens[8], nk = 0, tot = 0;
+        while (nk < mc_max_ && c0 + tot < n) { lens[nk] = std::min(chunk, n - c0 - tot); tot += lens[nk++]; }
+        next = forward_multi(tokens + c0, lens, nk, pos + c0);
+        c0 += tot;
     }
     return next;
 }
