@@ -66,6 +66,9 @@ $(BUILD)/deqtest: $(OBJ4) tools/deqtest.cu
 $(BUILD)/gemvbench: tools/gemvbench.cu $(BUILD)/kernels.o
 	$(NVCC) $(NVFLAGS) tools/gemvbench.cu $(BUILD)/kernels.o -o $@ $(LIBS)
 
+$(BUILD)/mkbench: tools/mkbench.cu $(BUILD)/kernels.o
+	$(NVCC) $(NVFLAGS) tools/mkbench.cu $(BUILD)/kernels.o -o $@ $(LIBS)
+
 $(BUILD)/mmabench: tools/mmabench.cu $(BUILD)/kernels.o
 	$(NVCC) $(NVFLAGS) tools/mmabench.cu $(BUILD)/kernels.o -o $@ $(LIBS)
 
