@@ -2,7 +2,12 @@
 
 #include "ggml-cpu.h"
 #include "ggml.h"
+#define GGML_COMMON_DECL_CPP
+#define GGML_COMMON_IMPL_CPP
+#include "ggml-common.h"
+#include "iq3s_dot.h"
 
+#include <immintrin.h>
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
@@ -20,6 +25,67 @@ namespace hyper {
 namespace {
 inline float silu(float x) { return x / (1.0f + std::exp(-x)); }
 inline const ggml_type_traits_cpu * traits(GType t) { return ggml_get_type_traits_cpu((ggml_type) t); }
+// activations -> Q8_K with AVX2, bit-identical to ggml's quantize_row_q8_K (on x86 the scalar reference: ~10 us for a
+// 4096-row on the critical path of every decode job): same first-occurrence signed max, iscale = -127 / max, the same
+// x * iscale products rounded by the same 1.5 * 2^23 trick, min(127, v), int16 sums of 16
+struct BlockQ8K { float d; int8_t qs[256]; int16_t bsums[16]; };
+void quantize_q8_K_avx2(const float * __restrict x, void * __restrict vy, int64_t k) {
+    BlockQ8K * y = (BlockQ8K *) vy;
+    const __m256 sign = _mm256_set1_ps(-0.0f);
+    for (int64_t i = 0; i < k / 256; ++i, x += 256) {
+        __m256 am = _mm256_setzero_ps();
+        for (int j = 0; j < 256; j += 8) am = _mm256_max_ps(am, _mm256_andnot_ps(sign, _mm256_loadu_ps(x + j)));
+        __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(am), _mm256_extractf128_ps(am, 1));
+        m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        m4 = _mm_max_ss(m4, _mm_movehdup_ps(m4));
+        const float amax = _mm_cvtss_f32(m4);
+        if (!(amax > 0.0f)) {   // (all zero; NaN rows: the reference's scalar path)
+            if (amax == 0.0f) { y[i].d = 0; memset(y[i].qs, 0, 256); continue; }
+            ggml_get_type_traits_cpu(GGML_TYPE_Q8_K)->from_float(x, &y[i], 256);
+            continue;
+        }
+        float mx = 0.0f;
+        for (int j = 0; j < 256; ++j) if (std::fabs(x[j]) == amax) { mx = x[j]; break; }
+        const float iscale = -127.f / mx;
+        const __m256 vs = _mm256_set1_ps(iscale), magic = _mm256_set1_ps(12582912.f);
+        const __m256i mant = _mm256_set1_epi32(0x007fffff), off = _mm256_set1_epi32(0x00400000), lim = _mm256_set1_epi32(127);
+        for (int j = 0; j < 256; j += 32) {
+            __m256i v[4];
+            for (int q = 0; q < 4; ++q) {
+                __m256 pr = _mm256_mul_ps(vs, _mm256_loadu_ps(x + j + 8 * q));
+                asm("" : "+x"(pr));   // (no fma contraction: the reference rounds the product first)
+                const __m256 f = _mm256_add_ps(pr, magic);
+                v[q] = _mm256_min_epi32(_mm256_sub_epi32(_mm256_and_si256(_mm256_castps_si256(f), mant), off), lim);
+            }
+            // pack 32 int32 -> 32 int8 in order (values within [-128, 127]: saturation never applies)
+            const __m256i a = _mm256_packs_epi32(v[0], v[1]), b = _mm256_packs_epi32(v[2], v[3]);
+            __m256i c = _mm256_packs_epi16(a, b);
+            c = _mm256_permutevar8x32_epi32(c, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+            _mm256_storeu_si256((__m256i *) (y[i].qs + j), c);
+        }
+        for (int j = 0; j < 16; ++j) {
+            const __m128i q = _mm_loadu_si128((const __m128i *) (y[i].qs + 16 * j));
+            const __m256i w = _mm256_cvtepi8_epi16(q);
+            __m128i h = _mm_add_epi16(_mm256_castsi256_si128(w), _mm256_extracti128_si256(w, 1));
+            h = _mm_hadd_epi16(h, h); h = _mm_hadd_epi16(h, h); h = _mm_hadd_epi16(h, h);
+            y[i].bsums[j] = (int16_t) _mm_extract_epi16(h, 0);
+        }
+        y[i].d = 1 / iscale;
+    }
+}
+// row dot products: IQ3_S x Q8_K with the grid lookups in scalar registers (+17 % on one core, bit-identical; the
+// gate/up phase of a decode job is compute-bound)
+void iq3s_vec_dot(int n, float * s, size_t, const void * vx, size_t, const void * vy, size_t, int) { iq3s_dot_v1(n, s, vx, vy); }
+ggml_vec_dot_t vec_dot_fast(GType t, GType tv) {
+    static const bool off = getenv("HYPER_CPU_REFDOT") != nullptr;
+    if (t == GType::IQ3_S && tv == GType::Q8_K && !off) return iq3s_vec_dot;
+    return traits(t)->vec_dot;
+}
+ggml_from_float_t from_float_fast(GType t) {
+    static const bool off = getenv("HYPER_CPU_REFQ") != nullptr;
+    if (t == GType::Q8_K && !off) return quantize_q8_K_avx2;
+    return traits(t)->from_float;
+}
 // spin with backoff: hot while work is flowing (a decode step's layers are ~0.3-0.5 ms apart; waking from a sleep costs
 // 50+ us), then real sleeps once nothing has happened for HYPER_SPIN_US (default 3000): an idle server costs no CPU
 const long g_spin_us = getenv("HYPER_SPIN_US") ? atol(getenv("HYPER_SPIN_US")) : 3000;
@@ -35,6 +101,8 @@ template <typename P> void spin_until(P && ready) {
     }
 }
 } // namespace
+
+void q8k_test_quantize(const float * x, void * y, int64_t k) { quantize_q8_K_avx2(x, y, k); }
 
 CpuMoe::CpuMoe(int n_threads, int n_embd, int ff, int k, CpuMoeRec * recs, CpuMoeOut * outs, int n_slots,
                CpuMoeBulk * bulk, CpuMoeBulkOut * bulk_out)
@@ -135,9 +203,13 @@ void CpuMoe::master_loop() {
             if (prof_) {
                 prof_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
                 if (++prof_jobs_ % 2000 == 0) {
-                    fprintf(stderr, "cpu_moe: %llu jobs, %.3f ms/job, %.1f GB/s, %.2f experts/job, seen->start %.1f us\n",
+                    fprintf(stderr, "cpu_moe: %llu jobs, %.3f ms/job, %.1f GB/s, %.2f experts/job, seen->start %.1f us"
+                                    " | setup %.1f, to last gu %.1f, last down %.1f, sum %.1f us\n",
                             (unsigned long long) prof_jobs_, prof_ns_ / 1e6 / 2000, prof_bytes_ / (double) prof_ns_, prof_experts_ / 2000.0,
-                            prof_wait_ns_ / 2e6);
+                            prof_wait_ns_ / 2e6, prof_ph_[0] / 2e6, prof_ph_[1] / 2e6, prof_ph_[2] / 2e6, prof_ph_[3] / 2e6);
+                    fprintf(stderr, "cpu_moe: previous token's experts at the same layer: %.1f %% of %llu\n",
+                            100.0 * prof_hit_ / std::max<uint64_t>(1, prof_tot_), (unsigned long long) prof_tot_);
+                    prof_hit_ = prof_tot_ = 0;
                     for (auto & v : prof_ph_) v = 0;
                     prof_wait_ns_ = 0;
                     prof_ns_ = 0; prof_bytes_ = 0; prof_experts_ = 0;
@@ -259,10 +331,19 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
     for (int p = 0; p < (int) pairs.size(); ++p) if (p == 0 || pairs[p].e != pairs[p - 1].e) grp.push_back(p);
     grp.push_back((int) pairs.size());
     const int G = (int) grp.size() - 1, P = (int) pairs.size();
-    if (prof_) { prof_bytes_ += (uint64_t) G * (2 * L.gate_bytes + L.down_bytes) / ff * fa; prof_experts_ += G; }
+    if (prof_) {
+        prof_bytes_ += (uint64_t) G * (2 * L.gate_bytes + L.down_bytes) / ff * fa; prof_experts_ += G;
+        if ((int) prev_e_.size() <= slot) prev_e_.resize(slot + 1);
+        std::vector<int> cur;
+        for (int q = 0; q < G; ++q) cur.push_back(pairs[grp[q]].e);
+        for (int e : cur) prof_hit_ += std::find(prev_e_[slot].begin(), prev_e_[slot].end(), e) != prev_e_[slot].end();
+        prof_tot_ += cur.size();
+        prev_e_[slot] = cur;
+    }
     const auto * tg = traits(L.tg), * td = traits(L.td);
     const ggml_type vg = tg->vec_dot_type, vd = td->vec_dot_type;
-    const auto from_g = traits((GType) vg)->from_float, from_d = traits((GType) vd)->from_float;
+    const ggml_vec_dot_t gdot = vec_dot_fast(L.tg, (GType) vg);
+    const auto from_g = from_float_fast((GType) vg), from_d = from_float_fast((GType) vd);
     const size_t qx_row = ggml_row_size(vg, n), qh_row = ggml_row_size(vd, ff);
     if (qx_.size() < (size_t) nt * qx_row) qx_.resize((size_t) nt * qx_row);
     if (qh_.size() < (size_t) P * qh_row) qh_.resize((size_t) P * qh_row);
@@ -278,6 +359,7 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
         // one expert overlaps the bandwidth-bound down projection of the previous one
         std::vector<int> qt;
         for (int t = 0; t < nt; ++t) if (tok[t]) qt.push_back(t);
+        const auto tj0 = std::chrono::steady_clock::now();   // (HYPER_CPUPROF: phase times of the decode job)
         for (int t : qt) from_g(x + (size_t) t * 4096, qx_.data() + t * qx_row, n);
         static const int RG = getenv("HYPER_CPU_RG") ? atoi(getenv("HYPER_CPU_RG")) : 16, RD = getenv("HYPER_CPU_RD") ? atoi(getenv("HYPER_CPU_RD")) : 32;
         // guided chunking: full-size row chunks, except that the last ~2 chunks per thread of a phase are split in 4 (the
@@ -286,49 +368,139 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
         if ((int) gu_left_.size() < G) { gu_left_ = std::vector<std::atomic<int>>(G + 16); ready_ = std::vector<std::atomic<int>>(G + 16); }
         auto & order = task_order_;
         order.clear();
-        auto add = [&](int g, int rows, int R, bool dn) {   // tasks (dn flag, g, r0, r1) packed: r0/r1 in units of 4 rows
-            const int tail = std::min(rows, tail_mult * n_threads_ * R);
-            int r = 0, nt_ = 0;
-            // r0, r1 in units of 4 rows (r1 stored minus one: 4096 rows fit the 10 bits)
-            auto push = [&](int r0, int r1) { order.push_back((dn ? 0x40000000 : 0) | (g << 20) | ((r0 >> 2) << 10) | (((r1 + 3) >> 2) - 1)); ++nt_; };
-            for (; r + R <= rows - tail; r += R) push(r, r + R);
-            for (; r < rows; r += std::max(4, R / 4)) push(r, std::min(rows, r + std::max(4, R / 4)));
-            return nt_;
+        // task codes: bit 30 down, bit 29 down part of the last group (part in bits 26..28), group in bits 20..25,
+        // r0 / 4 in bits 10..19, r1 / 4 - 1 in bits 0..9 (4096 rows fit)
+        auto code = [](int g, int r0, int r1, bool dn, int part) {
+            return (dn ? 0x40000000 : 0) | (part >= 0 ? 0x20000000 | (part << 26) : 0) | (g << 20) | ((r0 >> 2) << 10) | (((r1 + 3) >> 2) - 1);
         };
+        // balanced: a multiple of the team size of near-equal tasks (dynamic claiming then ends a phase with every thread
+        // finishing at about the same time; 128 tasks for 30 threads left 4.3 rounds)
+        static const bool bal = !getenv("HYPER_CPU_NOBAL");
+        auto add = [&](std::vector<int> & v, int g, int a, int b, int R, bool dn, int part) {
+            if (bal && tail_mult == 0 && part < 0 && (b - a) % 4 == 0) {
+                const int units = (b - a) / 4, nth = n_threads_;
+                int nt_ = std::max(1, (int) std::lround((double) units * 4 / R / nth)) * nth;
+                nt_ = std::min(nt_, units);
+                for (int i = 0, u0 = 0; i < nt_; ++i) {
+                    const int u1 = (int) ((long) units * (i + 1) / nt_);
+                    v.push_back(code(g, a + 4 * u0, a + 4 * u1, dn, part));
+                    u0 = u1;
+                }
+                return nt_;
+            }
+            const int tail = std::min(b - a, tail_mult * n_threads_ * R);
+            int r = a, cnt = 0;
+            for (; r + R <= b - tail; r += R) { v.push_back(code(g, r, r + R, dn, part)); ++cnt; }
+            for (; r < b; r += std::max(4, R / 4)) { v.push_back(code(g, r, std::min(b, r + std::max(4, R / 4)), dn, part)); ++cnt; }
+            return cnt;
+        };
+        // the last group's down projection overlaps its own gate/up: gate/up in S parts of whole 256-row blocks; a finished
+        // part's hidden rows are quantized (Q8_K is per block: the same bytes) and the down rows continue their IQ4_XS
+        // accumulators over that part (ggml's fma chain, paused and resumed: bit-identical)
+        // (measured: the down rows read in S partial passes halve the DRAM bandwidth -- off by default; a part-major
+        // layout would need the GPUs' streaming copies to change)
+        static const int S_env = getenv("HYPER_CPU_SPLIT") ? atoi(getenv("HYPER_CPU_SPLIT")) : 0;
+        const int S = S_env;
+        const bool split = S > 1 && L.td == GType::IQ4_XS && vd == GGML_TYPE_Q8_K && fa == ff && fa % (256 * S) == 0 && 256 % RG == 0 &&
+                           n % RD == 0 && n / RD <= 4096 && S <= 8 && G < 64 && tail_mult == 0;
         std::vector<int> gcount(G);
         for (int g = 0; g < G; ++g) ready_[g].store(0, std::memory_order_relaxed);
-        gcount[0] = add(0, fa, RG, false);
-        for (int g = 1; g < G; ++g) { gcount[g] = add(g, fa, RG, false); add(g - 1, n, RD, true); }
-        add(G - 1, n, RD, true);
+        if (!split) {
+            gcount[0] = add(order, 0, 0, fa, RG, false, -1);
+            for (int g = 1; g < G; ++g) { gcount[g] = add(order, g, 0, fa, RG, false, -1); add(order, g - 1, 0, n, RD, true, -1); }
+            add(order, G - 1, 0, n, RD, true, -1);
+        } else {
+            if ((int) part_left_.size() < S) { part_left_ = std::vector<std::atomic<int>>(8); part_ready_ = std::vector<std::atomic<int>>(8); }
+            if ((int) dprog_.size() < n / RD) dprog_ = std::vector<std::atomic<int>>(n / RD);
+            const int np_last = grp[G] - grp[G - 1];
+            if (acc_.size() < (size_t) np_last * n * 8) acc_.resize((size_t) np_last * n * 8);
+            for (int r = 0; r < n / RD; ++r) dprog_[r].store(0, std::memory_order_relaxed);
+            for (int g = 0; g < G - 1; ++g) {
+                gcount[g] = add(order, g, 0, fa, RG, false, -1);
+                if (g > 0) add(order, g - 1, 0, n, RD, true, -1);
+            }
+            // gate/up part q interleaved with down work that is ready by then: the previous expert's down next to part 1,
+            // the down rows' part q - 2 next to part q (a lag of one part: no thread waits on a part still in progress)
+            const int pl = fa / S;
+            static const int lag = getenv("HYPER_CPU_LAG") ? atoi(getenv("HYPER_CPU_LAG")) : 2;
+            std::vector<std::vector<int>> dq(S + 1);
+            if (G > 1) add(dq[0], G - 2, 0, n, RD, true, -1);
+            for (int q = 0; q < S; ++q) add(dq[q + 1], G - 1, 0, n, RD, true, q);
+            // dq[0]: previous expert, dq[q + 1]: down part q; interleave dq[k] with gate/up part k + lag - 1
+            int next = 0;
+            std::vector<int> a;
+            for (int q = 0; q < S; ++q) {
+                a.clear();
+                part_left_[q].store(add(a, G - 1, q * pl, (q + 1) * pl, RG, false, q), std::memory_order_relaxed);
+                part_ready_[q].store(0, std::memory_order_relaxed);
+                const int k = q - (lag - 1);
+                const std::vector<int> & b = k >= 0 && k <= S ? dq[k] : dq[S];   // (dq[S]: placeholder, never empty-checked)
+                const bool use_b = k >= 0 && k <= S;
+                for (size_t i = 0, j = 0; i < a.size() || (use_b && j < b.size());) {
+                    if (i < a.size()) order.push_back(a[i++]);
+                    if (use_b && j < b.size()) order.push_back(b[j++]);
+                }
+                if (use_b) next = k + 1;
+            }
+            for (int k = next; k <= S; ++k) order.insert(order.end(), dq[k].begin(), dq[k].end());
+            gcount[G - 1] = 0;
+        }
         for (int g = 0; g < G; ++g) gu_left_[g].store(gcount[g], std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_release);
+        const auto tj1 = std::chrono::steady_clock::now();
+        std::atomic<int64_t> t_last_gu{0};
+        const int nbp = fa / 256 / std::max(S, 1);   // super-blocks of a part
         parallel((int) order.size(), [&](int i) {
-            const int code = order[i], g = (code >> 20) & 0x3ff;
+            const int c = order[i], g = (c >> 20) & 0x3f, part = c & 0x20000000 ? (c >> 26) & 7 : -1;
             const int p0 = grp[g], p1 = grp[g + 1];
-            if (!(code & 0x40000000)) {
-                const int r0 = ((code >> 10) & 0x3ff) << 2, r1 = std::min(fa, ((code & 0x3ff) + 1) << 2);
+            if (!(c & 0x40000000)) {
+                const int r0 = ((c >> 10) & 0x3ff) << 2, r1 = std::min(fa, ((c & 0x3ff) + 1) << 2);
                 const uint8_t * gb = L.gate + L.index(pairs[p0].e) * L.gate_bytes, * ub = L.up + L.index(pairs[p0].e) * L.gate_bytes;
                 for (int r = r0; r < r1; ++r)
                     for (int p = p0; p < p1; ++p) {
                         float gv, uv;
                         const void * qx = qx_.data() + pairs[p].t * qx_row;
-                        tg->vec_dot(n, &gv, 0, gb + r * g_row, 0, qx, 0, 1);
-                        tg->vec_dot(n, &uv, 0, ub + r * g_row, 0, qx, 0, 1);
+                        gdot(n, &gv, 0, gb + r * g_row, 0, qx, 0, 1);
+                        gdot(n, &uv, 0, ub + r * g_row, 0, qx, 0, 1);
                         if (clamp_ > 0.0f) { gv = std::min(gv, clamp_); uv = std::min(std::max(uv, -clamp_), clamp_); }
                         h_[(size_t) p * ff + r] = silu(gv) * uv;
                     }
-                if (gu_left_[g].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                if (part >= 0) {
+                    if (part_left_[part].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        const int f0 = part * nbp * 256;
+                        for (int p = p0; p < p1; ++p)
+                            from_d(h_.data() + (size_t) p * ff + f0, qh_.data() + p * qh_row + (size_t) part * nbp * sizeof(BlockQ8K), nbp * 256);
+                        part_ready_[part].store(1, std::memory_order_release);
+                        if (prof_ && part == S - 1) t_last_gu.store(std::chrono::steady_clock::now().time_since_epoch().count());
+                    }
+                } else if (gu_left_[g].fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     for (int p = p0; p < p1; ++p) from_d(h_.data() + (size_t) p * ff, qh_.data() + p * qh_row, fa);
                     ready_[g].store(1, std::memory_order_release);
+                    if (prof_ && g == G - 1) t_last_gu.store(std::chrono::steady_clock::now().time_since_epoch().count());
                 }
+            } else if (part >= 0) {
+                const int r0 = ((c >> 10) & 0x3ff) << 2, r1 = std::min(n, ((c & 0x3ff) + 1) << 2), rt = r0 / RD;
+                while (!part_ready_[part].load(std::memory_order_acquire)) __builtin_ia32_pause();
+                while (dprog_[rt].load(std::memory_order_acquire) != part) __builtin_ia32_pause();
+                const uint8_t * db = L.down + L.index(pairs[p0].e) * L.down_bytes;
+                for (int r = r0; r < r1; ++r)
+                    for (int p = p0; p < p1; ++p) {
+                        float * st = acc_.data() + ((size_t) (p - p0) * n + r) * 8;
+                        __m256 acc = part == 0 ? _mm256_setzero_ps() : _mm256_loadu_ps(st);
+                        acc = iq4xs_dot_part(db + r * d_row, qh_.data() + p * qh_row, part * nbp, (part + 1) * nbp, acc);
+                        if (part == S - 1) y_[(size_t) p * n + r] = iq3s_hsum8(acc);
+                        else _mm256_storeu_ps(st, acc);
+                    }
+                dprog_[rt].store(part + 1, std::memory_order_release);
             } else {
                 while (!ready_[g].load(std::memory_order_acquire)) __builtin_ia32_pause();
-                const int r0 = ((code >> 10) & 0x3ff) << 2, r1 = std::min(n, ((code & 0x3ff) + 1) << 2);
+                const int r0 = ((c >> 10) & 0x3ff) << 2, r1 = std::min(n, ((c & 0x3ff) + 1) << 2);
                 const uint8_t * db = L.down + L.index(pairs[p0].e) * L.down_bytes;
                 for (int r = r0; r < r1; ++r)
                     for (int p = p0; p < p1; ++p) td->vec_dot(fa, &y_[(size_t) p * n + r], 0, db + r * d_row, 0, qh_.data() + p * qh_row, 0, 1);
             }
         });
+        const auto tj2 = std::chrono::steady_clock::now();
         for (int t : qt) {   // weighted sum per token (pairs in expert order: deterministic)
             float * o = yout + (size_t) t * 4096;
             bool first = true;
@@ -338,6 +510,14 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
                 if (first) { for (int r = 0; r < n; ++r) o[r] = w * y[r]; first = false; }
                 else for (int r = 0; r < n; ++r) o[r] += w * y[r];
             }
+        }
+        if (prof_) {   // ph 0: setup, 1: tasks until the last expert's hidden rows are ready, 2: its down tail, 3: weighted sum
+            const auto tj3 = std::chrono::steady_clock::now();
+            const int64_t tg = t_last_gu.load();
+            prof_ph_[0] += std::chrono::duration_cast<std::chrono::nanoseconds>(tj1 - tj0).count();
+            prof_ph_[1] += tg - tj1.time_since_epoch().count();
+            prof_ph_[2] += tj2.time_since_epoch().count() - tg;
+            prof_ph_[3] += std::chrono::duration_cast<std::chrono::nanoseconds>(tj3 - tj2).count();
         }
         return;
     }
@@ -356,8 +536,8 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
             for (int p = p0; p < p1; ++p) {
                 float g, u;
                 const void * qx = qx_.data() + pairs[p].t * qx_row;
-                tg->vec_dot(n, &g, 0, gb + r * g_row, 0, qx, 0, 1);
-                tg->vec_dot(n, &u, 0, ub + r * g_row, 0, qx, 0, 1);
+                gdot(n, &g, 0, gb + r * g_row, 0, qx, 0, 1);
+                gdot(n, &u, 0, ub + r * g_row, 0, qx, 0, 1);
                 if (clamp_ > 0.0f) { g = std::min(g, clamp_); u = std::min(std::max(u, -clamp_), clamp_); }
                 h_[(size_t) p * ff + r] = silu(g) * u;
             }

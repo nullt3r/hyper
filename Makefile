@@ -12,7 +12,7 @@ BUILD := build
 OBJ   := $(BUILD)/gguf.o $(BUILD)/model.o $(BUILD)/kernels.o $(BUILD)/engine.o
 OBJ4  := $(BUILD)/gguf.o $(BUILD)/model4.o $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/cpu_moe.o $(BUILD)/engine4.o \
          $(BUILD)/model5.o $(BUILD)/kernels5.o $(BUILD)/engine5.o
-GGML_INC := -I$(LLAMA)/ggml/include
+GGML_INC := -I$(LLAMA)/ggml/include -I$(LLAMA)/ggml/src
 
 all: $(BUILD)/hyper $(BUILD)/ref $(BUILD)/arbench
 
@@ -51,6 +51,10 @@ $(BUILD)/routebench: $(OBJ4) tools/routebench.cu
 # MoE decode kernels (Flash-Next shapes)
 $(BUILD)/moebench: $(OBJ4) tools/moebench.cu
 	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/moebench.cu $(OBJ4) -o $@ \
+	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)
+
+$(BUILD)/cpumoebench: $(OBJ4) tools/cpumoebench.cu
+	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/cpumoebench.cu $(OBJ4) -o $@ \
 	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)
 
 # dense GEMV on GGUF blocks: bandwidth on the Flash-Next K-quant shapes

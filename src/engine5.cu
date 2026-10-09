@@ -210,6 +210,8 @@ struct Engine5::Device {
     int * pos_x = nullptr;           // their positions
     float * big0 = nullptr, * o = nullptr, * qabs = nullptr, * olat = nullptr, * attn_part = nullptr;
     float * rlog = nullptr, * wts = nullptr, * sg = nullptr, * shgu = nullptr, * shh = nullptr, * shpart = nullptr;
+    float * plog = nullptr, * pwts = nullptr, * psg = nullptr;
+    int * pids = nullptr;
     float * hexp = nullptr, * yexp = nullptr, * logits = nullptr, * conv_raw = nullptr, * iscores = nullptr;
     int * ids = nullptr, * pos = nullptr, * counter = nullptr, * order = nullptr, * order_n = nullptr, * egrp = nullptr;
     int * ilist = nullptr, * ilist_n = nullptr;
@@ -307,6 +309,8 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
     CUDA_CHECK(cudaHostAlloc(&h_pos_, 8 * sizeof(int), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_res_, (size_t) nd * MAX_NT * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_topk_, (size_t) nd * MAX_NT * TOPK * 2 * sizeof(float), cudaHostAllocPortable));
+    if (getenv("HYPER5_PREDSTAT")) pred_k_ = std::max(1, std::min(MOE_MAX_USED, atoi(getenv("HYPER5_PREDSTAT"))));
+    CUDA_CHECK(cudaHostAlloc(&h_pred_, (size_t) cfg_.n_layer * MOE_MAX_USED * sizeof(int), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_ids_, (size_t) cfg_.n_layer * mc_max_ * R5 * cfg_.n_expert_used * sizeof(int), cudaHostAllocPortable));
     const size_t ll = (size_t) 2 * nd * MAX_NT * n / 2;
     CUDA_CHECK(cudaHostAlloc(&ar_ll_, ll * sizeof(uint2), cudaHostAllocPortable | cudaHostAllocMapped));
@@ -551,6 +555,7 @@ void Engine5::load_experts(int il, const std::vector<int> & quota) {
         memcpy((uint8_t *) cl.up + (size_t) e * gb, tu.data + (size_t) e * gb, gb);
         memcpy((uint8_t *) cl.down + (size_t) e * db, tdn.data + (size_t) e * db, db);
     }
+    collapse_huge(buf, bytes);
     CUDA_CHECK(cudaHostRegister(buf, bytes, cudaHostRegisterPortable));
     for (const GTensor * t : {&tg, &tu, &tdn}) {   // (the file's pages are not needed any more)
         const uintptr_t a0 = ((uintptr_t) t->data + 4095) & ~(uintptr_t) 4095, a1 = ((uintptr_t) t->data + t->nbytes) & ~(uintptr_t) 4095;
@@ -777,6 +782,8 @@ void Engine5::load_weights() {
         dev.olat = dev.alloc<float>((size_t) R * nh_max * MLA_LAT);
         dev.attn_part = dev.alloc<float>(mla_part_floats(nh_max, MAX_NT));
         dev.rlog = dev.alloc<float>((size_t) R * c.n_expert);
+        if (pred_k_) { dev.plog = dev.alloc<float>((size_t) MAX_NT * c.n_expert); dev.pids = dev.alloc<int>(MAX_NT * MOE_MAX_USED);
+                       dev.pwts = dev.alloc<float>(MAX_NT * MOE_MAX_USED); dev.psg = dev.alloc<float>(MAX_NT * 4); }
         dev.ids = dev.alloc<int>((size_t) R * K);
         dev.wts = dev.alloc<float>((size_t) R * K);
         dev.sg = dev.alloc<float>(R);
@@ -1040,18 +1047,28 @@ void Engine5::record_main(int gi, int nt) {
         // ---- FFN ----
         hc_pre(L.hcf_fn, L.hcf_raw, L.hcf_scale, L.hcf_base, L.ffn_norm);
         float * ffo = L.moe ? d.shpart : d.part;
-        mm(L.gu, d.xn, n, d.shgu, 2 * L.ff_l, nt);
-        if (nt <= MAX_NT) {
-            NormIn glu; glu.act = 3; glu.glu_off = L.ff_l; glu.act_scale = L.moe ? c.clamp_sh : c.clamp_sh;
-            mm(L.down, d.shgu, 2 * L.ff_l, ffo, n, nt, glu);
-        } else {
-            swiglu_clamp(d.shgu, 2 * L.ff_l, L.ff_l, d.shh, L.ff_l, L.ff_l, c.clamp_sh, nt, s);
-            mm(L.down, d.shh, L.ff_l, ffo, n, nt);
-        }
+        auto shared_ffn = [&] {   // (MoE layers: after the routing is published, so the CPU experts start without waiting for it)
+            mm(L.gu, d.xn, n, d.shgu, 2 * L.ff_l, nt);
+            if (nt <= MAX_NT) {
+                NormIn glu; glu.act = 3; glu.glu_off = L.ff_l; glu.act_scale = L.moe ? c.clamp_sh : c.clamp_sh;
+                mm(L.down, d.shgu, 2 * L.ff_l, ffo, n, nt, glu);
+            } else {
+                swiglu_clamp(d.shgu, 2 * L.ff_l, L.ff_l, d.shh, L.ff_l, L.ff_l, c.clamp_sh, nt, s);
+                mm(L.down, d.shh, L.ff_l, ffo, n, nt);
+            }
+        };
+        static const bool shared_first = getenv("HYPER5_SHARED_FIRST") != nullptr;
+        if (!L.moe || shared_first) shared_ffn();
         if (L.moe) {
             f32mm(L.router, c.n_expert, n, d.xn, n, d.rlog, c.n_expert, nt);
             moe_route_sig(d.rlog, c.n_expert, L.exp_bias, c.n_expert, K, c.w_scale, d.ids, d.wts, d.sg, nt, s);
             dbg("route_w", il, d.wts, (size_t) nt * K);
+            if (pred_k_ && !bulk && d.g == 0 && il + 1 < c.n_layer && is_moe(il + 1)) {   // (HYPER5_PREDSTAT)
+                const DevLayer & N = d.layers[il + 1];
+                f32mm(N.router, c.n_expert, n, d.xn, n, d.plog, c.n_expert, 1);
+                moe_route_sig(d.plog, c.n_expert, N.exp_bias, c.n_expert, pred_k_, c.w_scale, d.pids, d.pwts, d.psg, 1, s);
+                CUDA_CHECK(cudaMemcpyAsync(h_pred_ + (size_t) (il + 1) * MOE_MAX_USED, d.pids, pred_k_ * sizeof(int), cudaMemcpyDeviceToHost, s));
+            }
             if (bulk && d.g == 0 && adapt_)   // prompt routing for the adaptive placement
                 CUDA_CHECK(cudaMemcpyAsync(h_ids_ + ((size_t) il * mc_max_ + ci) * R5 * K, d.ids, (size_t) nt * K * sizeof(int), cudaMemcpyDeviceToHost, s));
             const bool stream = streaming && L.owner_bulk;
@@ -1061,6 +1078,7 @@ void Engine5::record_main(int gi, int nt) {
                 else moe_publish(&cpu_rec_[il].seq, &cpu_rec_[il].nt, &cpu_rec_[il].ids[0][0], &cpu_rec_[il].wts[0][0], &cpu_rec_[il].x[0][0],
                                  d.xn, n, n, d.ids, d.wts, K, nt, d.counter, (unsigned) il, s);
             }
+            if (!shared_first) shared_ffn();
             if (bulk) {
                 moe_order(L.moex, d.ids, nt * K, c.n_expert, d.order, d.order_n, s, d.egrp);
                 to_half(d.xn, n, nullptr, n, 0.0f, d.mix16, nt, s);
@@ -1241,6 +1259,26 @@ std::vector<int> Engine5::forward(const int * tokens, int nt, int pos) {
     }
     if (bulk) for (int il = 0; il < cfg_.n_layer; ++il) if (is_moe(il) && ehost_[il].stream_dirty) rebuild_stream(il);
     run(nt);
+    if (pred_k_ && !bulk) {
+        const int K = cfg_.n_expert_used;
+        for (int il = 1; il < cfg_.n_layer; ++il) {
+            if (!is_moe(il) || !is_moe(il - 1)) continue;
+            const int * pr = h_pred_ + (size_t) il * MOE_MAX_USED;
+            for (int j = 0; j < pred_k_; ++j) pred_cpu_ += ehost_[il].owner[pr[j]] == CPU_OWNER;
+            for (int j = 0; j < K; ++j) {
+                const int e = cpu_rec_[il].ids[0][j];
+                if (e < 0 || ehost_[il].owner[e] != CPU_OWNER) continue;
+                ++pred_tot_;
+                for (int q = 0; q < pred_k_; ++q) if (pr[q] == e) { ++pred_hit_; break; }
+            }
+        }
+        if (++pred_n_ % 200 == 0) {
+            fprintf(stderr, "hyper5: next-layer prediction (top %d): %.1f %% of %llu CPU experts predicted, %.2f predicted CPU experts per layer\n",
+                    pred_k_, 100.0 * pred_hit_ / std::max<uint64_t>(1, pred_tot_), (unsigned long long) pred_tot_,
+                    (double) pred_cpu_ / (200.0 * (cfg_.n_layer - 4)));
+            pred_hit_ = pred_tot_ = pred_cpu_ = 0;
+        }
+    }
     if (adapt_ && bulk) {
         const int K = cfg_.n_expert_used;
         for (int il = 0; il < cfg_.n_layer; ++il) {

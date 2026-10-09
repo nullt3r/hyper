@@ -733,6 +733,7 @@ void Engine4::load_experts(int il, const std::vector<int> & quota) {
         memcpy((uint8_t *) cl.up + i * gb, tu.data + (size_t) e * gb, gb);
         memcpy((uint8_t *) cl.down + i * db, tdn.data + (size_t) e * db, db);
     }
+    collapse_huge(buf, bytes);
     cpu_->set_layer(il, cl);
     // prefill streaming: pin the CPU copy, split it among the GPUs by PCIe bandwidth (x16 : x8 : x16)
     if (opt_.stream_experts && nc > 0) {

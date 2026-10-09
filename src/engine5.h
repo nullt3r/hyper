@@ -132,6 +132,11 @@ private:
     double acc_rate_ = 0.5;       // speculation: running fraction of drafted tokens accepted
     int stream_min_ = 280;        // prefill chunks this long stream the CPU experts to the GPUs; shorter ones use the CPU
     int * h_ids_ = nullptr;       // pinned [n_layer][R][K]: prefill routing from GPU 0
+    // HYPER5_PREDSTAT (decode, measurement): layer l+1's router applied to layer l's router input on GPU 0; how many of
+    // the CPU experts layer l+1 then really routes to were predicted
+    int pred_k_ = 0;
+    int * h_pred_ = nullptr;      // pinned [n_layer][MOE_MAX_USED]
+    uint64_t pred_hit_ = 0, pred_tot_ = 0, pred_cpu_ = 0, pred_n_ = 0;
 };
 
 } // namespace hyper

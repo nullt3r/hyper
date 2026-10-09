@@ -5,7 +5,11 @@
 #include "gguf.h"
 #include "kernels4.cuh"
 
+#include <sys/mman.h>
+
 #include <atomic>
+#include <cstdint>
+#include <cstdlib>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -15,6 +19,14 @@
 
 namespace hyper {
 
+// back a filled host region with 2 MB pages: page faults only get them while free RAM is unfragmented (a large page cache
+// leaves the engines' expert copies half on 4 KB pages, ~6 % less CPU expert bandwidth through TLB misses);
+// MADV_COLLAPSE (Linux 6.1+) compacts and collapses synchronously. Call before the region is pinned.
+inline void collapse_huge(void * p, size_t bytes) {
+    const uintptr_t H = 2u << 20, a0 = ((uintptr_t) p + H - 1) & ~(H - 1), a1 = ((uintptr_t) p + bytes) & ~(H - 1);
+    if (a1 > a0 && !getenv("HYPER_NO_COLLAPSE")) madvise((void *) a0, a1 - a0, 25 /* MADV_COLLAPSE */);
+}
+
 struct CpuExpertLayer {
     GType tg = GType::F32, td = GType::F32;
     const uint8_t * gate = nullptr, * up = nullptr, * down = nullptr;   // [n_expert][...] GGUF data
@@ -23,6 +35,9 @@ struct CpuExpertLayer {
     std::vector<int> cslot;   // optional: expert e lives at index cslot[e] of gate/up/down (compact copy)
     size_t index(int e) const { return cslot.empty() ? (size_t) e : (size_t) cslot[e]; }
 };
+
+// the CPU MoE's Q8_K activation quantizer (tests: must match ggml's bit for bit)
+void q8k_test_quantize(const float * x, void * y, int64_t k);
 
 class CpuMoe {
 public:
@@ -58,6 +73,13 @@ private:
     std::vector<int> split_;
     bool prof_ = false, old_path_ = false;
     std::vector<std::atomic<int>> gu_left_, ready_;   // decode path: per expert group
+    // decode path, last expert group in parts: gate/up tasks left / hidden rows quantized per part, down parts done per
+    // row task, the down rows' resumable accumulators [pair][row][8]
+    std::vector<std::atomic<int>> part_left_, part_ready_, dprog_;
+    std::vector<float> acc_;
+    // HYPER_CPUPROF: how many of a job's CPU experts the previous token's job at the same layer also had
+    std::vector<std::vector<int>> prev_e_;
+    uint64_t prof_hit_ = 0, prof_tot_ = 0;
     std::vector<int> task_order_;   // HYPER_CPUPROF: time / bandwidth per layer job
     uint64_t prof_ns_ = 0, prof_bytes_ = 0, prof_jobs_ = 0, prof_experts_ = 0, prof_ph_[6] = {}, prof_wait_ns_ = 0;
     CpuMoeRec * recs_;
