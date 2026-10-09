@@ -186,6 +186,10 @@ void CpuMoe::master_loop() {
         });
         std::atomic_thread_fence(std::memory_order_acquire);
         const auto t_seen = std::chrono::steady_clock::now();
+        if (prof_ && run && !job.bulk && prof_last_end_.time_since_epoch().count()) {
+            const int64_t gap = std::chrono::duration_cast<std::chrono::nanoseconds>(t_seen - prof_last_end_).count();
+            if (gap < 2000000) { prof_gap_ns_ += gap; ++prof_gaps_; }   // (gaps between tokens / requests excluded)
+        }
         cur_phase_ = 2;
         const int rows = job.bulk ? MOE_BULK_ROWS : MAX_NT;
         const int nt = std::min(job.bulk ? bulk_->nt : recs_[job.slot].nt, rows);
@@ -207,6 +211,9 @@ void CpuMoe::master_loop() {
                                     " | setup %.1f, to last gu %.1f, last down %.1f, sum %.1f us\n",
                             (unsigned long long) prof_jobs_, prof_ns_ / 1e6 / 2000, prof_bytes_ / (double) prof_ns_, prof_experts_ / 2000.0,
                             prof_wait_ns_ / 2e6, prof_ph_[0] / 2e6, prof_ph_[1] / 2e6, prof_ph_[2] / 2e6, prof_ph_[3] / 2e6);
+                    fprintf(stderr, "cpu_moe: job end -> next record %.1f us (%llu gaps)\n", prof_gap_ns_ / 1e3 / std::max<uint64_t>(1, prof_gaps_),
+                            (unsigned long long) prof_gaps_);
+                    prof_gap_ns_ = prof_gaps_ = 0;
                     fprintf(stderr, "cpu_moe: previous token's experts at the same layer: %.1f %% of %llu\n",
                             100.0 * prof_hit_ / std::max<uint64_t>(1, prof_tot_), (unsigned long long) prof_tot_);
                     prof_hit_ = prof_tot_ = 0;
@@ -219,6 +226,7 @@ void CpuMoe::master_loop() {
         cur_phase_ = 0;
         std::atomic_thread_fence(std::memory_order_release);
         (job.bulk ? bulk_out_->seq : outs_[job.slot].seq) = want;
+        if (prof_ && run) prof_last_end_ = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (--pending_ == 0) cv_done_.notify_all();

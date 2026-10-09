@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <condition_variable>
@@ -80,6 +81,9 @@ private:
     // HYPER_CPUPROF: how many of a job's CPU experts the previous token's job at the same layer also had
     std::vector<std::vector<int>> prev_e_;
     uint64_t prof_hit_ = 0, prof_tot_ = 0;
+    // HYPER_CPUPROF: from the end of a job to the next job's record arriving (the GPUs' share of the critical path)
+    std::chrono::steady_clock::time_point prof_last_end_{};
+    uint64_t prof_gap_ns_ = 0, prof_gaps_ = 0;
     std::vector<int> task_order_;   // HYPER_CPUPROF: time / bandwidth per layer job
     uint64_t prof_ns_ = 0, prof_bytes_ = 0, prof_jobs_ = 0, prof_experts_ = 0, prof_ph_[6] = {}, prof_wait_ns_ = 0;
     CpuMoeRec * recs_;

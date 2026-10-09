@@ -133,9 +133,15 @@ __global__ void __launch_bounds__(1024) k_mhc_pre2(const float * __restrict__ re
     const int t = blockIdx.x, tid = threadIdx.x;
     const float * r = res + (size_t) t * MHC * n;
     __shared__ float mx[25], pre[MHC];
-    if (tid < 25) {
+    if (tid < 25) {   // (16 loads in flight, summed in slice order as before)
         float v = 0.0f;
-        for (int i = 0; i < nsl; ++i) v += part[((size_t) t * nsl + i) * 25 + tid];
+        for (int i0 = 0; i0 < nsl; i0 += 16) {
+            float pv[16];
+#pragma unroll
+            for (int u = 0; u < 16; ++u) pv[u] = i0 + u < nsl ? part[((size_t) t * nsl + i0 + u) * 25 + tid] : 0.0f;
+#pragma unroll
+            for (int u = 0; u < 16; ++u) if (i0 + u < nsl) v += pv[u];
+        }
         mx[tid] = v;
     }
     __syncthreads();
@@ -216,10 +222,14 @@ __global__ void __launch_bounds__(256) k_kda_step(const float * __restrict__ in,
                                                   int n_head, float eps, int nt) {
     const int h = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const int j = blockIdx.y * 8 + w;
+    // state stored column-major per head (S[j][i]): a warp's 4 x 32 values of column j are one contiguous 512-byte run
+    // (row-major made every lane's loads 512 bytes apart). Snapshots use the same layout; only this kernel reads it.
     float * S = state + (size_t) h * 128 * 128;
     float s[4];
-#pragma unroll
-    for (int ii = 0; ii < 4; ++ii) s[ii] = S[(size_t) (lane * 4 + ii) * 128 + j];
+    {
+        const float4 v = *(const float4 *) (S + (size_t) j * 128 + lane * 4);
+        s[0] = v.x; s[1] = v.y; s[2] = v.z; s[3] = v.w;
+    }
     const float4 dtb = *(const float4 *) (dt_bias + (size_t) h * 128 + lane * 4);
     const float dt[4] = {dtb.x, dtb.y, dtb.z, dtb.w};
     const float a = A[h];
@@ -249,12 +259,10 @@ __global__ void __launch_bounds__(256) k_kda_step(const float * __restrict__ in,
         if (lane == 0) o[(size_t) t * o_stride + (size_t) h * 128 + j] = out * qs * 0.08838834764831845f;   // 1/sqrt(128)
         if (snap && t < nt - 1) {
             float * Sn = snap + (size_t) t * n_head * 128 * 128 + (size_t) h * 128 * 128;
-#pragma unroll
-            for (int ii = 0; ii < 4; ++ii) Sn[(size_t) (lane * 4 + ii) * 128 + j] = s[ii];
+            *(float4 *) (Sn + (size_t) j * 128 + lane * 4) = make_float4(s[0], s[1], s[2], s[3]);
         }
     }
-#pragma unroll
-    for (int ii = 0; ii < 4; ++ii) S[(size_t) (lane * 4 + ii) * 128 + j] = s[ii];
+    *(float4 *) (S + (size_t) j * 128 + lane * 4) = make_float4(s[0], s[1], s[2], s[3]);
 }
 
 // ---------------- MLA ----------------
