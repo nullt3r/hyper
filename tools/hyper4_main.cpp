@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <map>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 using namespace hyper;
@@ -39,10 +40,12 @@ static bool read_ref(const char * path, std::vector<int> & toks, std::vector<flo
 }
 
 struct Cmp {
-    int n = 0, top1 = 0;
+    int n = 0, top1 = 0, n_nll = 0;
     double kl_sum = 0, kl_max = 0;
     double last = 0;
-    void add(const float * r, const std::vector<float> & lg, int nv) {
+    double nll_ref = 0, nll_ours = 0;   // next-token negative log-likelihoods (perplexity of the reference text)
+    std::vector<double> kls;            // per position (distribution: median / tail)
+    void add(const float * r, const std::vector<float> & lg, int nv, int next = -1) {
         double mr = -1e30, mo = -1e30; int ar = 0, ao = 0;
         for (int j = 0; j < nv; ++j) {
             if (r[j] > mr) { mr = r[j]; ar = j; }
@@ -57,6 +60,28 @@ struct Cmp {
             kl += pr * (((r[j] - mr) - std::log(zr)) - ((lg[j] - mo) - std::log(zo)));
         }
         ++n; top1 += ar == ao; kl_sum += kl; kl_max = std::max(kl_max, kl); last = kl;
+        kls.push_back(kl);
+        if (next >= 0 && next < nv) {
+            nll_ref -= (r[next] - mr) - std::log(zr);
+            nll_ours -= (lg[next] - mo) - std::log(zo);
+            ++n_nll;
+        }
+    }
+    std::string ppl() const {
+        std::string out;
+        char b[192];
+        if (n_nll) { snprintf(b, sizeof b, "  PPL ours %.4f ref %.4f (%d tokens)", std::exp(nll_ours / n_nll), std::exp(nll_ref / n_nll), n_nll); out += b; }
+        if (!kls.empty()) {
+            std::vector<double> v = kls;
+            std::sort(v.begin(), v.end());
+            auto q = [&](double f) { return v[std::min(v.size() - 1, (size_t) (f * v.size()))]; };
+            double big = 0, tail = 0;
+            for (double x : v) if (x > 0.1) { ++big; tail += x; }
+            snprintf(b, sizeof b, "\n  KL median %.5f p90 %.4f p99 %.3f; positions > 0.1: %.1f%% (%.0f%% of the KL sum)", q(0.5), q(0.9), q(0.99),
+                     100.0 * big / v.size(), 100.0 * tail / std::max(1e-30, kl_sum));
+            out += b;
+        }
+        return out;
     }
 };
 
@@ -105,14 +130,14 @@ static int run_cmd(int argc, char ** argv) {
                         for (int j = 0; j < nv; ++j) { rmx = std::max(rmx, (double) r[j]); rmn = std::min(rmn, (double) r[j]); }
                         fprintf(stderr, "pos %d: nan %d  range [%.2f, %.2f]  ref [%.2f, %.2f]\n", i + t, nans, mn, mx, rmn, rmx);
                     }
-                    cmp.add(&ref[(size_t) (i + t) * nv], lg, nv);
+                    cmp.add(&ref[(size_t) (i + t) * nv], lg, nv, i + t + 1 < (int) toks.size() ? toks[i + t + 1] : -1);
                     if (i + t < 24 && getenv("HYPER4_PERPOS")) fprintf(stderr, "  pos %3d tok %6d KL %.5f\n", i + t, toks[i + t], cmp.last);
                 }
                 if (i % 64 == 0) fprintf(stderr, "  %d / %d  KL mean so far %.5f top1 %.1f%%\n", i, n, cmp.kl_sum / cmp.n, 100.0 * cmp.top1 / cmp.n);
             }
             const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            printf("CHECK4 nt=%d n=%d top1 %.2f%%  KL mean %.6f max %.5f  (%.1f tok/s incl. logits download)\n", nt, cmp.n,
-                   100.0 * cmp.top1 / cmp.n, cmp.kl_sum / cmp.n, cmp.kl_max, cmp.n / s);
+            printf("CHECK4 nt=%d n=%d top1 %.2f%%  KL mean %.6f max %.5f  (%.1f tok/s incl. logits download)%s\n", nt, cmp.n,
+                   100.0 * cmp.top1 / cmp.n, cmp.kl_sum / cmp.n, cmp.kl_max, cmp.n / s, cmp.ppl().c_str());
         } else if (cmd == "checkpf") {   // prefill the first n_pf tokens in chunks, then decode the rest token by token
             int n_pf = argc > 4 ? atoi(argv[4]) : 128;
             if (g_ref_first > 0) n_pf = g_ref_first + 1;   // v2 reference: logits from g_ref_first on

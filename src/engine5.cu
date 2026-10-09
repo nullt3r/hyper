@@ -30,13 +30,15 @@ constexpr int R5 = MOE_BULK_ROWS;   // activation rows (prefill chunk)
 constexpr int GSCORE_ROWS = 64;     // indexer: tokens scored at a time
 constexpr int GLIST = 2052;         // max attended cells per token: 512 pools * 4 + 3 tail cells (+1)
 
-// dense weight: Q8_0 (fragment-ordered int8) or anything else dequantized to fp16 at load
+// dense weight: Q8_0 (fragment-ordered int8), Q4_K / Q6_K as KQ (same bits, the LM head), or anything else dequantized to
+// fp16 at load
 struct DW {
     Q8W q8;
     BF16W f;
-    bool f16 = false;
-    int n() const { return f16 ? f.n : q8.n; }
-    int k() const { return f16 ? f.k : q8.k; }
+    bool f16 = false, kq = false;
+    KQW kw;
+    int n() const { return kq ? kw.n : f16 ? f.n : q8.n; }
+    int k() const { return kq ? kw.k : f16 ? f.k : q8.k; }
 };
 struct RowRange { const GTensor * t; int64_t r0, r1; };
 using ColRanges = std::vector<std::pair<int64_t, int64_t>>;
@@ -700,7 +702,29 @@ void Engine5::load_weights() {
         { const std::vector<float> v = to_f32(gguf_->need("output_norm.weight")); dev.out_norm = dev.upload(v.data(), v.size()); }
         auto [o0, o1] = split(c.n_vocab, nd, g);
         dev.vocab_off = (int) o0;
-        dev.output = upload_dense(A, dev.id, {{&gguf_->need("output.weight"), o0, o1}}, {}, !getenv("HYPER5_OUT_F16"));
+        {   // LM head: Q4_K / Q6_K natively (exact); HYPER5_OUT_Q8: re-quantized to Q8_0, HYPER5_OUT_F16: fp16
+            const GTensor & ot = gguf_->need("output.weight");
+            const bool out_q8 = getenv("HYPER5_OUT_Q8") != nullptr, out_f16 = getenv("HYPER5_OUT_F16") != nullptr;
+            if ((ot.type == GType::Q6_K || ot.type == GType::Q4_K) && !out_q8 && !out_f16) {
+                std::vector<int> kbl(ot.ne[0] / 32);
+                for (size_t b = 0; b < kbl.size(); ++b) kbl[b] = (int) b;
+                KQHost h;
+                const KQ kt = ot.type == GType::Q4_K ? KQ::Q4K : KQ::Q6K;
+                const int dg = repack_kq(kt, ot.data + (size_t) o0 * ot.row_bytes(), ot.row_bytes(), (int) (o1 - o0), kbl, h);
+                CUDA_CHECK(cudaSetDevice(dev.id));
+                auto up = [&](const auto & v) -> void * {
+                    if (v.empty()) return nullptr;
+                    void * pd = A(v.size() * sizeof(v[0]));
+                    CUDA_CHECK(cudaMemcpy(pd, v.data(), v.size() * sizeof(v[0]), cudaMemcpyHostToDevice));
+                    return pd;
+                };
+                DW & w = dev.output;
+                w.kq = true;
+                w.kw.type = kt; w.kw.n = (int) (o1 - o0); w.kw.k = (int) ot.ne[0]; w.kw.dg = dg;
+                w.kw.lo = (const uint2 *) up(h.lo); w.kw.hi = (const unsigned *) up(h.hi);
+                w.kw.scm = (const uint16_t *) up(h.scm); w.kw.sc6 = (const int8_t *) up(h.sc6); w.kw.d = (const half2 *) up(h.d);
+            } else dev.output = upload_dense(A, dev.id, {{&ot, o0, o1}}, {}, !out_f16);
+        }
         int nh_max = 0;
         for (auto & L : dev.layers) nh_max = std::max(nh_max, L.nh);
         dev.big_stride = std::max(kda_stride(nh_max), mla_stride(c, nh_max));
@@ -817,6 +841,11 @@ void Engine5::record_main(int gi, int nt) {
     const float eps = c.rms_eps;
     const bool bulk = nt > MAX_NT;
     auto mm = [&](const DW & W, const float * x, int xs, float * y, int ys, int rows, const NormIn & ni = NormIn{}) {
+        if (W.kq) {   // (the LM head: a few rows)
+            for (int r0 = 0; r0 < rows; r0 += MAX_NT)
+                gemv_kq(W.kw, x + (size_t) r0 * xs, xs, y + (size_t) r0 * ys, ys, std::min(MAX_NT, rows - r0), s, ni);
+            return;
+        }
         if (rows <= MAX_NT) {
             if (W.f16) gemv_bf16(W.f, x, xs, y, ys, nullptr, rows, s, ni);
             else gemv_q8(W.q8, x, xs, y, ys, nullptr, rows, s, ni);

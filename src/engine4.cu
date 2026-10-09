@@ -1572,16 +1572,22 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
             gen_snapshot();
         }
     } else {
+        // drafts per step adapt to the recent acceptance (a verification row costs more experts): kc = floor(avg + 1.5)
+        // in [1, K], avg = moving average of accepted drafts per step (HYPER4_FIXED_DRAFT: always K)
+        static const bool fixed_k = getenv("HYPER4_FIXED_DRAFT") != nullptr;
+        int kc = K;
+        double avg_acc = K;
         auto make_drafts = [&](const int * mt, int nt, int pos) {   // first from the main hidden rows, the rest chained
             auto ta = clk::now();
             drafts[0] = mtp_draft(mt, nt, pos);
-            for (int j = 1; j < K; ++j) drafts[j] = mtp_chain(drafts[j - 1], pos + nt - 1 + j);
+            for (int j = 1; j < kc; ++j) drafts[j] = mtp_chain(drafts[j - 1], pos + nt - 1 + j);
             st.t_mtp += since(ta);
         };
-        for (int j = 1; j < K; ++j) drafts[j] = mtp_chain(drafts[j - 1], p - 1 + j);   // first draft came with the prompt
+        for (int j = 1; j < kc; ++j) drafts[j] = mtp_chain(drafts[j - 1], p - 1 + j);   // first draft came with the prompt
         int cur = next;                            // token at position p, not yet in the main model
         std::vector<int> in(K + 1), mt(K + 1);
         while (!stop && p + K + 1 < opt_.max_pos) {
+            const int K = kc;   // (this step's drafts)
             in[0] = cur;
             for (int j = 0; j < K; ++j) in[j + 1] = drafts[j];
             auto ta = clk::now();
@@ -1601,6 +1607,10 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
                 st.t_restore += since(ta);
             }
             for (int i = 0; i <= m; ++i) mt[i] = i < m ? drafts[i] : a[m];
+            if (!fixed_k) {
+                avg_acc = 0.9 * avg_acc + 0.1 * m;
+                kc = std::max(1, std::min(opt_.n_draft, (int) (avg_acc + 1.5)));
+            }
             make_drafts(mt.data(), m + 1, p);       // positions p..p+m with main hidden rows 0..m
             cur = a[m];
             p += m + 1;
