@@ -77,6 +77,7 @@ public:
     // called after every prefill chunk with (tokens done incl. reused, prompt length, reused tokens)
     void set_prefill_progress(std::function<void(int, int, int)> fn) override { prefill_cb_ = std::move(fn); }
     void clear_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); park_.clear(snap_pool_); }
+    void reset_cache() override { clear_cache(); }
     int n_snapshots() const { return (int) snaps_.size(); }
     int max_pos() const override { return opt_.max_pos; }
     int n_draft() const override { return opt_.n_draft; }

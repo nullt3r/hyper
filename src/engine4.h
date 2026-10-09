@@ -66,7 +66,7 @@ public:
     std::vector<int> generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
                               const std::function<bool(int)> & on_token = {}, const SamplingParams & sp = {}) override;
     void set_snapshot_token(int tok) override { snap_token_ = tok; }
-    void reset_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); park_.clear(snap_pool_); }
+    void reset_cache() override { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); park_.clear(snap_pool_); }
     void set_prefill_progress(std::function<void(int, int, int)> fn) override { prefill_cb_ = std::move(fn); }
     int max_pos() const override { return opt_.max_pos; }
     int n_draft() const override { return mtp_g_ ? opt_.n_draft : 0; }

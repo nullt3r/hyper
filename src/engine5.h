@@ -49,7 +49,7 @@ public:
     int n_draft() const override { return std::min(opt_.n_draft, MAX_NT - 1); }
     bool has_mtp() const override { return false; }
     void save_expert_stats(const std::string & path);
-    void reset_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); park_.clear(snap_pool_); }
+    void reset_cache() override { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); park_.clear(snap_pool_); }
 
 private:
     struct DevLayer;

@@ -33,6 +33,7 @@ public:
     virtual int max_pos() const = 0;
     virtual int n_draft() const = 0;
     virtual bool has_mtp() const = 0;
+    virtual void reset_cache() = 0;   // forget the cached conversation(s); snapshot buffers stay allocated for reuse
 };
 
 } // namespace hyper

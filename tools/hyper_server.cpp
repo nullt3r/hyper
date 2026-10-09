@@ -144,10 +144,26 @@ struct Request {
     SamplingParams sp;
 };
 
+// tool-call arguments must be a JSON object: a call cut off mid-arguments ("{", a truncated command) becomes "{}" (not
+// completed: a truncated shell command must not run as something else); the client reports the error to the model
+std::string valid_args(const std::string & a, const char * where = nullptr) {
+    if (ojson::accept(a)) { const ojson j = ojson::parse(a); if (j.is_object()) return a; }
+    if (where) fprintf(stderr, "%s: invalid tool-call arguments replaced by {} (%zu bytes: %.40s)\n", where, a.size(), a.c_str());
+    return "{}";
+}
+
 Request prepare(Ctx & c, const ojson & body) {
     Request r;
     common_chat_templates_inputs in;
-    in.messages = common_chat_msgs_parse_oaicompat(to_cjson(body.at("messages")));
+    ojson msgs_in = body.at("messages");   // (broken tool-call arguments in the history: repaired, not rejected)
+    if (msgs_in.is_array())
+        for (auto & m : msgs_in)
+            if (m.is_object() && m.contains("tool_calls") && m["tool_calls"].is_array())
+                for (auto & tc : m["tool_calls"])
+                    if (tc.is_object() && tc.contains("function") && tc["function"].is_object() && tc["function"].contains("arguments") &&
+                        tc["function"]["arguments"].is_string())
+                        tc["function"]["arguments"] = valid_args(tc["function"]["arguments"].get<std::string>(), "request history");
+    in.messages = common_chat_msgs_parse_oaicompat(to_cjson(msgs_in));
     if (body.contains("tools") && body["tools"].is_array() && !body["tools"].empty())
         in.tools = common_chat_tools_parse_oaicompat(to_cjson(body["tools"]));
     if (body.contains("tool_choice") && body["tool_choice"].is_string())
@@ -446,7 +462,7 @@ ojson responses_to_chat(const ojson & body, std::set<std::string> & custom_tools
                 if (t.empty() && it.contains("summary")) t = part_text(it["summary"]);
                 pending_reasoning += t;
             } else if (type == "function_call") {
-                add_call(it.value("call_id", ""), it.value("name", ""), it.value("arguments", "{}"));
+                add_call(it.value("call_id", ""), it.value("name", ""), valid_args(it.value("arguments", "{}"), "responses history"));
             } else if (type == "custom_tool_call") {
                 add_call(it.value("call_id", ""), it.value("name", ""), ojson({{"input", it.value("input", "")}}).dump());
             } else if (type == "function_call_output" || type == "custom_tool_call_output") {
@@ -503,8 +519,8 @@ ojson tool_call_item(const common_chat_tool_call & t, const std::string & item_i
         return {{"type", "custom_tool_call"}, {"id", item_id}, {"call_id", t.id}, {"name", t.name}, {"input", done ? input : ""},
                 {"status", done ? "completed" : "in_progress"}};
     }
-    return {{"type", "function_call"}, {"id", item_id}, {"call_id", t.id}, {"name", t.name}, {"arguments", done ? t.arguments : ""},
-            {"status", done ? "completed" : "in_progress"}};
+    return {{"type", "function_call"}, {"id", item_id}, {"call_id", t.id}, {"name", t.name},
+            {"arguments", done ? valid_args(t.arguments, "responses output") : ""}, {"status", done ? "completed" : "in_progress"}};
 }
 ojson reasoning_item(const std::string & id, const std::string & text) {
     return {{"type", "reasoning"}, {"id", id}, {"summary", ojson::array({ojson({{"type", "summary_text"}, {"text", text}})})},
@@ -620,9 +636,22 @@ int main(int argc, char ** argv) {
         }
         if (!n_snap) fprintf(stderr, "hyper-server: no message-start token, prompt-cache snapshots only every 4096 tokens\n");
     }
-    {   // warm up: builds the CUDA graphs
+    {   // warm up: builds the CUDA graphs; then (unless HYPER_NO_WARMUP) a prompt of a few prefill chunks with message starts,
+        // so that the first real request does not pay the one-time costs (pinned snapshot buffers allocated under memory
+        // pressure, first cuBLAS calls, the CPU experts' work buffers): the first cold prompt after a start ran 2-4x slower
         GenStats st;
         eng.generate(tokenize(c.vocab, "Hello"), 4, eng.n_draft() > 0, &st);
+        if (!getenv("HYPER_NO_WARMUP")) {
+            const auto t0 = clk::now();
+            std::string text;
+            for (int i = 0; text.size() < 24000; ++i)
+                text += "<|im_start|>user\nParagraph " + std::to_string(i) + ": the quick brown fox jumps over the lazy dog, again and again.<|im_end|>\n";
+            std::vector<int> wp = tokenize(c.vocab, text);
+            wp.resize(std::min<size_t>(wp.size(), (size_t) std::max(64, std::min(eng.max_pos() / 2, 5000))));
+            eng.generate(wp, 16, eng.n_draft() > 0, &st);
+            eng.reset_cache();
+            fprintf(stderr, "hyper-server: warm-up (%zu tokens) in %.1f s\n", wp.size(), secs(t0, clk::now()));
+        }
     }
 
     httplib::Server srv;
