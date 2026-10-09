@@ -58,8 +58,10 @@ __global__ void k_hc_norm(const float * __restrict__ res, const float * __restri
         }
 }
 // same, thread per float4 (n % 4 == 0, n / 4 <= 1024): no loops, one combined reduction for the injection dots
+// (inj, cnt: the last of a token's hc blocks also sums the streams' injection partials into inj, in stream order)
 __global__ void __launch_bounds__(1024) k_hc_norm_v(const float * __restrict__ res, const float * __restrict__ w, float * __restrict__ xn,
-                                                    int n, int hc, float eps, const float * __restrict__ inj_w, float * __restrict__ injp) {
+                                                    int n, int hc, float eps, const float * __restrict__ inj_w, float * __restrict__ injp,
+                                                    float * __restrict__ inj, unsigned * cnt) {
     const int s = blockIdx.x, t = blockIdx.y, i = threadIdx.x, lane = i & 31, wid = i >> 5, nw = blockDim.x >> 5;
     const bool on = i < n / 4;
     const size_t row = ((size_t) t * hc + s) * n;
@@ -95,6 +97,20 @@ __global__ void __launch_bounds__(1024) k_hc_norm_v(const float * __restrict__ r
             if (lane == 0) injp[((size_t) t * hc + s) * 4 + j] = x;
         }
     }
+    if (!cnt) return;
+    __shared__ unsigned ticket;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) ticket = atomicAdd(&cnt[t], 1u);
+    __syncthreads();
+    if (ticket != (unsigned) hc - 1) return;
+    __threadfence();
+    if (threadIdx.x < hc) {
+        float a = 0.0f;
+        for (int ss = 0; ss < hc; ++ss) a += __ldcg(&injp[((size_t) t * hc + ss) * 4 + threadIdx.x]);
+        inj[(size_t) t * 4 + threadIdx.x] = a;
+    }
+    if (threadIdx.x == 0) cnt[t] = 0;
 }
 // inj[t][j] = sum_s injp[t][s][j]  (stream order: deterministic)
 __global__ void k_hc_inj_sum(const float * __restrict__ injp, float * __restrict__ inj, int hc) {
@@ -108,13 +124,13 @@ __global__ void k_silu_scale(float * x, int n, float scale, int stride) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) { float * p = x + (size_t) blockIdx.y * stride + i; *p = silu4(*p * scale); }
 }
-__global__ void k_hc_mixed(const float * __restrict__ xn, const float * __restrict__ gate, float * __restrict__ mixed, int n, int hc) {
+__global__ void k_hc_mixed(const float * __restrict__ xn, const float * __restrict__ gate, float * __restrict__ mixed, int n, int hc, int perm) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (e >= n) return;
     float acc = 0.0f;
-    for (int s = 0; s < hc; ++s) {
-        const size_t i = ((size_t) t * hc + s) * n + e;
-        acc += xn[i] * sigm(gate[i]);
+    for (int s = 0; s < hc; ++s) {   // (perm: gate rows in the order e * hc + s)
+        const size_t i = ((size_t) t * hc + s) * n + e, ig = perm ? (size_t) t * hc * n + (size_t) e * hc + s : i;
+        acc += xn[i] * sigm(gate[ig]);
     }
     mixed[(size_t) t * n + e] = acc / hc;
 }
@@ -1133,19 +1149,22 @@ __global__ void k_ple_apply(float * res, const float * __restrict__ value, const
 } // namespace
 
 void hc_norm(const float * res, const float * w, float * xn, int n, int hc, float eps, int nt, cudaStream_t s,
-             const float * inj_w, float * injp, float * inj) {
+             const float * inj_w, float * injp, float * inj, unsigned * cnt) {
     if (inj_w && hc > 4) throw std::runtime_error("hc_norm: inject fusion supports hc <= 4");
     static const bool old_norm = getenv("HYPER4_OLDNORM") != nullptr;
-    if (n % 4 == 0 && n / 4 <= 1024 && !old_norm)
-        k_hc_norm_v<<<dim3(hc, nt), (n / 4 + 31) / 32 * 32, 0, s>>>(res, w, xn, n, hc, eps, inj_w, injp);
-    else k_hc_norm<<<dim3(hc, nt), 256, 0, s>>>(res, w, xn, n, hc, eps, inj_w, injp);
+    if (n % 4 == 0 && n / 4 <= 1024 && !old_norm && (!inj_w || cnt)) {
+        k_hc_norm_v<<<dim3(hc, nt), (n / 4 + 31) / 32 * 32, 0, s>>>(res, w, xn, n, hc, eps, inj_w, injp, inj_w ? inj : nullptr,
+                                                                   inj_w ? cnt : nullptr);
+        return;
+    }
+    k_hc_norm<<<dim3(hc, nt), 256, 0, s>>>(res, w, xn, n, hc, eps, inj_w, injp);
     if (inj_w) k_hc_inj_sum<<<nt, 32, 0, s>>>(injp, inj, hc);
 }
 void silu_scale(float * x, int n, float scale, int nt, int stride, cudaStream_t s) {
     k_silu_scale<<<dim3((n + 255) / 256, nt), 256, 0, s>>>(x, n, scale, stride);
 }
-void hc_mixed(const float * xn, const float * gate, float * mixed, int n, int hc, int nt, cudaStream_t s) {
-    k_hc_mixed<<<dim3((n + 255) / 256, nt), 256, 0, s>>>(xn, gate, mixed, n, hc);
+void hc_mixed(const float * xn, const float * gate, float * mixed, int n, int hc, int nt, cudaStream_t s, bool perm) {
+    k_hc_mixed<<<dim3((n + 255) / 256, nt), 256, 0, s>>>(xn, gate, mixed, n, hc, perm ? 1 : 0);
 }
 void hc_combine(float * res, const float * bo, const float * inject, int inject_stride, int n, int hc, int nt, cudaStream_t s) {
     k_hc_combine<<<dim3((hc * n + 255) / 256, nt), 256, 0, s>>>(res, bo, inject, inject_stride, n, hc);

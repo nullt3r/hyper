@@ -14,12 +14,13 @@ constexpr int MOE_BULK_ROWS = 2048;  // prefill chunk
 // ---- hyper-connections (hc streams of n) ----
 // xn[t][s*n + e] = res[t][s*n + e] * rsqrt(mean_e res[t][s*n + e]^2 + eps) * w[s*n + e]
 // inj_w (optional, fp32 [hc][hc*n]): also inj[t][j] = inj_w[j] . xn[t] (per-stream partials in injp [nt][hc][4])
+// cnt (decode, with inj_w): MAX_NT zeroed counters; the injection sums then come out of the same kernel
 void hc_norm(const float * res, const float * w, float * xn, int n, int hc, float eps, int nt, cudaStream_t s,
-             const float * inj_w = nullptr, float * injp = nullptr, float * inj = nullptr);
+             const float * inj_w = nullptr, float * injp = nullptr, float * inj = nullptr, unsigned * cnt = nullptr);
 // lo = silu(lo * scale) in place
 void silu_scale(float * x, int n, float scale, int nt, int stride, cudaStream_t s);
 // mixed[t][e] = (1/hc) sum_s xn[t][s*n+e] * sigmoid(gate[t][s*n+e])
-void hc_mixed(const float * xn, const float * gate, float * mixed, int n, int hc, int nt, cudaStream_t s);
+void hc_mixed(const float * xn, const float * gate, float * mixed, int n, int hc, int nt, cudaStream_t s, bool perm = false);
 // res[t][s*n+e] += bo[t][e] * 2 * sigmoid(inject[t][s] / hc)
 void hc_combine(float * res, const float * bo, const float * inject, int inject_stride, int n, int hc, int nt, cudaStream_t s);
 // res[t][s*n+e] = x[t][e] (hc copies)

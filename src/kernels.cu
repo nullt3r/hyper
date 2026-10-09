@@ -1441,6 +1441,68 @@ __global__ void k_mma_q8_smallk(const uint4 * __restrict__ wq, const half * __re
     put(r0 + 8, t0, acc[2]); put(r0 + 8, t0 + 1, acc[3]);
 }
 
+// hyper-connection "up" + mixing (hc = 4): rows of W in the order e * 4 + s (stream s of element e), so a lane's 4 row
+// partners (stream 0..3 of one e) sit on lanes 4 and 8 apart; epilogue: mixed[t][e] = sum_s xn[t][s n + e] *
+// sigmoid(gate) / 4 (the separate mixing kernel and the gate round trip go away)
+__global__ void k_mma_q8_hcmix(const uint4 * __restrict__ wq, const half * __restrict__ ws, int rows, int k, const float * __restrict__ x,
+                               int xs, int nt, NormIn nin, const float * __restrict__ xn, int xns, float * __restrict__ mixed, int ms, int n_embd) {
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+    const int tile = blockIdx.x * (blockDim.x >> 5) + w;
+    const int ntile = (rows + 15) / 16;
+    const int kb = k / 32, k2 = k / 2;
+    __shared__ unsigned xh[8 * SMALLK_LD];
+    for (int i = threadIdx.x; i < nt * k2; i += blockDim.x) {
+        const int t = i / k2, c = 2 * (i % k2);
+        const float * xr = x + (size_t) t * xs;
+        float2 v = *(const float2 *) (xr + c);
+        if (nin.act) v = act2(nin, xr, c, v);
+        xh[t * SMALLK_LD + c / 2] = pack_h2(v.x, v.y);
+    }
+    __syncthreads();
+    if (tile >= ntile) return;
+    const uint4 * tq = wq + (size_t) tile * kb * 32 + lane;
+    const half * ts = ws + (size_t) tile * kb * 16;
+    const bool tok_ok = gid < nt;
+    const unsigned * xt = xh + (tok_ok ? gid : 0) * SMALLK_LD;
+    uint4 qv[16];
+    half2 sv[16];
+#pragma unroll
+    for (int b = 0; b < 16; ++b)
+        if (b < kb) { qv[b] = __ldg(tq + (size_t) b * 32); sv[b] = __halves2half2(ts[(size_t) b * 16 + gid], ts[(size_t) b * 16 + gid + 8]); }
+    float acc[4] = {0, 0, 0, 0};
+#pragma unroll
+    for (int b = 0; b < 16; ++b) {
+        if (b >= kb) break;
+        const unsigned qw[4] = {qv[b].x, qv[b].y, qv[b].z, qv[b].w};
+        float tmp[4] = {0, 0, 0, 0};
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            unsigned a[4];
+            a[0] = i8x2_to_h2(qw[2 * ks], 0x5140);
+            a[1] = i8x2_to_h2(qw[2 * ks], 0x7362);
+            a[2] = i8x2_to_h2(qw[2 * ks + 1], 0x5140);
+            a[3] = i8x2_to_h2(qw[2 * ks + 1], 0x7362);
+            const int c2 = b * 16 + ks * 8 + tig;
+            unsigned bb[2] = {0, 0};
+            if (tok_ok) { bb[0] = xt[c2]; bb[1] = xt[c2 + 4]; }
+            mma16816(tmp, a, bb);
+        }
+        acc[0] += tmp[0] * __low2float(sv[b]); acc[1] += tmp[1] * __low2float(sv[b]);
+        acc[2] += tmp[2] * __high2float(sv[b]); acc[3] += tmp[3] * __high2float(sv[b]);
+    }
+    // acc[i]: row tile * 16 + gid (+ 8 for i >= 2), token 2 tig + (i & 1); row r -> element r / 4, stream r % 4 (= gid % 4)
+    const int sidx = gid & 3;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int r = tile * 16 + gid + (i >= 2 ? 8 : 0), t = 2 * tig + (i & 1), e = r >> 2;
+        float v = 0.0f;
+        if (r < rows && t < nt) v = xn[(size_t) t * xns + (size_t) sidx * n_embd + e] / (1.0f + expf(-acc[i]));
+        v += __shfl_xor_sync(0xffffffff, v, 4);
+        v += __shfl_xor_sync(0xffffffff, v, 8);
+        if (sidx == 0 && r < rows && t < nt) mixed[(size_t) t * ms + e] = v * 0.25f;
+    }
+}
+
 // split-K scratch per device (gemv_init): tile partials and per-tile counters
 // two scratch slots per device: work issued on a second stream (gemv_scratch_slot(1)) cannot collide with the main one's
 namespace { struct KSplit { float * part = nullptr; unsigned * cnt = nullptr; int gw = 0; }; KSplit g_kslots[16][2]; int g_kslot = 0; }
@@ -1503,6 +1565,12 @@ void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const fl
                                            P > 1 ? g_ksplit_dev(dev).part : nullptr, P > 1 ? g_ksplit_dev(dev).cnt : nullptr);
 }
 
+void gemv_q8_hcmix(const Q8W & W, const float * x, int xs, const NormIn & nin, const float * xn, int xns, float * mixed, int ms,
+                   int n_embd, int nt, cudaStream_t s) {
+    if (nt < 1 || nt > 8 || W.k / 32 > 16 || W.n != 4 * n_embd) throw std::runtime_error("gemv_q8_hcmix: sizes");
+    const int tiles = (W.n + 15) / 16;
+    k_mma_q8_hcmix<<<(tiles + 7) / 8, 256, 0, s>>>(W.q, W.s, W.n, W.k, x, xs, nt, nin, xn, xns, mixed, ms, n_embd);
+}
 void gemv_kq(const KQW & W, const float * x, int xs, float * y, int ys, int nt, cudaStream_t s, const NormIn & nin) {
     if (nt < 1 || nt > 8 || W.k % 32 || (W.k / 32) % W.dg) throw std::runtime_error("gemv_kq: sizes");
     if (nin.w) throw std::runtime_error("gemv_kq: fused input norm unsupported");

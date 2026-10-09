@@ -52,6 +52,11 @@ void gemv_bf16(const BF16W & W, const float * x, int xs, float * y, int ys, cons
 void to_half(const float * x, int xs, const float * w, int k, float eps, half * xh, int nt, cudaStream_t s);
 void gemm_q8(const Q8W & W, const half * xh, int T, float * y, int ys, const float * add, cudaStream_t s);
 
+// hyper-connection "up" GEMV (k <= 512, rows 4 * n_embd in the order e * 4 + s) with the mixing in its epilogue:
+// mixed[t][e] = sum_s xn[t][s n_embd + e] * sigmoid(W x[t])[e * 4 + s] / 4
+void gemv_q8_hcmix(const Q8W & W, const float * x, int xs, const NormIn & nin, const float * xn, int xns, float * mixed, int ms,
+                   int n_embd, int nt, cudaStream_t s);
+
 // K-quant dense weights (Q4_K, Q6_K) repacked at load into mma fragment order with the same bits: per (16-row tile,
 // 32-column block) and lane 16 values (lo: 4 bits each; Q6_K hi: their top 2 bits), 6-bit Q4_K scale | min << 8 (scm) or
 // Q6_K int8 scales per 16 columns (sc6), and (d, dmin) per tile row and 256-column super-block. Exact: values convert to

@@ -34,6 +34,7 @@ struct DW {
     bool f16 = false;
     std::vector<DWSeg> seg;
     int sn = 0, sk = 0;
+    bool hcperm = false;   // hyper-connection "up": rows in the order e * hc + s (mixing fused into the GEMV)
     int n() const { return !seg.empty() ? sn : f16 ? f.n : q8.n; }
     int k() const { return !seg.empty() ? sk : f16 ? f.k : q8.k; }
 };
@@ -97,6 +98,7 @@ struct Engine4::Device {
     // activations [MAX_NT] rows
     float * x = nullptr, * res = nullptr, * xn = nullptr, * gate = nullptr, * lo = nullptr, * inj = nullptr, * mixed = nullptr;
     float * bo = nullptr, * part = nullptr, * big0 = nullptr, * o = nullptr, * attn_part = nullptr, * injp = nullptr;
+    unsigned * inj_cnt = nullptr;   // hc norm: per token, the stream blocks' tickets
     float * rlog = nullptr, * wts = nullptr, * sg = nullptr, * shgu = nullptr, * shh = nullptr, * shpart = nullptr;
     float * hexp = nullptr, * yexp = nullptr, * ple_emb = nullptr, * ple_key = nullptr, * ple_val = nullptr, * ple_sc = nullptr;
     float * logits = nullptr, * res2 = nullptr;
@@ -367,6 +369,40 @@ DW upload_dense(const std::function<void *(size_t)> & alloc, int dev, const std:
     return w;
 }
 
+// hyper-connection "up" matrix [hc * n][lr]: Q8_0 / Q5_0 / Q4_0 rows as int8 + fp16 scales (exact), reordered to e * hc + s
+// (the 4 streams of an element in one row tile: gemv_q8_hcmix mixes them in its epilogue); other types load as usual
+DW upload_hc_up(const std::function<void *(size_t)> & alloc, int dev, const GTensor & t, int hc) {
+    static const bool off = getenv("HYPER4_NO_HCMIX") != nullptr;
+    const GType ty = t.type;
+    if (off || hc != 4 || !(ty == GType::Q8_0 || ty == GType::Q5_0 || ty == GType::Q4_0) || t.rows() % hc) return upload_dense(alloc, dev, {{&t, 0, t.rows()}});
+    const int rows = (int) t.rows(), k = (int) t.ne[0], kb = k / 32, n = rows / hc;
+    const size_t bb = gtype_block_bytes(ty);
+    std::vector<int8_t> qs((size_t) rows * k);
+    std::vector<half> d((size_t) rows * kb);
+#pragma omp parallel for schedule(static)
+    for (int r2 = 0; r2 < rows; ++r2) {
+        const int src = (r2 % hc) * n + r2 / hc;
+        for (int b = 0; b < kb; ++b) {
+            const uint8_t * blk = t.data + (size_t) src * t.row_bytes() + (size_t) b * bb;
+            int8_t * q = qs.data() + (size_t) r2 * k + b * 32;
+            memcpy(&d[(size_t) r2 * kb + b], blk, 2);
+            if (ty == GType::Q8_0) memcpy(q, blk + 2, 32);
+            else if (ty == GType::Q4_0) for (int l = 0; l < 16; ++l) { q[l] = (int8_t) ((blk[2 + l] & 0xF) - 8); q[l + 16] = (int8_t) ((blk[2 + l] >> 4) - 8); }
+            else {
+                uint32_t qh; memcpy(&qh, blk + 2, 4);
+                for (int l = 0; l < 16; ++l) {
+                    q[l] = (int8_t) (((blk[6 + l] & 0xF) | (((qh >> l) << 4) & 0x10)) - 16);
+                    q[l + 16] = (int8_t) (((blk[6 + l] >> 4) | ((qh >> (l + 12)) & 0x10)) - 16);
+                }
+            }
+        }
+    }
+    DW w;
+    w.q8 = to_device_q8(alloc, dev, qs.data(), d.data(), rows, k);
+    w.hcperm = true;
+    return w;
+}
+
 std::pair<int64_t, int64_t> split(int64_t n, int ndev, int g, int64_t align = 1) {
     const int64_t units = n / align;
     return {units * g / ndev * align, units * (g + 1) / ndev * align};
@@ -503,9 +539,9 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
     L.hca_inj = f32(p + "hc_attn_inject.weight");
     L.hcf_inj = f32(p + "hc_ffn_inject.weight");
     L.hca_down = q8full(p + "hc_attn_down.weight");
-    L.hca_up = q8full(p + "hc_attn_up.weight");
+    L.hca_up = upload_hc_up(A, dev.id, *T(p + "hc_attn_up.weight"), c.hc);
     L.hcf_down = q8full(p + "hc_ffn_down.weight");
-    L.hcf_up = q8full(p + "hc_ffn_up.weight");
+    L.hcf_up = upload_hc_up(A, dev.id, *T(p + "hc_ffn_up.weight"), c.hc);
     if (L.full) {
         // whole kv groups per GPU (each KV head and its cache live on one GPU only); with fewer kv heads than GPUs,
         // some GPUs do no attention and keep that memory for experts
@@ -746,12 +782,12 @@ void Engine4::load_weights() {
             const std::string hu = own ? p + "nextn.hc_head_up.weight" : "output_hc_up.weight";
             dev.m_head_norm = up32(hn);
             { const GTensor * t = &mtp_g_->need(hd); dev.m_head_down = upload_dense(A, dev.id, {{t, 0, t->rows()}}); }
-            { const GTensor * t = &mtp_g_->need(hu); dev.m_head_up = upload_dense(A, dev.id, {{t, 0, t->rows()}}); }
+            dev.m_head_up = upload_hc_up(A, dev.id, mtp_g_->need(hu), c.hc);
             src_ = gguf_.get();
         }
         { const std::vector<float> v = to_f32(gguf_->need("output_hc_norm.weight")); dev.head_norm = dev.upload(v.data(), v.size()); }
         { const GTensor * t = &gguf_->need("output_hc_down.weight"); dev.head_down = upload_dense(A, dev.id, {{t, 0, t->rows()}}); }
-        { const GTensor * t = &gguf_->need("output_hc_up.weight"); dev.head_up = upload_dense(A, dev.id, {{t, 0, t->rows()}}); }
+        dev.head_up = upload_hc_up(A, dev.id, gguf_->need("output_hc_up.weight"), c.hc);
         auto [o0, o1] = split(c.n_vocab, nd, g);
         dev.vocab_off = (int) o0;
         dev.output = upload_dense(A, dev.id, {{&gguf_->need("output.weight"), o0, o1}});
@@ -767,6 +803,8 @@ void Engine4::load_weights() {
         dev.lo = dev.alloc<float>((size_t) R * c.hc_lr);
         dev.inj = dev.alloc<float>((size_t) R * 4);
         dev.injp = dev.alloc<float>((size_t) MAX_NT * c.hc * 4);
+        dev.inj_cnt = dev.alloc<unsigned>(MAX_NT);
+        CUDA_CHECK(cudaMemset(dev.inj_cnt, 0, MAX_NT * sizeof(unsigned)));
         dev.mixed = dev.alloc<float>((size_t) R * n);
         dev.bo = dev.alloc<float>((size_t) R * n);
         dev.part = dev.alloc<float>((size_t) R * n);
@@ -999,17 +1037,18 @@ void Engine4::record_main(int gi, int nt, int kind) {
         if (!res) res = R;
         if (rows < 0) rows = nt;
         const bool finj = inj && rows <= MAX_NT;   // decode: the injection dots ride along the norm kernel
-        hc_norm(res, norm, d.xn, n, hc, eps, rows, s, finj ? inj : nullptr, d.injp, d.inj);
+        hc_norm(res, norm, d.xn, n, hc, eps, rows, s, finj ? inj : nullptr, d.injp, d.inj, d.inj_cnt);
         mm(down, d.xn, hcn, d.lo, lr, rows);
+        if (inj && !finj) f32mm(inj, hc, hcn, d.xn, hcn, d.inj, 4, rows);
         if (rows <= MAX_NT) {
             NormIn act; act.act = 1; act.act_scale = 1.0f / hc;   // silu(lo / hc) on load
+            if (up.hcperm) { gemv_q8_hcmix(up.q8, d.lo, lr, act, d.xn, hcn, d.mixed, n, n, rows, s); return; }   // mixing fused
             mm(up, d.lo, lr, d.gate, hcn, rows, act);
         } else {
             silu_scale(d.lo, lr, 1.0f / hc, rows, lr, s);
             mm(up, d.lo, lr, d.gate, hcn, rows);
         }
-        if (inj && !finj) f32mm(inj, hc, hcn, d.xn, hcn, d.inj, 4, rows);
-        hc_mixed(d.xn, d.gate, d.mixed, n, hc, rows, s);
+        hc_mixed(d.xn, d.gate, d.mixed, n, hc, rows, s, up.hcperm);
     };
     if (kind) {   // [rms(e) * enorm | rms(h_s) * hnorm_s] -> eh_proj, one row per hc stream
         mtp_prep(d.x, d.m_enorm, kind == 1 ? d.res : d.mh, kind == 1 ? hcn : 0, d.m_hnorm, eps, n, hc, mtp_whole_norm_, d.ecat, nt, s);
