@@ -134,6 +134,7 @@ private:
     int * h_ids_ = nullptr;       // pinned [n_layer][R][K]: prefill routing from GPU 0
     // HYPER5_PREDSTAT (decode, measurement): layer l+1's router applied to layer l's router input on GPU 0; how many of
     // the CPU experts layer l+1 then really routes to were predicted
+    std::vector<int> zc_blocks_;   // HYPER5_ZC "cpu,g0,g1,g2": hidden 256-blocks of the CPU experts per side (decode)
     int pred_k_ = 0;
     int * h_pred_ = nullptr;      // pinned [n_layer][MOE_MAX_USED]
     uint64_t pred_hit_ = 0, pred_tot_ = 0, pred_cpu_ = 0, pred_n_ = 0;

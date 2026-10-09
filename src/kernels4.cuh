@@ -81,7 +81,9 @@ struct MoeZC {
     const uint8_t * gate = nullptr, * up = nullptr, * down = nullptr;
     GType tg = GType::F32, td = GType::F32;
     size_t gate_bytes = 0, down_bytes = 0;
-    const int * cslot = nullptr;
+    const int * cslot = nullptr;      // expert -> index in gate/up/down, -1: not CPU-owned
+    const int * owner = nullptr;      // (instead of cslot: expert e at index e while owner[e] == cpu_owner)
+    int cpu_owner = -1;
     int ff = 0, n = 0, f0 = 0, f1 = 0;
     float clamp = 0.0f;
 };

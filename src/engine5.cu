@@ -188,6 +188,7 @@ struct Engine5::DevLayer {
     DW gu, down;
     int ff_l = 0;
     float * router = nullptr, * exp_bias = nullptr;
+    MoeZC zc;   // decode: this GPU's slice [f0, f1) of the CPU-owned experts' hidden rows, read from mapped host memory
     MoeDev moex;
     int * owner = nullptr;
     // prefill streaming: this GPU's share of the CPU-owned experts in two halves (st_list[h], uploaded into staging buffer h);
@@ -211,6 +212,7 @@ struct Engine5::Device {
     float * big0 = nullptr, * o = nullptr, * qabs = nullptr, * olat = nullptr, * attn_part = nullptr;
     float * rlog = nullptr, * wts = nullptr, * sg = nullptr, * shgu = nullptr, * shh = nullptr, * shpart = nullptr;
     float * plog = nullptr, * pwts = nullptr, * psg = nullptr;
+    float * hzc = nullptr, * yzc = nullptr;   // zero-copy share of the CPU experts: hidden slice, partial outputs
     int * pids = nullptr;
     float * hexp = nullptr, * yexp = nullptr, * logits = nullptr, * conv_raw = nullptr, * iscores = nullptr;
     int * ids = nullptr, * pos = nullptr, * counter = nullptr, * order = nullptr, * order_n = nullptr, * egrp = nullptr;
@@ -309,6 +311,10 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
     CUDA_CHECK(cudaHostAlloc(&h_pos_, 8 * sizeof(int), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_res_, (size_t) nd * MAX_NT * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_topk_, (size_t) nd * MAX_NT * TOPK * 2 * sizeof(float), cudaHostAllocPortable));
+    if (const char * zs = getenv("HYPER5_ZC")) {
+        for (const char * q = zs; *q;) { zc_blocks_.push_back(atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
+        if (zc_blocks_.size() < 2) zc_blocks_.clear();
+    }
     if (getenv("HYPER5_PREDSTAT")) pred_k_ = std::max(1, std::min(MOE_MAX_USED, atoi(getenv("HYPER5_PREDSTAT"))));
     CUDA_CHECK(cudaHostAlloc(&h_pred_, (size_t) cfg_.n_layer * MOE_MAX_USED * sizeof(int), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_ids_, (size_t) cfg_.n_layer * mc_max_ * R5 * cfg_.n_expert_used * sizeof(int), cudaHostAllocPortable));
@@ -556,7 +562,30 @@ void Engine5::load_experts(int il, const std::vector<int> & quota) {
         memcpy((uint8_t *) cl.down + (size_t) e * db, tdn.data + (size_t) e * db, db);
     }
     collapse_huge(buf, bytes);
-    CUDA_CHECK(cudaHostRegister(buf, bytes, cudaHostRegisterPortable));
+    CUDA_CHECK(cudaHostRegister(buf, bytes, cudaHostRegisterPortable | (zc_blocks_.empty() ? 0 : cudaHostRegisterMapped)));
+    if (!zc_blocks_.empty()) {   // hidden 256-blocks: [0, zc_blocks_[0]) on the CPU, then zc_blocks_[1 + g] for GPU g
+        const size_t rbd = db / n;
+        const bool ok = ff % 256 == 0 && (gb / ff) % 8 == 0 && rbd % 8 == 0 && (rbd / (ff / 256)) % 8 == 0;
+        int f = ok ? std::min(zc_blocks_[0] * 256, ff) : ff;
+        cpu_->set_split(il, f);
+        for (auto & dp : devs_) {
+            Device & dev = *dp;
+            CUDA_CHECK(cudaSetDevice(dev.id));
+            MoeZC & z = dev.layers[il].zc;
+            void * dptr = nullptr;
+            CUDA_CHECK(cudaHostGetDevicePointer(&dptr, buf, 0));
+            const uint8_t * base = (const uint8_t *) dptr;
+            z.gate = base; z.up = base + (size_t) E * gb; z.down = base + (size_t) E * 2 * gb;
+            z.tg = tg.type; z.td = tdn.type;
+            z.gate_bytes = gb; z.down_bytes = db;
+            z.cpu_owner = CPU_OWNER;
+            z.ff = ff; z.n = n; z.clamp = c.clamp_exp;
+            const int nb = ok && 1 + dev.g < (int) zc_blocks_.size() ? zc_blocks_[1 + dev.g] : 0;
+            z.f0 = f; z.f1 = std::min(f + nb * 256, ff);
+            f = z.f1;
+        }
+        if (f < ff) throw std::runtime_error("HYPER5_ZC: the slices do not cover the hidden size");
+    }
     for (const GTensor * t : {&tg, &tu, &tdn}) {   // (the file's pages are not needed any more)
         const uintptr_t a0 = ((uintptr_t) t->data + 4095) & ~(uintptr_t) 4095, a1 = ((uintptr_t) t->data + t->nbytes) & ~(uintptr_t) 4095;
         if (a1 > a0) madvise((void *) a0, a1 - a0, MADV_DONTNEED);
@@ -595,6 +624,7 @@ void Engine5::load_experts(int il, const std::vector<int> & quota) {
         L.moex.clamp = c.clamp_exp;
         L.moex.slot = dev.upload(slot.data(), slot.size());
         L.owner = dev.upload(owner.data(), owner.size());
+        L.zc.owner = L.owner;   // (updated in place by the rebalance, like the CPU's ownership)
         if (opt_.stream_experts) {
             for (auto & sl : L.st_slot) sl = dev.alloc<int>(E);
             L.owner_bulk = dev.alloc<int>(E);
@@ -782,6 +812,11 @@ void Engine5::load_weights() {
         dev.olat = dev.alloc<float>((size_t) R * nh_max * MLA_LAT);
         dev.attn_part = dev.alloc<float>(mla_part_floats(nh_max, MAX_NT));
         dev.rlog = dev.alloc<float>((size_t) R * c.n_expert);
+        if (!zc_blocks_.empty()) {
+            moe_zc_init();
+            dev.hzc = dev.alloc<float>((size_t) MAX_NT * c.n_expert_used * c.n_ff_exp);
+            dev.yzc = dev.alloc<float>((size_t) MAX_NT * c.n_expert_used * n);
+        }
         if (pred_k_) { dev.plog = dev.alloc<float>((size_t) MAX_NT * c.n_expert); dev.pids = dev.alloc<int>(MAX_NT * MOE_MAX_USED);
                        dev.pwts = dev.alloc<float>(MAX_NT * MOE_MAX_USED); dev.psg = dev.alloc<float>(MAX_NT * 4); }
         dev.ids = dev.alloc<int>((size_t) R * K);
@@ -1105,10 +1140,12 @@ void Engine5::record_main(int gi, int nt) {
             } else {
                 moe_gate_up(L.moex, d.xn, n, d.ids, K, d.hexp, nt, s);
                 moe_down(L.moex, d.hexp, d.ids, d.wts, K, d.yexp, nt, s);
+                if (L.zc.f1 > L.zc.f0) moe_zc(L.zc, d.xn, n, d.ids, d.wts, K, d.hzc, d.yzc, nt, s);
             }
+            const bool zcl = !bulk && L.zc.f1 > L.zc.f0;
             const volatile unsigned * cflag = d.g == 0 && !nocpu_ && !stream ? (bulk ? &cpu_bulk_out_->seq : &cpu_out_[il].seq) : nullptr;
             moe_reduce(d.shpart, d.sg, d.yexp, K, d.part, n, nt, d.ids, stream ? L.owner_bulk : L.owner, d.g, CPU_OWNER, cflag,
-                       bulk ? &cpu_bulk_out_->y[0][0] : &cpu_out_[il].y[0][0], d.counter, (unsigned) il, s);
+                       bulk ? &cpu_bulk_out_->y[0][0] : &cpu_out_[il].y[0][0], d.counter, (unsigned) il, s, zcl ? d.yzc : nullptr);
         }
         dbg("ffn_part", il, d.part, (size_t) nt * n);
         block_out();

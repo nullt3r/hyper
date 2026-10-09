@@ -343,7 +343,21 @@ __global__ void __launch_bounds__(256) k_mla_attn(const float * __restrict__ q, 
     const int n = list ? list_n[t] : p + 1;
     const int c0 = (int) ((long long) n * sp / ns), c1 = (int) ((long long) n * (sp + 1) / ns);
     const int * lt = list ? list + (size_t) t * list_stride : nullptr;
-    for (int i = threadIdx.x; i < H * MLA_LAT; i += blockDim.x) qs[i] = q[(size_t) t * q_stride + i] * scale;
+    {   // q rows (scaled): float4 loads, eight in flight per thread (H * 512 / 4 = 128 H float4)
+        const float4 * q4 = (const float4 *) (q + (size_t) t * q_stride);
+        float4 * qs4 = (float4 *) qs;
+        const int n4 = H * MLA_LAT / 4;
+        for (int i0 = threadIdx.x; i0 < n4; i0 += 8 * blockDim.x) {
+            float4 v[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) { const int i = i0 + u * blockDim.x; if (i < n4) v[u] = q4[i]; }
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                const int i = i0 + u * blockDim.x;
+                if (i < n4) qs4[i] = make_float4(v[u].x * scale, v[u].y * scale, v[u].z * scale, v[u].w * scale);
+            }
+        }
+    }
     for (int h = threadIdx.x; h < H; h += blockDim.x) { ms[h] = -FLT_MAX; lsum[h] = 0.0f; }
     float acc[MLA_MAXH][2];
 #pragma unroll
@@ -351,32 +365,50 @@ __global__ void __launch_bounds__(256) k_mla_attn(const float * __restrict__ q, 
     for (int cb = c0; cb < c1; cb += MLA_CC) {
         const int cnt = min(MLA_CC, c1 - cb);
         __syncthreads();
-        for (int i = threadIdx.x; i < MLA_CC * (MLA_LAT / 8); i += blockDim.x) {
-            const int j = i / (MLA_LAT / 8), cc = i % (MLA_LAT / 8);
-            uint4 v = make_uint4(0, 0, 0, 0);
-            if (j < cnt) {
-                const int cell = lt ? lt[cb + j] : cb + j;
-                v = *(const uint4 *) (lat + (size_t) cell * MLA_LAT + cc * 8);
+        {   // the chunk's latent rows: every thread's eight 16-byte loads in flight together
+            constexpr int NL = MLA_CC * (MLA_LAT / 8) / 256;
+            uint4 v[NL];
+#pragma unroll
+            for (int u = 0; u < NL; ++u) {
+                const int i = threadIdx.x + u * 256, j = i / (MLA_LAT / 8), cc = i % (MLA_LAT / 8);
+                v[u] = make_uint4(0, 0, 0, 0);
+                if (j < cnt) { const int cell = lt ? lt[cb + j] : cb + j; v[u] = *(const uint4 *) (lat + (size_t) cell * MLA_LAT + cc * 8); }
             }
-            *(uint4 *) (ls + (size_t) j * MLA_LAT + cc * 8) = v;
+#pragma unroll
+            for (int u = 0; u < NL; ++u) {
+                const int i = threadIdx.x + u * 256, j = i / (MLA_LAT / 8), cc = i % (MLA_LAT / 8);
+                *(uint4 *) (ls + (size_t) j * MLA_LAT + cc * 8) = v[u];
+            }
         }
         __syncthreads();
-        // scores: warp per (h, j)
-        for (int pr = w; pr < H * MLA_CC; pr += 8) {
-            const int h = pr / MLA_CC, j = pr % MLA_CC;
-            float sc = 0.0f;
-            if (j < cnt) {
-                const float * qh = qs + (size_t) h * MLA_LAT;
-                const __half2 * l2 = (const __half2 *) (ls + (size_t) j * MLA_LAT);
+        // scores: warp per head with its q slice in registers (lane: dims 2 (lane + 32 k)), cells four at a time; each
+        // (h, j) partial sum and its warp reduction as in a warp-per-pair dot (same per-lane order: identical scores)
+        for (int h = w; h < H; h += 8) {
+            float2 qv[MLA_LAT / 64];
 #pragma unroll
-                for (int k = 0; k < MLA_LAT / 64; ++k) {
-                    const float2 lv = __half22float2(l2[lane + 32 * k]);
-                    const float2 qv = *(const float2 *) (qh + 2 * (lane + 32 * k));
-                    sc += lv.x * qv.x + lv.y * qv.y;
+            for (int k = 0; k < MLA_LAT / 64; ++k) qv[k] = *(const float2 *) (qs + (size_t) h * MLA_LAT + 2 * (lane + 32 * k));
+            for (int j0 = 0; j0 < MLA_CC; j0 += 4) {
+                float sc[4];
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    sc[u] = 0.0f;
+                    if (j0 + u < cnt) {
+                        const __half2 * l2 = (const __half2 *) (ls + (size_t) (j0 + u) * MLA_LAT);
+#pragma unroll
+                        for (int k = 0; k < MLA_LAT / 64; ++k) {
+                            const float2 lv = __half22float2(l2[lane + 32 * k]);
+                            sc[u] += lv.x * qv[k].x + lv.y * qv[k].y;
+                        }
+                    }
                 }
-                sc = wsum(sc);
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+                    for (int u = 0; u < 4; ++u) sc[u] += __shfl_xor_sync(0xffffffff, sc[u], o);
+                if (lane == 0)
+#pragma unroll
+                    for (int u = 0; u < 4; ++u) ps[h * MLA_CC + j0 + u] = j0 + u < cnt ? sc[u] : -FLT_MAX;
             }
-            if (lane == 0) ps[pr] = j < cnt ? sc : -FLT_MAX;
         }
         __syncthreads();
         // online softmax per head: warp per head, lane per cell
@@ -396,18 +428,38 @@ __global__ void __launch_bounds__(256) k_mla_attn(const float * __restrict__ q, 
         }
         __syncthreads();
         const int d = 2 * threadIdx.x;
+        // cells outer, heads inner: one latent load per cell for all heads, independent chains per head (each head's
+        // accumulation still runs over the cells in order)
 #pragma unroll
         for (int h = 0; h < MLA_MAXH; ++h) {
             if (h >= H) break;
             const float c = corr[h];
-            float a0 = acc[h][0] * c, a1 = acc[h][1] * c;
-            const float * ph = ps + h * MLA_CC;
-            for (int j = 0; j < cnt; ++j) {
-                const float2 lv = __half22float2(*(const __half2 *) (ls + (size_t) j * MLA_LAT + d));
-                a0 += ph[j] * lv.x;
-                a1 += ph[j] * lv.y;
+            acc[h][0] *= c; acc[h][1] *= c;
+        }
+        int j = 0;
+        for (; j + 4 <= cnt; j += 4) {   // four cells per step: the weights as one float4 per head
+            float2 lv[4];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) lv[u] = __half22float2(*(const __half2 *) (ls + (size_t) (j + u) * MLA_LAT + d));
+#pragma unroll
+            for (int h = 0; h < MLA_MAXH; ++h) {
+                if (h >= H) break;
+                const float4 p4 = *(const float4 *) (ps + h * MLA_CC + j);
+                acc[h][0] += p4.x * lv[0].x; acc[h][1] += p4.x * lv[0].y;
+                acc[h][0] += p4.y * lv[1].x; acc[h][1] += p4.y * lv[1].y;
+                acc[h][0] += p4.z * lv[2].x; acc[h][1] += p4.z * lv[2].y;
+                acc[h][0] += p4.w * lv[3].x; acc[h][1] += p4.w * lv[3].y;
             }
-            acc[h][0] = a0; acc[h][1] = a1;
+        }
+        for (; j < cnt; ++j) {
+            const float2 lv = __half22float2(*(const __half2 *) (ls + (size_t) j * MLA_LAT + d));
+#pragma unroll
+            for (int h = 0; h < MLA_MAXH; ++h) {
+                if (h >= H) break;
+                const float pj = ps[h * MLA_CC + j];
+                acc[h][0] += pj * lv.x;
+                acc[h][1] += pj * lv.y;
+            }
         }
     }
     __syncthreads();
@@ -452,7 +504,8 @@ constexpr size_t TC_SMEM = (size_t) 32 * TC_LD * 2 * 2 + 2 * 32 * 33 * 4 + 32 * 
 // per head row. Rows: the <= 32 heads (padded); K tiles of 32 cells from the fp16 latent cache.
 __global__ void __launch_bounds__(256) k_mla_attn_tc(const float * __restrict__ q, int q_stride, const half * __restrict__ lat,
                                                      const int * pos_p, int H, float scale, const int * __restrict__ list, int list_stride,
-                                                     const int * __restrict__ list_n, float * __restrict__ o, int o_stride) {
+                                                     const int * __restrict__ list_n, float * __restrict__ o, int o_stride,
+                                                     float * __restrict__ part) {
     extern __shared__ __align__(16) unsigned char smem[];
     half * Qs = (half *) smem;                       // [32][TC_LD]
     half * Ks = Qs + 32 * TC_LD;                     // [32][TC_LD]
@@ -461,9 +514,11 @@ __global__ void __launch_bounds__(256) k_mla_attn_tc(const float * __restrict__ 
     float * mrow = (float *) (Ps + 32 * 40);         // [32] running max
     float * lrow = mrow + 32;                        // [32] running sum
     float * arow = lrow + 32;                        // [32] rescale of this tile
-    const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, gid = lane >> 2, tig = lane & 3;
+    // grid (n_split, nt): block = cell slice sp of token t; n_split > 1: partials (m, l, acc) for k_mla_combine
+    const int t = blockIdx.y, sp = blockIdx.x, ns = gridDim.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, gid = lane >> 2, tig = lane & 3;
     const int p = *pos_p + t;
-    const int n = list ? list_n[t] : p + 1;
+    const int nall = list ? list_n[t] : p + 1;
+    const int c0 = (int) ((long long) nall * sp / ns), n = (int) ((long long) nall * (sp + 1) / ns);
     const int * lt = list ? list + (size_t) t * list_stride : nullptr;
     // Q (scaled) as fp16 rows; heads >= H zero
     for (int i = tid; i < 32 * (MLA_LAT / 8); i += blockDim.x) {
@@ -483,7 +538,7 @@ __global__ void __launch_bounds__(256) k_mla_attn_tc(const float * __restrict__ 
     float acc[16][4];
 #pragma unroll
     for (int i = 0; i < 16; ++i) { acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f; }
-    for (int cb = 0; cb < n; cb += TC_KC) {
+    for (int cb = c0; cb < n; cb += TC_KC) {
         const int cnt = min(TC_KC, n - cb);
         __syncthreads();
         for (int i = tid; i < TC_KC * (MLA_LAT / 8); i += blockDim.x) {
@@ -543,6 +598,18 @@ __global__ void __launch_bounds__(256) k_mla_attn_tc(const float * __restrict__ 
         }
     }
     __syncthreads();
+    if (ns > 1) {
+        const int h0 = mt * 16 + gid, h1 = h0 + 8;
+        float * pp = part + ((size_t) t * ns + sp) * H * (MLA_LAT + 2);
+        if (tid < H) { pp[(size_t) tid * (MLA_LAT + 2)] = mrow[tid]; pp[(size_t) tid * (MLA_LAT + 2) + 1] = lrow[tid]; }
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int col = np * 128 + i * 8 + 2 * tig;
+            if (h0 < H) { float * ph = pp + (size_t) h0 * (MLA_LAT + 2) + 2 + col; ph[0] = acc[i][0]; ph[1] = acc[i][1]; }
+            if (h1 < H) { float * ph = pp + (size_t) h1 * (MLA_LAT + 2) + 2 + col; ph[0] = acc[i][2]; ph[1] = acc[i][3]; }
+        }
+        return;
+    }
     const float il0 = lrow[mt * 16 + gid] > 0.0f ? 1.0f / lrow[mt * 16 + gid] : 0.0f;
     const float il1 = lrow[mt * 16 + gid + 8] > 0.0f ? 1.0f / lrow[mt * 16 + gid + 8] : 0.0f;
     const int h0 = mt * 16 + gid, h1 = h0 + 8;
@@ -562,13 +629,25 @@ __global__ void k_mla_combine(const float * __restrict__ part, int ns, int H, fl
     for (int s = 0; s < ns; ++s) m = fmaxf(m, base[(size_t) s * H * (MLA_LAT + 2)]);
     float l = 0.0f, a0 = 0.0f, a1 = 0.0f;
     const int d = 2 * threadIdx.x;
-    for (int s = 0; s < ns; ++s) {
-        const float * ps = base + (size_t) s * H * (MLA_LAT + 2);
-        if (ps[1] <= 0.0f) continue;
-        const float f = expf(ps[0] - m);
-        l += ps[1] * f;
-        a0 += ps[2 + d] * f;
-        a1 += ps[3 + d] * f;
+    const size_t ss = (size_t) H * (MLA_LAT + 2);
+    for (int s0 = 0; s0 < ns; s0 += 8) {   // eight partials' loads in flight, accumulated in order as before
+        float pm[8], pl[8];
+        float2 pa[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            if (s0 + u < ns) {
+                const float * ps = base + (size_t) (s0 + u) * ss;
+                pm[u] = ps[0]; pl[u] = ps[1]; pa[u] = make_float2(ps[2 + d], ps[3 + d]);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            if (s0 + u >= ns || pl[u] <= 0.0f) continue;
+            const float f = expf(pm[u] - m);
+            l += pl[u] * f;
+            a0 += pa[u].x * f;
+            a1 += pa[u].y * f;
+        }
     }
     const float il = l > 0.0f ? 1.0f / l : 0.0f;
     *(float2 *) (o + (size_t) t * o_stride + (size_t) h * MLA_LAT + d) = make_float2(a0 * il, a1 * il);
@@ -624,6 +703,7 @@ __device__ __forceinline__ unsigned fkey(float f) {   // order-preserving float 
 }
 constexpr int GHIST = 65536;   // score histogram bins: the top 16 bits of the order-preserving key
 // hist (optional): per row, counts of key >> 16 (selection without full radix passes)
+template <bool V4>
 __global__ void __launch_bounds__(256) k_gidx_score(const float * __restrict__ iq, int iq_stride, const float * __restrict__ wt, int w_stride,
                                                     const half * __restrict__ pooled, const int * pos_p, int t_off, int top,
                                                     float * __restrict__ scores, int score_stride, unsigned * __restrict__ hist) {
@@ -634,7 +714,16 @@ __global__ void __launch_bounds__(256) k_gidx_score(const float * __restrict__ i
     if (b0 >= np) return;
     __shared__ float qs[GIDX_HEADS * GIDX_DIM];
     __shared__ float ws[GIDX_HEADS];
-    for (int i = threadIdx.x; i < GIDX_HEADS * GIDX_DIM; i += blockDim.x) qs[i] = iq[(size_t) t * iq_stride + i];
+    if (!V4) for (int i = threadIdx.x; i < GIDX_HEADS * GIDX_DIM; i += blockDim.x) qs[i] = iq[(size_t) t * iq_stride + i];
+    else {   // q: four float4 per thread, all in flight (16-byte aligned rows)
+        constexpr int N4 = GIDX_HEADS * GIDX_DIM / 4 / 256;
+        const float4 * q4 = (const float4 *) (iq + (size_t) t * iq_stride);
+        float4 v[N4];
+#pragma unroll
+        for (int u = 0; u < N4; ++u) v[u] = q4[threadIdx.x + 256 * u];
+#pragma unroll
+        for (int u = 0; u < N4; ++u) ((float4 *) qs)[threadIdx.x + 256 * u] = v[u];
+    }
     if (threadIdx.x < GIDX_HEADS) ws[threadIdx.x] = wt[(size_t) t * w_stride + threadIdx.x];
     __syncthreads();
     const int b = b0 + threadIdx.x;
@@ -767,11 +856,23 @@ __global__ void __launch_bounds__(1024) k_gidx_select_h(const float * __restrict
             }
         }
         __syncthreads();
-        if (tid == 0) {
-            unsigned acc = 0, need = sNeedEq;
-            for (int d = 255; d >= 0; --d) {
-                if (acc + h8[d] >= need) { sThr = pre | ((unsigned) d << shift); sNeedEq = need - acc; break; }
-                acc += h8[d];
+        if (tid < 32) {   // the bin where the count from the top reaches `need`: lane L holds bins 255 - 8 L - (0..7), a
+            // warp prefix sum over the lanes finds the crossing lane (same bin as a serial walk from 255 down)
+            const unsigned need = sNeedEq;
+            unsigned c[8], tot = 0;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) { c[k] = h8[255 - 8 * tid - k]; tot += c[k]; }
+            unsigned incl = tot;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) { const unsigned v = __shfl_up_sync(0xffffffff, incl, o); if (tid >= o) incl += v; }
+            const unsigned excl = incl - tot;
+            if (excl < need && incl >= need) {
+                unsigned acc = excl;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    if (acc + c[k] >= need) { sThr = pre | ((unsigned) (255 - 8 * tid - k) << shift); sNeedEq = need - acc; break; }
+                    acc += c[k];
+                }
             }
         }
         __syncthreads();
@@ -1000,19 +1101,29 @@ void mla_init() {
         cudaFuncSetAttribute(k_mla_attn_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) TC_SMEM) != cudaSuccess)
         throw std::runtime_error("mla_init: shared memory limit");
 }
-size_t mla_part_floats(int H, int nt) { return (size_t) nt * MLA_SPLIT * H * (MLA_LAT + 2); }
+static int mla_split() {   // decode cell slices (HYPER5_MLA_SPLIT, default MLA_SPLIT)
+    static const int v = getenv("HYPER5_MLA_SPLIT") ? std::max(1, std::min(MLA_SPLIT_MAX, atoi(getenv("HYPER5_MLA_SPLIT")))) : MLA_SPLIT;
+    return v;
+}
+size_t mla_part_floats(int H, int nt) { return (size_t) nt * mla_split() * H * (MLA_LAT + 2); }
 void mla_attn(const float * q, int q_stride, const half * lat, const int * pos, int H, float scale, int nt, const int * list,
               int list_stride, const int * list_n, float * part, float * o, int o_stride, cudaStream_t s) {
     if (H > MLA_MAXH) throw std::runtime_error("mla_attn: too many heads");
     const size_t smem = (size_t) H * MLA_LAT * 4 + (size_t) MLA_CC * MLA_LAT * 2 + (size_t) H * MLA_CC * 4 + 3 * H * 4;
     static const bool no_tc = getenv("HYPER5_MLA_NOTC") != nullptr;
     if (nt > MAX_NT && H <= 32 && !no_tc) {   // prefill: tensor cores, block per token
-        k_mla_attn_tc<<<nt, 256, TC_SMEM, s>>>(q, q_stride, lat, pos, H, scale, list, list_stride, list_n, o, o_stride);
+        k_mla_attn_tc<<<dim3(1, nt), 256, TC_SMEM, s>>>(q, q_stride, lat, pos, H, scale, list, list_stride, list_n, o, o_stride, nullptr);
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) throw std::runtime_error(std::string("mla_attn_tc launch: ") + cudaGetErrorString(e));
         return;
     }
-    const int ns = nt <= MAX_NT ? MLA_SPLIT : 1;
+    const int ns = nt <= MAX_NT ? mla_split() : 1;
+    static const bool tc_dec = getenv("HYPER5_MLA_TCDEC") != nullptr;
+    if (tc_dec && H <= 32 && ns > 1) {   // decode on tensor cores: cell slices, partials merged by k_mla_combine
+        k_mla_attn_tc<<<dim3(ns, nt), 256, TC_SMEM, s>>>(q, q_stride, lat, pos, H, scale, list, list_stride, list_n, o, o_stride, part);
+        k_mla_combine<<<dim3(H, nt), 256, 0, s>>>(part, ns, H, o, o_stride);
+        return;
+    }
     k_mla_attn<<<dim3(ns, nt), 256, smem, s>>>(q, q_stride, lat, pos, H, scale, list, list_stride, list_n, part, o, o_stride);
     if (ns > 1) k_mla_combine<<<dim3(H, nt), 256, 0, s>>>(part, ns, H, o, o_stride);
 }
@@ -1037,8 +1148,11 @@ void gidx_select(const float * iq, int iq_stride, const float * w, int w_stride,
     for (int t0 = 0; t0 < nt; t0 += rows) {
         const int r = std::min(rows, nt - t0);
         if (hist) cudaMemsetAsync(hist, 0, (size_t) r * GHIST * sizeof(unsigned), s);
-        k_gidx_score<<<dim3((score_stride + 255) / 256, r), 256, 0, s>>>(iq, iq_stride, w, w_stride, pooled, pos, t0, top, scores,
-                                                                       score_stride, hist);
+        if ((uintptr_t) iq % 16 == 0 && iq_stride % 4 == 0)
+            k_gidx_score<true><<<dim3((score_stride + 255) / 256, r), 256, 0, s>>>(iq, iq_stride, w, w_stride, pooled, pos, t0, top, scores,
+                                                                             score_stride, hist);
+        else k_gidx_score<false><<<dim3((score_stride + 255) / 256, r), 256, 0, s>>>(iq, iq_stride, w, w_stride, pooled, pos, t0, top, scores,
+                                                                                score_stride, hist);
         if (hist) k_gidx_select_h<<<r, 1024, 0, s>>>(scores, score_stride, hist, pos, t0, top, list, list_stride, list_n);
         else k_gidx_select<<<r, 1024, 0, s>>>(scores, score_stride, pos, t0, top, list, list_stride, list_n);
     }

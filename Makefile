@@ -53,6 +53,10 @@ $(BUILD)/moebench: $(OBJ4) tools/moebench.cu
 	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/moebench.cu $(OBJ4) -o $@ \
 	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)
 
+$(BUILD)/mlabench: $(OBJ4) tools/mlabench.cu
+	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/mlabench.cu $(OBJ4) -o $@ \
+	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)
+
 $(BUILD)/cpumoebench: $(OBJ4) tools/cpumoebench.cu
 	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/cpumoebench.cu $(OBJ4) -o $@ \
 	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)

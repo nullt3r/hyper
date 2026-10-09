@@ -14,6 +14,7 @@ constexpr int MHC_W = 20;         // per-token mixing weights: post[4] | comb[4]
 constexpr int MLA_LAT = 512;      // latent width (kv_lora_rank)
 constexpr int MLA_MAXH = 24;      // local MLA heads per GPU
 constexpr int MLA_SPLIT = 48;     // decode: cell slices per token
+constexpr int MLA_SPLIT_MAX = 192; // (HYPER5_MLA_SPLIT; the partials buffer is sized for it)
 constexpr int GIDX_HEADS = 32, GIDX_DIM = 128;
 
 // ---- mHC ----
