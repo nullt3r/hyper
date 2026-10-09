@@ -43,6 +43,16 @@ clean:
 $(BUILD)/arbench: tools/arbench.cu $(BUILD)/kernels.o
 	$(NVCC) $(NVFLAGS) tools/arbench.cu $(BUILD)/kernels.o -o $@ $(LIBS)
 
+# MoE routing kernel
+$(BUILD)/routebench: $(OBJ4) tools/routebench.cu
+	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/routebench.cu $(OBJ4) -o $@ \
+	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)
+
+# MoE decode kernels (Flash-Next shapes)
+$(BUILD)/moebench: $(OBJ4) tools/moebench.cu
+	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/moebench.cu $(OBJ4) -o $@ \
+	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)
+
 # dense GEMV on GGUF blocks: bandwidth on the Flash-Next K-quant shapes
 $(BUILD)/ggbench: $(OBJ4) tools/ggbench.cu
 	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/ggbench.cu $(OBJ4) -o $@ \

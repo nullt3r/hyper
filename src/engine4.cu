@@ -117,6 +117,8 @@ struct Engine4::Device {
     uint8_t * stage[2] = {};                                  // staging buffers for streamed experts
     size_t stage_bytes = 0;
     cudaEvent_t ev_ar[2] = {};
+    cudaStream_t s2 = nullptr;                                // decode: the shared expert, concurrently with the routed ones
+    cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
     int big_stride = 0;
     size_t used = 0;
     std::vector<void *> allocs;
@@ -146,6 +148,9 @@ struct Engine4::Device {
         for (auto & ev : ev_up) if (ev) cudaEventDestroy(ev);
         for (auto & ev : ev_free) if (ev) cudaEventDestroy(ev);
         if (cstream) cudaStreamDestroy(cstream);
+        if (s2) cudaStreamDestroy(s2);
+        if (ev_fork) cudaEventDestroy(ev_fork);
+        if (ev_join) cudaEventDestroy(ev_join);
         for (void * p : allocs) cudaFree(p);
         if (stream) cudaStreamDestroy(stream);
     }
@@ -405,6 +410,9 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
         gemv_init(g);
         for (auto & ev : dev->ev_ar) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         CUDA_CHECK(cudaStreamCreateWithFlags(&dev->cstream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&dev->s2, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&dev->ev_fork, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&dev->ev_join, cudaEventDisableTiming));
         for (auto & ev : dev->ev_up) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         for (auto & ev : dev->ev_free) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         if (cublasCreate(&dev->blas) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasCreate failed");
@@ -1026,13 +1034,31 @@ void Engine4::record_main(int gi, int nt, int kind) {
         // ---- token mixer ----
         hc_mix(L.hca_norm, L.hca_down, L.hca_up, L.hca_inj);
         dbg("hc_mix_attn", il, d.mixed, (size_t) nt * n);
+        // decode: independent work on a second stream (indexer || q/k/v + attention prep, alpha/beta || the GDN input
+        // projection, shared expert || routed experts): the small kernels' fixed latencies overlap. The second stream's
+        // split-K GEMVs use their own scratch slot. HYPER4_SERIAL_SHEXP: one stream
+        static const bool serial_shexp = getenv("HYPER4_SERIAL_SHEXP") != nullptr;
+        const bool par = !bulk && !serial_shexp;
+        auto fork = [&] { CUDA_CHECK(cudaEventRecord(d.ev_fork, s)); CUDA_CHECK(cudaStreamWaitEvent(d.s2, d.ev_fork, 0)); };
+        auto on_s2 = [&](auto && f) {
+            const cudaStream_t sm = s;
+            s = d.s2;
+            gemv_scratch_slot(1);
+            f();
+            gemv_scratch_slot(0);
+            CUDA_CHECK(cudaEventRecord(d.ev_join, s));
+            s = sm;
+        };
+        auto join = [&] { CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_join, 0)); };
         if (L.full && L.n_head_l == 0) {   // no kv head on this GPU: contributes nothing to the attention output
             CUDA_CHECK(cudaMemsetAsync(d.part, 0, (size_t) nt * n * sizeof(float), s));
         } else if (L.full) {
-            mm(L.wqkv, d.mixed, n, d.big0, bs, nt);
             const bool qsa = L.kraw != nullptr;
+            const bool par_idx = par && qsa;
+            if (par_idx) fork();
+            mm(L.wqkv, d.mixed, n, d.big0, bs, nt);
             const int top = getenv("HYPER4_NOQSA") ? (1 << 28) : getenv("HYPER4_TOP") ? atoi(getenv("HYPER4_TOP")) : c.idx_top_k / 4;   // experiments
-            if (qsa) {   // indexer: cells each token attends to (all of them while the context has <= top complete blocks)
+            auto indexer = [&] {   // indexer: cells each token attends to (all of them while the context has <= top complete blocks)
                 if (bulk) {
                     to_half(d.mixed, n, nullptr, n, 0.0f, d.xh, nt, s);
                     gemm_f16(L.idx_q, d.xh, nt, d.iq, c.idx_n_head * 128, nullptr, s);
@@ -1050,6 +1076,13 @@ void Engine4::record_main(int gi, int nt, int kind) {
                 else
                     idx_select(d.iqn, L.kpool, P, nt, c.idx_n_head, top, d.iscores, opt_.max_pos / 4 + 4, QSA_SCORE_ROWS, d.ilist,
                                QSA_LIST, d.ilist_n, s);
+            };
+            if (par_idx) on_s2(indexer);
+            else if (qsa) indexer();
+            if (par_idx) {   // attention prep runs meanwhile (q/k norms, rope, the cache rows): it needs only q/k/v
+                attn_prep(d.big0, bs, L.q_norm, L.k_norm, L.kcache, L.vcache, P, opt_.max_pos, L.n_head_l, L.n_kv_l, c.head_dim,
+                          c.n_rot, c.rope_base, eps, nt, s);
+                join();
             }
             cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
             cudaStreamIsCapturing(s, &cap);
@@ -1066,8 +1099,9 @@ void Engine4::record_main(int gi, int nt, int kind) {
             }
                         // a prefill chunk entirely below the sparse regime keeps the (identical, faster) dense flash attention
             const bool dense_chunk = !qsa || (pos_host + nt) / 4 <= top;
-            attn_prep(d.big0, bs, L.q_norm, L.k_norm, L.kcache, L.vcache, P, opt_.max_pos, L.n_head_l, L.n_kv_l, c.head_dim,
-                      c.n_rot, c.rope_base, eps, nt, s);
+            if (!par_idx)
+                attn_prep(d.big0, bs, L.q_norm, L.k_norm, L.kcache, L.vcache, P, opt_.max_pos, L.n_head_l, L.n_kv_l, c.head_dim,
+                          c.n_rot, c.rope_base, eps, nt, s);
             const int ostride = L.n_head_l * c.head_dim;
             if (bulk && dense_chunk)
                 attn_prefill(d.big0, bs, L.kcache, L.vcache, d.o, ostride, P, opt_.max_pos, L.n_head_l, L.head_off,
@@ -1082,9 +1116,16 @@ void Engine4::record_main(int gi, int nt, int kind) {
             mm(L.wo, d.o, ostride, d.part, n, nt);
         } else {
             const int dv = c.head_v_dim();
-            mm(L.win, d.mixed, n, d.big0, bs, nt);
             const int z_off = L.conv_ch, ab_off = L.conv_ch + L.n_v_l * dv;
-            f32mm(L.ab_w, 2 * L.n_v_l, n, d.mixed, n, d.big0 + ab_off, bs, nt);
+            if (par) {   // alpha / beta (other columns of big0) next to the input projection
+                fork();
+                on_s2([&] { f32mm(L.ab_w, 2 * L.n_v_l, n, d.mixed, n, d.big0 + ab_off, bs, nt); });
+                mm(L.win, d.mixed, n, d.big0, bs, nt);
+                join();
+            } else {
+                mm(L.win, d.mixed, n, d.big0, bs, nt);
+                f32mm(L.ab_w, 2 * L.n_v_l, n, d.mixed, n, d.big0 + ab_off, bs, nt);
+            }
             gdn_conv(d.big0, bs, L.conv_state, snap ? L.conv_snap : nullptr, L.conv_w, L.conv_ch, c.ssm_conv, nt, s, bulk ? d.conv_raw : nullptr);
             const int ostride = L.n_v_l * dv;
             gdn_step(d.big0, bs, ab_off, L.state, snap ? L.state_snap : nullptr, d.o, ostride, L.dt_bias, L.ssm_a, L.n_k_l, L.n_v_l, c.ssm_d_state, dv, eps, nt, s);
@@ -1096,6 +1137,17 @@ void Engine4::record_main(int gi, int nt, int kind) {
         else allreduce_hc_ll16(R, d.inj, n, hc, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
         // ---- MoE ----
         hc_mix(L.hcf_norm, L.hcf_down, L.hcf_up, L.hcf_inj);
+        auto shexp = [&] {
+            mm(L.sh_gu, d.mixed, n, d.shgu, 2 * L.n_sh_l, nt);
+            if (nt <= MAX_NT) {   // silu(gate) * up on load
+                NormIn glu; glu.act = 2; glu.glu_off = L.n_sh_l;
+                mm(L.sh_down, d.shgu, 2 * L.n_sh_l, d.shpart, n, nt, glu);
+            } else {
+                silu_mul(d.shgu, 2 * L.n_sh_l, d.shh, c.n_ff_shexp, L.n_sh_l, nt, s);
+                mm(L.sh_down, d.shh, c.n_ff_shexp, d.shpart, n, nt);
+            }
+        };
+        if (par) { fork(); on_s2(shexp); }   // (the shared expert || routing and the routed experts, until moe_reduce)
         f32mm(L.router, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt);
         dbg("router", il, d.rlog, (size_t) nt * (c.n_expert + 1));
         moe_route(d.rlog, c.n_expert + 1, c.n_expert, K, d.ids, d.wts, d.sg, nt, s);
@@ -1107,14 +1159,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
             else moe_publish(&cpu_rec_[il].seq, &cpu_rec_[il].nt, &cpu_rec_[il].ids[0][0], &cpu_rec_[il].wts[0][0], &cpu_rec_[il].x[0][0],
                              d.mixed, n, n, d.ids, d.wts, K, nt, d.counter, (unsigned) il, s);
         }
-        mm(L.sh_gu, d.mixed, n, d.shgu, 2 * L.n_sh_l, nt);
-        if (nt <= MAX_NT) {   // silu(gate) * up on load
-            NormIn glu; glu.act = 2; glu.glu_off = L.n_sh_l;
-            mm(L.sh_down, d.shgu, 2 * L.n_sh_l, d.shpart, n, nt, glu);
-        } else {
-            silu_mul(d.shgu, 2 * L.n_sh_l, d.shh, c.n_ff_shexp, L.n_sh_l, nt, s);
-            mm(L.sh_down, d.shh, c.n_ff_shexp, d.shpart, n, nt);
-        }
+        if (!par) shexp();
         if (bulk) {   // local pairs grouped by expert: consecutive blocks share the expert's weights in L2
             moe_order(L.moe, d.ids, nt * K, c.n_expert, d.order, d.order_n, s, d.egrp);
             to_half(d.mixed, n, nullptr, n, 0.0f, d.mix16, nt, s);
@@ -1144,6 +1189,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
             moe_gate_up(L.moe, d.mixed, n, d.ids, K, d.hexp, nt, s);
             moe_down(L.moe, d.hexp, d.ids, d.wts, K, d.yexp, nt, s);
         }
+        if (par) join();
         dbg("shexp", il, d.shpart, (size_t) nt * n);
         dbg("experts", il, d.yexp, (size_t) nt * K * n);
         const volatile unsigned * cflag = d.g == 0 && !nocpu_ && !stream ? (bulk ? &cpu_bulk_out_->seq : &cpu_out_[il].seq) : nullptr;

@@ -251,7 +251,61 @@ __global__ void k_moe_route(const float * __restrict__ logits, int ls, int ne, i
     }
 }
 
+// warp per token (ne <= 32 * V): softmax with shuffles, each lane sorts its V probabilities (descending, ties to the lower
+// index), then k rounds of warp argmax over the lanes' heads; weights normalized over the selected, as k_moe_route
+__device__ __forceinline__ bool rt_better(float a, int ia, float b, int ib) { return a > b || (a == b && ia < ib); }
+template <int V>
+__global__ void __launch_bounds__(32) k_moe_route_w(const float * __restrict__ logits, int ls, int ne, int k, int * ids, float * wts, float * sg) {
+    const int t = blockIdx.x, lane = threadIdx.x;
+    const float * l = logits + (size_t) t * ls;
+    float v[V];
+    int vi[V];
+    float mx = -FLT_MAX;
+#pragma unroll
+    for (int i = 0; i < V; ++i) {
+        const int e = i * 32 + lane;
+        v[i] = e < ne ? l[e] : -FLT_MAX;
+        vi[i] = e < ne ? e : 0x7fffffff;
+        mx = fmaxf(mx, v[i]);
+    }
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < V; ++i) { v[i] = vi[i] < ne ? expf(v[i] - mx) : 0.0f; sum += v[i]; }
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
+#pragma unroll
+    for (int i = 0; i < V; ++i) { if (vi[i] < ne) v[i] /= sum; else v[i] = -1.0f; }
+    // insertion sort of the lane's V (descending; unrolled: registers only)
+#pragma unroll
+    for (int i = 1; i < V; ++i)
+#pragma unroll
+        for (int j = i; j > 0; --j)
+            if (rt_better(v[j], vi[j], v[j - 1], vi[j - 1])) {
+                const float tv = v[j]; v[j] = v[j - 1]; v[j - 1] = tv;
+                const int ti = vi[j]; vi[j] = vi[j - 1]; vi[j - 1] = ti;
+            }
+    float selw = 0.0f, tot = 0.0f;
+    int seli = 0;
+    for (int j = 0; j < k; ++j) {
+        float bv = v[0]; int bi = vi[0];
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffff, bv, o); const int oi = __shfl_xor_sync(0xffffffff, bi, o);
+            if (rt_better(ov, oi, bv, bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == j) { selw = bv; seli = bi; }
+        tot += bv;   // (same order on every lane: j = 0..k-1)
+        if (vi[0] == bi) {   // the winner's lane drops its head
+#pragma unroll
+            for (int i = 0; i < V - 1; ++i) { v[i] = v[i + 1]; vi[i] = vi[i + 1]; }
+            v[V - 1] = -1.0f; vi[V - 1] = 0x7fffffff;
+        }
+    }
+    if (lane < k) { ids[t * k + lane] = seli; wts[t * k + lane] = selw / tot; }
+    if (lane == 0) sg[t] = sigm(l[ne]);
+}
+
 // ---------------- expert GEMV on GGUF blocks ----------------
+
 // 8 consecutive weights (chunk c of the row) dequantized
 template <GType T> __device__ __forceinline__ void deq8(const uint8_t * __restrict__ row, int c, float * v);
 
@@ -529,6 +583,86 @@ __global__ void k_moe_down(MoeDev m, const float * __restrict__ h, const int * _
     }
 }
 
+// ---- decode MoE gate/up specialized for Q4_K (the generic kernel decodes 8 weights at a time and re-reads the block header
+// for each) ----
+// byte b (0..11) of a Q4_K super-block's scales, held in registers (words s0..s2)
+__device__ __forceinline__ int q4k_sbyte(unsigned s0, unsigned s1, unsigned s2, int b) {
+    const unsigned w = b < 4 ? s0 : b < 8 ? s1 : s2;
+    return (int) ((w >> (8 * (b & 3))) & 0xff);
+}
+__device__ __forceinline__ void q4k_sm(unsigned s0, unsigned s1, unsigned s2, int j, int & d, int & m) {
+    if (j < 4) { d = q4k_sbyte(s0, s1, s2, j) & 63; m = q4k_sbyte(s0, s1, s2, j + 4) & 63; }
+    else {
+        d = (q4k_sbyte(s0, s1, s2, j + 4) & 0xF) | ((q4k_sbyte(s0, s1, s2, j - 4) >> 6) << 4);
+        m = (q4k_sbyte(s0, s1, s2, j + 4) >> 4) | ((q4k_sbyte(s0, s1, s2, j) >> 6) << 4);
+    }
+}
+// Q4_K row . x: this lane's part of super-block sb (8 lanes per super-block: lane L takes qs bytes 16L..16L+15, i.e. 16 values
+// of sub-blocks 2(L/2) (low nibbles) and 2(L/2)+1 (high)); xa / xb: its 16 x values of the two sub-blocks, sums sxa / sxb
+__device__ __forceinline__ float q4k_part2(const uint4 hd, const uint4 qv, int L, const float * xa, const float * xb, float sxa, float sxb) {
+    const float d = __half2float(__ushort_as_half((unsigned short) (hd.x & 0xffff))), dm = __half2float(__ushort_as_half((unsigned short) (hd.x >> 16)));
+    const int j0 = 2 * (L >> 1);
+    int sc0, m0, sc1, m1;
+    q4k_sm(hd.y, hd.z, hd.w, j0, sc0, m0);
+    q4k_sm(hd.y, hd.z, hd.w, j0 + 1, sc1, m1);
+    const unsigned qw[4] = {qv.x, qv.y, qv.z, qv.w};
+    float a = 0.0f, b = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const unsigned byte = (qw[i >> 2] >> (8 * (i & 3))) & 0xff;
+        a += (float) (byte & 0xF) * xa[i];
+        b += (float) (byte >> 4) * xb[i];
+    }
+    return d * ((float) sc0 * a + (float) sc1 * b) - dm * ((float) m0 * sxa + (float) m1 * sxb);
+}
+// gate / up: warp = RW rows of both; 4 groups of 8 lanes take super-blocks g, g + 4, ...
+template <int RW>
+__global__ void __launch_bounds__(256) k_moe_gu_q4k(MoeDev m, const float * __restrict__ x, int xs, const int * __restrict__ ids, int k,
+                                                    float * __restrict__ h, int kdim, const int * __restrict__ order,
+                                                    const int * __restrict__ order_n) {
+    if (order && (int) blockIdx.x >= *order_n) return;
+    const int p = order ? order[blockIdx.x] : blockIdx.x, t = p / k;
+    const int slot = m.slot[ids[p]];
+    if (slot < 0) return;
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, grp = lane >> 3, L = lane & 7;
+    const int r0 = (blockIdx.y * 8 + w) * RW;
+    if (r0 >= m.ff) return;
+    const size_t rb = m.gate_bytes / m.ff;
+    const int nsb = kdim / 256, j0 = 2 * (L >> 1), l0 = (L & 1) * 16;
+    const float * xr = x + (size_t) t * xs;
+    float ag[RW] = {}, au[RW] = {};
+    for (int sb = grp; sb < nsb; sb += 4) {
+        uint4 hg[RW], qg[RW], hu[RW], qu[RW];
+        float xa[16], xb[16];
+        const float4 * pa = (const float4 *) (xr + sb * 256 + j0 * 32 + l0), * pb = (const float4 *) (xr + sb * 256 + (j0 + 1) * 32 + l0);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float4 va = __ldg(pa + i), vb = __ldg(pb + i);
+            xa[4 * i] = va.x; xa[4 * i + 1] = va.y; xa[4 * i + 2] = va.z; xa[4 * i + 3] = va.w;
+            xb[4 * i] = vb.x; xb[4 * i + 1] = vb.y; xb[4 * i + 2] = vb.z; xb[4 * i + 3] = vb.w;
+        }
+        float sxa = 0.0f, sxb = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) { sxa += xa[i]; sxb += xb[i]; }
+#pragma unroll
+        for (int rr = 0; rr < RW; ++rr) {   // (all loads of the step first: the rows' blocks are in flight together)
+            const int r = min(r0 + rr, m.ff - 1);
+            const size_t off = (size_t) slot * m.gate_bytes + (size_t) r * rb + (size_t) sb * 144;
+            hg[rr] = __ldg((const uint4 *) (m.gate + off)); qg[rr] = __ldg((const uint4 *) (m.gate + off + 16 + 16 * L));
+            hu[rr] = __ldg((const uint4 *) (m.up + off)); qu[rr] = __ldg((const uint4 *) (m.up + off + 16 + 16 * L));
+        }
+#pragma unroll
+        for (int rr = 0; rr < RW; ++rr) {
+            ag[rr] += q4k_part2(hg[rr], qg[rr], L, xa, xb, sxa, sxb);
+            au[rr] += q4k_part2(hu[rr], qu[rr], L, xa, xb, sxa, sxb);
+        }
+    }
+#pragma unroll
+    for (int rr = 0; rr < RW; ++rr) {
+        const float g = warp_sum4(ag[rr]), u = warp_sum4(au[rr]);
+        if (lane == 0 && r0 + rr < m.ff) h[(size_t) p * m.ff + r0 + rr] = swiglu4(g, u, m.clamp);
+    }
+}
 // ---- zero-copy share of the CPU experts: hidden slice [f0, f1) read straight from mapped host memory ----
 // row bytes staged through shared memory with 8-byte loads (PCIe reads stay coalesced), then the usual block dot
 template <GType T>
@@ -1030,8 +1164,12 @@ void gated_norm_sigmoid(float * o, int o_stride, const float * z, int z_stride, 
 void moe_route(const float * logits, int ls, int n_expert, int k, int * ids, float * wts, float * sg, int nt, cudaStream_t s) {
     if (n_expert > 1024 || k > MOE_MAX_USED) throw std::runtime_error("moe_route: too many experts");
     if (k * 9 > 8 * MOE_MAX_USED) throw std::runtime_error("moe_route: k too large");
-    // rank selection (HYPER4_RANKROUTE, bit-identical): measured slower on 512 experts (52 vs ~12 us), so off
-    static const bool rank_route = getenv("HYPER4_RANKROUTE") != nullptr;
+    // warp per token (HYPER4_BLOCKROUTE: the block version; HYPER4_RANKROUTE: its rank selection, slower)
+    static const bool block_route = getenv("HYPER4_BLOCKROUTE") != nullptr, rank_route = getenv("HYPER4_RANKROUTE") != nullptr;
+    if (!block_route && !rank_route && k <= 32) {
+        if (n_expert <= 256) { k_moe_route_w<8><<<nt, 32, 0, s>>>(logits, ls, n_expert, k, ids, wts, sg); return; }
+        if (n_expert <= 512) { k_moe_route_w<16><<<nt, 32, 0, s>>>(logits, ls, n_expert, k, ids, wts, sg); return; }
+    }
     k_moe_route<<<nt, 256, 0, s>>>(logits, ls, n_expert, k, ids, wts, sg, rank_route);
 }
 
@@ -1051,6 +1189,14 @@ void moe_route(const float * logits, int ls, int n_expert, int k, int * ids, flo
 void moe_gate_up(const MoeDev & m, const float * x, int xs, const int * ids, int k, float * h, int nt, cudaStream_t s,
                  const int * order, const int * order_n) {
     const int kdim = (int) (m.gate_bytes / m.ff / gtype_block_bytes(m.tg) * gtype_block_elems(m.tg));
+    static const bool old = getenv("HYPER_MOE_OLD") != nullptr;
+    if (!old && m.tg == GType::Q4_K && kdim % 256 == 0 && (m.gate_bytes / m.ff) % 16 == 0 && xs % 4 == 0) {
+        static const int rw = getenv("HYPER_MOE_RW") ? atoi(getenv("HYPER_MOE_RW")) : 1;   // (rows per warp; 1 measured best)
+        if (rw == 1) k_moe_gu_q4k<1><<<dim3(nt * k, (m.ff + 7) / 8), 256, 0, s>>>(m, x, xs, ids, k, h, kdim, order, order_n);
+        else if (rw == 4) k_moe_gu_q4k<4><<<dim3(nt * k, (m.ff + 31) / 32), 256, 0, s>>>(m, x, xs, ids, k, h, kdim, order, order_n);
+        else k_moe_gu_q4k<2><<<dim3(nt * k, (m.ff + 15) / 16), 256, 0, s>>>(m, x, xs, ids, k, h, kdim, order, order_n);
+        return;
+    }
     MOE_TYPE_SWITCH(m.tg, (k_moe_gate_up<TT><<<dim3(nt * k, (m.ff + MOE_ROWS - 1) / MOE_ROWS), 256, kdim * sizeof(float), s>>>(m, x, xs, ids, k, h, kdim, order, order_n)));
 }
 void moe_down(const MoeDev & m, const float * h, const int * ids, const float * wts, int k, float * y, int nt, cudaStream_t s,

@@ -1442,7 +1442,10 @@ __global__ void k_mma_q8_smallk(const uint4 * __restrict__ wq, const half * __re
 }
 
 // split-K scratch per device (gemv_init): tile partials and per-tile counters
-namespace { struct KSplit { float * part = nullptr; unsigned * cnt = nullptr; int gw = 0; }; KSplit g_ksplit[16]; }
+// two scratch slots per device: work issued on a second stream (gemv_scratch_slot(1)) cannot collide with the main one's
+namespace { struct KSplit { float * part = nullptr; unsigned * cnt = nullptr; int gw = 0; }; KSplit g_kslots[16][2]; int g_kslot = 0; }
+#define g_ksplit_dev(dev) g_kslots[dev][g_kslot]
+void gemv_scratch_slot(int slot) { g_kslot = slot & 1; }
 constexpr size_t KSPLIT_CNT = 8192;   // tile counters
 constexpr int KSPLIT_TILES = 1024, KSPLIT_MAX = 16;
 // split-K target: blocks per GEMV launch (HYPER_GEMV_TARGET; 0 = only for matrices with few row tiles)
@@ -1450,14 +1453,16 @@ static const int g_ksplit_blocks = getenv("HYPER_KSPLIT_BLOCKS") ? atoi(getenv("
 static const int g_ksplit_minkb = getenv("HYPER_KSPLIT_MINKB") ? atoi(getenv("HYPER_KSPLIT_MINKB")) : 16;
 static const int g_gemv_target = getenv("HYPER_GEMV_TARGET") ? atoi(getenv("HYPER_GEMV_TARGET")) : 0;
 void gemv_init(int dev) {
-    if (dev < 0 || dev >= 16 || g_ksplit[dev].part) return;
-    cudaMalloc(&g_ksplit[dev].part, (size_t) KSPLIT_TILES * KSPLIT_MAX * 128 * sizeof(float));
-    cudaMalloc(&g_ksplit[dev].cnt, KSPLIT_CNT * sizeof(unsigned));
-    cudaMemset(g_ksplit[dev].cnt, 0, KSPLIT_CNT * sizeof(unsigned));
+    if (dev < 0 || dev >= 16 || g_kslots[dev][0].part) return;
     int nb = 0, sms = 0;   // resident warps of the balanced GEMV
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_mma_q8_bal, 256, 0);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-    g_ksplit[dev].gw = nb * sms * 8;
+    for (auto & ks : g_kslots[dev]) {
+        cudaMalloc(&ks.part, (size_t) KSPLIT_TILES * KSPLIT_MAX * 128 * sizeof(float));
+        cudaMalloc(&ks.cnt, KSPLIT_CNT * sizeof(unsigned));
+        cudaMemset(ks.cnt, 0, KSPLIT_CNT * sizeof(unsigned));
+        ks.gw = nb * sms * 8;
+    }
 }
 
 void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const float * add, int nt, cudaStream_t s,
@@ -1472,30 +1477,30 @@ void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const fl
     int dev = 0;
     cudaGetDevice(&dev);
     static const bool no_bal = getenv("HYPER_GEMV_NOBAL") != nullptr;
-    if (!no_bal && dev < 16 && g_ksplit[dev].part && g_ksplit[dev].gw > 0) {
-        // balanced units when a block per tile would leave a large partial wave (resident blocks: g_ksplit[dev].gw / 8)
-        const int resident = g_ksplit[dev].gw / 8;
+    if (!no_bal && dev < 16 && g_ksplit_dev(dev).part && g_ksplit_dev(dev).gw > 0) {
+        // balanced units when a block per tile would leave a large partial wave (resident blocks: g_ksplit_dev(dev).gw / 8)
+        const int resident = g_ksplit_dev(dev).gw / 8;
         const double waves = (double) tiles / resident;
         const double eff = waves / std::ceil(waves);
         // (measured: gemvbench on the GLM / 27B shapes, k >= 4096; shorter rows make the units too small to pay for the partials)
         if (eff < 0.85 && waves < 8.0 && tiles >= 160 && kb >= 128) {
             static const int minkb = getenv("HYPER_BAL_MINKB") ? atoi(getenv("HYPER_BAL_MINKB")) : 8;
             static const double rounds = getenv("HYPER_BAL_ROUNDS") ? atof(getenv("HYPER_BAL_ROUNDS")) : 1.0;
-            int upt = std::max(1, std::min({32, kb / std::max(1, minkb), (int) ((rounds * g_ksplit[dev].gw) / tiles)}));
+            int upt = std::max(1, std::min({32, kb / std::max(1, minkb), (int) ((rounds * g_ksplit_dev(dev).gw) / tiles)}));
             while (upt > 1 && (size_t) tiles * upt > (size_t) KSPLIT_TILES * KSPLIT_MAX) --upt;
             if ((size_t) tiles <= KSPLIT_CNT && upt >= 3) {   // (short rows: units too small to pay for the partials)
                 const int units = tiles * upt, blocks = std::min(resident, (units + 7) / 8);
-                k_mma_q8_bal<<<blocks, 256, 0, s>>>(W.q, W.s, W.n, W.k, x, xs, y, ys, add, nt, nin, upt, g_ksplit[dev].part, g_ksplit[dev].cnt);
+                k_mma_q8_bal<<<blocks, 256, 0, s>>>(W.q, W.s, W.n, W.k, x, xs, y, ys, add, nt, nin, upt, g_ksplit_dev(dev).part, g_ksplit_dev(dev).cnt);
                 return;
             }
         }
     }
-    if (dev < 16 && g_ksplit[dev].part && tiles <= KSPLIT_TILES && tiles < 160)   // few row tiles: spread K over more SMs
+    if (dev < 16 && g_ksplit_dev(dev).part && tiles <= KSPLIT_TILES && tiles < 160)   // few row tiles: spread K over more SMs
         P = std::max(1, std::min({KSPLIT_MAX, g_ksplit_blocks / tiles, kb / g_ksplit_minkb}));
-    if (g_gemv_target > 0 && dev < 16 && g_ksplit[dev].part && tiles <= KSPLIT_TILES && tiles < g_gemv_target)   // medium: enough blocks in flight
+    if (g_gemv_target > 0 && dev < 16 && g_ksplit_dev(dev).part && tiles <= KSPLIT_TILES && tiles < g_gemv_target)   // medium: enough blocks in flight
         P = std::max(P, std::min({KSPLIT_MAX, g_gemv_target / tiles, kb / 16}));
     k_mma_q8<<<dim3(tiles, P), 256, 0, s>>>(W.q, W.s, W.n, W.k, x, xs, y, ys, add, nt, nin,
-                                           P > 1 ? g_ksplit[dev].part : nullptr, P > 1 ? g_ksplit[dev].cnt : nullptr);
+                                           P > 1 ? g_ksplit_dev(dev).part : nullptr, P > 1 ? g_ksplit_dev(dev).cnt : nullptr);
 }
 
 void gemv_kq(const KQW & W, const float * x, int xs, float * y, int ys, int nt, cudaStream_t s, const NormIn & nin) {
@@ -1505,10 +1510,10 @@ void gemv_kq(const KQW & W, const float * x, int xs, float * y, int ys, int nt, 
     int dev = 0;
     cudaGetDevice(&dev);
     int P = 1;   // (split-K as gemv_q8: few row tiles)
-    if (dev < 16 && g_ksplit[dev].part && tiles <= KSPLIT_TILES && tiles < 160)
+    if (dev < 16 && g_ksplit_dev(dev).part && tiles <= KSPLIT_TILES && tiles < 160)
         P = std::max(1, std::min({KSPLIT_MAX, g_ksplit_blocks / tiles, kb / g_ksplit_minkb}));
-    float * kp = P > 1 ? g_ksplit[dev].part : nullptr;
-    unsigned * kc = P > 1 ? g_ksplit[dev].cnt : nullptr;
+    float * kp = P > 1 ? g_ksplit_dev(dev).part : nullptr;
+    unsigned * kc = P > 1 ? g_ksplit_dev(dev).cnt : nullptr;
     if (W.type == KQ::Q4K) k_mma_kq<KQ::Q4K><<<dim3(tiles, P), 256, 0, s>>>(W, x, xs, y, ys, nt, nin, kp, kc);
     else k_mma_kq<KQ::Q6K><<<dim3(tiles, P), 256, 0, s>>>(W, x, xs, y, ys, nt, nin, kp, kc);
 }
@@ -1618,10 +1623,10 @@ void gemv_bf16(const BF16W & W, const float * x, int xs, float * y, int ys, cons
     const int tiles = (W.n + 15) / 16, nks = W.k / 16;
     int P = 1, dev = 0;
     cudaGetDevice(&dev);
-    if (dev < 16 && g_ksplit[dev].part && tiles <= KSPLIT_TILES && tiles < 160)
+    if (dev < 16 && g_ksplit_dev(dev).part && tiles <= KSPLIT_TILES && tiles < 160)
         P = std::max(1, std::min({KSPLIT_MAX, 320 / tiles, nks / 32}));
     k_mma_f16<<<dim3(tiles, P), 256, 0, s>>>(W.q, W.n, W.k, x, xs, y, ys, add, nt, nin,
-                                            P > 1 ? g_ksplit[dev].part : nullptr, P > 1 ? g_ksplit[dev].cnt : nullptr);
+                                            P > 1 ? g_ksplit_dev(dev).part : nullptr, P > 1 ? g_ksplit_dev(dev).cnt : nullptr);
 }
 
 void to_half(const float * x, int xs, const float * w, int k, float eps, half * xh, int nt, cudaStream_t s) {
