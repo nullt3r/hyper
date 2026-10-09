@@ -92,6 +92,21 @@ int main(int argc, char ** argv) {
             for (int c = 0; c < R / 16; ++c)
                 for (int r = c * 16; r < c * 16 + 16; ++r) mt->vec_dot(k, &y[r], 0, w.data() + (size_t) r * rb, 0, qm.data(), 0, 1);
         });
+        for (int cs : {64, 256}) {   // mainline vec_dot, larger contiguous row chunks
+            char nm[16]; snprintf(nm, sizeof nm, "main%d", cs);
+            bench(nm, [&] {
+#pragma omp parallel for num_threads(nth) schedule(dynamic, 1)
+                for (int c = 0; c < R / cs; ++c)
+                    for (int r = c * cs; r < c * cs + cs; ++r) mt->vec_dot(k, &y[r], 0, w.data() + (size_t) r * rb, 0, qm.data(), 0, 1);
+            });
+        }
+        bench("mainst", [&] {   // static contiguous share per thread (like iqk_mul_mat's split)
+#pragma omp parallel num_threads(nth)
+            {
+                const int ith = omp_get_thread_num(), r0 = (int) ((long) R * ith / nth), r1 = (int) ((long) R * (ith + 1) / nth);
+                for (int r = r0; r < r1; ++r) mt->vec_dot(k, &y[r], 0, w.data() + (size_t) r * rb, 0, qm.data(), 0, 1);
+            }
+        });
         bench("ik", [&] {
 #pragma omp parallel for num_threads(nth) schedule(dynamic, 1)
             for (int c = 0; c < R / 16; ++c)

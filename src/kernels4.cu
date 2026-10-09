@@ -354,15 +354,15 @@ template <> __device__ __forceinline__ void deq8<GType::Q5_K>(const uint8_t * __
 template <> __device__ __forceinline__ void deq8<GType::Q5_1>(const uint8_t * __restrict__ row, int c, float * v) {
     const uint8_t * b = row + (size_t) (c >> 2) * 24;
     const float d = h2f(b), m = h2f(b + 2);
-    uint32_t qh; memcpy(&qh, b + 4, 4);
-    const uint8_t * qs = b + 8;
-    const int o = (c & 3) * 8;
+    // values o..o+7 of the block: nibbles of qs bytes l0..l0+7 (low for o < 16, high above), bit 4 = qh bit o + i
+    // (no lane-dependent branch: lanes with different c & 3 used to take different paths)
+    const uint32_t qh = *(const uint32_t *) (b + 4);
+    const int o = (c & 3) * 8, l0 = o & 15, sh = o & 16 ? 4 : 0;
+    const uint32_t q0 = *(const uint32_t *) (b + 8 + l0), q1 = *(const uint32_t *) (b + 12 + l0);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const int jj = o + i;
-        int x;
-        if (jj < 16) x = (qs[jj] & 0xF) | (((qh >> jj) << 4) & 0x10);
-        else { const int j2 = jj - 16; x = (qs[j2] >> 4) | ((qh >> (j2 + 12)) & 0x10); }
+        const uint32_t qw = i < 4 ? q0 : q1;
+        const int x = ((qw >> (8 * (i & 3) + sh)) & 0xF) | (((qh >> (o + i)) & 1) << 4);
         v[i] = x * d + m;
     }
 }
@@ -371,13 +371,13 @@ template <> __device__ __forceinline__ void deq8<GType::Q5_0>(const uint8_t * __
     const float d = h2f(b);
     uint32_t qh; memcpy(&qh, b + 2, 4);
     const uint8_t * qs = b + 6;
-    const int o = (c & 3) * 8;
+    const int o = (c & 3) * 8, l0 = o & 15, sh = o & 16 ? 4 : 0;   // (as Q5_1; qs only 2-byte aligned here)
+    const uint16_t * q16 = (const uint16_t *) (qs + l0);
+    const uint32_t q0 = q16[0] | ((uint32_t) q16[1] << 16), q1 = q16[2] | ((uint32_t) q16[3] << 16);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const int jj = o + i;
-        int x;
-        if (jj < 16) x = (qs[jj] & 0xF) | (((qh >> jj) << 4) & 0x10);
-        else { const int j2 = jj - 16; x = (qs[j2] >> 4) | ((qh >> (j2 + 12)) & 0x10); }
+        const uint32_t qw = i < 4 ? q0 : q1;
+        const int x = ((qw >> (8 * (i & 3) + sh)) & 0xF) | (((qh >> (o + i)) & 1) << 4);
         v[i] = (x - 16) * d;
     }
 }
