@@ -213,7 +213,8 @@ static int run_cmd(int argc, char ** argv) {
             }
         } else if (cmd == "mtpgen") {   // HYPER4_MTP=file: greedy plain vs MTP speculative (identical output), speed
             const int n_gen = argc > 4 ? atoi(argv[4]) : 256;
-            std::vector<int> prompt(toks.begin(), toks.begin() + std::min<size_t>(toks.size(), 128));
+            const size_t np = getenv("HYPER4_GENP") ? atoi(getenv("HYPER4_GENP")) : 128;   // prompt length
+            std::vector<int> prompt(toks.begin(), toks.begin() + std::min<size_t>(toks.size(), np));
             GenStats a, b;
             const std::vector<int> plain = eng.generate(prompt, n_gen, false, &a);
             const std::vector<int> spec = eng.generate(prompt, n_gen, true, &b);
@@ -224,6 +225,9 @@ static int run_cmd(int argc, char ** argv) {
                    (double) b.tokens / std::max(1, b.steps), 1e3 * b.t_main / std::max(1, b.steps), 1e3 * b.t_mtp / std::max(1, b.steps),
                    1e3 * b.t_restore / std::max(1, b.steps));
             printf("MTPGEN identical prefix %d / %d%s\n", same, n_gen, same == n_gen ? " (sequences match)" : "");
+            uint64_t hsh = 1469598103934665603ull;
+            for (int t : spec) hsh = (hsh ^ (uint32_t) t) * 1099511628211ull;
+            printf("MTPGEN prompt %zu  prefill %.2f s  spec output hash %016llx\n", prompt.size(), b.t_prefill, (unsigned long long) hsh);
         } else if (cmd == "checkbulk") {   // HYPER4_ALLROWS=1: prefill up to the reference's first row, then its rows in one chunk
             const int n = (int) toks.size(), first = g_ref_first;
             Cmp cmp;

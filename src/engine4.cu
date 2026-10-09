@@ -101,6 +101,8 @@ struct Engine4::Device {
     unsigned * inj_cnt = nullptr;   // hc norm: per token, the stream blocks' tickets
     float * rlog = nullptr, * wts = nullptr, * sg = nullptr, * shgu = nullptr, * shh = nullptr, * shpart = nullptr;
     float * hexp = nullptr, * yexp = nullptr, * ple_emb = nullptr, * ple_key = nullptr, * ple_val = nullptr, * ple_sc = nullptr;
+    std::vector<float *> res_x, ple_x;   // the further chunks of a multi-chunk prefill pass: residual rows, PLE rows
+    int * pos_x = nullptr;
     float * logits = nullptr, * res2 = nullptr;
     int * ids = nullptr, * pos = nullptr, * counter = nullptr, * order = nullptr, * order_n = nullptr;
     half * xh = nullptr, * p16 = nullptr, * recv = nullptr;   // GEMM input scratch; DMA allreduce own / peers' parts
@@ -457,8 +459,10 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
         devs_.push_back(std::move(dev));
     }
     const int nd = opt_.n_devices, n = cfg_.n_embd;
-    CUDA_CHECK(cudaHostAlloc(&h_embd_, (size_t) R4 * n * sizeof(float), cudaHostAllocPortable));
-    CUDA_CHECK(cudaHostAlloc(&h_ple_, (size_t) R4 * std::max(1, cfg_.ple_n_heads() * cfg_.ple_dim) * sizeof(float), cudaHostAllocPortable));
+    if (getenv("HYPER4_MC")) mc_max_ = std::max(1, std::min(8, atoi(getenv("HYPER4_MC"))));
+    CUDA_CHECK(cudaHostAlloc(&h_embd_, (size_t) mc_max_ * R4 * n * sizeof(float), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_ple_, (size_t) mc_max_ * R4 * std::max(1, cfg_.ple_n_heads() * cfg_.ple_dim) * sizeof(float), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_cpos_, 8 * sizeof(int), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_stage_, (size_t) 2 * nd * R4 * n * sizeof(half), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&cpu_bulk_, sizeof(CpuMoeBulk), cudaHostAllocPortable | cudaHostAllocMapped));
     CUDA_CHECK(cudaHostAlloc(&cpu_bulk_out_, sizeof(CpuMoeBulkOut), cudaHostAllocPortable | cudaHostAllocMapped));
@@ -797,6 +801,14 @@ void Engine4::load_weights() {
         const int R = R4, K = c.n_expert_used;
         dev.x = dev.alloc<float>((size_t) R * n);
         dev.res = dev.alloc<float>((size_t) R * hcn);
+        {   // (HYPER4_MC_ALLOC: buffers for more chunks than used: equal VRAM, so the expert placement matches another setting)
+            const int mc_alloc = std::max(mc_max_, getenv("HYPER4_MC_ALLOC") ? atoi(getenv("HYPER4_MC_ALLOC")) : 0);
+            for (int ci = 1; ci < mc_alloc; ++ci) {
+                dev.res_x.push_back(dev.alloc<float>((size_t) R * hcn));
+                if (c.ple_layer >= 0) dev.ple_x.push_back(dev.alloc<float>((size_t) R * std::max(1, c.ple_n_heads() * c.ple_dim)));
+            }
+            dev.pos_x = dev.alloc<int>(8);
+        }
         dev.res2 = dev.alloc<float>((size_t) R * hcn);
         dev.xn = dev.alloc<float>((size_t) R * hcn);
         dev.gate = dev.alloc<float>((size_t) R * hcn);
@@ -978,20 +990,39 @@ void Engine4::record_main(int gi, int nt, int kind) {
         if (cublasSgemm(d.blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, nr, k, &one, W, k, x, xs, &zero, y, ys) != CUBLAS_STATUS_SUCCESS)
             throw std::runtime_error("cublasSgemm failed");
     };
-    float * R = kind ? d.mres : d.res;   // hc-wide residual rows
-    int * P = kind ? d.mpos : d.pos;
-    const int pos_host = h_pos_[kind ? 1 : 0];
-    CUDA_CHECK(cudaMemcpyAsync(P, h_pos_ + (kind ? 1 : 0), sizeof(int), cudaMemcpyHostToDevice, s));
-    CUDA_CHECK(cudaMemcpyAsync(d.x, kind ? h_membd_ : h_embd_, (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
-    if (!kind && c.ple_layer >= 0)
-        CUDA_CHECK(cudaMemcpyAsync(d.ple_emb, h_ple_, (size_t) nt * c.ple_n_heads() * c.ple_dim * sizeof(float), cudaMemcpyHostToDevice, s));
+    // chunks of this pass (a multi-chunk prefill runs each layer for all of them before the next layer): residual rows,
+    // positions, embeddings and PLE rows per chunk; everything else is per-layer scratch
+    struct Ck { int nt; float * R; int * P; int pos; float * ple; };
+    const int nck = !kind && bulk ? mc_n_ : 1;
+    std::vector<Ck> ck(nck);
+    for (int ci = 0; ci < nck; ++ci) {
+        ck[ci].nt = ci == 0 ? nt : mc_nt_[ci];
+        ck[ci].R = ci == 0 ? (kind ? d.mres : d.res) : d.res_x[ci - 1];
+        ck[ci].P = ci == 0 ? (kind ? d.mpos : d.pos) : d.pos_x + ci;
+        ck[ci].pos = ci == 0 ? h_pos_[kind ? 1 : 0] : mc_pos_[ci];
+        ck[ci].ple = ci == 0 || d.ple_x.empty() ? d.ple_emb : d.ple_x[ci - 1];
+    }
+    float * R = ck[0].R;   // hc-wide residual rows
+    int * P = ck[0].P;
+    int pos_host = ck[0].pos;
+    float * ple_emb = ck[0].ple;
+    const size_t pe_row = (size_t) std::max(1, c.ple_n_heads() * c.ple_dim);
+    for (int ci = 0; ci < nck; ++ci) {
+        if (nck > 1) CUDA_CHECK(cudaMemcpyAsync(ck[ci].P, h_cpos_ + ci, sizeof(int), cudaMemcpyHostToDevice, s));
+        else CUDA_CHECK(cudaMemcpyAsync(P, h_pos_ + (kind ? 1 : 0), sizeof(int), cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(d.x, kind ? h_membd_ : h_embd_ + (size_t) ci * R4 * n, (size_t) ck[ci].nt * n * sizeof(float),
+                                   cudaMemcpyHostToDevice, s));
+        if (!kind && c.ple_layer >= 0)
+            CUDA_CHECK(cudaMemcpyAsync(ck[ci].ple, h_ple_ + (size_t) ci * R4 * pe_row, (size_t) ck[ci].nt * pe_row * sizeof(float),
+                                       cudaMemcpyHostToDevice, s));
+        if (!kind) hc_init(ck[ci].R, d.x, n, hc, ck[ci].nt, s);
+    }
     incr_counter(d.counter, s);
     const bool streaming = bulk && opt_.stream_experts && nt >= stream_min_;   // short chunks: the CPU computes its experts
     if (streaming) {
         if (!kind && d.layers[0].owner_bulk) { upload_stage(d, 0); if (c.n_layer > 1) upload_stage(d, 1); }
         if (kind && d.mtp.owner_bulk) upload_stage(d, c.n_layer);
     }
-    if (!kind) hc_init(d.res, d.x, n, hc, nt, s);
     int call = 0;
     // debug (HYPER4_DEBUG, direct recording, single GPU): sync after a stage, report errors and non-finite values
     auto dbg = [&](const char * what, int il, const float * buf, size_t cnt) {
@@ -1051,7 +1082,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
         hc_mixed(d.xn, d.gate, d.mixed, n, hc, rows, s, up.hcperm);
     };
     if (kind) {   // [rms(e) * enorm | rms(h_s) * hnorm_s] -> eh_proj, one row per hc stream
-        mtp_prep(d.x, d.m_enorm, kind == 1 ? d.res : d.mh, kind == 1 ? hcn : 0, d.m_hnorm, eps, n, hc, mtp_whole_norm_, d.ecat, nt, s);
+        mtp_prep(d.x, d.m_enorm, kind == 1 ? (mtp_src_ > 0 ? d.res_x[mtp_src_ - 1] : d.res) : d.mh, kind == 1 ? hcn : 0, d.m_hnorm, eps, n, hc, mtp_whole_norm_, d.ecat, nt, s);
         const int blk = std::max(1, R4 * std::max(hcn, c.n_ff_shexp) / (2 * n));   // rows the fp16 scratch holds
         for (int r0 = 0; r0 < nt * hc; r0 += blk) {
             const int rr = std::min(blk, nt * hc - r0);
@@ -1060,12 +1091,15 @@ void Engine4::record_main(int gi, int nt, int kind) {
     }
     const int il0 = kind ? c.n_layer : 0, il1 = kind ? c.n_layer + 1 : c.n_layer;
     const bool snap = !kind && !bulk && nt > 1 && mtp_g_;   // verification: keep the state after every row for rollback
-    for (int il = il0; il < il1; ++il) {
+    for (int il = il0; il < il1; ++il)
+    for (int ci = 0; ci < nck; ++ci) {
+        nt = ck[ci].nt; R = ck[ci].R; P = ck[ci].P; pos_host = ck[ci].pos; ple_emb = ck[ci].ple;
+        const bool last_ck = ci == nck - 1;   // (the streamed experts' staging is released after the last chunk)
         DevLayer & L = kind ? d.mtp : d.layers[il];
         if (L.ple) {
             const int pe = c.ple_n_heads() * c.ple_dim;
-            mm(L.ple_key, d.ple_emb, pe, d.ple_key, hcn, nt);
-            mm(L.ple_value, d.ple_emb, pe, d.ple_val, n, nt);
+            mm(L.ple_key, ple_emb, pe, d.ple_key, hcn, nt);
+            mm(L.ple_value, ple_emb, pe, d.ple_val, n, nt);
             ple_apply(R, d.ple_key, d.ple_val, L.ple_wk, L.ple_wq, L.ple_wc, L.ple_conv, L.ple_state, snap ? L.ple_snap : nullptr, n, hc, c.ple_conv,
                       c.ple_ngram, eps, nt, d.ple_sc, s);
         }
@@ -1216,8 +1250,10 @@ void Engine4::record_main(int gi, int nt, int kind) {
                 moe_order(ms, d.ids, nt * K, c.n_expert, d.order, d.order_n, s, d.egrp);
                 moe_gemm_gate_up(ms, d.mix16, n, K, d.order, d.order_n, d.egrp, c.n_expert, d.h16, s);
                 moe_gemm_down(ms, d.h16, d.order, d.order_n, d.egrp, c.n_expert, d.wts, d.yexp, s);
-                CUDA_CHECK(cudaEventRecord(d.ev_free[sb], s));
-                if (il + 2 < c.n_layer) upload_stage(d, il + 2);
+                if (last_ck) {
+                    CUDA_CHECK(cudaEventRecord(d.ev_free[sb], s));
+                    if (il + 2 < c.n_layer) upload_stage(d, il + 2);
+                }
             }
         } else if (nt > 1 && grouped_decode_) {   // verification rows: each local expert read once (grouped GEMM)
             moe_order(L.moe, d.ids, nt * K, c.n_expert, d.order, d.order_n, s, d.egrp);
@@ -1249,7 +1285,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
     }
     // final mixer = output norm (prefill chunk: last row only)
     const int hr = bulk && !allrows_ ? 1 : nt;   // HYPER4_ALLROWS (debugging): logits for every row of a prefill chunk
-    hc_mix(d.head_norm, d.head_down, d.head_up, nullptr, d.res + (size_t) (nt - hr) * hcn, hr);
+    hc_mix(d.head_norm, d.head_down, d.head_up, nullptr, R + (size_t) (nt - hr) * hcn, hr);
     mm(d.output, d.mixed, n, d.logits, d.output.n(), hr);
     argmax_pairs(d.logits, d.output.n(), d.output.n(), d.vocab_off, d.wts, hr, s);   // wts reused as the result pairs
     CUDA_CHECK(cudaMemcpyAsync(h_res_ + (size_t) gi * MAX_NT * 2, d.wts, (size_t) std::min(hr, MAX_NT) * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
@@ -1331,11 +1367,11 @@ void Engine4::embed_tok(const int * tokens, int nt, float * dst) {
 }
 
 // token embeddings and the PLE n-gram hash rows, for positions pos..pos+nt-1
-void Engine4::embed(const int * tokens, int nt, int pos) {
+void Engine4::embed(const int * tokens, int nt, int pos, int chunk) {
     const Q4Config & c = cfg_;
     if ((int) seq_.size() < pos + nt) seq_.resize(pos + nt, -1);
     for (int t = 0; t < nt; ++t) seq_[pos + t] = tokens[t];
-    embed_tok(tokens, nt, h_embd_);
+    embed_tok(tokens, nt, h_embd_ + (size_t) chunk * R4 * c.n_embd);
     if (c.ple_layer < 0) return;
     const GTensor & pt = gguf_->need("per_layer_token_embd.weight");
     const auto * pt_tr = ggml_get_type_traits((ggml_type) pt.type);
@@ -1351,7 +1387,7 @@ void Engine4::embed(const int * tokens, int nt, int pos) {
             cut = cut || tk < 0 || tk == c.ple_eos;
             ctx[s] = cut ? c.ple_eos : tk;
         }
-        float * out = h_ple_ + (size_t) t * nh * dim;
+        float * out = h_ple_ + ((size_t) chunk * R4 + t) * std::max(1, nh * dim);
         for (int ngr = 2; ngr <= ng; ++ngr) {
             uint64_t mixed = (uint64_t) ctx[0] * c.ple_mult[0];
             for (int j = 1; j < ngr; ++j) mixed ^= (uint64_t) ctx[j] * c.ple_mult[j];
@@ -1433,6 +1469,48 @@ std::vector<int> Engine4::forward(const int * tokens, int nt, int pos) {
         out[t] = bi;
     }
     return out;
+}
+
+bool Engine4::multi_ok(const int * lens, int nck) const {
+    bool ok = nck >= 1 && nck <= mc_max_ && opt_.stream_experts;
+    for (int ci = 0; ok && ci < nck; ++ci) ok = lens[ci] > MAX_NT && lens[ci] <= R4 && lens[ci] >= stream_min_;
+    return ok;
+}
+
+int Engine4::forward_multi(const int * tokens, const int * lens, int nck, int pos) {
+    int total = 0;
+    for (int ci = 0; ci < nck; ++ci) total += lens[ci];
+    if (!multi_ok(lens, nck) || nck == 1) {   // one chunk at a time
+        int r = -1;
+        for (int ci = 0, off = 0; ci < nck; off += lens[ci++]) r = forward(tokens + off, lens[ci], pos + off).back();
+        mc_n_ = 1;
+        return r;
+    }
+    if (pos + total > opt_.max_pos) throw std::runtime_error("forward_multi: position exceeds max_pos");
+    for (int ci = 0, off = 0; ci < nck; off += lens[ci++]) {
+        embed(tokens + off, lens[ci], pos + off, ci);
+        mc_nt_[ci] = lens[ci]; mc_pos_[ci] = pos + off; h_cpos_[ci] = pos + off;
+    }
+    h_pos_[0] = pos;
+    mc_n_ = nck;
+    try { run(0, lens[0]); } catch (...) { mc_n_ = 1; throw; }
+    mc_n_ = 1;   // (later bulk forwards are single-chunk unless set again; mc_nt_/mc_pos_ stay for mtp_draft_chunk)
+    mc_last_ = nck;
+    last_nt_ = lens[nck - 1];
+    float best = -INFINITY; int bi = -1;
+    for (size_t g = 0; g < devs_.size(); ++g) {
+        const float v = h_res_[g * MAX_NT * 2];
+        const int idx = ((const int *) h_res_)[g * MAX_NT * 2 + 1];
+        if (v > best) { best = v; bi = idx; }
+    }
+    return bi;
+}
+
+// MTP pass over chunk ci of the last multi-chunk forward (tokens/nt/pos: that chunk's MTP inputs)
+int Engine4::mtp_draft_chunk(const int * tokens, int nt, int pos, int ci) {
+    if (ci < 0 || ci >= std::max(1, mc_last_)) throw std::runtime_error("mtp_draft_chunk: bad chunk");
+    mtp_src_ = ci;
+    try { const int r = mtp_draft(tokens, nt, pos); mtp_src_ = 0; return r; } catch (...) { mtp_src_ = 0; throw; }
 }
 
 int Engine4::mtp_result() const {
@@ -1596,7 +1674,8 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
         // snapshots at every full-chunk boundary (prefill runs in whole R4-token chunks: every MoE chunk pays a fixed cost,
         // one pass over the CPU-resident experts) and at the last message start (edits / regenerations resume there);
         // generation adds its own snapshots, so the end of a previous answer is covered too
-        for (int q = s + R4; q < P; q += R4) snap_at.push_back(q);
+        // (multi-chunk prefill: every mc_max_ chunks, so a whole group runs as one layer-major pass)
+        for (int q = s + R4 * mc_max_; q < P; q += R4 * mc_max_) snap_at.push_back(q);
         if (!msg.empty() && msg.back() - s >= 64) snap_at.push_back(msg.back());
         std::sort(snap_at.begin(), snap_at.end());
         snap_at.erase(std::unique(snap_at.begin(), snap_at.end()), snap_at.end());
@@ -1611,6 +1690,26 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
         // the stretch up to the next snapshot point in equal chunks of at most R4 (no short tail chunk inside it)
         while (si < snap_at.size() && snap_at[si] <= c0) ++si;
         const int seg = (si < snap_at.size() ? snap_at[si] : P) - c0, nch = (seg + R4 - 1) / R4;
+        {   // the whole stretch as one multi-chunk pass (all chunks streaming), MTP drafts per chunk afterwards
+            int lens[8], nk = 0, tot = 0;   // (the stretch's equal chunks, the first mc_max_ of them)
+            for (int rest = seg, left = nch; rest > 0 && nk < mc_max_; --left) { lens[nk] = (rest + left - 1) / left; tot += lens[nk]; rest -= lens[nk++]; }
+            if (nk > 1 && multi_ok(lens, nk)) {
+                const int end = c0 + tot;
+                next = forward_multi(&prompt[c0], lens, nk, c0);
+                if (sampling) next = sample_row(0, sp);
+                if (spec)
+                    for (int ci = 0, q = c0; ci < nk; q += lens[ci++]) {
+                        std::vector<int> mt(lens[ci]);
+                        for (int j = 0; j < lens[ci]; ++j) mt[j] = q + 1 + j < P ? prompt[q + 1 + j] : next;
+                        const int d0 = mtp_draft_chunk(mt.data(), lens[ci], q, ci);
+                        if (ci == nk - 1 && end == P) drafts[0] = d0;
+                    }
+                if (si < snap_at.size() && snap_at[si] == end) take_snapshot(end);
+                if (prefill_cb_) prefill_cb_(end, P, s);
+                c0 = end;
+                continue;
+            }
+        }
         const int end = c0 + (seg + nch - 1) / nch;
         const int len = end - c0;
         next = forward(&prompt[c0], len, c0)[len - 1];
@@ -1737,9 +1836,12 @@ int Engine4::prefill(const int * tokens, int n, int pos) {
     int next = -1;
     static const int chunk = getenv("HYPER4_CHUNK") ? std::max(1, std::min(R4, atoi(getenv("HYPER4_CHUNK")))) : R4;
     for (int c0 = 0; c0 < n;) {
-        const int len = std::min(chunk, n - c0);
-        next = forward(tokens + c0, len, pos + c0)[len - 1];
-        c0 += len;
+        int lens[8], nk = 0, q = c0;   // up to mc_max_ full chunks per layer-major pass
+        while (nk < mc_max_ && q < n) { lens[nk] = std::min(chunk, n - q); q += lens[nk++]; }
+        if (nk > 1 && !multi_ok(lens, nk)) nk = 1;
+        if (nk > 1) next = forward_multi(tokens + c0, lens, nk, pos + c0);
+        else next = forward(tokens + c0, lens[0], pos + c0)[lens[0] - 1];
+        for (int ci = 0; ci < nk; ++ci) c0 += lens[ci];
     }
     return next;
 }

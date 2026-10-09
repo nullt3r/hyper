@@ -57,6 +57,12 @@ public:
     // (tiled GEMMs, copy-engine allreduce, flash attention; only the last row gets logits).
     // Returns the greedy argmax per token (prefill chunk: last token only, -1 elsewhere)
     std::vector<int> forward(const int * tokens, int nt, int pos);
+    // several consecutive prefill chunks (each <= MOE_BULK_ROWS, all streaming) layer by layer: a layer's streamed CPU
+    // experts cross PCIe once for all of them; result: the last chunk's next token. mtp_draft_chunk: the MTP pass over
+    // chunk ci of the last forward_multi (its final residual rows)
+    int forward_multi(const int * tokens, const int * lens, int nck, int pos);
+    int mtp_draft_chunk(const int * tokens, int nt, int pos, int ci);
+    bool multi_ok(const int * lens, int nck) const;
     // whole prompt in prefill chunks; returns the argmax after the last token
     int prefill(const int * tokens, int n, int pos);
     void get_logits(int t, std::vector<float> & out);
@@ -84,7 +90,7 @@ private:
     void record_main(int gi, int nt, int kind = 0);
     void record_restore(int gi, int keep);
     void build_graphs();
-    void embed(const int * tokens, int nt, int pos);
+    void embed(const int * tokens, int nt, int pos, int chunk = 0);
     void embed_tok(const int * tokens, int nt, float * dst);
     void run(int kind, int nt);   // 0 main, 1 MTP, 2 MTP chain, 3 restore (nt = rows kept)
     int mtp_result() const;
@@ -133,6 +139,11 @@ private:
     bool graphs_ready_ = false;
     bool debug_ = false, nocpu_ = false, allrows_ = false, grouped_decode_ = false;
     int last_nt_ = 0;
+    int mc_max_ = 4;               // prefill chunks per layer pass (HYPER4_MC; 1: one at a time)
+    int mc_n_ = 1, mc_nt_[8] = {}, mc_pos_[8] = {};   // the chunks of the current bulk forward
+    int mc_last_ = 1;              // chunks of the last forward_multi
+    int mtp_src_ = 0;              // MTP pass: residual rows of chunk mtp_src_ of the last multi-chunk forward
+    int * h_cpos_ = nullptr;       // pinned: positions of the chunks
     int stream_min_ = 256;   // prefill chunks this long stream the CPU experts to the GPUs; shorter ones use the CPU
 };
 
