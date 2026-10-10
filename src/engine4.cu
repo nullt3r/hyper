@@ -1133,7 +1133,8 @@ void Engine4::record_main(int gi, int nt, int kind) {
             const bool qsa = L.kraw != nullptr;
             const bool par_idx = par && qsa;
             if (par_idx) fork();
-            mm(L.wqkv, d.mixed, n, d.big0, bs, nt);
+            static const bool idx_late = getenv("HYPER4_IDX_LATE") != nullptr;
+            if (!par_idx || idx_late) mm(L.wqkv, d.mixed, n, d.big0, bs, nt);
             const int top = getenv("HYPER4_NOQSA") ? (1 << 28) : getenv("HYPER4_TOP") ? atoi(getenv("HYPER4_TOP")) : c.idx_top_k / 4;   // experiments
             auto indexer = [&] {   // indexer: cells each token attends to (all of them while the context has <= top complete blocks)
                 if (bulk) {
@@ -1154,8 +1155,11 @@ void Engine4::record_main(int gi, int nt, int kind) {
                     idx_select(d.iqn, L.kpool, P, nt, c.idx_n_head, top, d.iscores, opt_.max_pos / 4 + 4, QSA_SCORE_ROWS, d.ilist,
                                QSA_LIST, d.ilist_n, s);
             };
+            // the indexer chain (projections, pooling, scoring, selection) is the longer branch: enqueued first so its kernels
+            // are scheduled ahead of the q/k/v projection's blocks
             if (par_idx) on_s2(indexer);
             else if (qsa) indexer();
+            if (par_idx && !idx_late) mm(L.wqkv, d.mixed, n, d.big0, bs, nt);
             if (par_idx) {   // attention prep runs meanwhile (q/k norms, rope, the cache rows): it needs only q/k/v
                 attn_prep(d.big0, bs, L.q_norm, L.k_norm, L.kcache, L.vcache, P, opt_.max_pos, L.n_head_l, L.n_kv_l, c.head_dim,
                           c.n_rot, c.rope_base, eps, nt, s);
