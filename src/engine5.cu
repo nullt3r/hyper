@@ -213,6 +213,7 @@ struct Engine5::Device {
     float * rlog = nullptr, * wts = nullptr, * sg = nullptr, * shgu = nullptr, * shh = nullptr, * shpart = nullptr;
     float * plog = nullptr, * pwts = nullptr, * psg = nullptr;
     float * hzc = nullptr, * yzc = nullptr;   // zero-copy share of the CPU experts: hidden slice, partial outputs
+    unsigned * ticket = nullptr;              // fused route + publish: blocks done
     int * pids = nullptr;
     float * hexp = nullptr, * yexp = nullptr, * logits = nullptr, * conv_raw = nullptr, * iscores = nullptr;
     int * ids = nullptr, * pos = nullptr, * counter = nullptr, * order = nullptr, * order_n = nullptr, * egrp = nullptr;
@@ -688,6 +689,9 @@ void Engine5::rebalance(int max_swaps) {
     const Glm5Config & c = cfg_;
     const int E = c.n_expert;
     const auto t_reb = std::chrono::steady_clock::now();
+    // every record of the last forward consumed first: layers whose experts were all on the GPUs are not waited for by
+    // the GPU, so their routing counts (and a still-running job) could lag -- placement then depended on timing
+    cpu_->drain();
     // decode routing seen by the CPU side since the last call
     for (int il = 0; il < c.n_layer; ++il) {
         if (!is_moe(il)) continue;
@@ -812,6 +816,8 @@ void Engine5::load_weights() {
         dev.olat = dev.alloc<float>((size_t) R * nh_max * MLA_LAT);
         dev.attn_part = dev.alloc<float>(mla_part_floats(nh_max, MAX_NT));
         dev.rlog = dev.alloc<float>((size_t) R * c.n_expert);
+        dev.ticket = dev.alloc<unsigned>(1);
+        CUDA_CHECK(cudaMemset(dev.ticket, 0, sizeof(unsigned)));
         if (!zc_blocks_.empty()) {
             moe_zc_init();
             dev.hzc = dev.alloc<float>((size_t) MAX_NT * c.n_expert_used * c.n_ff_exp);
@@ -1096,7 +1102,13 @@ void Engine5::record_main(int gi, int nt) {
         if (!L.moe || shared_first) shared_ffn();
         if (L.moe) {
             f32mm(L.router, c.n_expert, n, d.xn, n, d.rlog, c.n_expert, nt);
-            moe_route_sig(d.rlog, c.n_expert, L.exp_bias, c.n_expert, K, c.w_scale, d.ids, d.wts, d.sg, nt, s);
+            static const bool sep_pub = getenv("HYPER5_SEP_PUBLISH") != nullptr;
+            const bool fused_pub = !bulk && d.g == 0 && !sep_pub;   // (decode never streams)
+            if (fused_pub)
+                moe_route_sig_publish(d.rlog, c.n_expert, L.exp_bias, c.n_expert, K, c.w_scale, d.ids, d.wts, d.sg, nt, &cpu_rec_[il].seq,
+                                      &cpu_rec_[il].nt, &cpu_rec_[il].ids[0][0], &cpu_rec_[il].wts[0][0], &cpu_rec_[il].x[0][0], d.xn, n, n,
+                                      d.counter, (unsigned) il, d.ticket, s);
+            else moe_route_sig(d.rlog, c.n_expert, L.exp_bias, c.n_expert, K, c.w_scale, d.ids, d.wts, d.sg, nt, s);
             dbg("route_w", il, d.wts, (size_t) nt * K);
             if (pred_k_ && !bulk && d.g == 0 && il + 1 < c.n_layer && is_moe(il + 1)) {   // (HYPER5_PREDSTAT)
                 const DevLayer & N = d.layers[il + 1];
@@ -1110,8 +1122,9 @@ void Engine5::record_main(int gi, int nt) {
             if (d.g == 0 && !stream) {
                 if (bulk) moe_publish(&cpu_bulk_->seq, &cpu_bulk_->nt, &cpu_bulk_->ids[0][0], &cpu_bulk_->wts[0][0], &cpu_bulk_->x[0][0],
                                       d.xn, n, n, d.ids, d.wts, K, nt, d.counter, (unsigned) il, s);
-                else moe_publish(&cpu_rec_[il].seq, &cpu_rec_[il].nt, &cpu_rec_[il].ids[0][0], &cpu_rec_[il].wts[0][0], &cpu_rec_[il].x[0][0],
-                                 d.xn, n, n, d.ids, d.wts, K, nt, d.counter, (unsigned) il, s);
+                else if (!fused_pub)
+                    moe_publish(&cpu_rec_[il].seq, &cpu_rec_[il].nt, &cpu_rec_[il].ids[0][0], &cpu_rec_[il].wts[0][0], &cpu_rec_[il].x[0][0],
+                                d.xn, n, n, d.ids, d.wts, K, nt, d.counter, (unsigned) il, s);
             }
             if (!shared_first) shared_ffn();
             if (bulk) {

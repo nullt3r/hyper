@@ -73,6 +73,10 @@ void gidx_select(const float * iq, int iq_stride, const float * w, int w_stride,
 // sg[t] = 1 (the shared expert is ungated)
 void moe_route_sig(const float * logits, int ls, const float * bias, int n_expert, int k, float scale, int * ids, float * wts,
                    float * sg, int nt, cudaStream_t s);
+// decode, GPU 0: moe_route_sig + the CPU record (as moe_publish) in one launch; ticket: a zeroed device counter
+void moe_route_sig_publish(const float * logits, int ls, const float * bias, int n_expert, int k, float scale, int * ids, float * wts,
+                           float * sg, int nt, volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_dst, float * x_dst,
+                           const float * x, int xs, int n, const int * counter, unsigned seq_tag, unsigned * ticket, cudaStream_t s);
 // h[t][i] = silu(min(g, L)) * clamp(u, -L, L) with g = gu[t][i], u = gu[t][off + i]
 void swiglu_clamp(const float * gu, int gu_stride, int off, float * h, int h_stride, int n, float L, int nt, cudaStream_t s);
 

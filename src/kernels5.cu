@@ -145,6 +145,7 @@ __global__ void __launch_bounds__(1024) k_mhc_pre2(const float * __restrict__ re
         mx[tid] = v;
     }
     __syncthreads();
+    float sk = 0.0f;   // (warp 0: the Sinkhorn state after the first column normalization)
     if (tid < 32) {
         const float inv = rsqrtf(mx[24] / (MHC * n) + rms_eps);
         float * hw = hcw + (size_t) t * MHC_W;
@@ -164,14 +165,21 @@ __global__ void __launch_bounds__(1024) k_mhc_pre2(const float * __restrict__ re
         };
         auto sum_dst = [&](float v) { v += __shfl_xor_sync(0xffffffff, v, 1); v += __shfl_xor_sync(0xffffffff, v, 2); return v; };
         c = c / (sum_src(tid < 16 ? c : 0.0f) + hc_eps);
+        sk = c;
+        (void) d;
+    }
+    __syncthreads();   // pre[] ready: warp 0 runs the Sinkhorn iterations (only k_mhc_post needs them) and then its share of
+                       // the norm below; the other warps start the norm at once (same per-thread sums and reduction)
+    if (tid < 32) {
+        float c = sk;
+        auto sum_src = [&](float v) { v += __shfl_xor_sync(0xffffffff, v, 4); v += __shfl_xor_sync(0xffffffff, v, 8); return v; };
+        auto sum_dst = [&](float v) { v += __shfl_xor_sync(0xffffffff, v, 1); v += __shfl_xor_sync(0xffffffff, v, 2); return v; };
         for (int it = 1; it < iters; ++it) {
             c = c / (sum_dst(tid < 16 ? c : 0.0f) + hc_eps);
             c = c / (sum_src(tid < 16 ? c : 0.0f) + hc_eps);
         }
-        (void) d;
-        if (tid < 16) hw[4 + l] = c;
+        if (tid < 16) hcw[(size_t) t * MHC_W + 4 + (tid & 15)] = c;
     }
-    __syncthreads();
     __shared__ float xs[4096];
     float s2 = 0.0f;
     for (int e = tid; e < n; e += blockDim.x) {
@@ -1054,6 +1062,56 @@ __global__ void k_moe_route_sig(const float * __restrict__ logits, int ls, const
         sg[t] = 1.0f;
     }
 }
+// decode on GPU 0: routing as k_moe_route_sig (warp 0) while warps 1..7 copy the token's input row into the CPU record;
+// the last block (ticket) raises the record's sequence tag after the system fences -- one launch instead of two
+__global__ void k_moe_route_sig_pub(const float * __restrict__ logits, int ls, const float * __restrict__ bias, int ne, int k, float scale,
+                                    int * __restrict__ ids, float * __restrict__ wts, float * __restrict__ sg,
+                                    volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_dst, float * x_dst,
+                                    const float * __restrict__ x, int xs, int n, const int * counter, unsigned seq_tag, int nt,
+                                    unsigned * ticket) {
+    const int t = blockIdx.x;
+    __shared__ float pr[1024], sel[1024];
+    for (int e = threadIdx.x; e < ne; e += blockDim.x) {
+        const float pv = sigm5(logits[(size_t) t * ls + e]);
+        pr[e] = pv;
+        sel[e] = pv + bias[e];
+    }
+    __syncthreads();
+    if (threadIdx.x >= 32) {   // (x_dst sits in a host record, 8-byte aligned only)
+        for (int i = threadIdx.x - 32; i < n / 2; i += blockDim.x - 32)
+            *(float2 *) (x_dst + (size_t) t * 4096 + 2 * i) = *(const float2 *) (x + (size_t) t * xs + 2 * i);
+    } else {
+        const int lane = threadIdx.x;
+        float chosen[16];
+        float sum = 0.0f;
+        for (int j = 0; j < k; ++j) {
+            float bv = -FLT_MAX; int bi = 0x7fffffff;
+            for (int e = lane; e < ne; e += 32) if (sel[e] > bv || (sel[e] == bv && e < bi)) { bv = sel[e]; bi = e; }
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffff, bv, o); const int oi = __shfl_xor_sync(0xffffffff, bi, o);
+                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+            }
+            __syncwarp();
+            if (lane == 0) { ids[t * k + j] = bi; ids_dst[t * 16 + j] = bi; sel[bi] = -FLT_MAX; }
+            chosen[j] = pr[bi];
+            sum += chosen[j];
+            __syncwarp();
+        }
+        if (lane == 0) {
+            const float inv = scale / fmaxf(sum, 6.103515625e-5f);
+            for (int j = 0; j < k; ++j) { const float w = chosen[j] * inv; wts[t * k + j] = w; wts_dst[t * 16 + j] = w; }
+            sg[t] = 1.0f;
+        }
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0 && atomicAdd(ticket, 1u) == (unsigned) nt - 1) {
+        *ntp = nt;
+        __threadfence_system();
+        *seq = (unsigned) (*counter) * 64u + seq_tag;
+        *ticket = 0;
+    }
+}
 __global__ void k_swiglu_clamp(const float * __restrict__ gu, int gu_stride, int off, float * __restrict__ h, int h_stride, int n, float L) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (i >= n) return;
@@ -1169,6 +1227,13 @@ void moe_route_sig(const float * logits, int ls, const float * bias, int n_exper
                    float * sg, int nt, cudaStream_t s) {
     if (n_expert > 1024 || k > 16) throw std::runtime_error("moe_route_sig: sizes");
     k_moe_route_sig<<<nt, 256, 0, s>>>(logits, ls, bias, n_expert, k, scale, ids, wts, sg);
+}
+void moe_route_sig_publish(const float * logits, int ls, const float * bias, int n_expert, int k, float scale, int * ids, float * wts,
+                           float * sg, int nt, volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_dst, float * x_dst,
+                           const float * x, int xs, int n, const int * counter, unsigned seq_tag, unsigned * ticket, cudaStream_t s) {
+    if (n_expert > 1024 || k > 16 || nt > MAX_NT || n % 2 || xs % 2) throw std::runtime_error("moe_route_sig_publish: sizes");
+    k_moe_route_sig_pub<<<nt, 256, 0, s>>>(logits, ls, bias, n_expert, k, scale, ids, wts, sg, seq, ntp, ids_dst, wts_dst, x_dst, x, xs, n,
+                                           counter, seq_tag, nt, ticket);
 }
 void swiglu_clamp(const float * gu, int gu_stride, int off, float * h, int h_stride, int n, float L, int nt, cudaStream_t s) {
     k_swiglu_clamp<<<dim3((n + 255) / 256, nt), 256, 0, s>>>(gu, gu_stride, off, h, h_stride, n, L);
