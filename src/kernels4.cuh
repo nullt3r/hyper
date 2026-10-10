@@ -40,6 +40,10 @@ void gated_norm_sigmoid(float * o, int o_stride, const float * z, int z_stride, 
 // logits[t][0..n_expert) router logits, logits[t][n_expert] the shared-expert gate logit.
 // softmax over the experts, top-k (ties to the lower index), renormalized weights; sg[t] = sigmoid(shared gate)
 void moe_route(const float * logits, int ls, int n_expert, int k, int * ids, float * wts, float * sg, int nt, cudaStream_t s);
+// decode, GPU 0: moe_route + the CPU record (moe_publish) in one launch; false: not applicable (caller does both)
+bool moe_route_publish(const float * logits, int ls, int n_expert, int k, int * ids, float * wts, float * sg, int nt, volatile unsigned * seq,
+                       int * ntp, int * ids_dst, float * wts_dst, float * x_dst, const float * x, int xs, int n, const int * counter,
+                       unsigned seq_tag, unsigned * ticket, cudaStream_t s);
 
 // expert weights of one layer on one device: n_local experts, gate/up [n_local][ff][k] and down [n_local][n][ff]
 // in their GGUF types; slot[e] = local index or -1

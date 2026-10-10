@@ -320,6 +320,78 @@ __global__ void __launch_bounds__(32) k_moe_route_w(const float * __restrict__ l
     if (lane == 0) sg[t] = sigm(l[ne]);
 }
 
+// decode on GPU 0: k_moe_route_w (warp 0, unchanged) + the CPU record (warps 1..7 copy the token's input row); the last
+// block (ticket) raises the sequence tag after the system fences: one launch instead of route + publish
+template <int V>
+__global__ void __launch_bounds__(256) k_moe_route_w_pub(const float * __restrict__ logits, int ls, int ne, int k, int * ids, float * wts,
+                                                         float * sg, volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_dst,
+                                                         float * x_dst, const float * __restrict__ x, int xs, int n, const int * counter,
+                                                         unsigned seq_tag, int nt, unsigned * ticket) {
+    const int t = blockIdx.x;
+    if (threadIdx.x >= 32) {   // (x_dst sits in a host record, 8-byte aligned only)
+        for (int i = threadIdx.x - 32; i < n / 2; i += blockDim.x - 32)
+            *(float2 *) (x_dst + (size_t) t * 4096 + 2 * i) = *(const float2 *) (x + (size_t) t * xs + 2 * i);
+    } else {
+        const int lane = threadIdx.x;
+        const float * l = logits + (size_t) t * ls;
+        float v[V];
+        int vi[V];
+        float mx = -FLT_MAX;
+#pragma unroll
+        for (int i = 0; i < V; ++i) {
+            const int e = i * 32 + lane;
+            v[i] = e < ne ? l[e] : -FLT_MAX;
+            vi[i] = e < ne ? e : 0x7fffffff;
+            mx = fmaxf(mx, v[i]);
+        }
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < V; ++i) { v[i] = vi[i] < ne ? expf(v[i] - mx) : 0.0f; sum += v[i]; }
+        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
+#pragma unroll
+        for (int i = 0; i < V; ++i) { if (vi[i] < ne) v[i] /= sum; else v[i] = -1.0f; }
+#pragma unroll
+        for (int i = 1; i < V; ++i)
+#pragma unroll
+            for (int j = i; j > 0; --j)
+                if (rt_better(v[j], vi[j], v[j - 1], vi[j - 1])) {
+                    const float tv = v[j]; v[j] = v[j - 1]; v[j - 1] = tv;
+                    const int ti = vi[j]; vi[j] = vi[j - 1]; vi[j - 1] = ti;
+                }
+        float selw = 0.0f, tot = 0.0f;
+        int seli = 0;
+        for (int j = 0; j < k; ++j) {
+            float bv = v[0]; int bi = vi[0];
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffff, bv, o); const int oi = __shfl_xor_sync(0xffffffff, bi, o);
+                if (rt_better(ov, oi, bv, bi)) { bv = ov; bi = oi; }
+            }
+            if (lane == j) { selw = bv; seli = bi; }
+            tot += bv;
+            if (vi[0] == bi) {
+#pragma unroll
+                for (int i = 0; i < V - 1; ++i) { v[i] = v[i + 1]; vi[i] = vi[i + 1]; }
+                v[V - 1] = -1.0f; vi[V - 1] = 0x7fffffff;
+            }
+        }
+        if (lane < k) {
+            const float w = selw / tot;
+            ids[t * k + lane] = seli; wts[t * k + lane] = w;
+            ids_dst[t * MOE_MAX_USED + lane] = seli; wts_dst[t * MOE_MAX_USED + lane] = w;
+        }
+        if (lane == 0) sg[t] = sigm(l[ne]);
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0 && atomicAdd(ticket, 1u) == (unsigned) nt - 1) {
+        *ntp = nt;
+        __threadfence_system();
+        *seq = (unsigned) (*counter) * 64u + seq_tag;
+        *ticket = 0;
+    }
+}
+
 // ---------------- expert GEMV on GGUF blocks ----------------
 
 // 8 consecutive weights (chunk c of the row) dequantized
@@ -1190,6 +1262,20 @@ void moe_route(const float * logits, int ls, int n_expert, int k, int * ids, flo
         if (n_expert <= 512) { k_moe_route_w<16><<<nt, 32, 0, s>>>(logits, ls, n_expert, k, ids, wts, sg); return; }
     }
     k_moe_route<<<nt, 256, 0, s>>>(logits, ls, n_expert, k, ids, wts, sg, rank_route);
+}
+
+bool moe_route_publish(const float * logits, int ls, int n_expert, int k, int * ids, float * wts, float * sg, int nt, volatile unsigned * seq,
+                       int * ntp, int * ids_dst, float * wts_dst, float * x_dst, const float * x, int xs, int n, const int * counter,
+                       unsigned seq_tag, unsigned * ticket, cudaStream_t s) {
+    static const bool block_route = getenv("HYPER4_BLOCKROUTE") != nullptr, rank_route = getenv("HYPER4_RANKROUTE") != nullptr;
+    if (block_route || rank_route || k > 32 || nt > MAX_NT || n % 2 || xs % 2 || n_expert > 512) return false;
+    if (n_expert <= 256)
+        k_moe_route_w_pub<8><<<nt, 256, 0, s>>>(logits, ls, n_expert, k, ids, wts, sg, seq, ntp, ids_dst, wts_dst, x_dst, x, xs, n, counter,
+                                                seq_tag, nt, ticket);
+    else
+        k_moe_route_w_pub<16><<<nt, 256, 0, s>>>(logits, ls, n_expert, k, ids, wts, sg, seq, ntp, ids_dst, wts_dst, x_dst, x, xs, n, counter,
+                                                 seq_tag, nt, ticket);
+    return true;
 }
 
 #define MOE_TYPE_SWITCH(T, CALL)                                                  \

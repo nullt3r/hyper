@@ -102,6 +102,7 @@ struct Engine4::Device {
     float * rlog = nullptr, * wts = nullptr, * sg = nullptr, * shgu = nullptr, * shh = nullptr, * shpart = nullptr;
     float * hexp = nullptr, * yexp = nullptr, * ple_emb = nullptr, * ple_key = nullptr, * ple_val = nullptr, * ple_sc = nullptr;
     std::vector<float *> res_x, ple_x;   // the further chunks of a multi-chunk prefill pass: residual rows, PLE rows
+    unsigned * ticket = nullptr;          // fused route + publish: blocks done
     int * pos_x = nullptr;
     float * logits = nullptr, * res2 = nullptr;
     int * ids = nullptr, * pos = nullptr, * counter = nullptr, * order = nullptr, * order_n = nullptr;
@@ -829,6 +830,8 @@ void Engine4::load_weights() {
             dev.attn_part = dev.alloc<float>(mx);
         }
         dev.rlog = dev.alloc<float>((size_t) R * (c.n_expert + 1));
+        dev.ticket = dev.alloc<unsigned>(1);
+        CUDA_CHECK(cudaMemset(dev.ticket, 0, sizeof(unsigned)));
         dev.ids = dev.alloc<int>((size_t) R * K);
         dev.wts = dev.alloc<float>((size_t) R * K);
         dev.sg = dev.alloc<float>(R);
@@ -1224,10 +1227,16 @@ void Engine4::record_main(int gi, int nt, int kind) {
         if (par) { fork(); on_s2(shexp); }   // (the shared expert || routing and the routed experts, until moe_reduce)
         f32mm(L.router, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt);
         dbg("router", il, d.rlog, (size_t) nt * (c.n_expert + 1));
-        moe_route(d.rlog, c.n_expert + 1, c.n_expert, K, d.ids, d.wts, d.sg, nt, s);
-        dbg("route_w", il, d.wts, (size_t) nt * K);
         const bool stream = streaming && L.owner_bulk;
-        if (d.g == 0 && !stream) {
+        static const bool sep_pub = getenv("HYPER4_SEP_PUBLISH") != nullptr;
+        // decode on GPU 0: routing and the CPU record in one launch
+        const bool fused_pub = !bulk && d.g == 0 && !sep_pub &&
+            moe_route_publish(d.rlog, c.n_expert + 1, c.n_expert, K, d.ids, d.wts, d.sg, nt, &cpu_rec_[il].seq, &cpu_rec_[il].nt,
+                              &cpu_rec_[il].ids[0][0], &cpu_rec_[il].wts[0][0], &cpu_rec_[il].x[0][0], d.mixed, n, n, d.counter,
+                              (unsigned) il, d.ticket, s);
+        if (!fused_pub) moe_route(d.rlog, c.n_expert + 1, c.n_expert, K, d.ids, d.wts, d.sg, nt, s);
+        dbg("route_w", il, d.wts, (size_t) nt * K);
+        if (d.g == 0 && !stream && !fused_pub) {
             if (bulk) moe_publish(&cpu_bulk_->seq, &cpu_bulk_->nt, &cpu_bulk_->ids[0][0], &cpu_bulk_->wts[0][0], &cpu_bulk_->x[0][0],
                                   d.mixed, n, n, d.ids, d.wts, K, nt, d.counter, (unsigned) il, s);
             else moe_publish(&cpu_rec_[il].seq, &cpu_rec_[il].nt, &cpu_rec_[il].ids[0][0], &cpu_rec_[il].wts[0][0], &cpu_rec_[il].x[0][0],
