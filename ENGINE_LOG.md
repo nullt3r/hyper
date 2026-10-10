@@ -347,3 +347,21 @@ Srovnání: Strata na 2× RTX 3090 s IQ3_S (3 bity) a int8 KV 137–145 t/s s MT
 - Adaptivní rozmístění pro Flash-Next: CPU experty stojí ~1 ms z 10,2 ms na token (HYPER4_NOCPU 109 vs 98 t/s),
   přínos nejvýš 2–3 % – odloženo.
 
+## 2026-10-11 – adaptivní rozmístění expertů i pro Flash-Next
+
+Uživatel na serveru (262k kontext, T 1,0) viděl 145 t/s u kódu, ale 50–60 t/s v delším českém chatu: krok byl dražší
+(~29 ms místo ~23 ms) při menším počtu ověřovaných řádků → experty, které chat používá, ležely na CPU (rozmístění ze
+statistik převážně z kódu; při 262k kontextu drží GPU1/GPU2 KV cache, na GPU je jen 59–63 % expertů).
+Port mechanismu z Engine5: kopie všech expertů v hostu (2 MB stránky, pinned), skóre z routingu promptu (váha 0,25) a
+z dekódování (decay 0,92), výměna nejteplejších CPU expertů za nejstudenější GPU (stejný slot) po promptu a každých
+16 kroků (max 64), streamování prefillu ze seznamů expertů (běhy po sobě jdoucích). `HYPER4_ADAPT=0` = staré chování
+(KL bitově shodné: 0,048582).
+
+| 262k kontext | bez adaptace | s adaptací |
+|---|---|---|
+| tfbench 11k (kód/poznámky) | 87,1 / 88,9 t/s | **92,9 / 93,1 t/s (+5,5 %)** |
+| replay 20 požadavků Codexu, T 1, MTP – dekódování | 132,9 t/s | **138,7 t/s (+4,4 %)** |
+| – prefill | 1248 t/s | **1352 t/s (+8,3 %)** |
+
+Výměny za celý replay 1,3 s (14k výměn). Na obsahu vzdálenějším od statistik (jiný jazyk, chat) čekám víc.
+

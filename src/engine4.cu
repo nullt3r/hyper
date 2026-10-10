@@ -71,11 +71,10 @@ struct Engine4::DevLayer {
     int n_sh_l = 0;
     MoeDev moe;
     int * owner = nullptr;     // [n_expert]: device or CPU_OWNER
-    // prefill streaming: this GPU's share of the layer's CPU experts (cslot range [st_a, st_b)) is copied into a staging
-    // buffer; st_slot[e] = index in the share or -1; owner_bulk[e] = the GPU that computes e in a prefill chunk
+    // prefill streaming: this GPU's share of the layer's CPU experts (st_list, ascending) is copied into a staging buffer;
+    // st_slot[e] = index in the share or -1; owner_bulk[e] = the GPU that computes e in a prefill chunk
     int * st_slot = nullptr, * owner_bulk = nullptr;
-    int st_a = 0, st_b = 0;
-    const uint8_t * st_host_g = nullptr, * st_host_u = nullptr, * st_host_d = nullptr;   // pinned host (whole CPU layer)
+    std::vector<int> st_list;
     // PLE
     DW ple_key, ple_value;
     float * ple_wk = nullptr, * ple_wq = nullptr, * ple_wc = nullptr, * ple_conv = nullptr, * ple_state = nullptr, * ple_snap = nullptr;
@@ -507,6 +506,12 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
     }
     cpu_ = std::make_unique<CpuMoe>(opt_.cpu_threads, n, cfg_.n_ff_exp, cfg_.n_expert_used, cpu_rec_, cpu_out_, slots,
                                     cpu_bulk_, cpu_bulk_out_);
+    adapt_ = !getenv("HYPER4_ADAPT") || atoi(getenv("HYPER4_ADAPT")) != 0;
+    if (getenv("HYPER4_ADAPT_EVERY")) adapt_every_ = std::max(1, atoi(getenv("HYPER4_ADAPT_EVERY")));
+    if (getenv("HYPER4_ADAPT_BUDGET")) adapt_budget_ = atoi(getenv("HYPER4_ADAPT_BUDGET"));
+    ehost_.resize(slots);
+    for (auto & H : ehost_) { H.score.assign(cfg_.n_expert, 0.0); H.last_count.assign(1024, 0); }
+    CUDA_CHECK(cudaHostAlloc(&h_ids_, (size_t) slots * mc_max_ * R4 * cfg_.n_expert_used * sizeof(int), cudaHostAllocPortable));
     load_weights();
 }
 
@@ -527,6 +532,7 @@ Engine4::~Engine4() {
     if (h_membd_) cudaFreeHost(h_membd_);
     if (h_mres_) cudaFreeHost(h_mres_);
     if (h_mtopk_) cudaFreeHost(h_mtopk_);
+    if (h_ids_) cudaFreeHost(h_ids_);
     cpu_.reset();
     for (auto & [p, sz] : host_bufs_) munmap(p, sz);
     devs_.clear();
@@ -725,50 +731,58 @@ void Engine4::load_experts(int il, const std::vector<int> & quota) {
         L.moe.slot = dev.upload(slot.data(), slot.size());
         L.owner = dev.upload(owner.data(), owner.size());
     }
-    // CPU experts: compact copy into 2 MB pages (the mmapped file would be read through 4 KB pages)
+    // every expert in pinned 2 MB pages (the mmapped file would be read through 4 KB pages): the CPU computes whichever experts
+    // it owns at the moment, prefill chunks stream them to the GPUs, and the GPUs take them over when the routing shifts
     CpuExpertLayer cl;
     cl.tg = tg.type; cl.td = tdn.type;
     cl.gate_bytes = gb; cl.down_bytes = db;
     cl.owned.resize(E);
-    cl.cslot.assign(E, -1);
     int nc = 0;
-    for (int e = 0; e < E; ++e) { cl.owned[e] = owner[e] == CPU_OWNER; if (cl.owned[e]) cl.cslot[e] = nc++; }
-    const size_t bytes = (size_t) std::max(nc, 1) * (2 * gb + db);
+    for (int e = 0; e < E; ++e) { cl.owned[e] = owner[e] == CPU_OWNER; nc += cl.owned[e]; }
+    const size_t bytes = (size_t) E * (2 * gb + db);
     uint8_t * buf = (uint8_t *) host_huge_alloc(bytes);
-    cl.gate = buf; cl.up = buf + (size_t) nc * gb; cl.down = buf + (size_t) nc * 2 * gb;
+    cl.gate = buf; cl.up = buf + (size_t) E * gb; cl.down = buf + (size_t) E * 2 * gb;
 #pragma omp parallel for schedule(dynamic)
     for (int e = 0; e < E; ++e) {
-        if (cl.cslot[e] < 0) continue;
-        const size_t i = (size_t) cl.cslot[e];
-        memcpy((uint8_t *) cl.gate + i * gb, tg.data + (size_t) e * gb, gb);
-        memcpy((uint8_t *) cl.up + i * gb, tu.data + (size_t) e * gb, gb);
-        memcpy((uint8_t *) cl.down + i * db, tdn.data + (size_t) e * db, db);
+        memcpy((uint8_t *) cl.gate + (size_t) e * gb, tg.data + (size_t) e * gb, gb);
+        memcpy((uint8_t *) cl.up + (size_t) e * gb, tu.data + (size_t) e * gb, gb);
+        memcpy((uint8_t *) cl.down + (size_t) e * db, tdn.data + (size_t) e * db, db);
     }
     collapse_huge(buf, bytes);
+    CUDA_CHECK(cudaHostRegister(buf, bytes, cudaHostRegisterPortable));
     cpu_->set_layer(il, cl);
-    // prefill streaming: pin the CPU copy, split it among the GPUs by PCIe bandwidth (x16 : x8 : x16)
+    ExpertHost & H = ehost_[il];
+    if (il < (int) stats_.size()) {   // prior: the calibration's routing shares, weighted like ~256 tokens of routing
+        double tot = 0;
+        for (int e = 0; e < E; ++e) tot += (double) stats_[il][e];
+        if (tot > 0) for (int e = 0; e < E; ++e) H.score[e] = (double) stats_[il][e] / tot * 256.0 * c.n_expert_used;
+    }
+    H.gate = cl.gate; H.up = cl.up; H.down = cl.down; H.gb = gb; H.db = db;
+    H.owner = owner;
+    H.slot.assign(nd, std::vector<int>(E, -1));
+    for (auto & dp : devs_) {
+        int nl = 0;
+        for (int e = 0; e < E; ++e) if (owner[e] == dp->g) H.slot[dp->g][e] = nl++;
+    }
+    // prefill streaming: the CPU-owned experts dealt to the GPUs by PCIe bandwidth (x16 : x8 : x16); the count per layer
+    // never changes (moves are exchanges), so the staging size is fixed; the lists are rebuilt when the placement changes
     if (opt_.stream_experts && nc > 0) {
-        CUDA_CHECK(cudaHostRegister(buf, bytes, cudaHostRegisterPortable));
         std::vector<double> wbw(nd, 2.0);
         if (nd > 1) wbw[1] = 1.0;   // GPU 1 sits on a x8 link on this box
-        double tw = 0;
+        double tw = 0, acc = 0;
         for (double w : wbw) tw += w;
-        std::vector<int> bulk_owner = owner;
         int a = 0;
-        double acc = 0;
         for (auto & dp : devs_) {
-            DevLayer & L = il < c.n_layer ? dp->layers[il] : dp->mtp;
+            DevLayer & L = lay(*dp, il);
             acc += wbw[dp->g];
             const int b = dp->g == nd - 1 ? nc : (int) (nc * acc / tw + 0.5);
-            L.st_a = a; L.st_b = b;
-            std::vector<int> sl(E, -1);
-            for (int e = 0; e < E; ++e) if (cl.cslot[e] >= a && cl.cslot[e] < b) { sl[e] = cl.cslot[e] - a; bulk_owner[e] = dp->g; }
-            L.st_slot = dp->upload(sl.data(), sl.size());
-            L.st_host_g = cl.gate; L.st_host_u = cl.up; L.st_host_d = cl.down;
             dp->stage_bytes = std::max(dp->stage_bytes, (size_t) (b - a) * (2 * gb + db));
+            L.st_slot = dp->alloc<int>(E);
+            L.owner_bulk = dp->alloc<int>(E);
             a = b;
         }
-        for (auto & dp : devs_) (il < c.n_layer ? dp->layers[il] : dp->mtp).owner_bulk = dp->upload(bulk_owner.data(), bulk_owner.size());
+        H.stream_dirty = true;
+        rebuild_stream(il);
     }
 }
 
@@ -1286,6 +1300,9 @@ void Engine4::record_main(int gi, int nt, int kind) {
                               (unsigned) il, d.ticket, s);
         if (!fused_pub) moe_route(d.rlog, c.n_expert + 1, c.n_expert, K, d.ids, d.wts, d.sg, nt, s);
         dbg("route_w", il, d.wts, (size_t) nt * K);
+        if (bulk && !kind && d.g == 0 && adapt_)   // prompt routing for the adaptive placement
+            CUDA_CHECK(cudaMemcpyAsync(h_ids_ + ((size_t) il * mc_max_ + ci) * R4 * K, d.ids, (size_t) nt * K * sizeof(int),
+                                       cudaMemcpyDeviceToHost, s));
         if (d.g == 0 && !stream && !fused_pub) {
             if (bulk) moe_publish(&cpu_bulk_->seq, &cpu_bulk_->nt, &cpu_bulk_->ids[0][0], &cpu_bulk_->wts[0][0], &cpu_bulk_->x[0][0],
                                   d.mixed, n, n, d.ids, d.wts, K, nt, d.counter, (unsigned) il, s);
@@ -1301,7 +1318,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
             if (stream) {   // this GPU's share of the CPU experts, uploaded into staging buffer il % 2
                 const int sb = il & 1;
                 MoeDev ms = L.moe;
-                const int cnt = L.st_b - L.st_a;
+                const int cnt = (int) L.st_list.size();
                 ms.gate = d.stage[sb];
                 ms.up = d.stage[sb] + (size_t) cnt * L.moe.gate_bytes;
                 ms.down = d.stage[sb] + (size_t) 2 * cnt * L.moe.gate_bytes;
@@ -1364,19 +1381,140 @@ void Engine4::record_main(int gi, int nt, int kind) {
     }
 }
 
+Engine4::DevLayer & Engine4::lay(Device & d, int il) { return il < cfg_.n_layer ? d.layers[il] : d.mtp; }
+
+// prefill streaming maps of layer il from the current placement: the CPU-owned experts dealt to the GPUs by PCIe bandwidth
+// (x16 : x8 : x16) in ascending order
+void Engine4::rebuild_stream(int il) {
+    ExpertHost & H = ehost_[il];
+    const int nd = opt_.n_devices, E = cfg_.n_expert;
+    std::vector<int> cpu;
+    for (int e = 0; e < E; ++e) if (H.owner[e] == CPU_OWNER) cpu.push_back(e);
+    const int nc = (int) cpu.size();
+    std::vector<double> wbw(nd, 2.0);
+    if (nd > 1) wbw[1] = 1.0;
+    double tw = 0, acc = 0;
+    for (double w : wbw) tw += w;
+    std::vector<int> bulk_owner = H.owner;
+    int a = 0;
+    for (auto & dp : devs_) {
+        DevLayer & L = lay(*dp, il);
+        acc += wbw[dp->g];
+        const int b = dp->g == nd - 1 ? nc : (int) (nc * acc / tw + 0.5);
+        L.st_list.assign(cpu.begin() + a, cpu.begin() + b);
+        if ((size_t) L.st_list.size() * (2 * H.gb + H.db) > dp->stage_bytes && dp->stage[0]) throw std::runtime_error("rebuild_stream: staging too small");
+        std::vector<int> sl(E, -1);
+        for (int i = 0; i < (int) L.st_list.size(); ++i) { sl[L.st_list[i]] = i; bulk_owner[L.st_list[i]] = dp->g; }
+        CUDA_CHECK(cudaSetDevice(dp->id));
+        CUDA_CHECK(cudaMemcpy(L.st_slot, sl.data(), E * sizeof(int), cudaMemcpyHostToDevice));
+        a = b;
+    }
+    for (auto & dp : devs_) {
+        CUDA_CHECK(cudaSetDevice(dp->id));
+        CUDA_CHECK(cudaMemcpy(lay(*dp, il).owner_bulk, bulk_owner.data(), E * sizeof(int), cudaMemcpyHostToDevice));
+    }
+    H.stream_dirty = false;
+}
+
+// adaptive placement (as Engine5::rebalance): routing scores (decayed counts: prompt routing of the prefill chunks, the
+// CPU side's decode counts) pull the hottest CPU experts onto the GPUs in exchange for their coldest experts (same GPU,
+// same slot), at most max_swaps exchanges, the largest gains first. Runs between forwards (nothing in flight).
+void Engine4::rebalance(int max_swaps) {
+    const Q4Config & c = cfg_;
+    const int E = c.n_expert, nl = c.n_layer + (mtp_g_ ? 1 : 0);
+    const auto t_reb = std::chrono::steady_clock::now();
+    cpu_->drain();   // (every record of the last forward consumed: counts and ownership changes do not depend on timing)
+    for (int il = 0; il < nl; ++il) {
+        auto & sc = ehost_[il].score;
+        const auto & cnt = cpu_->counts[il];
+        auto & last = ehost_[il].last_count;
+        for (int e = 0; e < E; ++e) { sc[e] = sc[e] * adapt_decay_ + (double) (cnt[e] - last[e]); last[e] = cnt[e]; }
+    }
+    struct Sw { double gain; int il, ein, eout, g; };
+    std::vector<Sw> cand;
+    for (int il = 0; il < nl; ++il) {
+        ExpertHost & H = ehost_[il];
+        std::vector<int> cpu, gpu;
+        for (int e = 0; e < E; ++e) (H.owner[e] == CPU_OWNER ? cpu : gpu).push_back(e);
+        std::sort(cpu.begin(), cpu.end(), [&](int a, int b) { return H.score[a] > H.score[b]; });
+        std::sort(gpu.begin(), gpu.end(), [&](int a, int b) { return H.score[a] < H.score[b]; });
+        for (size_t i = 0; i < std::min(cpu.size(), gpu.size()); ++i) {
+            const double si = H.score[cpu[i]], so = H.score[gpu[i]];
+            if (si < so * adapt_ratio_ + adapt_min_) break;   // (only clear, persistent differences pay for the copy)
+            cand.push_back({si - so, il, cpu[i], gpu[i], H.owner[gpu[i]]});
+        }
+    }
+    std::sort(cand.begin(), cand.end(), [](const Sw & a, const Sw & b) { return a.gain > b.gain; });
+    if ((int) cand.size() > max_swaps) cand.resize(max_swaps);
+    if (cand.empty()) return;
+    for (const Sw & w : cand) {   // weights first (copy engines of all GPUs in parallel), then the tables
+        ExpertHost & H = ehost_[w.il];
+        Device & d = *devs_[w.g];
+        DevLayer & L = lay(d, w.il);
+        const int k = H.slot[w.g][w.eout];
+        CUDA_CHECK(cudaSetDevice(d.id));
+        CUDA_CHECK(cudaMemcpyAsync((uint8_t *) L.moe.gate + (size_t) k * H.gb, H.gate + (size_t) w.ein * H.gb, H.gb, cudaMemcpyHostToDevice, d.cstream));
+        CUDA_CHECK(cudaMemcpyAsync((uint8_t *) L.moe.up + (size_t) k * H.gb, H.up + (size_t) w.ein * H.gb, H.gb, cudaMemcpyHostToDevice, d.cstream));
+        CUDA_CHECK(cudaMemcpyAsync((uint8_t *) L.moe.down + (size_t) k * H.db, H.down + (size_t) w.ein * H.db, H.db, cudaMemcpyHostToDevice, d.cstream));
+        H.slot[w.g][w.ein] = k;
+        H.slot[w.g][w.eout] = -1;
+        H.owner[w.ein] = w.g;
+        H.owner[w.eout] = CPU_OWNER;
+        cpu_->set_owned(w.il, w.ein, false);
+        cpu_->set_owned(w.il, w.eout, true);
+        H.tables_dirty = H.stream_dirty = true;
+    }
+    for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->cstream)); }
+    for (int il = 0; il < nl; ++il) {
+        ExpertHost & H = ehost_[il];
+        if (!H.tables_dirty) continue;
+        for (auto & dp : devs_) {
+            DevLayer & L = lay(*dp, il);
+            CUDA_CHECK(cudaSetDevice(dp->id));
+            CUDA_CHECK(cudaMemcpy((void *) L.moe.slot, H.slot[dp->g].data(), E * sizeof(int), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(L.owner, H.owner.data(), E * sizeof(int), cudaMemcpyHostToDevice));
+        }
+        H.tables_dirty = false;
+    }
+    n_swaps_ += (int) cand.size();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_reb).count();
+    t_rebalance_ += ms;
+    if (getenv("HYPER4_ADAPT_LOG")) fprintf(stderr, "hyper4: rebalance: %zu exchanges in %.1f ms (total %d, %.1f s)\n", cand.size(), ms, n_swaps_, t_rebalance_ / 1e3);
+}
+
+// the last bulk pass's prompt routing (GPU 0's ids per chunk) into the placement scores, weighted below decode routing
+void Engine4::score_prompt(const int * lens, int nck) {
+    if (!adapt_) return;
+    const int K = cfg_.n_expert_used, E = cfg_.n_expert;
+    for (int il = 0; il < cfg_.n_layer; ++il) {
+        auto & sc = ehost_[il].score;
+        for (int ci = 0; ci < nck; ++ci)
+            for (int i = 0; i < lens[ci] * K; ++i) {
+                const int e = h_ids_[((size_t) il * mc_max_ + ci) * R4 * K + i];
+                if (e >= 0 && e < E) sc[e] += prompt_weight_;
+            }
+    }
+    prompt_routed_ = true;
+}
+
 // copy this GPU's share of layer il's CPU experts into staging buffer il % 2 (on the copy stream, after the buffer's
 // previous user has finished)
 void Engine4::upload_stage(Device & d, int il) {
-    DevLayer & L = il < cfg_.n_layer ? d.layers[il] : d.mtp;
-    const int sb = il & 1, cnt = L.st_b - L.st_a;
+    DevLayer & L = lay(d, il);
+    const ExpertHost & H = ehost_[il];
+    const std::vector<int> & lst = L.st_list;
+    const int sb = il & 1, cnt = (int) lst.size();
     CUDA_CHECK(cudaStreamWaitEvent(d.cstream, d.ev_free[sb], 0));
-    if (cnt > 0) {
-        const size_t gb = L.moe.gate_bytes, db = L.moe.down_bytes;
-        CUDA_CHECK(cudaMemcpyAsync(d.stage[sb], L.st_host_g + (size_t) L.st_a * gb, (size_t) cnt * gb, cudaMemcpyHostToDevice, d.cstream));
-        CUDA_CHECK(cudaMemcpyAsync(d.stage[sb] + (size_t) cnt * gb, L.st_host_u + (size_t) L.st_a * gb, (size_t) cnt * gb,
-                                   cudaMemcpyHostToDevice, d.cstream));
-        CUDA_CHECK(cudaMemcpyAsync(d.stage[sb] + (size_t) 2 * cnt * gb, L.st_host_d + (size_t) L.st_a * db, (size_t) cnt * db,
-                                   cudaMemcpyHostToDevice, d.cstream));
+    const size_t gb = H.gb, db = H.db;
+    for (int i = 0; i < cnt;) {   // runs of consecutive experts in one copy each
+        int j = i + 1;
+        while (j < cnt && lst[j] == lst[j - 1] + 1) ++j;
+        const size_t e = (size_t) lst[i], r = (size_t) (j - i);
+        CUDA_CHECK(cudaMemcpyAsync(d.stage[sb] + (size_t) i * gb, H.gate + e * gb, r * gb, cudaMemcpyHostToDevice, d.cstream));
+        CUDA_CHECK(cudaMemcpyAsync(d.stage[sb] + (size_t) (cnt + i) * gb, H.up + e * gb, r * gb, cudaMemcpyHostToDevice, d.cstream));
+        CUDA_CHECK(cudaMemcpyAsync(d.stage[sb] + (size_t) 2 * cnt * gb + (size_t) i * db, H.down + e * db, r * db, cudaMemcpyHostToDevice,
+                                   d.cstream));
+        i = j;
     }
     CUDA_CHECK(cudaEventRecord(d.ev_up[sb], d.cstream));
 }
@@ -1528,8 +1666,14 @@ std::vector<int> Engine4::forward(const int * tokens, int nt, int pos) {
     const auto th0 = std::chrono::steady_clock::now();
     embed(tokens, nt, pos);
     h_pos_[0] = pos;
+    if (adapt_ && !bulk) {   // placement follows the routing: after a prompt, then every adapt_every_ decode steps
+        if (prompt_routed_) { rebalance(1 << 20); prompt_routed_ = false; steps_ = 0; }
+        else if (++steps_ % adapt_every_ == 0) rebalance(adapt_budget_);
+    }
+    if (bulk) for (int il = 0; il < (int) ehost_.size(); ++il) if (ehost_[il].stream_dirty && lay(*devs_[0], il).owner_bulk) rebuild_stream(il);
     const auto th1 = std::chrono::steady_clock::now();
     run(0, nt);
+    if (bulk) score_prompt(&nt, 1);
     if (hprof && !bulk) {
         const auto th2 = std::chrono::steady_clock::now();
         h_gap += std::chrono::duration<double>(th0 - h_last).count();
@@ -1577,8 +1721,10 @@ int Engine4::forward_multi(const int * tokens, const int * lens, int nck, int po
         mc_nt_[ci] = lens[ci]; mc_pos_[ci] = pos + off; h_cpos_[ci] = pos + off;
     }
     h_pos_[0] = pos;
+    for (int il = 0; il < (int) ehost_.size(); ++il) if (ehost_[il].stream_dirty && lay(*devs_[0], il).owner_bulk) rebuild_stream(il);
     mc_n_ = nck;
     try { run(0, lens[0]); } catch (...) { mc_n_ = 1; throw; }
+    score_prompt(lens, nck);
     mc_n_ = 1;   // (later bulk forwards are single-chunk unless set again; mc_nt_/mc_pos_ stay for mtp_draft_chunk)
     mc_last_ = nck;
     last_nt_ = lens[nck - 1];

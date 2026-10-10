@@ -123,10 +123,11 @@ which is why they agree with each other. Other checks:
   double-buffered GPU staging memory (shares weighted by link speed). Prefill therefore runs entirely on the GPUs.
   Up to four 2048-token chunks go through each layer together, so a layer's experts cross PCIe once for all of them.
   Short chunks stay on the CPU, where they are faster.
-- **Adaptive expert placement (GLM).** Routing counts from the prompt and from generation are tracked with decay. The
+- **Adaptive expert placement (GLM, Flash-Next).** Routing counts from the prompt and from generation are tracked with decay. The
   hottest CPU experts are swapped with the coldest GPU experts at runtime (one PCIe copy per swap, under a millisecond),
   so the GPU set follows what the conversation actually uses (prose, code, tool JSON, …). The swaps are decided from
-  complete counts only (the CPU queue is drained first), so the placement does not depend on timing.
+  complete counts only (the CPU queue is drained first), so the placement does not depend on timing. Flash-Next at
+  262k context (59–63 % of its experts in VRAM): decode +5.5 % on code, Codex replay +4.4 % decode / +8.3 % prefill.
 - **Prompt cache for recurrent models.** Linear-attention layers (Gated DeltaNet, KDA) cannot be truncated like a KV
   cache, so the engine keeps snapshots of their state:
   - at message starts in the prompt,
@@ -232,7 +233,7 @@ Selected environment variables:
 
 | Variable | Effect |
 |---|---|
-| `HYPER5_ADAPT=0` | GLM: disable adaptive expert placement (fully deterministic placement) |
+| `HYPER5_ADAPT=0`, `HYPER4_ADAPT=0` | GLM / Flash-Next: disable adaptive expert placement (fully deterministic placement) |
 | `HYPER_GUMBEL_DRAFT=0/1` | sampled MTP drafts coupled to the sampling noise (default on for Flash-Next and GLM, off for the 27B) |
 | `HYPER5_MTP_PMIN`, `HYPER4_MTP_PMIN`, `HYPER_MTP_PMIN` | MTP drafts while the drafted run's MTP probability is at least this: GLM (default 0.85), Flash-Next (0.5), 27B; 0: count from recent acceptance (Flash-Next, GLM) or always `--draft` (27B) |
 | `HYPER4_STREAM_MIN`, `HYPER5_STREAM_MIN` | shortest prefill chunk that streams CPU experts to the GPUs (default 256 / 280) |

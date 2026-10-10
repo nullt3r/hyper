@@ -90,6 +90,10 @@ private:
     void load_layer(Device & dev, DevLayer & L, int il);
     void load_experts(int il, const std::vector<int> & quota);
     void upload_stage(Device & d, int il);
+    void rebuild_stream(int il);
+    void rebalance(int max_swaps);
+    void score_prompt(const int * lens, int nck);   // prefill routing of the last bulk pass into the placement scores
+    DevLayer & lay(Device & d, int il);   // layer il, the MTP block at n_layer
     void record_main(int gi, int nt, int kind = 0);
     void record_restore(int gi, int keep);
     void build_graphs();
@@ -155,6 +159,25 @@ private:
     bool debug_ = false, nocpu_ = false, allrows_ = false, grouped_decode_ = false;
     int last_nt_ = 0;
     int mc_max_ = 4;               // prefill chunks per layer pass (HYPER4_MC; 1: one at a time)
+    // adaptive expert placement (as Engine5; HYPER4_ADAPT=0: off): a host copy of every expert (pinned), the current
+    // placement, decayed routing scores; the hottest CPU experts trade places with the coldest GPU ones between forwards
+    struct ExpertHost {
+        const uint8_t * gate = nullptr, * up = nullptr, * down = nullptr;
+        size_t gb = 0, db = 0;
+        std::vector<int> owner;               // [E]: GPU or CPU_OWNER
+        std::vector<std::vector<int>> slot;   // [ndev][E]
+        std::vector<double> score;            // decayed routing counts
+        std::vector<uint64_t> last_count;     // CPU side's counts at the last rebalance
+        bool tables_dirty = false, stream_dirty = false;
+    };
+    std::vector<ExpertHost> ehost_;   // [n_layer + 1]: the MTP block last
+    bool adapt_ = true, prompt_routed_ = false;
+    double adapt_decay_ = 0.92, prompt_weight_ = 0.25;   // (Engine5's measured settings)
+    int adapt_every_ = 16, adapt_budget_ = 64;
+    double adapt_min_ = 6.0, adapt_ratio_ = 1.25;
+    double t_rebalance_ = 0;
+    int steps_ = 0, n_swaps_ = 0;
+    int * h_ids_ = nullptr;   // pinned [n_layer + 1][mc_max_][R][K]: prefill routing from GPU 0
     int mc_n_ = 1, mc_nt_[8] = {}, mc_pos_[8] = {};   // the chunks of the current bulk forward
     int mc_last_ = 1;              // chunks of the last forward_multi
     int mtp_src_ = 0;              // MTP pass: residual rows of chunk mtp_src_ of the last multi-chunk forward
