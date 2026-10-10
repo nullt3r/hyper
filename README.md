@@ -23,22 +23,45 @@ The engine is picked from the GGUF architecture.
 
 ## Performance
 
-Measured on the machine above (October 2026), same weights for hyper and llama.cpp. Output was checked against llama.cpp
-logits: the KL divergence is at the level llama.cpp shows against itself with a different batch size (the noise floor).
+All numbers: this machine, October 2026, greedy decoding, the same GGUF files for hyper and llama.cpp.
 
-| Model | Metric | llama.cpp (mainline / ik_llama) | hyper |
+### hyper (current version)
+
+| Model (quantization) | Decode | Decode, speculative | Prefill |
 |---|---|---|---|
-| Qwen3.8-27B | decode, short context | 34.6 t/s (`-sm tensor`), 26.4 t/s (`-sm layer`) | **66 t/s**, **145 t/s** with MTP (greedy) |
-| Qwen3.8-27B | prefill, 4096 tokens | 1672 t/s | **2113 t/s** |
-| Qwen3.8-Flash-Next | decode, short context | 37.8 / 38.4 t/s | **74.5 t/s**, **124 t/s** with MTP (greedy), ~75–83 t/s at temperature 1 |
-| Qwen3.8-Flash-Next | prefill, real text 8–21k | 461 t/s (pp512), 584 t/s (pp2048 @ 32k) | **1100–1350 t/s** |
-| GLM-5.3-Flash | decode, short context | 15.7–17.0 / 16.8 t/s | **35–38 t/s** (prose) |
-| GLM-5.3-Flash | decode, 16–65k context (coding agent) | ~15 t/s | **~26–28 t/s** |
-| GLM-5.3-Flash | prefill, 16–32k | 280 t/s (mainline, 32k) / 164 t/s (ik) | **510–620 t/s** |
+| Qwen3.8-27B (UD-Q8_K_XL) | **59.6 t/s** at 11k context | **130 t/s** (built-in MTP, 2 drafts) | **1771 t/s** (11k-token prompt) |
+| Qwen3.8-Flash-Next (UD-Q4_K_XL) | **97.5 t/s** at 11k context | **~140 t/s** (NextN MTP, 3 drafts) | **1774 t/s** (11k-token prompt) |
+| Qwen3.8-Flash-Next Uncensored (Q4_K_M) | **93 t/s** at 11k context | – | **1806 t/s** (11k-token prompt) |
+| GLM-5.3-Flash (UD-IQ4_XS) | **30.7 t/s** at 16k context | – (prompt lookup is off by default) | **998 t/s** (16k-token prompt) |
 
-GLM decode speed depends on content: only about a third of the experts fit in VRAM, and the rest are computed by the CPU
-at the speed of system RAM. See [ENGINE_LOG.md](ENGINE_LOG.md) (Czech) for the step-by-step development log with every
-measurement.
+- Decode: `hyper4 tfbench` / `hyper gen` – a prefilled prompt of real text (source code and notes), then the reference
+  tokens fed one per step, so the expert routing is that of real text.
+- Speculative: `mtpgen` / `gen`, 9–11k prompt. The speed depends on how predictable the text is; with greedy decoding
+  the output is token-for-token the plain output.
+- GLM decode depends on the content: about a third of its experts fit in VRAM, the rest are computed by the CPU at
+  the speed of system RAM.
+
+### Compared with llama.cpp
+
+Best llama.cpp configuration found for each model (mainline d812350 or ik_llama, tuned flags, experts that do not fit
+in VRAM on the CPU). The contexts are the closest ones that were measured on both sides.
+
+| Model | Metric | llama.cpp | hyper |
+|---|---|---|---|
+| Qwen3.8-27B | decode | 34.4 t/s at 8k (mainline, `-sm tensor`) | 59.6 t/s at 11k |
+| Qwen3.8-27B | prefill | 1396 t/s (pp512, mainline `-sm layer`) | 1771 t/s (11k prompt) |
+| Qwen3.8-Flash-Next | decode | 36.1 t/s at 32k (mainline), 38.4 t/s short (ik_llama) | 97.5 t/s at 11k |
+| Qwen3.8-Flash-Next | prefill | 584 t/s (pp2048 at 32k, mainline) | 1774 t/s (11k prompt) |
+| GLM-5.3-Flash | decode | 15.2 t/s at 32k (mainline), 15.7 t/s at 32k (ik_llama, patched) | 30.7 t/s at 16k |
+| GLM-5.3-Flash | prefill | 280 t/s (32k, mainline) | 998 t/s (16k prompt) |
+
+### Correctness
+
+Output is checked against llama.cpp logits (`ref` + `hyper4 check` / `hyper check`): the KL divergence is at the level
+llama.cpp shows against itself with a different batch size (the noise floor). Speed changes are additionally required to
+leave the output unchanged: the same KL / PPL on the reference text, the same chunked-prefill result and the same
+speculative output hash before and after; kernel rewrites are compared bit for bit in microbenchmarks.
+[ENGINE_LOG.md](ENGINE_LOG.md) (Czech) has the step-by-step log with every measurement.
 
 ## How it works
 
@@ -48,21 +71,26 @@ measurement.
   device), which overlaps with compute.
 - **Weights in tensor-core fragment order.** Q8_0 weights are repacked at load time so that a single 16-byte load per lane
   forms an `mma.m16n8k16` operand. Decode uses a tensor-core GEMV (with split-K and a work-balanced variant for matrices
-  that would otherwise leave a partial last wave). Prefill uses tiled GEMMs. Other quantization types are dequantized
-  to fp16 at load, or re-quantized to Q8_0 (the GLM output layer).
+  that would otherwise leave a partial last wave). Prefill uses tiled GEMMs. K-quants (Q4_K, Q6_K) are repacked into
+  the same fragment order in their own format (exact, no requantization); Q5_0 / Q4_0 become Q8_0 losslessly.
 - **CUDA graphs** for every decode shape (1–4 tokens). The decode critical path is mostly cross-GPU synchronization and
   memory bandwidth.
 - **Mixture of experts across GPU + CPU.**
   - Experts live in their GGUF block formats (Q4_K, Q5_K, Q6_K, Q8_0, IQ3_S, IQ4_XS, …), dequantized on the fly in
     GPU kernels. The most frequently routed experts (from routing statistics) are placed on the GPUs.
-  - CPU-side experts sit in 2 MB huge pages and are computed with ggml's CPU dot products by a pinned thread pool.
+  - CPU-side experts sit in 2 MB huge pages and are computed by a thread pool with ggml's CPU dot products, plus own
+    AVX2 kernels where ggml is slow (IQ3_S dot product, Q8_K activation quantizer), bit-identical to ggml's.
   - GPU and CPU hand work to each other through mapped memory records, with no host round trip in the decode graph.
+    On GPU 0 one kernel computes the routing and writes the CPU's record; the shared expert runs after it, while the
+    CPU is already working.
 - **Prefill streaming.** For long prompts, the CPU-resident experts of each layer are streamed over PCIe into
   double-buffered GPU staging memory (shares weighted by link speed). Prefill therefore runs entirely on the GPUs.
+  Up to four 2048-token chunks go through each layer together, so a layer's experts cross PCIe once for all of them.
   Short chunks stay on the CPU, where they are faster.
 - **Adaptive expert placement (GLM).** Routing counts from the prompt and from generation are tracked with decay. The
   hottest CPU experts are swapped with the coldest GPU experts at runtime (one PCIe copy per swap, under a millisecond),
-  so the GPU set follows what the conversation actually uses (prose, code, tool JSON, …).
+  so the GPU set follows what the conversation actually uses (prose, code, tool JSON, …). The swaps are decided from
+  complete counts only (the CPU queue is drained first), so the placement does not depend on timing.
 - **Prompt cache for recurrent models.** Linear-attention layers (Gated DeltaNet, KDA) cannot be truncated like a KV
   cache, so the engine keeps snapshots of their state:
   - at message starts in the prompt,
@@ -164,6 +192,8 @@ Selected environment variables:
 | `hyper4` | MoE engines (Flash-Next, GLM): `check` / `checkpf` (KL vs the reference), `bench`, `tfbench` (fixed-content decode), `pfbench` (prefill), `ntbench`, `calib` (routing statistics), `mtpgen` (plain vs speculative, must match), `cachetest` |
 | `hyper` | 27B engine: `check`, `checkn`, `gen`, `pfbench`, `cachetest`, `samptest` |
 | `gemvbench`, `arbench`, `arbulk`, `iqkbench`, `bwtest`, `zctest` | microbenchmarks: Q8 GEMV per shape, allreduce, CPU expert dot products (mainline vs ik_llama), PCIe and zero-copy bandwidth |
+| `cpumoebench`, `iq3bench` | the CPU expert decode job on real expert weights (time per job, bandwidth, output bit hash); IQ3_S / IQ4_XS kernels vs ggml, bit for bit |
+| `moebench`, `mlabench`, `topkbench`, `f32bench` | GPU expert kernels for 1–4 local experts, GLM MLA decode attention, sampling candidates (top-64), fp32 router GEMV |
 
 Example correctness check:
 

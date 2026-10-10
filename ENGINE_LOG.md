@@ -201,3 +201,44 @@ Server na promptu z opencode ukázal ~190 t/s (131k kontext, 65 % expertů na GP
   1,91 přijatých draftů/krok (K=3); K=2: 124,9 (1,51), K=1: 110,7. Norma skrytého stavu po proudech 1,91 vs přes
   všechny proudy (ik) 1,88 → ponechána po proudech.
 - Server (T=1,0, 262k ctx, 61 % expertů na GPU): krátký prompt 83,4 t/s (předtím ~49), 21k kontext 55 t/s.
+
+## 2026-10-09/10 – vícechunkový prefill a optimalizace kernelů a přenosů
+
+Všechny změny mají **bit-identický výstup** (stejné KL/PPL na referenci, stejný výsledek `checkpf`, stejný hash
+spekulativního/MTP výstupu; přepsané kernely porovnané bit po bitu v mikrobenchmarcích). Varianty, které měnily
+numeriku, zůstaly vypnuté (env).
+
+Měřicí podmínky (stejné před i po): dekódování `tfbench` (prefill reálného textu, pak referenční tokeny po jednom),
+Flash-Next 11k kontext, GLM 16k; prefill `pfbench` s reálným textem (`HYPER4_PFREAL=1`); 27B `gen` / `pfbench` 11k.
+
+| Model | Metrika | před | po |
+|---|---|---|---|
+| GLM-5.3-Flash | dekódování @16k | 27,4–27,6 t/s | **30,7 t/s** (+11 %) |
+| GLM-5.3-Flash | prefill 16k | 653–656 t/s | **998 t/s** (+52 %) |
+| Qwen3.8-Flash-Next | dekódování @11k | 91,7–92,3 t/s | **97,5 t/s** (+6 %) |
+| Qwen3.8-Flash-Next | MTP (prompt 9k, greedy) | 116 t/s | **138–142 t/s** (+20 %) |
+| Qwen3.8-Flash-Next | prefill 11k | 1486–1491 t/s | **1774 t/s** (+19 %) |
+| Flash-Next Uncensored | dekódování @11k / prefill 11k | 89 / 1491 t/s | **93 / 1806 t/s** |
+| Qwen3.8-27B | dekódování / MTP / prefill 11k | 58,4 / 126 / 1774 t/s | **59,6 / 130 / 1771 t/s** |
+
+Co pomohlo:
+- **Prefill po vrstvách pro až 4 chunky** (GLM i Flash): streamované CPU experty vrstvy přejdou přes PCIe jednou
+  pro všechny chunky; MTP drafty po chuncích.
+- **GLM: routing publikovaný CPU před sdíleným expertem** (CPU začne o ~50 µs/vrstvu dřív) a **routing + zápis
+  záznamu pro CPU v jednom kernelu** (oba MoE enginy).
+- **GLM MLA dekódovací attention 85 → 48 µs/vrstvu** (q v registrech po warpech, buňky po 4, váhy softmaxu jako float4,
+  dávkované globální loady); **stav KDA uložený po sloupcích** (souvislé loady místo kroku 512 B, 15 → 3 µs).
+- **CPU experty:** přesný AVX2 kvantizátor Q8_K (ggml má na x86 jen skalární referenci), IQ3_S dot s lookupy
+  ve skalárních registrech (+17 % na jádro), vážený součet rozdělený mezi vlákna, MADV_COLLAPSE na hostovské kopie.
+- **Výběr kandidátů pro sampling (top-64) dvoustupňově:** 117 → 17 µs na token (všechny enginy).
+- **Flash-Next:** Q5_1/Q5_0 dekvantizace bez větvení podle lane, indexer zařazený před q/k/v projekci, prep + pool
+  indexeru v jednom kernelu, předčítání buněk v attention (i 27B).
+- **Oprava:** adaptivní rozmístění expertů GLM záviselo na časování (rebalance četl počty routingu dřív, než je
+  CPU vlákno dopočítalo) → nejdřív se vyprázdní fronta CPU, rozmístění je deterministické.
+
+Slepé uličky (změřeno): zero-copy čtení části CPU expertů přes PCIe, překrytí down projekce posledního experta
+(čtení částí řádků půlí propustnost RAM), vyvažování počtu úloh, vícetokenové CPU doty (úlohy jsou omezené přenosem
+různých expertů), GPU MoE kernely s loady předem, fúze mHC mix + pre, MLA na tensor cores s fp16 (není přesné),
+dvakrát `#pragma unroll`, který změnil kontrakci FMA (vráceno).
+
+Nástroje: `cpumoebench`, `iq3bench`, `mlabench`, `topkbench`, `f32bench`.
