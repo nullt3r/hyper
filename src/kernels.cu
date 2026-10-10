@@ -751,10 +751,20 @@ __global__ void __launch_bounds__(128) k_attn_split(const float * __restrict__ q
     }
     const half * kb = kcache + (size_t) hk * max_pos * HD + lane * 8;
     const half * vb = vcache + (size_t) hk * max_pos * HD + lane * 8;
+    // the next cell's index and K/V rows are loaded while this cell is processed (same arithmetic, latency hidden)
+    uint4 kn = make_uint4(0, 0, 0, 0), vn = kn;
+    if (p0 + w < p1) {
+        const int p = lt ? lt[p0 + w] : p0 + w;
+        kn = *(const uint4 *) (kb + (size_t) p * HD);
+        vn = *(const uint4 *) (vb + (size_t) p * HD);
+    }
     for (int pi = p0 + w; pi < p1; pi += NW) {
-        const int p = lt ? lt[pi] : pi;
-        const uint4 kr = *(const uint4 *) (kb + (size_t) p * HD);
-        const uint4 vr = *(const uint4 *) (vb + (size_t) p * HD);
+        const uint4 kr = kn, vr = vn;
+        if (pi + NW < p1) {
+            const int p = lt ? lt[pi + NW] : pi + NW;
+            kn = *(const uint4 *) (kb + (size_t) p * HD);
+            vn = *(const uint4 *) (vb + (size_t) p * HD);
+        }
         float kf[8], vf[8];
         const __half2 * kh = (const __half2 *) &kr, * vh = (const __half2 *) &vr;
 #pragma unroll
@@ -811,11 +821,18 @@ __global__ void k_attn_combine(const float * __restrict__ qkv, int stride, const
     float gm = -FLT_MAX;
     for (int s = 0; s < nsplit; ++s) if (pp[s * (HD + 2) + HD + 1] > 0.0f) gm = fmaxf(gm, pp[s * (HD + 2) + HD]);
     float num = 0.0f, den = 0.0f;
-    for (int s = 0; s < nsplit; ++s) {
-        const float * ps = pp + s * (HD + 2);
-        if (ps[HD + 1] <= 0.0f) continue;
-        const float c = __expf(ps[HD] - gm);
-        num += ps[i] * c; den += ps[HD + 1] * c;
+    for (int s0 = 0; s0 < nsplit; s0 += 8) {   // eight partials' loads in flight, accumulated in order as before
+        float pm[8], pl[8], pv[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            if (s0 + u < nsplit) { const float * ps = pp + (s0 + u) * (HD + 2); pm[u] = ps[HD]; pl[u] = ps[HD + 1]; pv[u] = ps[i]; }
+        }
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            if (s0 + u >= nsplit || pl[u] <= 0.0f) continue;
+            const float c = __expf(pm[u] - gm);
+            num += pv[u] * c; den += pl[u] * c;
+        }
     }
     const float gate = qkv[(size_t) t * stride + (size_t) h * 2 * HD + HD + i];
     out[(size_t) t * out_stride + (size_t) h * HD + i] = (num / den) * sigmoidf(gate);
