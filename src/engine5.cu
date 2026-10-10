@@ -200,15 +200,20 @@ struct Engine5::DevLayer {
 struct Engine5::Device {
     int id = 0, g = 0;
     cudaStream_t stream = nullptr;
-    cudaGraphExec_t g_main[MAX_NT + 1] = {}, g_restore[MAX_NT] = {};
-    std::vector<DevLayer> layers;
+    cudaGraphExec_t g_main[MAX_NT + 1] = {}, g_restore[MAX_NT] = {}, g_mtp[MAX_NT + 1] = {}, g_chain = nullptr;
+    std::vector<DevLayer> layers;   // (+ the MTP block at index n_layer)
     float * out_norm = nullptr;
     DW output;
+    // MTP block input: eh_proj on [enorm(token embedding) | hnorm(hidden)]; its head norm; mprev: the main model's hidden row
+    // before the next MTP row; mchain: the MTP block's last output after its head norm (the chained hidden)
+    DW m_eh;
+    float * m_enorm = nullptr, * m_hnorm = nullptr, * m_shnorm = nullptr, * mprev = nullptr, * mchain = nullptr;
     int vocab_off = 0;
     // activations [R5] rows
     float * x = nullptr, * res = nullptr, * xn = nullptr, * mix = nullptr, * mixpart = nullptr, * hcw = nullptr, * bo = nullptr, * part = nullptr;
     std::vector<float *> res_x;      // residual rows of the further chunks of a multi-chunk prefill pass
     int * pos_x = nullptr;           // their positions
+    int * pos_last = nullptr;        // MTP update: the last row's position
     float * big0 = nullptr, * o = nullptr, * qabs = nullptr, * olat = nullptr, * attn_part = nullptr;
     float * rlog = nullptr, * wts = nullptr, * sg = nullptr, * shgu = nullptr, * shh = nullptr, * shpart = nullptr;
     float * plog = nullptr, * pwts = nullptr, * psg = nullptr;
@@ -251,6 +256,8 @@ struct Engine5::Device {
         cudaSetDevice(id);
         for (auto & gr : g_main) if (gr) cudaGraphExecDestroy(gr);
         for (auto & gr : g_restore) if (gr) cudaGraphExecDestroy(gr);
+        for (auto & gr : g_mtp) if (gr) cudaGraphExecDestroy(gr);
+        if (g_chain) cudaGraphExecDestroy(g_chain);
         for (auto & ev : ev_ar) if (ev) cudaEventDestroy(ev);
         if (blas) cublasDestroy(blas);
         for (auto & ev : ev_up) if (ev) cudaEventDestroy(ev);
@@ -280,6 +287,12 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
     cfg_ = Glm5Config::from_gguf(*gguf_);
     fprintf(stderr, "hyper5: %s\n", cfg_.describe().c_str());
     if (cfg_.n_expert_used > MOE_MAX_USED) throw std::runtime_error("hyper5: too many experts per token");
+    if (!opt_.mtp_path.empty()) {
+        mtp_g_ = std::make_unique<GGUF>(opt_.mtp_path);
+        if (!mtp_g_->tensor("blk." + std::to_string(cfg_.n_layer) + ".nextn.eh_proj.weight"))
+            throw std::runtime_error("hyper5: " + opt_.mtp_path + " has no NextN block blk." + std::to_string(cfg_.n_layer));
+        fprintf(stderr, "hyper5: MTP block from %s\n", opt_.mtp_path.c_str());
+    }
     int ndev = 0;
     CUDA_CHECK(cudaGetDeviceCount(&ndev));
     opt_.n_devices = std::min(opt_.n_devices, ndev);
@@ -309,7 +322,7 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
     memset((void *) cpu_bulk_, 0, sizeof(CpuMoeBulk));
     memset((void *) cpu_bulk_out_, 0, sizeof(CpuMoeBulkOut));
     barrier_ = std::make_unique<Barrier4>(nd);
-    CUDA_CHECK(cudaHostAlloc(&h_pos_, 8 * sizeof(int), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_pos_, 16 * sizeof(int), cudaHostAllocPortable));   // ([8]: the MTP update's last row)
     CUDA_CHECK(cudaHostAlloc(&h_res_, (size_t) nd * MAX_NT * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_topk_, (size_t) nd * MAX_NT * TOPK * 2 * sizeof(float), cudaHostAllocPortable));
     if (const char * zs = getenv("HYPER5_ZC")) {
@@ -318,11 +331,11 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
     }
     if (getenv("HYPER5_PREDSTAT")) pred_k_ = std::max(1, std::min(MOE_MAX_USED, atoi(getenv("HYPER5_PREDSTAT"))));
     CUDA_CHECK(cudaHostAlloc(&h_pred_, (size_t) cfg_.n_layer * MOE_MAX_USED * sizeof(int), cudaHostAllocPortable));
-    CUDA_CHECK(cudaHostAlloc(&h_ids_, (size_t) cfg_.n_layer * mc_max_ * R5 * cfg_.n_expert_used * sizeof(int), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_ids_, (size_t) nl_tot() * mc_max_ * R5 * cfg_.n_expert_used * sizeof(int), cudaHostAllocPortable));
     const size_t ll = (size_t) 2 * nd * MAX_NT * n / 2;
     CUDA_CHECK(cudaHostAlloc(&ar_ll_, ll * sizeof(uint2), cudaHostAllocPortable | cudaHostAllocMapped));
     memset(ar_ll_, 0xff, ll * sizeof(uint2));
-    const int slots = cfg_.n_layer;
+    const int slots = nl_tot();
     CUDA_CHECK(cudaHostAlloc(&cpu_rec_, (size_t) slots * sizeof(CpuMoeRec), cudaHostAllocPortable | cudaHostAllocMapped));
     CUDA_CHECK(cudaHostAlloc(&cpu_out_, (size_t) slots * sizeof(CpuMoeOut), cudaHostAllocPortable | cudaHostAllocMapped));
     memset((void *) cpu_rec_, 0, (size_t) slots * sizeof(CpuMoeRec));
@@ -331,7 +344,8 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
         FILE * f = fopen(sp, "rb");
         if (f) {
             int nl = 0, w = 0;
-            if (fread(&nl, 4, 1, f) == 1 && fread(&w, 4, 1, f) == 1 && nl == cfg_.n_layer) {
+            // (n_layer + 1 rows: written with the MTP block)
+            if (fread(&nl, 4, 1, f) == 1 && fread(&w, 4, 1, f) == 1 && (nl == cfg_.n_layer || nl == cfg_.n_layer + 1)) {
                 stats_.assign(nl, std::vector<uint64_t>(w));
                 for (auto & s : stats_) if (fread(s.data(), 8, w, f) != (size_t) w) { stats_.clear(); break; }
             }
@@ -343,6 +357,8 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
                                     cpu_bulk_out_);
     cpu_->set_clamp(cfg_.clamp_exp);
     adapt_ = !getenv("HYPER5_ADAPT") || atoi(getenv("HYPER5_ADAPT")) != 0;
+    if (getenv("HYPER5_MTP_PMIN")) mtp_pmin_ = atof(getenv("HYPER5_MTP_PMIN"));
+    mtp_full_ = getenv("HYPER5_MTP_FULL") != nullptr;
     if (getenv("HYPER5_STREAM_MIN")) stream_min_ = atoi(getenv("HYPER5_STREAM_MIN"));
     if (getenv("HYPER5_DECAY")) adapt_decay_ = atof(getenv("HYPER5_DECAY"));
     if (getenv("HYPER5_PROMPT_W")) prompt_weight_ = atof(getenv("HYPER5_PROMPT_W"));
@@ -350,7 +366,7 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
     if (getenv("HYPER5_ADAPT_BUDGET")) adapt_budget_ = atoi(getenv("HYPER5_ADAPT_BUDGET"));
     if (getenv("HYPER5_ADAPT_MIN")) adapt_min_ = atof(getenv("HYPER5_ADAPT_MIN"));
     if (getenv("HYPER5_ADAPT_RATIO")) adapt_ratio_ = atof(getenv("HYPER5_ADAPT_RATIO"));
-    ehost_.resize(cfg_.n_layer);
+    ehost_.resize(nl_tot());
     for (auto & H : ehost_) { H.score.assign(cfg_.n_expert, 0.0); H.last_count.assign(1024, 0); }
     load_weights();
 }
@@ -381,33 +397,37 @@ Engine5::~Engine5() {
 void Engine5::load_layer(Device & dev, DevLayer & L, int il) {
     const Glm5Config & c = cfg_;
     const int nd = opt_.n_devices, g = dev.g, n = c.n_embd;
+    const GGUF & G = src(il);
+    const bool mtp = il == c.n_layer;   // the NextN block: an MLA + MoE layer without mHC
     auto A = [&](size_t nb) { return (void *) dev.alloc<uint8_t>(nb); };
-    auto T = [&](const std::string & name) { return &gguf_->need(name); };
+    auto T = [&](const std::string & name) { return &G.need(name); };
     auto f32 = [&](const std::string & name) {
-        const std::vector<float> v = to_f32(gguf_->need(name));
+        const std::vector<float> v = to_f32(G.need(name));
         return dev.upload(v.data(), v.size());
     };
     auto full = [&](const std::string & name) { const GTensor * t = T(name); return upload_dense(A, dev.id, {{t, 0, t->rows()}}); };
     auto fp16_rows = [&](const std::string & name, int64_t r0, int64_t r1) {
-        const std::vector<float> v = to_f32(gguf_->need(name), r0, r1);
+        const std::vector<float> v = to_f32(G.need(name), r0, r1);
         std::vector<half> h(v.size());
         for (size_t i = 0; i < v.size(); ++i) h[i] = __float2half(v[i]);
         return dev.upload(h.data(), h.size());
     };
     const std::string p = "blk." + std::to_string(il) + ".";
-    L.mla = c.is_mla[il];
+    L.mla = mtp || c.is_mla[il];
     L.moe = is_moe(il);
-    L.hca_fn = full(p + "hc_attn_fn.weight");
-    L.hcf_fn = full(p + "hc_ffn_fn.weight");
-    for (auto [nm, dst] : {std::pair<const char *, uint8_t **>{"hc_attn_fn.weight", &L.hca_raw}, {"hc_ffn_fn.weight", &L.hcf_raw}}) {
-        const GTensor & t = gguf_->need(p + nm);
-        if (t.type != GType::Q8_0) throw std::runtime_error("hc_fn: expected Q8_0");
-        *dst = dev.upload(t.data, t.nbytes);
+    if (!mtp) {
+        L.hca_fn = full(p + "hc_attn_fn.weight");
+        L.hcf_fn = full(p + "hc_ffn_fn.weight");
+        for (auto [nm, dst] : {std::pair<const char *, uint8_t **>{"hc_attn_fn.weight", &L.hca_raw}, {"hc_ffn_fn.weight", &L.hcf_raw}}) {
+            const GTensor & t = G.need(p + nm);
+            if (t.type != GType::Q8_0) throw std::runtime_error("hc_fn: expected Q8_0");
+            *dst = dev.upload(t.data, t.nbytes);
+        }
+        L.hca_scale = f32(p + "hc_attn_scale.weight");
+        L.hca_base = f32(p + "hc_attn_base.weight");
+        L.hcf_scale = f32(p + "hc_ffn_scale.weight");
+        L.hcf_base = f32(p + "hc_ffn_base.weight");
     }
-    L.hca_scale = f32(p + "hc_attn_scale.weight");
-    L.hca_base = f32(p + "hc_attn_base.weight");
-    L.hcf_scale = f32(p + "hc_ffn_scale.weight");
-    L.hcf_base = f32(p + "hc_ffn_base.weight");
     L.attn_norm = f32(p + "attn_norm.weight");
     L.ffn_norm = f32(p + "ffn_norm.weight");
     auto [h0, h1] = split(c.n_head, nd, g);
@@ -442,13 +462,13 @@ void Engine5::load_layer(Device & dev, DevLayer & L, int il) {
         {   // conv taps of the local q, k, v channels
             std::vector<float> buf;
             for (const char * nm : {"ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight"}) {
-                const std::vector<float> cw = to_f32(gguf_->need(p + nm));
+                const std::vector<float> cw = to_f32(G.need(p + nm));
                 buf.insert(buf.end(), cw.begin() + a0 * c.conv, cw.begin() + a1 * c.conv);
             }
             L.conv_w = dev.upload(buf.data(), buf.size());
         }
         {
-            const std::vector<float> dt = to_f32(gguf_->need(p + "ssm_dt.bias")), sa = to_f32(gguf_->need(p + "ssm_a"));
+            const std::vector<float> dt = to_f32(G.need(p + "ssm_dt.bias")), sa = to_f32(G.need(p + "ssm_a"));
             L.dt_bias = dev.upload(dt.data() + a0, (size_t) (a1 - a0));
             L.ssm_a = dev.upload(sa.data() + h0, (size_t) nh);
         }
@@ -466,7 +486,7 @@ void Engine5::load_layer(Device & dev, DevLayer & L, int il) {
                                         {T(p + "indexer.attn_q_b.weight"), 0, GIDX_HEADS * GIDX_DIM}});
         static const bool head_f16 = getenv("HYPER5_HEAD_F16") != nullptr;
         auto q8_rows = [&](const std::string & name, int64_t r0, int64_t r1, int8_t ** q, half ** sc) {
-            const GTensor & t = gguf_->need(name);
+            const GTensor & t = G.need(name);
             const int64_t C = t.ne[0], kb = C / 32, nr = r1 - r0;
             std::vector<int8_t> qs((size_t) nr * C);
             std::vector<half> d((size_t) nr * kb);
@@ -479,7 +499,7 @@ void Engine5::load_layer(Device & dev, DevLayer & L, int il) {
             *q = dev.upload(qs.data(), qs.size());
             *sc = dev.upload(d.data(), d.size());
         };
-        const bool hq = !head_f16 && gguf_->need(p + "attn_k_b.weight").type == GType::Q8_0 && gguf_->need(p + "attn_v_b.weight").type == GType::Q8_0;
+        const bool hq = !head_f16 && G.need(p + "attn_k_b.weight").type == GType::Q8_0 && G.need(p + "attn_v_b.weight").type == GType::Q8_0;
         if (hq) {
             q8_rows(p + "attn_k_b.weight", h0 * c.kv_lora, h1 * c.kv_lora, &L.wkb_q, &L.wkb_s);
             q8_rows(p + "attn_v_b.weight", h0 * c.v_dim, h1 * c.v_dim, &L.wvb_q, &L.wvb_s);
@@ -491,7 +511,7 @@ void Engine5::load_layer(Device & dev, DevLayer & L, int il) {
         L.q_a_norm = f32(p + "attn_q_a_norm.weight");
         L.kv_a_norm = f32(p + "attn_kv_a_norm.weight");
         {
-            std::vector<float> pw = to_f32(gguf_->need(p + "indexer.proj.weight"));
+            std::vector<float> pw = to_f32(G.need(p + "indexer.proj.weight"));
             const float sc = 1.0f / sqrtf((float) (GIDX_DIM * GIDX_HEADS));
             for (auto & v : pw) v *= sc;
             L.idx_proj = dev.upload(pw.data(), pw.size());
@@ -523,8 +543,9 @@ void Engine5::load_experts(int il, const std::vector<int> & quota) {
     const Glm5Config & c = cfg_;
     const int nd = opt_.n_devices, n = c.n_embd;
     const std::string p = "blk." + std::to_string(il) + ".";
-    const GTensor & tg = gguf_->need(p + "ffn_gate_exps.weight"), & tu = gguf_->need(p + "ffn_up_exps.weight"),
-                  & tdn = gguf_->need(p + "ffn_down_exps.weight");
+    const GGUF & G = src(il);
+    const GTensor & tg = G.need(p + "ffn_gate_exps.weight"), & tu = G.need(p + "ffn_up_exps.weight"),
+                  & tdn = G.need(p + "ffn_down_exps.weight");
     if (tu.type != tg.type) throw std::runtime_error("expert gate/up types differ");
     const int E = c.n_expert, ff = c.n_ff_exp;
     std::vector<int> order(E);
@@ -693,7 +714,7 @@ void Engine5::rebalance(int max_swaps) {
     // the GPU, so their routing counts (and a still-running job) could lag -- placement then depended on timing
     cpu_->drain();
     // decode routing seen by the CPU side since the last call
-    for (int il = 0; il < c.n_layer; ++il) {
+    for (int il = 0; il < nl_tot(); ++il) {
         if (!is_moe(il)) continue;
         auto & sc = ehost_[il].score;
         const auto & cnt = cpu_->counts[il];
@@ -702,7 +723,7 @@ void Engine5::rebalance(int max_swaps) {
     }
     struct Sw { double gain; int il, ein, eout, g; };
     std::vector<Sw> cand;
-    for (int il = 0; il < c.n_layer; ++il) {
+    for (int il = 0; il < nl_tot(); ++il) {
         if (!is_moe(il)) continue;
         ExpertHost & H = ehost_[il];
         std::vector<int> cpu, gpu;
@@ -739,7 +760,7 @@ void Engine5::rebalance(int max_swaps) {
         H.stream_dirty = true;
     }
     for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->cstream)); }
-    for (int il = 0; il < c.n_layer; ++il) {
+    for (int il = 0; il < nl_tot(); ++il) {
         ExpertHost & H = ehost_[il];
         if (!is_moe(il) || !H.tables_dirty) continue;
         for (auto & dp : devs_) {
@@ -764,9 +785,19 @@ void Engine5::load_weights() {
         Device & dev = *dp;
         const int g = dev.g;
         auto A = [&](size_t nb) { return (void *) dev.alloc<uint8_t>(nb); };
-        dev.layers.resize(c.n_layer);
-        for (int il = 0; il < c.n_layer; ++il) load_layer(dev, dev.layers[il], il);
+        dev.layers.resize(nl_tot());
+        for (int il = 0; il < nl_tot(); ++il) load_layer(dev, dev.layers[il], il);
         { const std::vector<float> v = to_f32(gguf_->need("output_norm.weight")); dev.out_norm = dev.upload(v.data(), v.size()); }
+        if (mtp_g_) {   // (replicated: eh_proj is one GEMV per MTP row)
+            const std::string p = "blk." + std::to_string(c.n_layer) + ".nextn.";
+            auto up32 = [&](const std::string & name) { const std::vector<float> v = to_f32(mtp_g_->need(name)); return dev.upload(v.data(), v.size()); };
+            { const GTensor * t = &mtp_g_->need(p + "eh_proj.weight"); dev.m_eh = upload_dense(A, dev.id, {{t, 0, t->rows()}}); }
+            dev.m_enorm = up32(p + "enorm.weight");
+            dev.m_hnorm = up32(p + "hnorm.weight");
+            dev.m_shnorm = up32(p + "shared_head_norm.weight");
+            dev.mprev = dev.alloc<float>(n);
+            dev.mchain = dev.alloc<float>(n);
+        }
         auto [o0, o1] = split(c.n_vocab, nd, g);
         dev.vocab_off = (int) o0;
         {   // LM head: Q4_K / Q6_K natively (exact); HYPER5_OUT_Q8: re-quantized to Q8_0, HYPER5_OUT_F16: fp16
@@ -804,6 +835,7 @@ void Engine5::load_weights() {
         const int mc_alloc = std::max(mc_max_, getenv("HYPER5_MC_ALLOC") ? atoi(getenv("HYPER5_MC_ALLOC")) : 0);
         for (int ci = 1; ci < mc_alloc; ++ci) dev.res_x.push_back(dev.alloc<float>((size_t) R * hcn));
         dev.pos_x = dev.alloc<int>(8);
+        dev.pos_last = dev.alloc<int>(1);
         dev.xn = dev.alloc<float>((size_t) R * n);
         dev.mix = dev.alloc<float>((size_t) R * 32);
         dev.mixpart = dev.alloc<float>((size_t) R * (hcn / 256) * 25);
@@ -857,10 +889,10 @@ void Engine5::load_weights() {
     {
         size_t eb = 0, eb_max = 0;
         int nm = 0;
-        for (int il = 0; il < c.n_layer; ++il) {
+        for (int il = 0; il < nl_tot(); ++il) {
             if (!is_moe(il)) continue;
             const std::string p = "blk." + std::to_string(il) + ".";
-            const size_t b = (gguf_->need(p + "ffn_gate_exps.weight").nbytes * 2 + gguf_->need(p + "ffn_down_exps.weight").nbytes) / c.n_expert;
+            const size_t b = (src(il).need(p + "ffn_gate_exps.weight").nbytes * 2 + src(il).need(p + "ffn_down_exps.weight").nbytes) / c.n_expert;
             eb += b;
             eb_max = std::max(eb_max, b);
             ++nm;
@@ -890,7 +922,7 @@ void Engine5::load_weights() {
         fprintf(stderr, "hyper5: experts per layer on GPUs:");
         for (int q : quota) fprintf(stderr, " %d", q);
         fprintf(stderr, " (%.0f%% of %d), the rest on the CPU\n", 100.0 * tq / c.n_expert, c.n_expert);
-        for (int il = 0; il < c.n_layer; ++il) if (is_moe(il)) load_experts(il, quota);
+        for (int il = 0; il < nl_tot(); ++il) if (is_moe(il)) load_experts(il, quota);
         if (opt_.stream_experts)
             for (auto & dp : devs_) {
                 for (auto & sb : dp->stage) sb = dp->alloc<uint8_t>(std::max<size_t>(dp->stage_bytes, 1));
@@ -911,17 +943,18 @@ void Engine5::reset() {
                 CUDA_CHECK(cudaMemset(L.conv_state, 0, (size_t) (c.conv - 1) * 3 * L.nh * 128 * sizeof(float)));
                 CUDA_CHECK(cudaMemset(L.state, 0, (size_t) L.nh * 128 * 128 * sizeof(float)));
             }
+        if (dp->mprev) CUDA_CHECK(cudaMemset(dp->mprev, 0, c.n_embd * sizeof(float)));   // (MTP row 0: no hidden before it)
     }
 }
 
-void Engine5::record_main(int gi, int nt) {
+void Engine5::record_main(int gi, int nt, int kind) {
     const Glm5Config & c = cfg_;
     Device & d = *devs_[gi];
     cudaStream_t s = d.stream;
     const int n = c.n_embd, hcn = MHC * n, K = c.n_expert_used, bs = d.big_stride;
     const int nd = opt_.n_devices;
     const float eps = c.rms_eps;
-    const bool bulk = nt > MAX_NT;
+    const bool bulk = nt > MAX_NT, mtp = kind != 0;
     auto mm = [&](const DW & W, const float * x, int xs, float * y, int ys, int rows, const NormIn & ni = NormIn{}) {
         if (W.kq) {   // (the LM head: a few rows)
             for (int r0 = 0; r0 < rows; r0 += MAX_NT)
@@ -978,16 +1011,38 @@ void Engine5::record_main(int gi, int nt) {
     int * P = d.pos;
     int pos_host = h_pos_[0];
     for (int ci = 0; ci < nck; ++ci) {
+        const int m = ck[ci].nt;
         CUDA_CHECK(cudaMemcpyAsync(ck[ci].P, h_pos_ + ci, sizeof(int), cudaMemcpyHostToDevice, s));
-        CUDA_CHECK(cudaMemcpyAsync(d.x, h_embd_ + (size_t) ci * R5 * n, (size_t) ck[ci].nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
-        mhc_init(ck[ci].R, d.x, n, ck[ci].nt, s);
+        CUDA_CHECK(cudaMemcpyAsync(d.x, h_embd_ + (size_t) ci * R5 * n, (size_t) m * n * sizeof(float), cudaMemcpyHostToDevice, s));
+        if (!mtp) { mhc_init(ck[ci].R, d.x, n, m, s); continue; }
+        // MTP block input: eh_proj([enorm(emb) | hnorm(hidden)]); its residual stream (rows of n) replaces the chunk's
+        // main residual rows once their hidden rows (the main LM head's input) are taken
+        float * ecat = d.big0;   // [m][2n]
+        rmsnorm(d.x, n, d.m_enorm, ecat, 2 * n, n, m, eps, s);
+        if (kind == 2) rmsnorm(d.mchain, n, d.m_hnorm, ecat + n, 2 * n, n, 1, eps, s);
+        else {
+            mhc_head(ck[ci].R, d.out_norm, eps, n, d.xn, m, s);
+            if (mtp_shift_) {   // row r: the hidden of row r - 1 (row 0: the previous chunk's last)
+                rmsnorm(d.mprev, n, d.m_hnorm, ecat + n, 2 * n, n, 1, eps, s);
+                if (m > 1) rmsnorm(d.xn, n, d.m_hnorm, ecat + 3 * n, 2 * n, n, m - 1, eps, s);
+            } else rmsnorm(d.xn, n, d.m_hnorm, ecat + n, 2 * n, n, m, eps, s);
+            CUDA_CHECK(cudaMemcpyAsync(d.mprev, d.xn + (size_t) (m - 1) * n, n * sizeof(float), cudaMemcpyDeviceToDevice, s));
+        }
+        mm(d.m_eh, ecat, 2 * n, ck[ci].R, n, m);
     }
+    // MTP update over several rows: all of them enter the block's cache, only the last one goes on (attention, FFN, head)
+    const bool last_only = kind == 1 && !mtp_shift_ && !bulk && nt > 1 && !mtp_full_;
+    if (last_only) CUDA_CHECK(cudaMemcpyAsync(d.pos_last, h_pos_ + 8, sizeof(int), cudaMemcpyHostToDevice, s));
     incr_counter(d.counter, s);
-    const bool streaming = bulk && opt_.stream_experts && nt >= stream_min_;
+    const int il0 = mtp ? c.n_layer : 0, il1 = mtp ? c.n_layer + 1 : c.n_layer;   // (this pass's layers)
+    // prompt rows of the MTP block: only its cache (latents, indexer keys) is used later, and that depends on the block's
+    // input alone -- no attention output, FFN or head for them
+    const bool cache_only = mtp && mtp_shift_ && !mtp_full_;
+    const bool streaming = bulk && opt_.stream_experts && nt >= stream_min_ && !cache_only;
     if (streaming) {
-        int first = 0;
-        while (first < c.n_layer && !d.layers[first].owner_bulk) ++first;
-        if (first < c.n_layer) { upload_stage(d, first, 0); upload_stage(d, first, 1); }
+        int first = il0;
+        while (first < il1 && !d.layers[first].owner_bulk) ++first;
+        if (first < il1) { upload_stage(d, first, 0); upload_stage(d, first, 1); }
     }
     int call = 0;
     auto dbg = [&](const char * what, int il, const float * buf, size_t cnt) {
@@ -1004,9 +1059,9 @@ void Engine5::record_main(int gi, int nt) {
         if (bad || err != cudaSuccess) throw std::runtime_error("debug stop");
     };
     int dcall = 0;
-    auto allreduce = [&] {   // d.bo = sum over the GPUs of d.part
-        CUDA_CHECK(cudaMemsetAsync(d.bo, 0, (size_t) nt * n * sizeof(float), s));
-        if (!bulk) { allreduce_add_ll16(d.bo, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s, nullptr); return; }
+    auto allreduce = [&](float * x = nullptr) {   // x += sum over the GPUs of d.part (default: d.bo = the sum)
+        if (!x) { x = d.bo; CUDA_CHECK(cudaMemsetAsync(d.bo, 0, (size_t) nt * n * sizeof(float), s)); }
+        if (!bulk) { allreduce_add_ll16(x, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s, nullptr); return; }
         const int par = dcall++ & 1;
         const size_t N = (size_t) nt * n;
         auto stage = [&](int g) { return h_stage_ + ((size_t) par * nd + g) * R5 * n; };
@@ -1021,7 +1076,7 @@ void Engine5::record_main(int gi, int nt) {
             CUDA_CHECK(cudaMemcpyAsync(d.recv + (size_t) j * R5 * n, stage(p), N * sizeof(half), cudaMemcpyHostToDevice, s));
             ++j;
         }
-        add_parts(d.bo, d.p16, d.recv, (size_t) R5 * n, nd - 1, (int) N, s);
+        add_parts(x, d.p16, d.recv, (size_t) R5 * n, nd - 1, (int) N, s);
     };
     // block output: allreduce of d.part over the GPUs, scattered into the residual streams (decode: in the allreduce epilogue)
     static const bool old_post = getenv("HYPER5_OLDPOST") != nullptr;
@@ -1038,14 +1093,15 @@ void Engine5::record_main(int gi, int nt) {
         mhc_pre(R, d.mix, 32, scale, base, norm_w, eps, c.hc_eps, c.sinkhorn, n, d.hcw, d.xn, nt, s);
     };
     dbg("embed", -1, R, (size_t) nt * hcn);
-    for (int il = 0; il < c.n_layer; ++il)
+    for (int il = il0; il < il1; ++il)
     for (int ci = 0; ci < nck; ++ci) {
         nt = ck[ci].nt; R = ck[ci].R; P = ck[ci].P; pos_host = ck[ci].pos;
         const bool last_ck = ci == nck - 1;   // (the streamed experts' staging is released after the last chunk)
         DevLayer & L = d.layers[il];
         const int nh = L.nh;
         // ---- token mixer ----
-        hc_pre(L.hca_fn, L.hca_raw, L.hca_scale, L.hca_base, L.attn_norm);
+        if (mtp) rmsnorm(R, n, L.attn_norm, d.xn, n, n, nt, eps, s);   // (the MTP block: plain pre-norm residual layer)
+        else hc_pre(L.hca_fn, L.hca_raw, L.hca_scale, L.hca_base, L.attn_norm);
         dbg("attn_in", il, d.xn, (size_t) nt * n);
         if (!L.mla) {
             const int fa = kda_fa(nh), fb = kda_fb(nh);
@@ -1062,6 +1118,19 @@ void Engine5::record_main(int gi, int nt) {
         } else {
             const int wq = mla_w(c), qr = mla_qr(c), qo = mla_q(c);
             mm(L.min, d.xn, n, d.big0, bs, nt);
+            if (cache_only || last_only) {
+                mla_kv(d.big0 + c.q_lora, bs, L.kv_a_norm, eps, L.lat, P, nt, s);
+                gidx_pool(d.big0 + c.q_lora + c.kv_lora, d.big0 + c.q_lora + c.kv_lora + GIDX_DIM, bs, L.idx_lnw, L.idx_lnb, c.ln_eps, L.idx_ape,
+                          L.ring, L.pooled, P, nt, s);
+                if (cache_only) continue;
+                // the last row moves to row 0 (its block input, normed input and projections), then a 1-row layer
+                const size_t lr = (size_t) (nt - 1);
+                CUDA_CHECK(cudaMemcpyAsync(R, R + lr * n, n * sizeof(float), cudaMemcpyDeviceToDevice, s));
+                CUDA_CHECK(cudaMemcpyAsync(d.xn, d.xn + lr * n, n * sizeof(float), cudaMemcpyDeviceToDevice, s));
+                CUDA_CHECK(cudaMemcpyAsync(d.big0, d.big0 + lr * bs, (size_t) mla_w(c) * sizeof(float), cudaMemcpyDeviceToDevice, s));
+                nt = 1;
+                P = d.pos_last;
+            }
             f32mm(L.idx_proj, GIDX_HEADS, n, d.xn, n, d.big0 + wq, bs, nt);
             rmsnorm(d.big0, bs, L.q_a_norm, d.big0 + qr, bs, c.q_lora, nt, eps, s);
             mm(L.mq, d.big0 + qr, bs, d.big0 + qo, bs, nt);
@@ -1083,10 +1152,11 @@ void Engine5::record_main(int gi, int nt) {
             mm(L.wo, d.o, nh * c.v_dim, d.part, n, nt);
         }
         dbg(L.mla ? "mla_part" : "kda_part", il, d.part, (size_t) nt * n);
-        block_out();
-        dbg("attn_res", il, R, (size_t) nt * hcn);
+        if (mtp) allreduce(R); else block_out();
+        dbg("attn_res", il, R, (size_t) nt * (mtp ? n : hcn));
         // ---- FFN ----
-        hc_pre(L.hcf_fn, L.hcf_raw, L.hcf_scale, L.hcf_base, L.ffn_norm);
+        if (mtp) rmsnorm(R, n, L.ffn_norm, d.xn, n, n, nt, eps, s);
+        else hc_pre(L.hcf_fn, L.hcf_raw, L.hcf_scale, L.hcf_base, L.ffn_norm);
         float * ffo = L.moe ? d.shpart : d.part;
         auto shared_ffn = [&] {   // (MoE layers: after the routing is published, so the CPU experts start without waiting for it)
             mm(L.gu, d.xn, n, d.shgu, 2 * L.ff_l, nt);
@@ -1147,8 +1217,8 @@ void Engine5::record_main(int gi, int nt) {
                         if (!last_ck) continue;
                         CUDA_CHECK(cudaEventRecord(d.ev_free[sb], s));
                         int nx = il + 1;
-                        while (nx < c.n_layer && !d.layers[nx].owner_bulk) ++nx;
-                        if (nx < c.n_layer) upload_stage(d, nx, sb);
+                        while (nx < il1 && !d.layers[nx].owner_bulk) ++nx;
+                        if (nx < il1) upload_stage(d, nx, sb);
                     }
             } else {
                 moe_gate_up(L.moex, d.xn, n, d.ids, K, d.hexp, nt, s);
@@ -1161,8 +1231,17 @@ void Engine5::record_main(int gi, int nt) {
                        bulk ? &cpu_bulk_out_->y[0][0] : &cpu_out_[il].y[0][0], d.counter, (unsigned) il, s, zcl ? d.yzc : nullptr);
         }
         dbg("ffn_part", il, d.part, (size_t) nt * n);
-        block_out();
-        dbg("l_out", il, R, (size_t) nt * hcn);
+        if (mtp) allreduce(R); else block_out();
+        dbg("l_out", il, R, (size_t) nt * (mtp ? n : hcn));
+    }
+    if (mtp) {   // draft: argmax after the last row (the head norm's output is the next chained hidden)
+        if (cache_only) return;
+        rmsnorm(R + (size_t) (nt - 1) * n, n, d.m_shnorm, d.mchain, n, n, 1, eps, s);
+        mm(d.output, d.mchain, n, d.logits, d.output.n(), 1);
+        argmax_pairs(d.logits, d.output.n(), d.output.n(), d.vocab_off, d.wts, 1, s);
+        max_sumexp(d.logits, d.output.n(), d.wts + 2, s);   // (the draft's probability)
+        CUDA_CHECK(cudaMemcpyAsync(h_res_ + (size_t) gi * MAX_NT * 2, d.wts, 4 * sizeof(float), cudaMemcpyDeviceToHost, s));
+        return;
     }
     const int hr = bulk ? 1 : nt;
     mhc_head(R + (size_t) (nt - hr) * hcn, d.out_norm, eps, n, d.xn, hr, s);
@@ -1227,6 +1306,16 @@ void Engine5::build_graphs() {
             CUDA_CHECK(cudaGraphInstantiate(&d.g_main[nt], graph, 0));
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
+        if (mtp_g_)   // MTP: update over the kept verification rows (1..MAX_NT), chained (1 row)
+            for (int nt = 1; nt <= MAX_NT + 1; ++nt) {
+                const bool chain = nt > MAX_NT;
+                cudaGraph_t graph;
+                CUDA_CHECK(cudaStreamBeginCapture(d.stream, cudaStreamCaptureModeThreadLocal));
+                record_main(gi, chain ? 1 : nt, chain ? 2 : 1);
+                CUDA_CHECK(cudaStreamEndCapture(d.stream, &graph));
+                CUDA_CHECK(cudaGraphInstantiate(chain ? &d.g_chain : &d.g_mtp[nt], graph, 0));
+                CUDA_CHECK(cudaGraphDestroy(graph));
+            }
         if (opt_.n_draft > 0)
             for (int keep = 1; keep < MAX_NT; ++keep) {
                 cudaGraph_t graph;
@@ -1251,15 +1340,16 @@ void Engine5::embed(const int * tokens, int nt, int chunk) {
     }
 }
 
-void Engine5::run(int nt) {
+void Engine5::run(int nt, int kind) {
     const bool bulk = nt > MAX_NT;
     if (!graphs_ready_ && !debug_) {
         build_graphs();
     }
     ++fwd_counter_;
-    if (!(bulk && opt_.stream_experts && nt >= stream_min_)) {
+    if (!(bulk && opt_.stream_experts && nt >= stream_min_) && !(kind == 1 && mtp_shift_ && !mtp_full_)) {   // (MTP prompt rows: no FFN)
         std::vector<int> slots;
-        for (int i = 0; i < cfg_.n_layer; ++i) if (is_moe(i)) slots.push_back(i);
+        if (kind) slots.push_back(cfg_.n_layer);
+        else for (int i = 0; i < cfg_.n_layer; ++i) if (is_moe(i)) slots.push_back(i);
         cpu_->expect(fwd_counter_, slots, bulk);
     }
     if (bulk) {
@@ -1267,7 +1357,7 @@ void Engine5::run(int nt) {
         std::vector<std::string> err(devs_.size());
         for (int gi = 0; gi < (int) devs_.size(); ++gi)
             th.emplace_back([&, gi] {
-                try { CUDA_CHECK(cudaSetDevice(devs_[gi]->id)); record_main(gi, nt); }
+                try { CUDA_CHECK(cudaSetDevice(devs_[gi]->id)); record_main(gi, nt, kind); }
                 catch (const std::exception & ex) { err[gi] = ex.what(); }
             });
         for (auto & t : th) t.join();
@@ -1276,8 +1366,8 @@ void Engine5::run(int nt) {
         for (int gi = 0; gi < (int) devs_.size(); ++gi) {
             auto & dp = devs_[gi];
             CUDA_CHECK(cudaSetDevice(dp->id));
-            if (debug_) { record_main(gi, nt); continue; }
-            CUDA_CHECK(cudaGraphLaunch(dp->g_main[nt], dp->stream));
+            if (debug_ || (kind == 1 && mtp_shift_)) { record_main(gi, nt, kind); continue; }   // (short prefill tail: no graph)
+            CUDA_CHECK(cudaGraphLaunch(kind == 2 ? dp->g_chain : kind == 1 ? dp->g_mtp[nt] : dp->g_main[nt], dp->stream));
         }
     }
     auto t_wait = std::chrono::steady_clock::now();
@@ -1359,6 +1449,7 @@ size_t Engine5::snap_floats(int gi) const {
     size_t n = 0;
     for (auto & L : devs_[gi]->layers)
         n += L.mla ? 8 * GIDX_DIM : (size_t) (c.conv - 1) * 3 * L.nh * 128 + (size_t) L.nh * 128 * 128;
+    if (devs_[gi]->mprev) n += c.n_embd;
     return n;
 }
 
@@ -1380,6 +1471,7 @@ void Engine5::snap_copy(Snap & sn, bool to_host) {
                 cp(L.state, (size_t) L.nh * 128 * 128);
             }
         }
+        if (d.mprev) cp(d.mprev, c.n_embd);
     }
     for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->stream)); }
 }
@@ -1481,6 +1573,8 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
         snap_at.erase(std::unique(snap_at.begin(), snap_at.end()), snap_at.end());
     }
     GenStats st;
+    const int K = std::min(opt_.n_draft, MAX_NT - 1);
+    const bool use_mtp = mtp_g_ && K > 0 && spec_req;   // (the MTP block's cache follows the prompt chunk by chunk)
     auto tp = clk::now();
     int next = -1;
     size_t si = 0;
@@ -1491,12 +1585,13 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
         const int L = (seg + nch - 1) / nch;
         int lens[8], nk = 0, tot = 0;   // up to mc_max_ of the stretch's chunks in one layer-by-layer pass
         while (nk < mc_max_ && tot < seg) { lens[nk] = std::min(L, seg - tot); tot += lens[nk++]; }
-        bool multi = nk > 1;
+        bool multi = nk > 1 && opt_.stream_experts;
         for (int i = 0; i < nk && multi; ++i) multi = lens[i] >= stream_min_ && lens[i] > MAX_NT;
         if (!multi) { nk = 1; tot = lens[0]; }
         const int end = c0 + tot, len = lens[nk - 1];
         next = multi ? forward_multi(&prompt[c0], lens, nk, c0) : forward(&prompt[c0], len, c0)[len - 1];
         if (sampling) next = sample_row(len <= MAX_NT ? len - 1 : 0, sp);
+        if (use_mtp) mtp_prefill(nk);
         if (si < snap_at.size() && snap_at[si] == end) take_snapshot(end);
         if (prefill_cb_) prefill_cb_(end, P, s);
         c0 = end;
@@ -1525,8 +1620,65 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
         snap_mark = p / 1024;
         take_snapshot(p);
     };
-    const int K = std::min(opt_.n_draft, MAX_NT - 1);
-    if (K <= 0 || !spec_req) {
+    if (use_mtp) {
+        // MTP drafts: the first from the MTP block over (token at p, main hidden of p - 1), the rest chained on its own
+        // output; a draft is kept iff the token sampled (or argmax) at its row equals it: exact. A verification row costs
+        // 0.6-0.75 of a step here (its CPU-held experts are mostly not the other rows'), so drafts stop once the MTP block's
+        // probability of the drafted run drops below mtp_pmin_; with 0 the count follows the recent acceptance
+        // (kc = floor(avg accepted + 1.5) in [1, K]; HYPER5_FIXED_DRAFT: always K)
+        static const bool fixed_k = getenv("HYPER5_FIXED_DRAFT") != nullptr;
+        const double pmin = mtp_pmin_;
+        int kc = K;
+        double avg_acc = K;
+        std::vector<int> drafts(K), in(K + 1), mt(K + 1);
+        auto extend = [&](int pos) {   // drafts[0] just made (token at pos + 1): the chained ones, the count to verify
+            double pc = mtp_p_;
+            if (pc < pmin) return 0;
+            int k = 1;
+            for (; k < kc; ++k) {
+                drafts[k] = mtp_chain(drafts[k - 1], pos + k);
+                pc *= mtp_p_;
+                if (pc < pmin) break;
+            }
+            return k;
+        };
+        int cur = next;   // token at position p, not yet in the main model
+        auto ta = clk::now();
+        drafts[0] = mtp_chain(cur, p, true);
+        int nd = extend(p);
+        st.t_mtp += since(ta);
+        while (!stop && p + K + 1 < opt_.max_pos) {
+            in[0] = cur;
+            for (int j = 0; j < nd; ++j) in[j + 1] = drafts[j];
+            ta = clk::now();
+            std::vector<int> a = forward(in.data(), nd + 1, p);
+            st.t_main += since(ta);
+            st.steps++;
+            st.drafted += nd;
+            int m = 0;
+            if (sampling) { while (m < nd && (a[m] = sample_row(m, sp)) == drafts[m]) ++m; if (m == nd) a[nd] = sample_row(nd, sp); }
+            else while (m < nd && a[m] == drafts[m]) ++m;
+            st.accepted += m;
+            if (emit(cur)) for (int j = 0; j < m; ++j) if (!emit(drafts[j])) break;
+            if (stop) { state_ok = false; break; }   // (the state holds rows past the end of the output)
+            if (m < nd) { ta = clk::now(); restore(m + 1); st.t_restore += since(ta); }
+            cur = a[m];
+            for (int i = 0; i < m; ++i) mt[i] = drafts[i];
+            mt[m] = cur;
+            if (!fixed_k && pmin <= 0) {
+                avg_acc = 0.9 * avg_acc + 0.1 * m;
+                kc = std::max(1, std::min(K, (int) (avg_acc + 1.5)));
+            }
+            p += m + 1;
+            if (p + K + 1 < opt_.max_pos) {   // (rows p - m .. p: the kept rows' tokens after them, positions + 1)
+                ta = clk::now();
+                drafts[0] = mtp_update(mt.data(), m + 1, p - m);
+                nd = extend(p);
+                st.t_mtp += since(ta);
+            }
+            gen_snapshot();
+        }
+    } else if (K <= 0 || !spec_req) {
         while (emit(next) && p + 1 < opt_.max_pos) {
             next = forward(&next, 1, p++)[0];
             if (sampling) next = sample_row(0, sp);
@@ -1566,6 +1718,7 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
             std::vector<int> a = forward(in.data(), nd + 1, p);
             st.t_main += since(ta);
             st.steps++;
+            st.drafted += nd;
             int m = 0;
             if (sampling) { while (m < nd && (a[m] = sample_row(m, sp)) == in[1 + m]) ++m; if (m == nd) a[nd] = sample_row(nd, sp); }
             else while (m < nd && a[m] == in[1 + m]) ++m;
@@ -1593,7 +1746,7 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
 }
 
 void Engine5::save_expert_stats(const std::string & path) {
-    const int nl = cfg_.n_layer, w = 1024;
+    const int nl = nl_tot(), w = 1024;
     std::vector<std::vector<uint64_t>> tot(nl, std::vector<uint64_t>(w, 0));
     for (int l = 0; l < nl; ++l)
         for (int e = 0; e < w; ++e) {
@@ -1651,6 +1804,57 @@ int Engine5::forward_multi(const int * tokens, const int * lens, int nck, int po
         if (v > best) { best = v; bi = idx; }
     }
     return bi;
+}
+
+// ---------------- MTP (NextN) block: row at position q = (token q, main hidden of q - 1), predicts token q + 1 ----------------
+int Engine5::mtp_result() {
+    float best = -INFINITY; int bi = -1;
+    for (size_t g = 0; g < devs_.size(); ++g) {
+        const float v = h_res_[(g * MAX_NT) * 2];
+        const int idx = ((const int *) h_res_)[(g * MAX_NT) * 2 + 1];
+        if (v > best) { best = v; bi = idx; }
+    }
+    double z = 0;   // softmax normalizer relative to the best logit: [2] = slice max, [3] = sum exp(x - slice max)
+    for (size_t g = 0; g < devs_.size(); ++g) z += h_res_[(g * MAX_NT) * 2 + 3] * std::exp((double) h_res_[(g * MAX_NT) * 2 + 2] - best);
+    mtp_p_ = z > 0 ? 1.0 / z : 0.0;
+    return bi;
+}
+
+// tokens[r] at pos + r with the main hidden row r of the last verification (which started at pos - 1): the kept rows
+int Engine5::mtp_update(const int * tokens, int nt, int pos) {
+    if (nt < 1 || nt > MAX_NT || pos + nt > opt_.max_pos) throw std::runtime_error("mtp_update: bad rows");
+    embed(tokens, nt);
+    h_pos_[0] = pos;
+    h_pos_[8] = pos + nt - 1;
+    run(nt, 1);
+    return mtp_result();
+}
+
+// token at pos with the MTP block's own last output (from_prev: with the main model's hidden of pos - 1)
+int Engine5::mtp_chain(int token, int pos, bool from_prev) {
+    if (pos >= opt_.max_pos) throw std::runtime_error("mtp_chain: position exceeds max_pos");
+    if (from_prev)
+        for (auto & dp : devs_) {
+            CUDA_CHECK(cudaSetDevice(dp->id));
+            CUDA_CHECK(cudaMemcpyAsync(dp->mchain, dp->mprev, cfg_.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, dp->stream));
+        }
+    embed(&token, 1);
+    h_pos_[0] = pos;
+    run(1, 2);
+    return mtp_result();
+}
+
+// the MTP block over the chunks of the last prompt forward (its embeddings and positions are still in place; row r takes
+// the main hidden of row r - 1, row 0 the previous chunk's last): the block's cache for the prompt, mprev = the last hidden
+void Engine5::mtp_prefill(int nck) {
+    const int nt0 = nck > 1 ? mc_nt_[0] : last_nt_;
+    if (h_pos_[0] == 0) memset(h_embd_, 0, cfg_.n_embd * sizeof(float));   // (position 0: no token embedding either, as ik)
+    if (mtp_full_ && ehost_[cfg_.n_layer].stream_dirty) rebuild_stream(cfg_.n_layer);   // (the test path streams its experts)
+    mtp_shift_ = true;
+    mc_n_ = nck;
+    try { run(nt0, 1); } catch (...) { mtp_shift_ = false; mc_n_ = 1; throw; }
+    mtp_shift_ = false;
+    mc_n_ = 1;
 }
 
 int Engine5::prefill(const int * tokens, int n, int pos) {

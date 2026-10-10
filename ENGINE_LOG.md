@@ -242,3 +242,45 @@ různých expertů), GPU MoE kernely s loady předem, fúze mHC mix + pre, MLA n
 dvakrát `#pragma unroll`, který změnil kontrakci FMA (vráceno).
 
 Nástroje: `cpumoebench`, `iq3bench`, `mlabench`, `topkbench`, `f32bench`.
+
+## 2026-10-10 – GLM: MTP (NextN) hlava
+
+NextN blok `blk.45` je jen v původních Unsloth GGUF (5 shardů; `to_mainline.py` ho vynechal), data jsou bajtově
+stejná → `--mtp <shard 1>` / `HYPER4_MTP` otevře původní soubor a vezme z něj jen blk.45 (vrstva s indexem n_layer
+ve stejných polích: MLA + MoE bez mHC, experti Q3_K/Q4_K → nová dekvantizace Q3_K na GPU, bit po bitu = ggml).
+
+Sémantika podle ik_llama (`build_glm5next_mtp` + `common/speculative.cpp`): řádek MTP na pozici q = (token q,
+skrytý stav hlavního modelu na q−1 = vstup LM hlavy, tj. output_norm průměru 4 mHC proudů); token na pozici 0
+vynulovaný; x = eh_proj([enorm(emb) | hnorm(h)]), pre-norm MLA s indexerem, MoE + sdílený expert, shared_head_norm →
+LM hlava; řetězené drafty berou vlastní výstup po shared_head_norm.
+
+| 16k kontext, greedy, 300 tokenů | t/s | vs obyčejné | ověřený krok |
+|---|---|---|---|
+| obyčejné dekódování | 30,3–31,2 | | 32–33 ms |
+| 1 draft | 33,3–35,5 | +10–14 % | 52 ms (1,6×) |
+| 2 drafty / 3 drafty (pevně) | 32,4 / 31,7 | +2 / +4 % | 74 / 93 ms (2,35× / 2,9×) |
+| **do 3 draftů, dokud p(MTP) běhu ≥ 0,85** | **34,7–36,4** | **+11–17 %** | 61 ms, 1,37 draftu/krok, 96 % přijato |
+
+Ověřovací řádek stojí 0,6–0,75 kroku: po sobě jdoucí tokeny skoro nesdílejí experty na CPU, takže každý další řádek
+čte z RAM nové experty (proto ik_llama s MTP na GLM zpomalil). Vyplatí se jen drafty s velkou šancí → pravděpodobnost
+draftu z MTP (max + součet exp po GPU, `max_sumexp`) a řetěz končí, když součin klesne pod 0,85 (`HYPER5_MTP_PMIN`).
+
+Reálný provoz – replay 20 požadavků Codexu (`tools/replay.py`, 300 tokenů, server s `--mtp --draft 3`):
+
+| | dekódování | prefill | experti na GPU / vrstvu |
+|---|---|---|---|
+| bez MTP, greedy | 25,8 t/s | 752 t/s | 31/32/31 |
+| MTP, greedy | **28,3 t/s (+9,9 %)** | 733 t/s (−2,6 %) | 29/31/29 |
+| bez MTP, teplota 1 | 24,4 t/s | 760 t/s | |
+| MTP, teplota 1 | **27,1 t/s (+11,4 %)**, 92 % draftů přijato | 735 t/s (−3,2 %) | |
+
+Prefill ztrácí kvůli VRAM (váhy bloku, latentní cache MTP přes celý kontext, snapshoty KDA pro rollback).
+MTP vrstva v prefillu i u ponechaných ověřovacích řádků jen **zapisuje do své cache** (latenty, klíče indexeru závisí
+jen na vstupu bloku): bez attention, MoE a hlavy → prefill MTP téměř zdarma (dřív −4,3 %), MTP za krok 4,9 → 3,6 ms.
+Celou vrstvou jde jen poslední řádek (ten, co dává draft). Drafty jsou s tím stejné (`HYPER5_MTP_FULL` = stará cesta,
+A/B s `HYPER5_ADAPT=0`: shodné počty draftů i hash výstupu).
+
+Výstup: s pevným rozmístěním (`HYPER5_ADAPT=0`) je spekulativní greedy výstup **token po tokenu shodný** s obyčejným
+(300/300, stejný hash pro všechny politiky draftů); hlavní cesta beze změny (CHECK4 KL 0,027086, PPL 7,6363).
+Nástroje: `mtpgen` s `HYPER5_SWEEP=k:pmin,...` (víc politik v jednom procesu), `deqtest` s Q3_K.
+

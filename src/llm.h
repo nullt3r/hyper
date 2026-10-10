@@ -14,7 +14,7 @@ struct SamplingParams {
 };
 
 struct GenStats {
-    int tokens = 0, steps = 0, accepted = 0;
+    int tokens = 0, steps = 0, accepted = 0, drafted = 0;
     double seconds = 0;
     double t_main = 0, t_mtp = 0, t_restore = 0;   // wall time per phase
     double t_prefill = 0;

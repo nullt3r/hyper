@@ -23,8 +23,8 @@ struct Engine5Options {
     int max_pos = 8192;
     float gpu_expert_frac = 1.0f;
     float vram_reserve_gib = 0.8f;
-    std::string mtp_path;           // (no NextN head in the GLM files yet)
-    int n_draft = 3;                // prompt-lookup (n-gram) speculation: drafted tokens per step (0: off)
+    std::string mtp_path;           // GGUF with the NextN (MTP) block blk.<n_layer> (the original split files): MTP drafts
+    int n_draft = 3;                // drafted tokens per step: MTP (with mtp_path), else prompt lookup (0: off)
     bool stream_experts = true;
     int cpu_threads = 30;
     bool prompt_cache = false;
@@ -50,8 +50,10 @@ public:
     void set_prefill_progress(std::function<void(int, int, int)> fn) override { prefill_cb_ = std::move(fn); }
     int max_pos() const override { return opt_.max_pos; }
     int n_draft() const override { return std::min(opt_.n_draft, MAX_NT - 1); }
-    bool has_mtp() const override { return false; }
+    bool has_mtp() const override { return mtp_g_ != nullptr; }
     void save_expert_stats(const std::string & path);
+    // MTP drafts per step (<= MAX_NT - 1; the engine was built with drafts) and the run-probability floor (tests)
+    void set_draft(int k, double pmin) { opt_.n_draft = std::max(1, k); mtp_pmin_ = pmin; }
     void reset_cache() override { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); park_.clear(snap_pool_); }
 
 private:
@@ -63,12 +65,20 @@ private:
     void upload_stage(Device & d, int il, int sb);
     void rebuild_stream(int il);
     void rebalance(int max_swaps);
-    void record_main(int gi, int nt);
+    // kind 0: main model; 1: MTP block over the main model's hidden rows (decode: rows 0..nt-1 of the last verification;
+    // mtp_shift_: prefill chunks, row r takes the hidden of row r - 1); 2: MTP block chained on its own last output
+    void record_main(int gi, int nt, int kind = 0);
     void record_restore(int gi, int keep);
     void restore(int keep);   // keep the first `keep` rows of the last verification
     void build_graphs();
     void embed(const int * tokens, int nt, int chunk = 0);
-    void run(int nt);
+    void run(int nt, int kind = 0);
+    int mtp_result();
+    int mtp_update(const int * tokens, int nt, int pos);   // kind 1 (decode): draft after the last row
+    int mtp_chain(int token, int pos, bool from_prev = false);   // kind 2 (from_prev: on the main hidden before pos)
+    void mtp_prefill(int nck);   // kind 1 shifted over the chunks of the last bulk forward (embeddings / positions kept)
+    int nl_tot() const { return cfg_.n_layer + (mtp_g_ ? 1 : 0); }   // layers incl. the MTP block (index n_layer)
+    const GGUF & src(int il) const { return il >= cfg_.n_layer ? *mtp_g_ : *gguf_; }
     void * host_huge_alloc(size_t bytes);
     int sample_row(int t, const SamplingParams & sp);
     struct Snap { int pos; std::vector<float *> h; };
@@ -88,7 +98,13 @@ private:
     std::vector<std::pair<void *, size_t>> host_bufs_;
 
     Engine5Options opt_;
-    std::unique_ptr<GGUF> gguf_;
+    std::unique_ptr<GGUF> gguf_, mtp_g_;
+    bool mtp_shift_ = false;
+    double mtp_p_ = 1.0;   // the MTP block's softmax probability of its last draft
+    // drafts while their run's MTP probability stays >= this (HYPER5_MTP_PMIN; 0: the acceptance-driven count). 0.85 measured
+    // best: at 16k +16 % (vs +10 % one fixed draft, +0.5 % three), Codex replay +10 % greedy / +11 % at temperature 1
+    double mtp_pmin_ = 0.85;
+    bool mtp_full_ = false;   // HYPER5_MTP_FULL (test): prompt / kept rows through the whole MTP block, not just into its cache
     Glm5Config cfg_;
     std::vector<std::unique_ptr<Device>> devs_;
     std::unique_ptr<CpuMoe> cpu_;

@@ -346,9 +346,9 @@ GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::strin
             r.id.c_str(), 1e3 * o.t_prompt, n_new, 1e3 * o.t_prompt / std::max(1, n_new), n_new / std::max(1e-9, o.t_prompt), o.reused);
     fprintf(stderr, "[%s]        eval time = %10.2f ms / %6d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
             r.id.c_str(), 1e3 * o.t_gen, o.n_gen, 1e3 * o.t_gen / std::max(1, o.n_gen), o.n_gen / std::max(1e-9, o.t_gen));
-    fprintf(stderr, "[%s]       total time = %10.2f ms / %6d tokens, finish: %s, draft acceptance %.2f / %d per step\n",
+    fprintf(stderr, "[%s]       total time = %10.2f ms / %6d tokens, finish: %s, draft acceptance %.2f / %d per step (%.2f drafted)\n",
             r.id.c_str(), 1e3 * secs(t0, t2), n_new + o.n_gen, o.finish.c_str(), o.steps ? (double) o.accepted / o.steps : 0.0,
-            c.eng->n_draft());
+            c.eng->n_draft(), o.steps ? (double) st.drafted / o.steps : 0.0);
     if (on_text) fprintf(stderr, "[%s]  stream parse+send: %.0f ms on the stream thread (%ld snapshots of %d tokens)\n", r.id.c_str(),
                          streamer.busy_ms, streamer.n_parsed, o.n_gen);
     {
@@ -558,7 +558,7 @@ int main(int argc, char ** argv) {
     int port = 8080, ctx = 262144, draft = 3, snaps = 48, cpu_threads = 30;
     float gpu_frac = 1.0f;
     std::string stats_path;   // qwen4exp: routing statistics, read at start and updated after every request
-    std::string mtp_path;     // qwen4exp: separate NextN (MTP) GGUF for speculative decoding
+    std::string mtp_path;     // qwen4exp: separate NextN (MTP) GGUF; glm5-next: a GGUF with blk.<n_layer> (the original split files)
     std::string template_file;   // chat template (jinja) instead of the GGUF's
     bool ctx_given = false;
     SamplingParams defaults;   // Qwen's recommendation for thinking mode
@@ -628,7 +628,8 @@ int main(int argc, char ** argv) {
         o5.cpu_threads = cpu_threads;
         o5.prompt_cache = true;
         o5.max_snapshots = snaps;
-        o5.n_draft = draft;   // prompt-lookup speculation
+        o5.n_draft = draft;   // MTP drafts with --mtp, else prompt-lookup speculation
+        o5.mtp_path = mtp_path;
         auto e5 = std::make_unique<Engine5>(path, o5);
         if (!stats_path.empty()) {
             Engine5 * pe = e5.get();

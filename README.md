@@ -17,7 +17,7 @@ three GPUs assumed, sm_86 only.
 |---|---|---|---|
 | Qwen3.8-27B | `qwen35` | Unsloth UD-Q8_K_XL | dense, Gated DeltaNet + gated attention, built-in MTP head |
 | Qwen3.8-Flash-Next | `qwen4exp` | Unsloth UD-Q4_K_XL (4 shards) | MoE, hyper-connections, QSA sparse attention, PLE; optional separate NextN (MTP) GGUF |
-| GLM-5.3-Flash | `glm5-next` | Unsloth UD-IQ4_XS, mainline tensor layout | MoE (288 experts), mHC residual streams, KDA linear attention, nope-MLA with a k-pool DSA indexer |
+| GLM-5.3-Flash | `glm5-next` | Unsloth UD-IQ4_XS, mainline tensor layout | MoE (288 experts), mHC residual streams, KDA linear attention, nope-MLA with a k-pool DSA indexer; optional NextN (MTP) block read from the original Unsloth split GGUF |
 
 The engine is picked from the GGUF architecture.
 
@@ -32,7 +32,7 @@ All numbers: this machine, October 2026, greedy decoding, the same GGUF files fo
 | Qwen3.8-27B (UD-Q8_K_XL) | **59.6 t/s** at 11k context | **130 t/s** (built-in MTP, 2 drafts) | **1771 t/s** (11k-token prompt) |
 | Qwen3.8-Flash-Next (UD-Q4_K_XL) | **97.5 t/s** at 11k context | **~140 t/s** (NextN MTP, 3 drafts) | **1774 t/s** (11k-token prompt) |
 | Qwen3.8-Flash-Next Uncensored (Q4_K_M) | **93 t/s** at 11k context | – | **1806 t/s** (11k-token prompt) |
-| GLM-5.3-Flash (UD-IQ4_XS) | **30.7 t/s** at 16k context | – (prompt lookup is off by default) | **998 t/s** (16k-token prompt) |
+| GLM-5.3-Flash (UD-IQ4_XS) | **30.7 t/s** at 16k context | **~35 t/s** at 16k (NextN MTP, up to 3 drafts) | **998 t/s** (16k-token prompt) |
 
 - Decode: `hyper4 tfbench` / `hyper gen` – a prefilled prompt of real text (source code and notes), then the reference
   tokens fed one per step, so the expert routing is that of real text.
@@ -40,6 +40,10 @@ All numbers: this machine, October 2026, greedy decoding, the same GGUF files fo
   the output is token-for-token the plain output.
 - GLM decode depends on the content: about a third of its experts fit in VRAM, the rest are computed by the CPU at
   the speed of system RAM.
+- GLM MTP: every verified row costs 0.6–0.75 of a plain step (consecutive tokens rarely share CPU-held experts), so
+  drafts are made only while the MTP block's own probability of the drafted run stays ≥ 0.85. Replay of 20 real Codex
+  requests: decode +10 % greedy (28.3 vs 25.8 t/s), +11 % at temperature 1 (27.1 vs 24.4 t/s); prefill −3 % (the MTP
+  block's weights and latent cache take VRAM from experts).
 
 ### Compared with llama.cpp
 
@@ -99,7 +103,11 @@ speculative output hash before and after; kernel rewrites are compared bit for b
 
   A follow-up request in an agent loop therefore only recomputes the part after the last snapshot.
 - **Speculative decoding with exact sampling.**
-  - Draft sources: MTP heads (27B built-in, Flash-Next from a separate NextN GGUF) or prompt-lookup n-grams (GLM).
+  - Draft sources: MTP heads (27B built-in, Flash-Next from a separate NextN GGUF, GLM from the original split GGUF)
+    or prompt-lookup n-grams (GLM without MTP).
+  - GLM's NextN block is one MLA + MoE layer. Prompt rows and kept verification rows only enter its cache (latents,
+    indexer keys), so a prompt costs it a few small projections per token; only the row that drafts runs the whole
+    block. Drafts stop once the block's probability of the drafted run drops below 0.85.
   - A draft is accepted only when it equals the token sampled at its row, so the output distribution is exactly
     plain sampling. With greedy decoding the output is token-for-token identical to non-speculative generation.
   - Rejected rows are rolled back from per-row state snapshots.
@@ -140,6 +148,10 @@ make -j build/hyper-server build/hyper4 build/hyper build/ref
 ./build/hyper-server GLM-5.3-Flash-UD-IQ4_XS.gguf --ctx 262144 --cpu-threads 30 \
     --expert-stats glm_stats.bin --alias glm-5.3-flash --temp 1.0 --top-p 0.95
 
+# the same with its NextN (MTP) block from the original split GGUF (blk.45): up to 3 drafts per step
+./build/hyper-server GLM-5.3-Flash-UD-IQ4_XS.gguf --ctx 262144 --cpu-threads 30 --expert-stats glm_stats.bin \
+    --mtp GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf --draft 3 --alias glm-5.3-flash --temp 1.0 --top-p 0.95
+
 # Qwen3.8-Flash-Next with a NextN (MTP) head, 3 drafted tokens per step
 ./build/hyper-server Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --ctx 262144 \
     --mtp Qwen3.8-Flash-Next-MTP-Q4_K_M.gguf --draft 3 --expert-stats fn_stats.bin
@@ -167,7 +179,7 @@ Options:
 | `--alias` | file name | model name reported by the API |
 | `--temp`, `--top-p`, `--top-k`, `--min-p` | 0.6, 0.95, 20, 0 | sampling defaults (request fields override them) |
 | `--draft` | 3 | speculative tokens per step (MTP or n-gram); `0` disables |
-| `--mtp file` | — | Flash-Next: separate NextN GGUF |
+| `--mtp file` | — | Flash-Next: separate NextN GGUF; GLM: a GGUF with the NextN block `blk.<n_layer>` (the original split files) |
 | `--cpu-threads` | 30 | CPU expert threads (MoE models) |
 | `--gpu-frac` | 1.0 | cap on the fraction of each layer's experts placed on the GPUs |
 | `--expert-stats file` | — | routing statistics: read at start for placement, updated after every request |
@@ -179,6 +191,7 @@ Selected environment variables:
 | Variable | Effect |
 |---|---|
 | `HYPER5_ADAPT=0` | GLM: disable adaptive expert placement (fully deterministic placement) |
+| `HYPER5_MTP_PMIN` | GLM MTP: draft while the drafted run's MTP probability is at least this (default 0.85; 0: count from recent acceptance) |
 | `HYPER4_STREAM_MIN`, `HYPER5_STREAM_MIN` | shortest prefill chunk that streams CPU experts to the GPUs (default 256 / 280) |
 | `HYPER_DUMP_REQUEST=dir` | save every request body to `dir` (for replay benchmarks) |
 | `HYPER_CPUPROF=1` | CPU expert timing and bandwidth in the log |
@@ -189,7 +202,7 @@ Selected environment variables:
 | Tool | Purpose |
 |---|---|
 | `ref` | runs mainline llama.cpp on a prompt and dumps the token ids and full logits (the reference). Supports experts on the CPU (`REF_CPU_MOE=1`) and only the last N rows (`REF_LAST=N`) |
-| `hyper4` | MoE engines (Flash-Next, GLM): `check` / `checkpf` (KL vs the reference), `bench`, `tfbench` (fixed-content decode), `pfbench` (prefill), `ntbench`, `calib` (routing statistics), `mtpgen` (plain vs speculative, must match), `cachetest` |
+| `hyper4` | MoE engines (Flash-Next, GLM): `check` / `checkpf` (KL vs the reference), `bench`, `tfbench` (fixed-content decode), `pfbench` (prefill), `ntbench`, `calib` (routing statistics), `mtpgen` (plain vs speculative, must match; GLM with `HYPER5_ADAPT=0`, `HYPER5_SWEEP=k:pmin,...` compares draft policies in one run), `cachetest` |
 | `hyper` | 27B engine: `check`, `checkn`, `gen`, `pfbench`, `cachetest`, `samptest` |
 | `gemvbench`, `arbench`, `arbulk`, `iqkbench`, `bwtest`, `zctest` | microbenchmarks: Q8 GEMV per shape, allreduce, CPU expert dot products (mainline vs ik_llama), PCIe and zero-copy bandwidth |
 | `cpumoebench`, `iq3bench` | the CPU expert decode job on real expert weights (time per job, bandwidth, output bit hash); IQ3_S / IQ4_XS kernels vs ggml, bit for bit |

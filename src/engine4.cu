@@ -1813,6 +1813,7 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
             std::vector<int> a = forward(in.data(), K + 1, p);
             st.t_main += since(ta);
             st.steps++;
+            st.drafted += K;
             // a draft is kept iff the token sampled (or argmax) at its row equals it: exact plain sampling
             int m = 0;
             if (sampling) { while (m < K && (a[m] = sample_row(m, sp)) == drafts[m]) ++m; if (m == K) a[K] = sample_row(K, sp); }

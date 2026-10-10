@@ -17,6 +17,7 @@
 #include <map>
 #include <string>
 #include <algorithm>
+#include <type_traits>
 #include <vector>
 
 using namespace hyper;
@@ -218,11 +219,37 @@ static int run_cmd(int argc, char ** argv) {
             std::vector<int> prompt(toks.begin(), toks.begin() + std::min<size_t>(toks.size(), np));
             GenStats a, b;
             const std::vector<int> plain = eng.generate(prompt, n_gen, false, &a);
+            if constexpr (std::is_same_v<Engine, Engine5>) {
+                if (const char * sw = getenv("HYPER5_SWEEP")) {   // "k:pmin,k:pmin,...": MTP policies after one plain run
+                    printf("MTPSWEEP plain %.2f t/s\n", a.tokens / a.seconds);
+                    for (const char * q = sw; *q;) {
+                        const int k = atoi(q);
+                        while (*q && *q != ':') ++q;
+                        const double pm = *q ? atof(++q) : 0.0;
+                        while (*q && *q != ',') ++q;
+                        if (*q) ++q;
+                        eng.set_draft(k, pm);
+                        GenStats c;
+                        const std::vector<int> o = eng.generate(prompt, n_gen, true, &c);
+                        int same = 0;
+                        while (same < n_gen && plain[same] == o[same]) ++same;
+                        uint64_t hs = 1469598103934665603ull;
+                        for (int t : o) hs = (hs ^ (uint32_t) t) * 1099511628211ull;
+                        printf("MTPSWEEP K=%d pmin %.2f: %.2f t/s (%+.1f %%)  drafted/step %.2f  accepted/step %.2f  tokens/step %.2f  main %.2f ms  "
+                               "mtp %.2f ms  identical %d  hash %016llx\n", k, pm, c.tokens / c.seconds,
+                               100.0 * (c.tokens / c.seconds) / (a.tokens / a.seconds) - 100.0, (double) c.drafted / std::max(1, c.steps),
+                               (double) c.accepted / std::max(1, c.steps), (double) c.tokens / std::max(1, c.steps), 1e3 * c.t_main / std::max(1, c.steps),
+                               1e3 * c.t_mtp / std::max(1, c.steps), same, (unsigned long long) hs);
+                        fflush(stdout);
+                    }
+                    return 0;
+                }
+            }
             const std::vector<int> spec = eng.generate(prompt, n_gen, true, &b);
             int same = 0;
             while (same < n_gen && plain[same] == spec[same]) ++same;
-            printf("MTPGEN plain %.2f t/s | spec %.2f t/s  steps %d  accepted/step %.2f  tokens/step %.2f  main %.2f ms  mtp %.2f ms  restore %.2f ms\n",
-                   a.tokens / a.seconds, b.tokens / b.seconds, b.steps, (double) b.accepted / std::max(1, b.steps),
+            printf("MTPGEN plain %.2f t/s | spec %.2f t/s  steps %d  drafted/step %.2f  accepted/step %.2f  tokens/step %.2f  main %.2f ms  mtp %.2f ms  restore %.2f ms\n",
+                   a.tokens / a.seconds, b.tokens / b.seconds, b.steps, (double) b.drafted / std::max(1, b.steps), (double) b.accepted / std::max(1, b.steps),
                    (double) b.tokens / std::max(1, b.steps), 1e3 * b.t_main / std::max(1, b.steps), 1e3 * b.t_mtp / std::max(1, b.steps),
                    1e3 * b.t_restore / std::max(1, b.steps));
             printf("MTPGEN identical prefix %d / %d%s\n", same, n_gen, same == n_gen ? " (sequences match)" : "");

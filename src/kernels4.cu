@@ -564,6 +564,18 @@ template <> __device__ __forceinline__ void deq8<GType::IQ3_S>(const uint8_t * _
         v[4 + j] = db * (float) ((g2 >> (8 * j)) & 0xff) * ((sg >> (4 + j)) & 1 ? -1.0f : 1.0f);
     }
 }
+// Q3_K (110 B: hmask[32] | qs[64] | scales[12] | d): element e = 128 hf + 32 j + l (l < 32) has its 2 low bits at qs[32 hf + l]
+// >> 2 j, its high bit (set: +0, clear: -4) at hmask[l] bit 4 hf + j, and the 6-bit scale e / 16 (ggml's dequantize_row_q3_K)
+template <> __device__ __forceinline__ void deq8<GType::Q3_K>(const uint8_t * __restrict__ row, int c, float * v) {
+    const uint8_t * b = row + (size_t) (c >> 5) * 110;
+    const int o = (c & 31) * 8, hf = o >> 7, j = (o >> 5) & 3, l = o & 31, is = o >> 4, k = is & 3, grp = is >> 2;
+    const int sc = (((b[96 + (grp & 1) * 4 + k] >> (4 * (grp >> 1))) & 0xF) | (((b[104 + k] >> (2 * grp)) & 3) << 4)) - 32;
+    const float dl = h2f(b + 108) * sc;
+    const uint8_t * q = b + 32 + hf * 32 + l, * hm = b + l;
+    const int sh = 2 * j, mb = 1 << (4 * hf + j);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = dl * (float) (((q[i] >> sh) & 3) - ((hm[i] & mb) ? 0 : 4));
+}
 template <> __device__ __forceinline__ void deq8<GType::Q8_0>(const uint8_t * __restrict__ row, int c, float * v) {
     const uint8_t * b = row + (size_t) (c >> 2) * 34;
     const float d = h2f(b);
@@ -1309,6 +1321,7 @@ bool moe_route_publish(const float * logits, int ls, int n_expert, int k, int * 
 
 #define MOE_TYPE_SWITCH(T, CALL)                                                  \
     switch (T) {                                                                  \
+        case GType::Q3_K: { constexpr GType TT = GType::Q3_K; CALL; } break;       \
         case GType::Q4_K: { constexpr GType TT = GType::Q4_K; CALL; } break;       \
         case GType::Q5_K: { constexpr GType TT = GType::Q5_K; CALL; } break;       \
         case GType::Q5_1: { constexpr GType TT = GType::Q5_1; CALL; } break;       \
