@@ -71,12 +71,19 @@ required to leave the output unchanged: the same KL / PPL on the reference text,
 same speculative output hash before and after; kernel rewrites are compared bit for bit in microbenchmarks.
 [ENGINE_LOG.md](ENGINE_LOG.md) (Czech) has the step-by-step log with every measurement.
 
-| Model | KL hyper vs llama.cpp | KL llama.cpp vs itself (other batch size / CPU experts) |
-|---|---|---|
-| GLM-5.3-Flash (512 tokens) | 0.038–0.040 | 0.043 |
-| Qwen3.8-Flash-Next (256 tokens) | 0.046–0.062 | 0.029–0.038 |
-| Flash-Next Uncensored (256 tokens) | 0.104–0.111 | 0.069 |
-| Qwen3.8-27B (64 / 700 tokens) | 0.00022 / 0.00065 | – |
+Decode on reference text, the same GGUF files on both sides (this measures the implementation, not the quantization):
+
+| Model | Tokens | KL hyper vs llama.cpp | KL llama.cpp vs itself¹ | Top-1 agreement | Perplexity hyper / llama.cpp |
+|---|---|---|---|---|---|
+| Qwen3.8-27B | 64 / 700 | 0.00022 / 0.00065 | – | 100 % / 98.4 % | – |
+| GLM-5.3-Flash | 512 / 2048 | 0.038–0.040 / 0.027 | 0.043 | 90–92 % / 92.8 % | 11.19 / 10.90–11.05; 7.64 / 7.69 |
+| Qwen3.8-Flash-Next | 256 / 2048 | 0.046–0.062 / 0.049 | 0.029–0.038 | 89–91 % / 90.2 % | 11.18 / 11.00–11.47; 6.502 / 6.504 |
+| Flash-Next Uncensored | 256 | 0.104–0.111 | 0.069 | 86–88 % | 14.71 / 14.37–14.56 |
+
+¹ llama.cpp against its own reference with another batch size (GLM, Flash-Next) or with the experts on the CPU
+instead of the GPU (Uncensored). For MoE models a KL of 0.03–0.1 is the usual effect of rounding changing which experts
+a token routes to. KL against the original unquantized models has not been measured (it would be dominated by the
+GGUF quantization, which hyper does not change).
 
 Flash-Next sits above llama.cpp's own spread, and a layer-by-layer trace (`hyper4 trace`, `ref` with `REF_DUMPLAST`)
 shows where: the first hyper-connection mixer, from identical inputs. Computed exactly (double precision, the file's
