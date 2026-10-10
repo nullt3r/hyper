@@ -1472,9 +1472,25 @@ std::vector<int> Engine4::forward(const int * tokens, int nt, int pos) {
     if (nt < 1 || nt > R4) throw std::runtime_error("forward: bad token count");
     if (pos + nt > opt_.max_pos) throw std::runtime_error("forward: position exceeds max_pos");
     const bool bulk = nt > MAX_NT;
+    static const bool hprof = getenv("HYPER4_HOSTPROF") != nullptr;   // host time per decode forward (GPUs idle meanwhile)
+    static double h_embed = 0, h_run = 0, h_gap = 0; static long h_n = 0;
+    static auto h_last = std::chrono::steady_clock::now();
+    const auto th0 = std::chrono::steady_clock::now();
     embed(tokens, nt, pos);
     h_pos_[0] = pos;
+    const auto th1 = std::chrono::steady_clock::now();
     run(0, nt);
+    if (hprof && !bulk) {
+        const auto th2 = std::chrono::steady_clock::now();
+        h_gap += std::chrono::duration<double>(th0 - h_last).count();
+        h_embed += std::chrono::duration<double>(th1 - th0).count();
+        h_run += std::chrono::duration<double>(th2 - th1).count();
+        h_last = th2;
+        if (++h_n % 200 == 0) {
+            fprintf(stderr, "hyper4: per decode forward: embed %.1f us, run %.1f us, caller between forwards %.1f us\n",
+                    h_embed / h_n * 1e6, h_run / h_n * 1e6, h_gap / h_n * 1e6);
+        }
+    }
     last_nt_ = nt;
     std::vector<int> out(nt, -1);
     for (int t = bulk ? nt - 1 : 0; t < nt; ++t) {

@@ -775,7 +775,7 @@ __global__ void __launch_bounds__(256) k_qidx_score(const float * __restrict__ q
     const int tl = blockIdx.y, t = t_off + tl;
     const int p = *pos_p + t, np = (p + 1) / 4;
     if (np <= top) return;
-    const int b0 = blockIdx.x * 256;
+    const int b0 = blockIdx.x * blockDim.x;
     if (b0 >= np) return;
     __shared__ float qs[4 * 128];
     for (int i = threadIdx.x; i < n_head * 128; i += blockDim.x) qs[i] = qn[(size_t) t * n_head * 128 + i];
@@ -825,10 +825,15 @@ __global__ void __launch_bounds__(1024) k_gidx_select_h(const float * __restrict
     for (int i = tid; i < nw; i += blockDim.x) { sel[i] = 0; bnd[i] = 0; }
     // 1. bin B: thread i owns bins [65536 - 64 (i+1), 65536 - 64 i) (thread 0 the highest); block scan of the thread sums
     unsigned own = 0;
+    unsigned hb[64];   // this thread's bins, kept for the crossing walk below (it read them one by one from memory)
     {
         const uint4 * hv = (const uint4 *) (hg + GHIST - 64 * (tid + 1));
 #pragma unroll
-        for (int j = 0; j < 16; ++j) { const uint4 v = hv[j]; own += v.x + v.y + v.z + v.w; }
+        for (int j = 0; j < 16; ++j) {
+            const uint4 v = hv[j];
+            hb[4 * j] = v.x; hb[4 * j + 1] = v.y; hb[4 * j + 2] = v.z; hb[4 * j + 3] = v.w;
+            own += v.x + v.y + v.z + v.w;
+        }
     }
     part[tid] = own;
     __syncthreads();
@@ -842,9 +847,15 @@ __global__ void __launch_bounds__(1024) k_gidx_select_h(const float * __restrict
         const unsigned before = part[tid] - own;
         if (before < (unsigned) top && part[tid] >= (unsigned) top) {   // the crossing is in this thread's bins (exactly one thread)
             unsigned acc = before;
-            int bin = GHIST - 64 * tid - 1;
-            for (; bin > GHIST - 64 * (tid + 1); --bin) { const unsigned h = hg[bin]; if (acc + h >= (unsigned) top) break; acc += h; }
-            sB = (unsigned) bin;
+            int i = 63;   // bin GHIST - 64 (tid + 1) + i, from the highest down (the lowest is taken without its test)
+#pragma unroll
+            for (int q = 63; q > 0; --q) {
+                if (i != q) continue;
+                if (acc + hb[q] >= (unsigned) top) break;
+                acc += hb[q];
+                i = q - 1;
+            }
+            sB = (unsigned) (GHIST - 64 * (tid + 1) + i);
             sNeed = (unsigned) top - acc;
         }
     }
@@ -1204,7 +1215,9 @@ void idx_select_hist(const float * qn, const half * pool, const int * pos, int n
     for (int t0 = 0; t0 < nt; t0 += score_rows) {
         const int r = std::min(score_rows, nt - t0);
         cudaMemsetAsync(hist, 0, (size_t) r * GHIST * sizeof(unsigned), s);
-        k_qidx_score<<<dim3((score_stride + 255) / 256, r), 256, 0, s>>>(qn, pool, pos, t0, n_head, top, scores, score_stride, hist);
+        static const int qb = getenv("HYPER_QIDX_BLOCK") ? atoi(getenv("HYPER_QIDX_BLOCK")) : 128;   // (thread per pool: small blocks
+        // spread the few hundred to few thousand pools over more SMs)
+        k_qidx_score<<<dim3((score_stride + qb - 1) / qb, r), qb, 0, s>>>(qn, pool, pos, t0, n_head, top, scores, score_stride, hist);
         k_gidx_select_h<<<r, 1024, 0, s>>>(scores, score_stride, hist, pos, t0, top, list, list_stride, list_n);
     }
 }
