@@ -97,11 +97,12 @@ private:
     void embed_tok(const int * tokens, int nt, float * dst);
     void run(int kind, int nt);   // 0 main, 1 MTP, 2 MTP chain, 3 restore (nt = rows kept)
     int mtp_result();
+    void draft_at(int64_t pos) { mtp_pos_ = pos; }   // the next MTP pass drafts the token at pos
     // need_draft false: the rows only enter the MTP block's cache (its K / V and indexer keys depend on its input alone)
     int mtp_draft(const int * tokens, int nt, int pos, bool need_draft = true);
     int mtp_chain(int token, int pos);
     void * host_huge_alloc(size_t bytes);   // anonymous, transparent huge pages; freed with the engine
-    int sample_row(int t, const SamplingParams & sp);
+    int sample_row(int t, const SamplingParams & sp, int64_t pos);   // pos: the sampled token's position
     struct Snap { int pos; std::vector<float *> h; };
     size_t snap_floats(int gi) const;
     void snap_copy(Snap & sn, bool to_host);
@@ -114,7 +115,11 @@ private:
     int snap_token_ = -1;
     std::function<void(int, int, int)> prefill_cb_;
     float * h_topk_ = nullptr;      // pinned [ndev][MAX_NT][TOPK][2]
-    std::mt19937_64 rng_;
+    uint64_t samp_seed_ = 0;   // this request's sampling noise (sampling.h gumbel_noise)
+    float samp_invT_ = 0.0f;   // MTP drafts: 1 / temperature when sampling (coupled to the noise), 0: greedy drafts
+    SamplingParams samp_;      // this request's sampling (the drafts' truncation)
+    int64_t mtp_pos_ = 0;      // the position of the token the next MTP pass drafts
+    float * h_mtopk_ = nullptr;   // pinned [ndev][TOPK][2]: the MTP head's candidates per vocab slice (coupled drafts)
     std::vector<std::pair<void *, size_t>> host_bufs_;
 
     Engine4Options opt_;

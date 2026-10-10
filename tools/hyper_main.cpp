@@ -81,6 +81,18 @@ static int cmd_check(const char * model, const char * ref_path, int nt) {
     return 0;
 }
 
+// sampling for the generation tests: HYPER_TEMP (0: greedy), HYPER_TOPP, HYPER_TOPK, HYPER_MINP, HYPER_SEED (default 42: a plain
+// and a speculative run share the sampling noise, so their texts must match)
+static hyper::SamplingParams test_sampling() {
+    hyper::SamplingParams sp;
+    if (getenv("HYPER_TEMP")) sp.temp = (float) atof(getenv("HYPER_TEMP"));
+    if (getenv("HYPER_TOPP")) sp.top_p = (float) atof(getenv("HYPER_TOPP"));
+    if (getenv("HYPER_TOPK")) sp.top_k = atoi(getenv("HYPER_TOPK"));
+    if (getenv("HYPER_MINP")) sp.min_p = (float) atof(getenv("HYPER_MINP"));
+    sp.seed = getenv("HYPER_SEED") ? strtoull(getenv("HYPER_SEED"), nullptr, 10) : 42;
+    return sp;
+}
+
 static int cmd_gen(const char * model, const char * ref_path, int n_prompt, int n_gen) {
     std::vector<int> toks; std::vector<float> ref; int nv = 0;
     if (!read_ref(ref_path, toks, ref, nv)) return 1;
@@ -90,7 +102,8 @@ static int cmd_gen(const char * model, const char * ref_path, int n_prompt, int 
     if (getenv("HYPER_DRAFT")) opt.n_draft = atoi(getenv("HYPER_DRAFT"));
     Engine eng(model, opt);
     GenStats a, b;
-    const std::vector<int> plain = eng.generate(toks, n_gen, false, &a);
+    const hyper::SamplingParams gsp = test_sampling();
+    const std::vector<int> plain = eng.generate(toks, n_gen, false, &a, {}, gsp);
     if (const char * sw = getenv("HYPER_SWEEP")) {   // "k:pmin,k:pmin,...": draft policies after one plain run
         printf("GENSWEEP plain %.2f t/s\n", a.tokens / a.seconds);
         for (const char * q = sw; *q;) {
@@ -101,7 +114,7 @@ static int cmd_gen(const char * model, const char * ref_path, int n_prompt, int 
             if (*q) ++q;
             eng.set_draft(k, pm);
             GenStats c;
-            const std::vector<int> o = eng.generate(toks, n_gen, true, &c);
+            const std::vector<int> o = eng.generate(toks, n_gen, true, &c, {}, gsp);
             int same = 0;
             while (same < n_gen && plain[same] == o[same]) ++same;
             printf("GENSWEEP K=%d pmin %.2f: %.2f t/s (%+.1f %%)  drafted/step %.2f  accepted/step %.2f  tokens/step %.2f  main %.2f ms  "
@@ -112,7 +125,7 @@ static int cmd_gen(const char * model, const char * ref_path, int n_prompt, int 
         }
         return 0;
     }
-    const std::vector<int> spec = eng.generate(toks, n_gen, true, &b);
+    const std::vector<int> spec = eng.generate(toks, n_gen, true, &b, {}, gsp);
     int same = 0;
     while (same < n_gen && plain[same] == spec[same]) ++same;
     printf("GEN plain: %d tokens %.2f t/s\n", a.tokens, a.tokens / a.seconds);

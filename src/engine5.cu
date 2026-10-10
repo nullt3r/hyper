@@ -325,6 +325,7 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
     memset((void *) cpu_bulk_out_, 0, sizeof(CpuMoeBulkOut));
     barrier_ = std::make_unique<Barrier4>(nd);
     CUDA_CHECK(cudaHostAlloc(&h_pos_, 16 * sizeof(int), cudaHostAllocPortable));   // ([8]: the MTP update's last row)
+    CUDA_CHECK(cudaHostAlloc(&h_mtopk_, (size_t) nd * TOPK * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_res_, (size_t) nd * MAX_NT * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_topk_, (size_t) nd * MAX_NT * TOPK * 2 * sizeof(float), cudaHostAllocPortable));
     if (const char * zs = getenv("HYPER5_ZC")) {
@@ -391,6 +392,7 @@ Engine5::~Engine5() {
     cpu_.reset();
     for (auto & [p, sz] : host_bufs_) munmap(p, sz);
     devs_.clear();
+    if (h_mtopk_) cudaFreeHost(h_mtopk_);
     for (void * p : {(void *) h_embd_, (void *) h_pos_, (void *) h_res_, (void *) ar_ll_, (void *) cpu_rec_, (void *) cpu_out_,
                      (void *) h_stage_, (void *) cpu_bulk_, (void *) cpu_bulk_out_})
         if (p) cudaFreeHost(p);
@@ -1242,7 +1244,9 @@ void Engine5::record_main(int gi, int nt, int kind) {
         rmsnorm(R + (size_t) (nt - 1) * n, n, d.m_shnorm, d.mchain, n, n, 1, eps, s);
         mm(d.output, d.mchain, n, d.logits, d.output.n(), 1);
         argmax_pairs(d.logits, d.output.n(), d.output.n(), d.vocab_off, d.wts, 1, s);
-        max_sumexp(d.logits, d.output.n(), d.wts + 2, s);   // (the draft's probability)
+        max_sumexp(d.logits, d.output.n(), d.wts + 2, s);   // (the best token's probability: the drafts' gate)
+        topk_pairs(d.logits, d.output.n(), d.output.n(), d.vocab_off, d.topk, TOPK, 1, s);   // (sampled drafts' candidates)
+        CUDA_CHECK(cudaMemcpyAsync(h_mtopk_ + (size_t) gi * TOPK * 2, d.topk, (size_t) TOPK * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
         CUDA_CHECK(cudaMemcpyAsync(h_res_ + (size_t) gi * MAX_NT * 2, d.wts, 4 * sizeof(float), cudaMemcpyDeviceToHost, s));
         return;
     }
@@ -1521,7 +1525,7 @@ void Engine5::take_snapshot(int pos) {
     snaps_.push_back(sn);
 }
 
-int Engine5::sample_row(int t, const SamplingParams & sp) {
+int Engine5::sample_row(int t, const SamplingParams & sp, int64_t pos) {
     std::vector<std::pair<float, int>> cand;
     for (size_t g = 0; g < devs_.size(); ++g) {
         const float * p = h_topk_ + ((size_t) g * MAX_NT + t) * TOPK * 2;
@@ -1545,7 +1549,7 @@ int Engine5::sample_row(int t, const SamplingParams & sp) {
         Z = 0;
         for (size_t g = 0; g < devs_.size(); ++g) Z += ms[2 * g + 1] * std::exp(((double) ms[2 * g] - M) * invT);
     };
-    return sample_candidates(cand, TOPK, sp, rng_, stats, [&](std::vector<float> & lg) { get_logits(t, lg); });
+    return sample_candidates(cand, TOPK, sp, samp_seed_, pos, stats, [&](std::vector<float> & lg) { get_logits(t, lg); });
 }
 
 std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, bool spec_req, GenStats * stats,
@@ -1554,7 +1558,12 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
     if ((int) prompt.size() + 8 > opt_.max_pos) throw std::runtime_error("generate: prompt longer than the context");
     using clk = std::chrono::steady_clock;
     const bool sampling = sp.temp > 0.0f;
-    rng_.seed(sp.seed ? sp.seed : std::random_device{}());
+    samp_seed_ = sp.seed ? sp.seed : random_seed64();
+    // sampled drafts coupled to the sampling noise (HYPER_GUMBEL_DRAFT=0/1; default: GLM, fixed-placement A/B at T 1: acceptance
+    // never lower, one ungated draft 0.79 -> 0.88 accepted)
+    static const bool gumbel_draft = getenv("HYPER_GUMBEL_DRAFT") ? atoi(getenv("HYPER_GUMBEL_DRAFT")) != 0 : true;
+    samp_invT_ = sampling && gumbel_draft ? 1.0f / sp.temp : 0.0f;   // (MTP drafts coupled to the sampling noise)
+    samp_ = sp;
     const int P = (int) prompt.size();
     int s = 0;
     if (opt_.prompt_cache) {
@@ -1598,7 +1607,7 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
         if (!multi) { nk = 1; tot = lens[0]; }
         const int end = c0 + tot, len = lens[nk - 1];
         next = multi ? forward_multi(&prompt[c0], lens, nk, c0) : forward(&prompt[c0], len, c0)[len - 1];
-        if (sampling) next = sample_row(len <= MAX_NT ? len - 1 : 0, sp);
+        if (sampling) next = sample_row(len <= MAX_NT ? len - 1 : 0, sp, end);
         if (use_mtp) mtp_prefill(nk);
         if (si < snap_at.size() && snap_at[si] == end) take_snapshot(end);
         if (prefill_cb_) prefill_cb_(end, P, s);
@@ -1664,7 +1673,7 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
             st.steps++;
             st.drafted += nd;
             int m = 0;
-            if (sampling) { while (m < nd && (a[m] = sample_row(m, sp)) == drafts[m]) ++m; if (m == nd) a[nd] = sample_row(nd, sp); }
+            if (sampling) { while (m < nd && (a[m] = sample_row(m, sp, p + m + 1)) == drafts[m]) ++m; if (m == nd) a[nd] = sample_row(nd, sp, p + nd + 1); }
             else while (m < nd && a[m] == drafts[m]) ++m;
             st.accepted += m;
             if (emit(cur)) for (int j = 0; j < m; ++j) if (!emit(drafts[j])) break;
@@ -1689,7 +1698,7 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
     } else if (K <= 0 || !spec_req) {
         while (emit(next) && p + 1 < opt_.max_pos) {
             next = forward(&next, 1, p++)[0];
-            if (sampling) next = sample_row(0, sp);
+            if (sampling) next = sample_row(0, sp, p);
             st.steps++;
             gen_snapshot();
         }
@@ -1728,7 +1737,7 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
             st.steps++;
             st.drafted += nd;
             int m = 0;
-            if (sampling) { while (m < nd && (a[m] = sample_row(m, sp)) == in[1 + m]) ++m; if (m == nd) a[nd] = sample_row(nd, sp); }
+            if (sampling) { while (m < nd && (a[m] = sample_row(m, sp, p + m + 1)) == in[1 + m]) ++m; if (m == nd) a[nd] = sample_row(nd, sp, p + nd + 1); }
             else while (m < nd && a[m] == in[1 + m]) ++m;
             st.accepted += m;
             if (nd > 0) acc_rate_ = 0.9 * acc_rate_ + 0.1 * ((double) m / nd);
@@ -1822,9 +1831,21 @@ int Engine5::mtp_result() {
         const int idx = ((const int *) h_res_)[(g * MAX_NT) * 2 + 1];
         if (v > best) { best = v; bi = idx; }
     }
-    double z = 0;   // softmax normalizer relative to the best logit: [2] = slice max, [3] = sum exp(x - slice max)
-    for (size_t g = 0; g < devs_.size(); ++g) z += h_res_[(g * MAX_NT) * 2 + 3] * std::exp((double) h_res_[(g * MAX_NT) * 2 + 2] - best);
+    float M = -INFINITY;   // softmax normalizer relative to the best logit: [2] = slice max, [3] = sum exp(x - slice max)
+    for (size_t g = 0; g < devs_.size(); ++g) M = std::max(M, h_res_[(g * MAX_NT) * 2 + 2]);
+    double z = 0;
+    for (size_t g = 0; g < devs_.size(); ++g) z += h_res_[(g * MAX_NT) * 2 + 3] * std::exp((double) h_res_[(g * MAX_NT) * 2 + 2] - M);
     mtp_p_ = z > 0 ? 1.0 / z : 0.0;
+    if (samp_invT_ > 0) {   // sampling: a draft drawn like the main model's sample (truncation, noise) from the head's candidates
+        std::vector<std::pair<float, int>> cand;
+        for (size_t g = 0; g < devs_.size(); ++g)
+            for (int i = 0; i < TOPK; ++i) {
+                const float * q = h_mtopk_ + ((size_t) g * TOPK + i) * 2;
+                const int idx = ((const int *) q)[1];
+                if (idx >= 0) cand.push_back({q[0], idx});
+            }
+        if (!cand.empty()) return draft_pick(cand, samp_, samp_seed_, mtp_pos_);
+    }
     return bi;
 }
 
@@ -1834,6 +1855,7 @@ int Engine5::mtp_update(const int * tokens, int nt, int pos) {
     embed(tokens, nt);
     h_pos_[0] = pos;
     h_pos_[8] = pos + nt - 1;
+    draft_at(pos + nt);   // (the last row drafts the token after it)
     run(nt, 1);
     return mtp_result();
 }
@@ -1848,6 +1870,7 @@ int Engine5::mtp_chain(int token, int pos, bool from_prev) {
         }
     embed(&token, 1);
     h_pos_[0] = pos;
+    draft_at(pos + 1);
     run(1, 2);
     return mtp_result();
 }

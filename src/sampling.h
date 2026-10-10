@@ -118,7 +118,32 @@ inline KeptSet sampling_set(std::vector<std::pair<float, int>> & cand, int ntop,
     return pick(pr, (int) kept.size(), [&](int i) { return kept[i]; });
 }
 
-inline int sample_candidates(std::vector<std::pair<float, int>> & cand, int ntop, const SamplingParams & sp, std::mt19937_64 & rng,
+// Gumbel noise fixed per (seed, position, token): a draw is argmax_i (log p_i + G_i), exact sampling from p for every
+// position, and an MTP drafter drawing with the same noise (draft_pick) proposes the main model's sample whenever its
+// distribution is close. Positions are those of the sampled token, so a plain and a speculative run with one seed produce
+// the same text.
+inline uint64_t gmix64(uint64_t x) {
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; x ^= x >> 33;
+    return x;
+}
+inline double gumbel_noise(uint64_t seed, int64_t pos, int tok) {
+    const uint64_t k = gmix64(seed ^ gmix64(((uint64_t) (uint32_t) pos << 32) | (uint32_t) tok));
+    const double u = ((double) (k >> 11) + 0.5) * (1.0 / 9007199254740992.0);   // (0, 1), 53 bits
+    return -std::log(-std::log(u));
+}
+
+// the draw from a kept set: argmax_i (log p_i + G(seed, pos, token_i))
+inline int gumbel_pick(const KeptSet & ks, uint64_t seed, int64_t pos) {
+    int best = 0;
+    double bv = -INFINITY;
+    for (size_t i = 0; i < ks.tok.size(); ++i) {
+        const double v = std::log(ks.pr[i]) + gumbel_noise(seed, pos, ks.tok[i]);
+        if (v > bv || (v == bv && ks.tok[i] < ks.tok[best])) { bv = v; best = (int) i; }
+    }
+    return ks.tok[best];
+}
+
+inline int sample_candidates(std::vector<std::pair<float, int>> & cand, int ntop, const SamplingParams & sp, uint64_t seed, int64_t pos,
                              const std::function<void(double, float &, double &)> & stats,
                              const std::function<void(std::vector<float> &)> & full) {
     if (sp.temp <= 0.0f || cand.size() == 1) {
@@ -127,12 +152,37 @@ inline int sample_candidates(std::vector<std::pair<float, int>> & cand, int ntop
             if (cand[i].first > cand[best].first || (cand[i].first == cand[best].first && cand[i].second < cand[best].second)) best = i;
         return cand[best].second;
     }
-    const KeptSet ks = sampling_set(cand, ntop, sp, stats, full);
-    double tot = 0;
-    for (double p : ks.pr) tot += p;
-    double u = std::uniform_real_distribution<double>(0.0, tot)(rng);
-    for (size_t i = 0; i < ks.pr.size(); ++i) { u -= ks.pr[i]; if (u <= 0) return ks.tok[i]; }
-    return ks.tok.back();
+    return gumbel_pick(sampling_set(cand, ntop, sp, stats, full), seed, pos);
+}
+
+// an MTP draft coupled to the main model's sampling: the same truncation (top_k, min_p, top_p) over the MTP head's top
+// candidates (the rest of its distribution is not read -- an approximation; drafts are verified) and the same noise, so
+// the draft is the main model's sample whenever the two distributions are close
+inline int draft_pick(std::vector<std::pair<float, int>> & cand, const SamplingParams & sp, uint64_t seed, int64_t pos) {
+    std::sort(cand.begin(), cand.end(), [](const std::pair<float, int> & a, const std::pair<float, int> & b) {
+        return a.first > b.first || (a.first == b.first && a.second < b.second);
+    });
+    const int n = (int) cand.size();
+    int k = sp.top_k > 0 ? std::min(sp.top_k, n) : n;
+    std::vector<double> pr(k);
+    double z = 0;
+    for (int i = 0; i < k; ++i) { pr[i] = std::exp((cand[i].first - cand[0].first) / sp.temp); z += pr[i]; }
+    for (auto & v : pr) v /= z;
+    if (sp.min_p > 0) { int kk = 1; while (kk < k && pr[kk] >= sp.min_p * pr[0]) ++kk; k = kk; }
+    if (sp.top_p < 1.0f) { double cum = 0; int kk = 0; while (kk < k) { cum += pr[kk++]; if (cum >= sp.top_p) break; } k = kk; }
+    int best = 0;
+    double bv = -INFINITY;
+    for (int i = 0; i < k; ++i) {
+        const double v = std::log(pr[i]) + gumbel_noise(seed, pos, cand[i].second);
+        if (v > bv) { bv = v; best = i; }
+    }
+    return cand[best].second;
+}
+
+// a fresh per-request seed (SamplingParams::seed 0)
+inline uint64_t random_seed64() {
+    std::random_device rd;
+    return ((uint64_t) rd() << 32) ^ rd();
 }
 
 } // namespace hyper

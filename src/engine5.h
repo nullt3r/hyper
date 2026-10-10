@@ -74,13 +74,14 @@ private:
     void embed(const int * tokens, int nt, int chunk = 0);
     void run(int nt, int kind = 0);
     int mtp_result();
+    void draft_at(int64_t pos) { mtp_pos_ = pos; }   // the next MTP pass drafts the token at pos
     int mtp_update(const int * tokens, int nt, int pos);   // kind 1 (decode): draft after the last row
     int mtp_chain(int token, int pos, bool from_prev = false);   // kind 2 (from_prev: on the main hidden before pos)
     void mtp_prefill(int nck);   // kind 1 shifted over the chunks of the last bulk forward (embeddings / positions kept)
     int nl_tot() const { return cfg_.n_layer + (mtp_g_ ? 1 : 0); }   // layers incl. the MTP block (index n_layer)
     const GGUF & src(int il) const { return il >= cfg_.n_layer ? *mtp_g_ : *gguf_; }
     void * host_huge_alloc(size_t bytes);
-    int sample_row(int t, const SamplingParams & sp);
+    int sample_row(int t, const SamplingParams & sp, int64_t pos);   // pos: the sampled token's position
     struct Snap { int pos; std::vector<float *> h; };
     size_t snap_floats(int gi) const;
     void snap_copy(Snap & sn, bool to_host);
@@ -94,7 +95,11 @@ private:
     std::vector<int> snap_tokens_;
     std::function<void(int, int, int)> prefill_cb_;
     float * h_topk_ = nullptr;
-    std::mt19937_64 rng_;
+    uint64_t samp_seed_ = 0;   // this request's sampling noise (sampling.h gumbel_noise)
+    float samp_invT_ = 0.0f;   // MTP drafts: 1 / temperature when sampling (coupled to the noise), 0: greedy drafts
+    SamplingParams samp_;      // this request's sampling (the drafts' truncation)
+    int64_t mtp_pos_ = 0;      // the position of the token the next MTP pass drafts
+    float * h_mtopk_ = nullptr;   // pinned [ndev][TOPK][2]: the MTP head's candidates per vocab slice (coupled drafts)
     std::vector<std::pair<void *, size_t>> host_bufs_;
 
     Engine5Options opt_;

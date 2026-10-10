@@ -142,7 +142,12 @@ which is why they agree with each other. Other checks:
     row that drafts runs the whole block.
   - Drafts stop once the MTP head's probability of the drafted run drops below a floor.
   - A draft is accepted only when it equals the token sampled at its row, so the output distribution is exactly
-    plain sampling. With greedy decoding the output is token-for-token identical to non-speculative generation.
+    plain sampling. Sampling draws argmax(log p + G) with Gumbel noise G fixed per (seed, position, token), so a
+    speculative run produces the same text as a plain one, greedy or sampled (same seed).
+  - Sampled drafts can use the same noise and truncation (top_k / top_p / min_p over the MTP head's candidates):
+    the draft is then the main model's sample whenever the two distributions agree (idea from
+    [Strata](https://github.com/Niko1221/Strata)). Flash-Next at temperature 0.6: 128 → 132 t/s; off for the 27B,
+    whose greedy drafts are accepted more often (`HYPER_GUMBEL_DRAFT=0/1`).
   - Rejected rows are rolled back from per-row state snapshots.
 - **GLM-5.3 specifics.**
   - mHC: 4 residual streams mixed by per-token Sinkhorn-normalized matrices, fused with the Q8_0 mixing projection.
@@ -228,6 +233,7 @@ Selected environment variables:
 | Variable | Effect |
 |---|---|
 | `HYPER5_ADAPT=0` | GLM: disable adaptive expert placement (fully deterministic placement) |
+| `HYPER_GUMBEL_DRAFT=0/1` | sampled MTP drafts coupled to the sampling noise (default on for Flash-Next and GLM, off for the 27B) |
 | `HYPER5_MTP_PMIN`, `HYPER4_MTP_PMIN`, `HYPER_MTP_PMIN` | MTP drafts while the drafted run's MTP probability is at least this: GLM (default 0.85), Flash-Next (0.5), 27B; 0: count from recent acceptance (Flash-Next, GLM) or always `--draft` (27B) |
 | `HYPER4_STREAM_MIN`, `HYPER5_STREAM_MIN` | shortest prefill chunk that streams CPU experts to the GPUs (default 256 / 280) |
 | `HYPER_DUMP_REQUEST=dir` | save every request body to `dir` (for replay benchmarks) |

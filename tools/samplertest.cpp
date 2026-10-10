@@ -7,7 +7,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <numeric>
+#include <random>
+#include <tuple>
 #include <vector>
 
 using namespace hyper;
@@ -95,6 +98,37 @@ int main(int argc, char ** argv) {
         printf("T %.1f top_k %4d top_p %.2f min_p %.2f: %d rows, %d set mismatches, whole row read %5.1f %%, max rel. prob. diff %.2e\n",
                c.T, c.k, c.p, c.mp, c.n, c.bad, 100.0 * c.fb / c.n, c.maxd);
         bad += c.bad;
+    }
+    // the Gumbel draw: N draws at distinct positions (independent noise) against the kept set's probabilities, next to
+    // N draws of a plain multinomial sampler (std::mt19937_64): both total-variation distances are sampling noise
+    {
+        const int N = 200000;
+        std::mt19937_64 rng(7);
+        for (int r : {rows / 3, (2 * rows) / 3}) {
+            const float * lg = &L[(size_t) r * nv];
+            for (auto [T, k, p] : {std::tuple<float, int, float>{1.0f, 0, 0.95f}, {0.6f, 20, 0.95f}, {1.0f, 40, 1.0f}}) {
+                SamplingParams sp; sp.temp = T; sp.top_k = k; sp.top_p = p;
+                std::vector<std::pair<float, int>> cand;
+                for (int i = 0; i < nv; ++i) cand.push_back({lg[i], i});
+                auto stats = [&](double invT, float & M, double & Z) {
+                    M = *std::max_element(lg, lg + nv); Z = 0;
+                    for (int i = 0; i < nv; ++i) Z += std::exp((lg[i] - M) * invT);
+                };
+                const KeptSet ks = sampling_set(cand, nv, sp, stats, [&](std::vector<float> & o) { o.assign(lg, lg + nv); });
+                double tot = 0;
+                for (double v : ks.pr) tot += v;
+                std::map<int, int> idx;
+                for (size_t i = 0; i < ks.tok.size(); ++i) idx[ks.tok[i]] = (int) i;
+                std::vector<double> cg(ks.tok.size(), 0), cm(ks.tok.size(), 0);
+                std::discrete_distribution<int> dd(ks.pr.begin(), ks.pr.end());
+                for (int i = 0; i < N; ++i) { cg[idx[gumbel_pick(ks, 12345, i)]] += 1; cm[dd(rng)] += 1; }
+                double tvg = 0, tvm = 0;
+                for (size_t i = 0; i < ks.tok.size(); ++i) { tvg += std::fabs(cg[i] / N - ks.pr[i] / tot); tvm += std::fabs(cm[i] / N - ks.pr[i] / tot); }
+                printf("GUMBEL row %d T %.1f top_k %d top_p %.2f: %zu tokens kept, TV(gumbel) %.4f  TV(multinomial) %.4f\n", r, T, k, p,
+                       ks.tok.size(), tvg / 2, tvm / 2);
+                if (tvg / 2 > 2.0 * tvm / 2 + 0.01) ++bad;
+            }
+        }
     }
     printf("SAMPLERTEST %s: %d mismatches\n", bad ? "FAILED" : "OK", bad);
     return bad != 0;

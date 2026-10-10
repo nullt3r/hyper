@@ -110,11 +110,12 @@ private:
     void take_snapshot(int pos);
     std::vector<ConvPark<Snap>::Dev> park_devs() const;
     ConvPark<Snap> park_;
-    int sample_row(int t, const SamplingParams & sp);   // kind: 0 main, 1 mtp, 2 restore
+    int sample_row(int t, const SamplingParams & sp, int64_t pos);   // pos: the sampled token's position   // kind: 0 main, 1 mtp, 2 restore
     void embed(const int * tokens, int nt, float * dst);
     int mtp_draft(const int * tokens, int nt, int pos);   // MTP over (tokens[t], main hidden row t) at pos+t; argmax of last
     int mtp_chain(int token, int pos);                   // MTP over (token, MTP's own last hidden) at pos
-    int mtp_result();                                    // the draft; mtp_p_ = its probability under the MTP head
+    int mtp_result();                                    // the draft; mtp_p_ = the MTP head's best probability
+    void draft_at(int64_t pos) { mtp_pos_ = pos; }   // the next MTP pass drafts the token at pos
     double mtp_p_ = 1.0;
     double mtp_pmin_ = 0.0;   // drafts while their run's MTP probability stays >= this (HYPER_MTP_PMIN; 0: always n_draft)
 
@@ -136,7 +137,11 @@ private:
     std::vector<std::vector<float *>> snap_pool_;
     int snap_token_ = -1;
     std::function<void(int, int, int)> prefill_cb_;
-    std::mt19937_64 rng_;
+    uint64_t samp_seed_ = 0;   // this request's sampling noise (sampling.h gumbel_noise)
+    float samp_invT_ = 0.0f;   // MTP drafts: 1 / temperature when sampling (coupled to the noise), 0: greedy drafts
+    SamplingParams samp_;      // this request's sampling (the drafts' truncation)
+    int64_t mtp_pos_ = 0;      // the position of the token the next MTP pass drafts
+    float * h_mtopk_ = nullptr;   // pinned [ndev][TOPK][2]: the MTP head's candidates per vocab slice (coupled drafts)
     bool graphs_ready_ = false;
     int last_nt_ = 0;
 };

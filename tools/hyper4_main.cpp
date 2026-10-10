@@ -95,6 +95,18 @@ static void on_crash(int sig) {
     _exit(128 + sig);
 }
 
+// sampling for the generation tests: HYPER_TEMP (0: greedy), HYPER_TOPP, HYPER_TOPK, HYPER_MINP, HYPER_SEED (default 42: a plain
+// and a speculative run share the sampling noise, so their texts must match)
+static hyper::SamplingParams test_sampling() {
+    hyper::SamplingParams sp;
+    if (getenv("HYPER_TEMP")) sp.temp = (float) atof(getenv("HYPER_TEMP"));
+    if (getenv("HYPER_TOPP")) sp.top_p = (float) atof(getenv("HYPER_TOPP"));
+    if (getenv("HYPER_TOPK")) sp.top_k = atoi(getenv("HYPER_TOPK"));
+    if (getenv("HYPER_MINP")) sp.min_p = (float) atof(getenv("HYPER_MINP"));
+    sp.seed = getenv("HYPER_SEED") ? strtoull(getenv("HYPER_SEED"), nullptr, 10) : 42;
+    return sp;
+}
+
 template <class Engine, class Options>
 static int run_cmd(int argc, char ** argv) {
     const std::string cmd = argv[1];
@@ -226,7 +238,8 @@ static int run_cmd(int argc, char ** argv) {
             const size_t np = getenv("HYPER4_GENP") ? atoi(getenv("HYPER4_GENP")) : 128;   // prompt length
             std::vector<int> prompt(toks.begin(), toks.begin() + std::min<size_t>(toks.size(), np));
             GenStats a, b;
-            const std::vector<int> plain = eng.generate(prompt, n_gen, false, &a);
+            const hyper::SamplingParams gsp = test_sampling();
+            const std::vector<int> plain = eng.generate(prompt, n_gen, false, &a, {}, gsp);
             {
                 const char * sw = getenv("HYPER_SWEEP") ? getenv("HYPER_SWEEP") : getenv("HYPER5_SWEEP");
                 if (sw) {   // "k:pmin,k:pmin,...": draft policies after one plain run
@@ -239,7 +252,7 @@ static int run_cmd(int argc, char ** argv) {
                         if (*q) ++q;
                         eng.set_draft(k, pm);
                         GenStats c;
-                        const std::vector<int> o = eng.generate(prompt, n_gen, true, &c);
+                        const std::vector<int> o = eng.generate(prompt, n_gen, true, &c, {}, gsp);
                         int same = 0;
                         while (same < n_gen && plain[same] == o[same]) ++same;
                         uint64_t hs = 1469598103934665603ull;
@@ -254,7 +267,7 @@ static int run_cmd(int argc, char ** argv) {
                     return 0;
                 }
             }
-            const std::vector<int> spec = eng.generate(prompt, n_gen, true, &b);
+            const std::vector<int> spec = eng.generate(prompt, n_gen, true, &b, {}, gsp);
             int same = 0;
             while (same < n_gen && plain[same] == spec[same]) ++same;
             printf("MTPGEN plain %.2f t/s | spec %.2f t/s  steps %d  drafted/step %.2f  accepted/step %.2f  tokens/step %.2f  main %.2f ms  mtp %.2f ms  restore %.2f ms\n",

@@ -217,6 +217,7 @@ Engine::Engine(const std::string & model_path, const EngineOptions & opt) : opt_
     CUDA_CHECK(cudaHostAlloc(&h_res_, (size_t) nd * MAX_ROWS * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_topk_, (size_t) nd * MAX_NT * TOPK * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_mres_, (size_t) nd * MAX_ROWS * 2 * sizeof(float), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_mtopk_, (size_t) nd * TOPK * 2 * sizeof(float), cudaHostAllocPortable));
     const size_t ll = ll_slots(nd, DMA_MIN, n);   // (fp32 parts: a packet per element)
     CUDA_CHECK(cudaHostAlloc(&ar_ll_, ll * sizeof(uint2), cudaHostAllocPortable | cudaHostAllocMapped));
     memset(ar_ll_, 0xff, ll * sizeof(uint2));
@@ -229,7 +230,8 @@ Engine::~Engine() {
     park_.release(snap_pool_);
     for (auto & v : snap_pool_) for (float * p : v) cudaFreeHost(p);
     devs_.clear();
-    for (void * p : {(void *) h_embd_, (void *) h_membd_, (void *) h_pos_, (void *) h_res_, (void *) h_mres_, (void *) ar_ll_, (void *) h_stage_, (void *) h_topk_})
+    for (void * p : {(void *) h_embd_, (void *) h_membd_, (void *) h_pos_, (void *) h_res_, (void *) h_mres_, (void *) ar_ll_, (void *) h_stage_, (void *) h_topk_,
+                     (void *) h_mtopk_})
         if (p) cudaFreeHost(p);
 }
 
@@ -647,7 +649,9 @@ void Engine::record_mtp(int gi, int nt, bool chain) {
     Act a1 = act(d, 0, 0, s, d.mpos, false);
     mm(a1, d.output_q8, d.x + (size_t) (nt - 1) * n, n, d.logits, d.output.n, 1, nl);
     argmax_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.mres, 1, s);
-    max_sumexp(d.logits, d.output.n, d.mres + 2, s);   // (the draft's probability)
+    max_sumexp(d.logits, d.output.n, d.mres + 2, s);   // (the best token's probability: the drafts' gate)
+    topk_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.topk, TOPK, 1, s);   // (sampled drafts' candidates)
+    CUDA_CHECK(cudaMemcpyAsync(h_mtopk_ + (size_t) gi * TOPK * 2, d.topk, (size_t) TOPK * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
     CUDA_CHECK(cudaMemcpyAsync(h_mres_ + (size_t) gi * 4, d.mres, 4 * sizeof(float), cudaMemcpyDeviceToHost, s));
 }
 
@@ -772,6 +776,7 @@ int Engine::mtp_draft(const int * tokens, int nt, int pos) {
     if (nt < 1 || nt > MAX_ROWS) throw std::runtime_error("mtp_draft: bad token count");
     embed(tokens, nt, h_membd_);
     h_pos_[1] = pos;
+    draft_at(pos + nt + 1);   // (the row at q holds token q + 1 and drafts token q + 2)
     launch(1, nt);
     return mtp_result();
 }
@@ -779,6 +784,7 @@ int Engine::mtp_draft(const int * tokens, int nt, int pos) {
 int Engine::mtp_chain(int token, int pos) {
     embed(&token, 1, h_membd_);
     h_pos_[1] = pos;
+    draft_at(pos + 2);
     launch(3, 1);
     return mtp_result();
 }
@@ -790,9 +796,21 @@ int Engine::mtp_result() {
         const int idx = ((const int *) h_mres_)[g * 4 + 1];
         if (v > best) { best = v; bi = idx; }
     }
-    double z = 0;   // softmax normalizer relative to the best logit: [2] = slice max, [3] = sum exp(x - slice max)
-    for (size_t g = 0; g < devs_.size(); ++g) z += h_mres_[g * 4 + 3] * std::exp((double) h_mres_[g * 4 + 2] - best);
+    float M = -INFINITY;   // softmax normalizer relative to the best logit: [2] = slice max, [3] = sum exp(x - slice max)
+    for (size_t g = 0; g < devs_.size(); ++g) M = std::max(M, h_mres_[g * 4 + 2]);
+    double z = 0;
+    for (size_t g = 0; g < devs_.size(); ++g) z += h_mres_[g * 4 + 3] * std::exp((double) h_mres_[g * 4 + 2] - M);
     mtp_p_ = z > 0 ? 1.0 / z : 0.0;
+    if (samp_invT_ > 0) {   // sampling: a draft drawn like the main model's sample (truncation, noise) from the head's candidates
+        std::vector<std::pair<float, int>> cand;
+        for (size_t g = 0; g < devs_.size(); ++g)
+            for (int i = 0; i < TOPK; ++i) {
+                const float * q = h_mtopk_ + ((size_t) g * TOPK + i) * 2;
+                const int idx = ((const int *) q)[1];
+                if (idx >= 0) cand.push_back({q[0], idx});
+            }
+        if (!cand.empty()) return draft_pick(cand, samp_, samp_seed_, mtp_pos_);
+    }
     return bi;
 }
 
@@ -885,7 +903,7 @@ void Engine::take_snapshot(int pos) {
 
 // ---------------- sampling ----------------
 // candidates of row t from every device's top-K, then temperature / top-k / min-p / top-p
-int Engine::sample_row(int t, const SamplingParams & sp) {
+int Engine::sample_row(int t, const SamplingParams & sp, int64_t pos) {
     std::vector<std::pair<float, int>> cand;
     cand.reserve(devs_.size() * TOPK);
     for (size_t g = 0; g < devs_.size(); ++g) {
@@ -910,7 +928,7 @@ int Engine::sample_row(int t, const SamplingParams & sp) {
         Z = 0;
         for (size_t g = 0; g < devs_.size(); ++g) Z += ms[2 * g + 1] * std::exp(((double) ms[2 * g] - M) * invT);
     };
-    return sample_candidates(cand, TOPK, sp, rng_, stats, [&](std::vector<float> & lg) { get_logits(t, lg); });
+    return sample_candidates(cand, TOPK, sp, samp_seed_, pos, stats, [&](std::vector<float> & lg) { get_logits(t, lg); });
 }
 
 std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
@@ -919,7 +937,11 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
     if (prompt.empty()) throw std::runtime_error("generate: empty prompt");
     if ((int) prompt.size() + 8 > opt_.max_pos) throw std::runtime_error("generate: prompt longer than the context");
     const bool sampling = sp.temp > 0.0f;
-    rng_.seed(sp.seed ? sp.seed : std::random_device{}());
+    samp_seed_ = sp.seed ? sp.seed : random_seed64();
+    // sampled drafts coupled to the sampling noise (HYPER_GUMBEL_DRAFT=0/1; default: the 27B head's greedy drafts are accepted more often: 142 vs 138 t/s at T 0.6)
+    static const bool gumbel_draft = getenv("HYPER_GUMBEL_DRAFT") ? atoi(getenv("HYPER_GUMBEL_DRAFT")) != 0 : false;
+    samp_invT_ = sampling && gumbel_draft ? 1.0f / sp.temp : 0.0f;   // (MTP drafts coupled to the sampling noise)
+    samp_ = sp;
     const int P = (int) prompt.size();
     // prompt cache: KV entries are valid for the common prefix with the last sequence; the recurrent state is
     // restored from the latest snapshot at s <= L - 1 (MTP entry s - 1 used token s, so token s must match too)
@@ -968,7 +990,7 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
         if (si < snap_at.size() && snap_at[si] < end) end = snap_at[si];
         const int len = end - c0;
         next = forward(&prompt[c0], len, c0)[len - 1];
-        if (sampling) next = sample_row(len <= MAX_NT ? len - 1 : 0, sp);
+        if (sampling) next = sample_row(len <= MAX_NT ? len - 1 : 0, sp, end);
         if (spec) {
             std::vector<int> mt(len);
             for (int j = 0; j < len; ++j) mt[j] = c0 + 1 + j < P ? prompt[c0 + 1 + j] : next;
@@ -1005,7 +1027,7 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
     if (!spec) {
         while (emit(next) && p + 1 < opt_.max_pos) {
             next = forward(&next, 1, p++)[0];
-            if (sampling) next = sample_row(0, sp);
+            if (sampling) next = sample_row(0, sp, p);
             st.steps++;
             gen_snapshot();
         }
@@ -1039,7 +1061,7 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
             // verification: a draft is kept iff the token sampled (or argmax) at its row equals it, which
             // reproduces plain sampling exactly; rows are sampled lazily up to the first mismatch
             int m = 0;
-            if (sampling) { while (m < nd && (a[m] = sample_row(m, sp)) == drafts[m]) ++m; if (m == nd) a[nd] = sample_row(nd, sp); }
+            if (sampling) { while (m < nd && (a[m] = sample_row(m, sp, p + m + 1)) == drafts[m]) ++m; if (m == nd) a[nd] = sample_row(nd, sp, p + nd + 1); }
             else while (m < nd && a[m] == drafts[m]) ++m;
             st.accepted += m;
             if (emit(cur)) for (int j = 0; j < m; ++j) if (!emit(drafts[j])) break;

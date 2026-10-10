@@ -325,3 +325,25 @@ Nástroje: `mtpgen` s `HYPER_SWEEP=k:pmin,...` (víc politik v jednom procesu), 
 - Rozdíly podle umístění expertů (CPU: 8bitové aktivace jako llama.cpp, GPU: fp16/fp32) zůstávají: jsou vlastní
   dělení CPU/GPU (llama.cpp GPU vs CPU experty: KL 0,069) a na kvalitu nemají vliv.
 
+## 2026-10-11 – nápady ze Strata (Niko1221/Strata: Flash-Next na jedné herní GPU, 2–3bitové kvanty, int8/4bit KV)
+
+Srovnání: Strata na 2× RTX 3090 s IQ3_S (3 bity) a int8 KV 137–145 t/s s MTP; hyper na 3× 3090 s UD-Q4_K_XL (4 bity)
+~140 t/s s MTP. Rychlost Strata jde hlavně z nižší přesnosti (kvanty, KV), to nepřebíráme.
+
+- **Sampling s Gumbelovým šumem pevným pro (seed, pozice, token):** tah = argmax(log p + G) – přesné vzorkování;
+  pozice jsou pozice vzorkovaného tokenu, takže **spekulativní běh dá stejný text jako obyčejný i při samplingu**
+  (Flash, 27B, GLM s pevným rozmístěním: 256/256 resp. 300/300). `samplertest`: TV Gumbelova tahu = TV multinomického
+  (0,0036 vs 0,0040 při 200k tazích).
+- **Drafty svázané se samplingem** (myšlenka ze Strata): MTP hlava vrací top-64 kandidátů na řez, host z nich táhne
+  draft se stejným ořezem (top_k / min_p / top_p) a stejným šumem. Šum přes celý slovník bez ořezu škodil (koncové
+  tokeny mimo nucleus: 27B −5 %, GLM přijetí 1,17 → 0,97). S ořezem při T 0,6: **Flash 128 → 132 t/s** (přijato
+  1,64 → 1,73 / krok), 27B 142 → 138 (jeho greedy drafty se trefují lépe → vypnuto), GLM T 1 s pevným rozmístěním:
+  přijetí nikdy nižší, jeden draft bez prahu 0,79 → 0,88, s prahem ±2 % (šum). `HYPER_GUMBEL_DRAFT=0/1`.
+- **Přesouvání expertů GLM bez zastavení dekódování** (odcházející expert hned na CPU, příchozí se kopíruje na pozadí):
+  **pomalejší** (29,4–29,7 vs 30,3–30,6 t/s) – během kopírování počítá CPU oba a kopie se perou o PCIe s allreduce;
+  zastavení přitom stojí jen ~0,4 % (1–7 přesunů za 1–3 ms na 16 tokenů). Vráceno.
+- **Jeden rozpočet VRAM přes všechny vrstvy místo stejného počtu na vrstvu:** podle reálných statistik routingu by
+  přidal 0,04 b. (GLM) / 0,6 b. (Flash) podílu routingu na GPU – nedělá se.
+- Adaptivní rozmístění pro Flash-Next: CPU experty stojí ~1 ms z 10,2 ms na token (HYPER4_NOCPU 109 vs 98 t/s),
+  přínos nejvýš 2–3 % – odloženo.
+
