@@ -1145,8 +1145,13 @@ void Engine4::record_main(int gi, int nt, int kind) {
                     gemv_bf16(L.idx_q, d.mixed, n, d.iq, c.idx_n_head * 128, nullptr, nt, s);
                     gemv_bf16(L.idx_k, d.mixed, n, d.ik, 128, nullptr, nt, s);
                 }
-                idx_prep(d.iq, d.ik, L.idx_qn, d.iqn, L.kraw, P, c.idx_n_head, c.n_rot, c.rope_base, eps, nt, s);
-                idx_pool(L.kraw, L.kpool, L.idx_kn, P, nt, c.n_rot, c.rope_base, eps, s);
+                static const bool sep_pool = getenv("HYPER4_SEP_POOL") != nullptr;
+                if (nt == 1 && !sep_pool)
+                    idx_prep_pool(d.iq, d.ik, L.idx_qn, d.iqn, L.kraw, L.kpool, L.idx_kn, P, c.idx_n_head, c.n_rot, c.rope_base, eps, s);
+                else {
+                    idx_prep(d.iq, d.ik, L.idx_qn, d.iqn, L.kraw, P, c.idx_n_head, c.n_rot, c.rope_base, eps, nt, s);
+                    idx_pool(L.kraw, L.kpool, L.idx_kn, P, nt, c.n_rot, c.rope_base, eps, s);
+                }
                 static const bool old_sel = getenv("HYPER4_OLDSEL") != nullptr;
                 if (d.ihist && !old_sel)
                     idx_select_hist(d.iqn, L.kpool, P, nt, c.idx_n_head, top, d.iscores, opt_.max_pos / 4 + 4, QSA_SCORE_ROWS, d.ihist,

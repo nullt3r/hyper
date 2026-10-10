@@ -1021,6 +1021,35 @@ __global__ void k_idx_prep(const float * __restrict__ qi, const float * __restri
     __syncthreads();
     qn[((size_t) t * n_head + h) * 128 + i] = rope_dim(buf, i, pos, n_rot, base);
 }
+// decode (one token): k_idx_prep, and the block that stores the raw key also pools a completed block of 4 cells exactly as
+// k_idx_pool (the three earlier cells from the cache, this one as the fp16 value it stores) -- one launch instead of two
+__global__ void k_idx_prep_pool(const float * __restrict__ qi, const float * __restrict__ kr, const float * __restrict__ qnorm,
+                                float * __restrict__ qn, half * __restrict__ kraw, half * __restrict__ pool, const float * __restrict__ knorm,
+                                const int * pos_p, int n_head, int n_rot, float base, float eps) {
+    const int h = blockIdx.y, i = threadIdx.x;
+    const int pos = *pos_p;
+    __shared__ float buf[128];
+    if (h == n_head) {
+        const half kh = __float2half(kr[i]);
+        kraw[(size_t) pos * 128 + i] = kh;
+        if ((pos & 3) != 3) return;
+        const int b = pos / 4;
+        float x = 0.0f;
+        for (int j = 0; j < 3; ++j) x += __half2float(kraw[(size_t) (4 * b + j) * 128 + i]);
+        x += __half2float(kh);
+        x *= 0.25f;
+        const float ss = block_sum4(x * x);
+        buf[i] = x * rsqrtf(ss / 128 + eps) * knorm[i];
+        __syncthreads();
+        pool[(size_t) b * 128 + i] = __float2half(rope_dim(buf, i, 4 * b, n_rot, base));
+        return;
+    }
+    float x = qi[(size_t) h * 128 + i];
+    const float ss = block_sum4(x * x);
+    buf[i] = x * rsqrtf(ss / 128 + eps) * qnorm[i];
+    __syncthreads();
+    qn[(size_t) h * 128 + i] = rope_dim(buf, i, pos, n_rot, base);
+}
 // grid (candidate blocks), 128 threads: blocks of 4 cells completed by tokens pos..pos+nt-1: mean raw key -> rms norm ->
 // rope at the block's first position -> pool[b]
 __global__ void k_idx_pool(const half * __restrict__ kraw, half * __restrict__ pool, const float * __restrict__ knorm, const int * pos_p,
@@ -1373,6 +1402,10 @@ void moe_publish(volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_
 void idx_prep(const float * qi, const float * kr, const float * qnorm, float * qn, half * kraw, const int * pos, int n_head, int n_rot,
               float base, float eps, int nt, cudaStream_t s) {
     k_idx_prep<<<dim3(nt, n_head + 1), 128, 0, s>>>(qi, kr, qnorm, qn, kraw, pos, n_head, n_rot, base, eps);
+}
+void idx_prep_pool(const float * qi, const float * kr, const float * qnorm, float * qn, half * kraw, half * pool, const float * knorm,
+                   const int * pos, int n_head, int n_rot, float base, float eps, cudaStream_t s) {
+    k_idx_prep_pool<<<dim3(1, n_head + 1), 128, 0, s>>>(qi, kr, qnorm, qn, kraw, pool, knorm, pos, n_head, n_rot, base, eps);
 }
 void idx_pool(const half * kraw, half * pool, const float * knorm, const int * pos, int nt, int n_rot, float base, float eps, cudaStream_t s) {
     k_idx_pool<<<nt / 4 + 2, 128, 0, s>>>(kraw, pool, knorm, pos, nt, n_rot, base, eps);
