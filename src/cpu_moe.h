@@ -77,6 +77,7 @@ private:
     // decode path, last expert group in parts: gate/up tasks left / hidden rows quantized per part, down parts done per
     // row task, the down rows' resumable accumulators [pair][row][8]
     std::vector<std::atomic<int>> part_left_, part_ready_, dprog_;
+    std::vector<std::atomic<int>> ck_left_;   // decode: expert groups still to finish each output chunk
     std::vector<float> acc_;
     // HYPER_CPUPROF: how many of a job's CPU experts the previous token's job at the same layer also had
     std::vector<std::vector<int>> prev_e_;

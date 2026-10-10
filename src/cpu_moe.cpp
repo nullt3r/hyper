@@ -454,6 +454,26 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
             gcount[G - 1] = 0;
         }
         for (int g = 0; g < G; ++g) gu_left_[g].store(gcount[g], std::memory_order_relaxed);
+        // the weighted sum per output chunk of RD rows by the thread finishing the chunk's last down task (it was the master's
+        // serial tail): same per-row order over the pairs
+        static const bool serial_sum = getenv("HYPER_CPU_SERIAL_SUM") != nullptr;
+        const bool dsum = !split && !serial_sum && tail_mult == 0 && !bal && n % RD == 0;
+        if (dsum) {
+            if ((int) ck_left_.size() < n / RD) ck_left_ = std::vector<std::atomic<int>>(n / RD);
+            for (int k = 0; k < n / RD; ++k) ck_left_[k].store(G, std::memory_order_relaxed);
+        }
+        auto chunk_sum = [&](int r0, int r1) {
+            for (int t : qt) {
+                float * o = yout + (size_t) t * 4096;
+                bool first = true;
+                for (int p = 0; p < P; ++p) {
+                    if (pairs[p].t != t) continue;
+                    const float w = pairs[p].w, * y = y_.data() + (size_t) p * n;
+                    if (first) { for (int r = r0; r < r1; ++r) o[r] = w * y[r]; first = false; }
+                    else for (int r = r0; r < r1; ++r) o[r] += w * y[r];
+                }
+            }
+        };
         std::atomic_thread_fence(std::memory_order_release);
         const auto tj1 = std::chrono::steady_clock::now();
         std::atomic<int64_t> t_last_gu{0};
@@ -506,19 +526,11 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
                 const uint8_t * db = L.down + L.index(pairs[p0].e) * L.down_bytes;
                 for (int r = r0; r < r1; ++r)
                     for (int p = p0; p < p1; ++p) td->vec_dot(fa, &y_[(size_t) p * n + r], 0, db + r * d_row, 0, qh_.data() + p * qh_row, 0, 1);
+                if (dsum && ck_left_[r0 / RD].fetch_sub(1, std::memory_order_acq_rel) == 1) chunk_sum(r0, r1);
             }
         });
         const auto tj2 = std::chrono::steady_clock::now();
-        for (int t : qt) {   // weighted sum per token (pairs in expert order: deterministic)
-            float * o = yout + (size_t) t * 4096;
-            bool first = true;
-            for (int p = 0; p < P; ++p) {
-                if (pairs[p].t != t) continue;
-                const float w = pairs[p].w, * y = y_.data() + (size_t) p * n;
-                if (first) { for (int r = 0; r < n; ++r) o[r] = w * y[r]; first = false; }
-                else for (int r = 0; r < n; ++r) o[r] += w * y[r];
-            }
-        }
+        if (!dsum) chunk_sum(0, n);   // weighted sum per token (pairs in expert order: deterministic)
         if (prof_) {   // ph 0: setup, 1: tasks until the last expert's hidden rows are ready, 2: its down tail, 3: weighted sum
             const auto tj3 = std::chrono::steady_clock::now();
             const int64_t tg = t_last_gu.load();
