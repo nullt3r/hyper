@@ -1911,7 +1911,9 @@ void attn_prefill(const float * qkv, int stride, const half * kcache, const half
     k_attn_fa<256><<<dim3((nt + FA_BQ - 1) / FA_BQ, n_head), 128, smem, s>>>(qkv, stride, kcache, vcache, out, out_stride, pos, max_pos,
                                                                            head_off, group, kv_off, scale, nt);
 }
-int attn_nsplit(int n_kv, int nt) { return std::max(1, std::min(64, 256 / (n_kv * nt))); }
+// decode-sized forwards (speculative verification rows) split the cache like a single row: every row's partial sums, and
+// so its rounding, are those of a plain decode step (the split count changed the output of 3- and 4-row verifications)
+int attn_nsplit(int n_kv, int nt) { return std::max(1, std::min(64, 256 / (n_kv * (nt <= MAX_NT ? 1 : nt)))); }
 size_t attn_part_floats(int n_head, int n_kv, int nt, int hd) { return (size_t) nt * n_head * attn_nsplit(n_kv, nt) * (hd + 2); }
 void attn_split(const float * qkv, int stride, const half * kcache, const half * vcache, float * part, float * out, int out_stride,
                 const int * pos, int max_pos, int n_head, int n_kv, int head_off, int group, int kv_off, int hd,
@@ -1953,6 +1955,21 @@ void gated_norm(float * o, int o_stride, const float * z, int z_stride, const fl
 void silu_mul(const float * gu, int gu_stride, float * h, int h_stride, int n, int nt, cudaStream_t s) {
     k_silu_mul<<<dim3((n + 255) / 256, nt), 256, 0, s>>>(gu, gu_stride, h, h_stride, n);
 }
+__global__ void k_max_sumexp(const float * __restrict__ x, int n, float * out) {
+    __shared__ float red[32];
+    float m = -INFINITY;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) m = fmaxf(m, x[i]);
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
+    __syncthreads();
+    m = (int) (threadIdx.x & 31) < (int) (blockDim.x >> 5) ? red[threadIdx.x & 31] : -INFINITY;
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) sum += expf(x[i] - m);
+    sum = block_sum(sum);
+    if (threadIdx.x == 0) { out[0] = m; out[1] = sum; }
+}
+void max_sumexp(const float * x, int n, float * out, cudaStream_t s) { k_max_sumexp<<<1, 1024, 0, s>>>(x, n, out); }
 void argmax_pairs(const float * x, int xs, int n, int offset, float * out, int nt, cudaStream_t s) {
     k_argmax_pairs<<<nt, 1024, 0, s>>>(x, xs, n, offset, out);
 }

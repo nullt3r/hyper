@@ -474,8 +474,10 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
     CUDA_CHECK(cudaHostAlloc(&h_res_, (size_t) nd * MAX_NT * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_topk_, (size_t) nd * MAX_NT * TOPK * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_membd_, (size_t) R4 * n * sizeof(float), cudaHostAllocPortable));
-    CUDA_CHECK(cudaHostAlloc(&h_mres_, (size_t) nd * 2 * sizeof(float), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_mres_, (size_t) nd * 4 * sizeof(float), cudaHostAllocPortable));
     mtp_whole_norm_ = getenv("HYPER4_MTP_WHOLE_NORM") != nullptr;
+    mtp_full_ = getenv("HYPER4_MTP_FULL") != nullptr;
+    if (getenv("HYPER4_MTP_PMIN")) mtp_pmin_ = atof(getenv("HYPER4_MTP_PMIN"));
     const size_t ll = (size_t) 2 * nd * MAX_NT * n / 2;
     CUDA_CHECK(cudaHostAlloc(&ar_ll_, ll * sizeof(uint2), cudaHostAllocPortable | cudaHostAllocMapped));
     memset(ar_ll_, 0xff, ll * sizeof(uint2));
@@ -947,7 +949,11 @@ void Engine4::record_main(int gi, int nt, int kind) {
     const int n = c.n_embd, hc = c.hc, hcn = c.hc_dim(), lr = c.hc_lr, K = c.n_expert_used, bs = d.big_stride;
     const int nd = opt_.n_devices;
     const float eps = c.rms_eps;
-    const bool bulk = nt > MAX_NT;
+    bool bulk = nt > MAX_NT;   // (an MTP pass continues its last row in decode mode)
+    // MTP rows that only enter the block's cache (its K / V and indexer keys depend on its input alone): prompt rows, and
+    // all but the last of the kept verification rows; the last one alone goes on through the FFN to the head
+    const bool cache_only = kind == 1 && mtp_cache_only_ && !mtp_full_;
+    const bool last_only = kind == 1 && !mtp_cache_only_ && !mtp_full_ && nt > 1;
     // matmul: decode GEMV (split-K for few rows) or, for a prefill chunk, fp16 conversion + tiled tensor-core GEMM
     auto mm = [&](const DW & W, const float * x, int xs, float * y, int ys, int rows, const NormIn & ni = NormIn{}) {
         if (!W.seg.empty()) {   // segments: Q8 fragments or KQ (prefill: dequantized to fp16 in slices + cuBLAS)
@@ -1022,7 +1028,8 @@ void Engine4::record_main(int gi, int nt, int kind) {
         if (!kind) hc_init(ck[ci].R, d.x, n, hc, ck[ci].nt, s);
     }
     incr_counter(d.counter, s);
-    const bool streaming = bulk && opt_.stream_experts && nt >= stream_min_;   // short chunks: the CPU computes its experts
+    // short chunks: the CPU computes its experts (the MTP block's FFN never runs over a whole chunk)
+    const bool streaming = bulk && opt_.stream_experts && nt >= stream_min_ && (!kind || mtp_full_);
     if (streaming) {
         if (!kind && d.layers[0].owner_bulk) { upload_stage(d, 0); if (c.n_layer > 1) upload_stage(d, 1); }
         if (kind && d.mtp.owner_bulk) upload_stage(d, c.n_layer);
@@ -1152,6 +1159,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
                     idx_prep(d.iq, d.ik, L.idx_qn, d.iqn, L.kraw, P, c.idx_n_head, c.n_rot, c.rope_base, eps, nt, s);
                     idx_pool(L.kraw, L.kpool, L.idx_kn, P, nt, c.n_rot, c.rope_base, eps, s);
                 }
+                if (cache_only) return;
                 static const bool old_sel = getenv("HYPER4_OLDSEL") != nullptr;
                 if (d.ihist && !old_sel)
                     idx_select_hist(d.iqn, L.kpool, P, nt, c.idx_n_head, top, d.iscores, opt_.max_pos / 4 + 4, QSA_SCORE_ROWS, d.ihist,
@@ -1188,6 +1196,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
             if (!par_idx)
                 attn_prep(d.big0, bs, L.q_norm, L.k_norm, L.kcache, L.vcache, P, opt_.max_pos, L.n_head_l, L.n_kv_l, c.head_dim,
                           c.n_rot, c.rope_base, eps, nt, s);
+            if (cache_only) continue;
             const int ostride = L.n_head_l * c.head_dim;
             if (bulk && dense_chunk)
                 attn_prefill(d.big0, bs, L.kcache, L.vcache, d.o, ostride, P, opt_.max_pos, L.n_head_l, L.head_off,
@@ -1218,9 +1227,15 @@ void Engine4::record_main(int gi, int nt, int kind) {
             gated_norm_sigmoid(d.o, ostride, d.big0 + z_off, bs, L.ssm_norm, L.n_v_l, dv, eps, nt, s);
             mm(L.wout, d.o, ostride, d.part, n, nt);
         }
+        if (cache_only) continue;
         dbg(L.full ? "attn_part" : "gdn_part", il, d.part, (size_t) nt * n);
         if (bulk) { allreduce(); hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s); }
         else allreduce_hc_ll16(R, d.inj, n, hc, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
+        if (last_only) {   // the last row moves to row 0 and continues alone, in decode mode
+            CUDA_CHECK(cudaMemcpyAsync(R, R + (size_t) (nt - 1) * hcn, (size_t) hcn * sizeof(float), cudaMemcpyDeviceToDevice, s));
+            nt = 1;
+            bulk = false;
+        }
         // ---- MoE ----
         hc_mix(L.hcf_norm, L.hcf_down, L.hcf_up, L.hcf_inj);
         auto shexp = [&] {
@@ -1295,11 +1310,13 @@ void Engine4::record_main(int gi, int nt, int kind) {
         dbg("l_last", il, R, (size_t) nt * hcn);
     }
     if (kind) {   // drafts: the last row only; its residual feeds the next chained step
+        if (cache_only) return;
         CUDA_CHECK(cudaMemcpyAsync(d.mh, d.mres + (size_t) (nt - 1) * hcn, (size_t) hcn * sizeof(float), cudaMemcpyDeviceToDevice, s));
         hc_mix(d.m_head_norm, d.m_head_down, d.m_head_up, nullptr, d.mres + (size_t) (nt - 1) * hcn, 1);
         mm(d.output, d.mixed, n, d.logits, d.output.n(), 1);
         argmax_pairs(d.logits, d.output.n(), d.output.n(), d.vocab_off, d.wts, 1, s);
-        CUDA_CHECK(cudaMemcpyAsync(h_mres_ + (size_t) gi * 2, d.wts, 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
+        max_sumexp(d.logits, d.output.n(), d.wts + 2, s);   // (the draft's probability)
+        CUDA_CHECK(cudaMemcpyAsync(h_mres_ + (size_t) gi * 4, d.wts, 4 * sizeof(float), cudaMemcpyDeviceToHost, s));
         return;
     }
     // final mixer = output norm (prefill chunk: last row only)
@@ -1425,11 +1442,13 @@ void Engine4::run(int kind, int nt) {
     if (!graphs_ready_ && !debug_) build_graphs();
     ++fwd_counter_;
     if (kind == 3) --fwd_counter_;   // restore graphs do not count
-    if (kind <= 2 && !(bulk && opt_.stream_experts && nt >= stream_min_)) {
+    // (MTP: the FFN runs for the last row only, in decode mode, and not at all for cache-only rows; HYPER4_MTP_FULL: as main)
+    const bool mtp_full = kind == 0 || mtp_full_;
+    if (kind <= 2 && !(bulk && opt_.stream_experts && nt >= stream_min_ && mtp_full) && !(kind == 1 && mtp_cache_only_ && !mtp_full_)) {
         std::vector<int> slots;
         if (kind == 0) for (int i = 0; i < cfg_.n_layer; ++i) slots.push_back(i);
         else slots.push_back(cfg_.n_layer);
-        cpu_->expect(fwd_counter_, slots, bulk);
+        cpu_->expect(fwd_counter_, slots, bulk && mtp_full);
     }
     if (bulk) {   // record straight into the streams, one host thread per device (barriers inside the allreduces)
         std::vector<std::thread> th;
@@ -1445,7 +1464,7 @@ void Engine4::run(int kind, int nt) {
         for (int gi = 0; gi < (int) devs_.size(); ++gi) {
             auto & dp = devs_[gi];
             CUDA_CHECK(cudaSetDevice(dp->id));
-            if (debug_ && kind < 3) { record_main(gi, nt, kind); continue; }
+            if ((debug_ && kind < 3) || (kind == 1 && mtp_cache_only_)) { record_main(gi, nt, kind); continue; }   // (no graph)
             cudaGraphExec_t ex = kind == 0 ? dp->g_main[nt] : kind == 1 ? dp->g_mtp[nt] : kind == 2 ? dp->g_chain : dp->g_restore[nt];
             if (!ex) throw std::runtime_error("run: graph missing (kind " + std::to_string(kind) + ", nt " + std::to_string(nt) + ")");
             CUDA_CHECK(cudaGraphLaunch(ex, dp->stream));
@@ -1542,28 +1561,34 @@ int Engine4::forward_multi(const int * tokens, const int * lens, int nck, int po
 }
 
 // MTP pass over chunk ci of the last multi-chunk forward (tokens/nt/pos: that chunk's MTP inputs)
-int Engine4::mtp_draft_chunk(const int * tokens, int nt, int pos, int ci) {
+int Engine4::mtp_draft_chunk(const int * tokens, int nt, int pos, int ci, bool need_draft) {
     if (ci < 0 || ci >= std::max(1, mc_last_)) throw std::runtime_error("mtp_draft_chunk: bad chunk");
     mtp_src_ = ci;
-    try { const int r = mtp_draft(tokens, nt, pos); mtp_src_ = 0; return r; } catch (...) { mtp_src_ = 0; throw; }
+    try { const int r = mtp_draft(tokens, nt, pos, need_draft); mtp_src_ = 0; return r; } catch (...) { mtp_src_ = 0; throw; }
 }
 
-int Engine4::mtp_result() const {
+int Engine4::mtp_result() {
     float best = -INFINITY; int bi = -1;
     for (size_t g = 0; g < devs_.size(); ++g) {
-        const float v = h_mres_[g * 2];
-        const int idx = ((const int *) h_mres_)[g * 2 + 1];
+        const float v = h_mres_[g * 4];
+        const int idx = ((const int *) h_mres_)[g * 4 + 1];
         if (v > best) { best = v; bi = idx; }
     }
+    double z = 0;   // softmax normalizer relative to the best logit: [2] = slice max, [3] = sum exp(x - slice max)
+    for (size_t g = 0; g < devs_.size(); ++g) z += h_mres_[g * 4 + 3] * std::exp((double) h_mres_[g * 4 + 2] - best);
+    mtp_p_ = z > 0 ? 1.0 / z : 0.0;
     return bi;
 }
 
-// MTP over (tokens[t], main hidden row t) at positions pos + t; returns the draft after the last row
-int Engine4::mtp_draft(const int * tokens, int nt, int pos) {
+// MTP over (tokens[t], main hidden row t) at positions pos + t; returns the draft after the last row (need_draft false:
+// the rows only enter the block's cache, -1)
+int Engine4::mtp_draft(const int * tokens, int nt, int pos, bool need_draft) {
     embed_tok(tokens, nt, h_membd_);
     h_pos_[1] = pos;
-    run(1, nt);
-    return mtp_result();
+    mtp_cache_only_ = !need_draft;
+    try { run(1, nt); } catch (...) { mtp_cache_only_ = false; throw; }
+    mtp_cache_only_ = false;
+    return need_draft ? mtp_result() : -1;
 }
 
 // MTP over (token, its own last hidden row) at pos
@@ -1736,8 +1761,9 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
                     for (int ci = 0, q = c0; ci < nk; q += lens[ci++]) {
                         std::vector<int> mt(lens[ci]);
                         for (int j = 0; j < lens[ci]; ++j) mt[j] = q + 1 + j < P ? prompt[q + 1 + j] : next;
-                        const int d0 = mtp_draft_chunk(mt.data(), lens[ci], q, ci);
-                        if (ci == nk - 1 && end == P) drafts[0] = d0;
+                        const bool last = ci == nk - 1 && end == P;   // (only the prompt's last row drafts)
+                        const int d0 = mtp_draft_chunk(mt.data(), lens[ci], q, ci, last);
+                        if (last) drafts[0] = d0;
                     }
                 if (si < snap_at.size() && snap_at[si] == end) take_snapshot(end);
                 if (prefill_cb_) prefill_cb_(end, P, s);
@@ -1752,7 +1778,7 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
         if (spec) {   // MTP consumes (t_{q+1}, h_q) at q for the chunk; the last pair uses the predicted next token
             std::vector<int> mt(len);
             for (int j = 0; j < len; ++j) mt[j] = c0 + 1 + j < P ? prompt[c0 + 1 + j] : next;
-            const int d0 = mtp_draft(mt.data(), len, c0);
+            const int d0 = mtp_draft(mt.data(), len, c0, end == P);
             if (end == P) drafts[0] = d0;
         }
         if (si < snap_at.size() && snap_at[si] == end) take_snapshot(end);
@@ -1791,47 +1817,58 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
             gen_snapshot();
         }
     } else {
-        // drafts per step adapt to the recent acceptance (a verification row costs more experts): kc = floor(avg + 1.5)
-        // in [1, K], avg = moving average of accepted drafts per step (HYPER4_FIXED_DRAFT: always K)
+        // drafts per step: with a probability floor (mtp_pmin_ > 0), while the MTP block's probability of the drafted run
+        // stays above it; otherwise adapted to the recent acceptance, kc = floor(avg + 1.5) in [1, K], avg = moving average
+        // of accepted drafts per step (HYPER4_FIXED_DRAFT: always K)
         static const bool fixed_k = getenv("HYPER4_FIXED_DRAFT") != nullptr;
+        const double pmin = mtp_pmin_;
         int kc = K;
         double avg_acc = K;
-        auto make_drafts = [&](const int * mt, int nt, int pos) {   // first from the main hidden rows, the rest chained
-            auto ta = clk::now();
-            drafts[0] = mtp_draft(mt, nt, pos);
-            for (int j = 1; j < kc; ++j) drafts[j] = mtp_chain(drafts[j - 1], pos + nt - 1 + j);
-            st.t_mtp += since(ta);
+        auto extend = [&](int base) {   // drafts[0] just made by the MTP row at base: the chained ones, the count to verify
+            double pc = mtp_p_;
+            if (pc < pmin) return 0;
+            int k = 1;
+            for (; k < kc; ++k) {
+                drafts[k] = mtp_chain(drafts[k - 1], base + k);
+                pc *= mtp_p_;
+                if (pc < pmin) break;
+            }
+            return k;
         };
-        for (int j = 1; j < kc; ++j) drafts[j] = mtp_chain(drafts[j - 1], p - 1 + j);   // first draft came with the prompt
-        int cur = next;                            // token at position p, not yet in the main model
+        auto ta = clk::now();
+        int nd = extend(p - 1);   // (the first draft came with the prompt)
+        st.t_mtp += since(ta);
+        int cur = next;           // token at position p, not yet in the main model
         std::vector<int> in(K + 1), mt(K + 1);
         while (!stop && p + K + 1 < opt_.max_pos) {
-            const int K = kc;   // (this step's drafts)
             in[0] = cur;
-            for (int j = 0; j < K; ++j) in[j + 1] = drafts[j];
-            auto ta = clk::now();
-            std::vector<int> a = forward(in.data(), K + 1, p);
+            for (int j = 0; j < nd; ++j) in[j + 1] = drafts[j];
+            ta = clk::now();
+            std::vector<int> a = forward(in.data(), nd + 1, p);
             st.t_main += since(ta);
             st.steps++;
-            st.drafted += K;
+            st.drafted += nd;
             // a draft is kept iff the token sampled (or argmax) at its row equals it: exact plain sampling
             int m = 0;
-            if (sampling) { while (m < K && (a[m] = sample_row(m, sp)) == drafts[m]) ++m; if (m == K) a[K] = sample_row(K, sp); }
-            else while (m < K && a[m] == drafts[m]) ++m;
+            if (sampling) { while (m < nd && (a[m] = sample_row(m, sp)) == drafts[m]) ++m; if (m == nd) a[nd] = sample_row(nd, sp); }
+            else while (m < nd && a[m] == drafts[m]) ++m;
             st.accepted += m;
             if (emit(cur)) for (int j = 0; j < m; ++j) if (!emit(drafts[j])) break;
             if (stop) { state_ok = false; break; }   // (the state holds rows past the end of the output)
-            if (m < K) {                            // keep rows 0..m of the verified block
+            if (m < nd) {                           // keep rows 0..m of the verified block
                 ta = clk::now();
                 run(3, m + 1);
                 st.t_restore += since(ta);
             }
             for (int i = 0; i <= m; ++i) mt[i] = i < m ? drafts[i] : a[m];
-            if (!fixed_k) {
+            if (!fixed_k && pmin <= 0) {
                 avg_acc = 0.9 * avg_acc + 0.1 * m;
-                kc = std::max(1, std::min(opt_.n_draft, (int) (avg_acc + 1.5)));
+                kc = std::max(1, std::min(K, (int) (avg_acc + 1.5)));
             }
-            make_drafts(mt.data(), m + 1, p);       // positions p..p+m with main hidden rows 0..m
+            ta = clk::now();
+            drafts[0] = mtp_draft(mt.data(), m + 1, p);   // positions p..p+m with main hidden rows 0..m
+            nd = extend(p + m);
+            st.t_mtp += since(ta);
             cur = a[m];
             p += m + 1;
             gen_snapshot();

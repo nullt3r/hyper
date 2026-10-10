@@ -1151,21 +1151,6 @@ void mhc_post(float * res, const float * out, const float * hcw, int n, int nt, 
 void mhc_init(float * res, const float * x, int n, int nt, cudaStream_t s) {
     k_mhc_init<<<dim3((MHC * n + 255) / 256, nt), 256, 0, s>>>(res, x, n);
 }
-__global__ void k_max_sumexp(const float * __restrict__ x, int n, float * out) {
-    __shared__ float red[32];
-    float m = -INFINITY;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) m = fmaxf(m, x[i]);
-    m = wmax(m);
-    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
-    __syncthreads();
-    m = (int) (threadIdx.x & 31) < (int) (blockDim.x >> 5) ? red[threadIdx.x & 31] : -INFINITY;
-    m = wmax(m);
-    float sum = 0.0f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) sum += expf(x[i] - m);
-    sum = bsum(sum);
-    if (threadIdx.x == 0) { out[0] = m; out[1] = sum; }
-}
-void max_sumexp(const float * x, int n, float * out, cudaStream_t s) { k_max_sumexp<<<1, 1024, 0, s>>>(x, n, out); }
 void mhc_head(const float * res, const float * w, float eps, int n, float * xn, int nt, cudaStream_t s) {
     k_mhc_head<<<nt, 1024, 0, s>>>(res, w, eps, n, xn);
 }

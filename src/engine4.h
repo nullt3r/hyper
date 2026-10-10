@@ -61,7 +61,7 @@ public:
     // experts cross PCIe once for all of them; result: the last chunk's next token. mtp_draft_chunk: the MTP pass over
     // chunk ci of the last forward_multi (its final residual rows)
     int forward_multi(const int * tokens, const int * lens, int nck, int pos);
-    int mtp_draft_chunk(const int * tokens, int nt, int pos, int ci);
+    int mtp_draft_chunk(const int * tokens, int nt, int pos, int ci, bool need_draft = true);
     bool multi_ok(const int * lens, int nck) const;
     // whole prompt in prefill chunks; returns the argmax after the last token
     int prefill(const int * tokens, int n, int pos);
@@ -79,6 +79,8 @@ public:
     bool has_mtp() const override { return mtp_g_ != nullptr; }
     // routing statistics: the loaded ones plus what the CPU side has seen since (decode routing of every layer)
     void save_expert_stats(const std::string & path);
+    // MTP drafts per step and the run-probability floor (tests)
+    void set_draft(int k, double pmin) { opt_.n_draft = std::max(1, std::min(k, MAX_NT - 1)); mtp_pmin_ = pmin; }
 
 private:
     struct DevLayer;
@@ -93,8 +95,9 @@ private:
     void embed(const int * tokens, int nt, int pos, int chunk = 0);
     void embed_tok(const int * tokens, int nt, float * dst);
     void run(int kind, int nt);   // 0 main, 1 MTP, 2 MTP chain, 3 restore (nt = rows kept)
-    int mtp_result() const;
-    int mtp_draft(const int * tokens, int nt, int pos);
+    int mtp_result();
+    // need_draft false: the rows only enter the MTP block's cache (its K / V and indexer keys depend on its input alone)
+    int mtp_draft(const int * tokens, int nt, int pos, bool need_draft = true);
     int mtp_chain(int token, int pos);
     void * host_huge_alloc(size_t bytes);   // anonymous, transparent huge pages; freed with the engine
     int sample_row(int t, const SamplingParams & sp);
@@ -126,7 +129,13 @@ private:
     int * h_pos_ = nullptr;
     float * h_res_ = nullptr;       // pinned [ndev][MAX_NT][2]
     float * h_membd_ = nullptr;     // pinned [R][n_embd]: MTP input embeddings
-    float * h_mres_ = nullptr;      // pinned [ndev][2]: MTP draft argmax
+    float * h_mres_ = nullptr;      // pinned [ndev][4]: MTP draft argmax, slice max logit, slice sum exp
+    bool mtp_cache_only_ = false;   // this MTP pass: rows into the block's cache only (no attention output, FFN, head)
+    bool mtp_full_ = false;         // HYPER4_MTP_FULL (test): every MTP row through the whole block
+    double mtp_p_ = 1.0;            // the MTP block's probability of its last draft
+    // drafts while their run's MTP probability stays >= this (HYPER4_MTP_PMIN; 0: acceptance-driven count). 0.5 measured best
+    // (9k prompt): Flash-Next 138 -> 142.5 t/s, Uncensored with the base model's NextN head 124 -> 129.5 t/s
+    double mtp_pmin_ = 0.5;
     bool mtp_whole_norm_ = false;   // MTP hidden norm over all hc streams (ik layout) instead of per stream
     uint2 * ar_ll_ = nullptr;
     CpuMoeRec * cpu_rec_ = nullptr; // mapped [n_layer]

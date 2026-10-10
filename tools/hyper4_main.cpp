@@ -219,8 +219,9 @@ static int run_cmd(int argc, char ** argv) {
             std::vector<int> prompt(toks.begin(), toks.begin() + std::min<size_t>(toks.size(), np));
             GenStats a, b;
             const std::vector<int> plain = eng.generate(prompt, n_gen, false, &a);
-            if constexpr (std::is_same_v<Engine, Engine5>) {
-                if (const char * sw = getenv("HYPER5_SWEEP")) {   // "k:pmin,k:pmin,...": MTP policies after one plain run
+            {
+                const char * sw = getenv("HYPER_SWEEP") ? getenv("HYPER_SWEEP") : getenv("HYPER5_SWEEP");
+                if (sw) {   // "k:pmin,k:pmin,...": draft policies after one plain run
                     printf("MTPSWEEP plain %.2f t/s\n", a.tokens / a.seconds);
                     for (const char * q = sw; *q;) {
                         const int k = atoi(q);
@@ -236,10 +237,10 @@ static int run_cmd(int argc, char ** argv) {
                         uint64_t hs = 1469598103934665603ull;
                         for (int t : o) hs = (hs ^ (uint32_t) t) * 1099511628211ull;
                         printf("MTPSWEEP K=%d pmin %.2f: %.2f t/s (%+.1f %%)  drafted/step %.2f  accepted/step %.2f  tokens/step %.2f  main %.2f ms  "
-                               "mtp %.2f ms  identical %d  hash %016llx\n", k, pm, c.tokens / c.seconds,
+                               "mtp %.2f ms  identical %d  hash %016llx  prefill %.2f s\n", k, pm, c.tokens / c.seconds,
                                100.0 * (c.tokens / c.seconds) / (a.tokens / a.seconds) - 100.0, (double) c.drafted / std::max(1, c.steps),
                                (double) c.accepted / std::max(1, c.steps), (double) c.tokens / std::max(1, c.steps), 1e3 * c.t_main / std::max(1, c.steps),
-                               1e3 * c.t_mtp / std::max(1, c.steps), same, (unsigned long long) hs);
+                               1e3 * c.t_mtp / std::max(1, c.steps), same, (unsigned long long) hs, c.t_prefill);
                         fflush(stdout);
                     }
                     return 0;

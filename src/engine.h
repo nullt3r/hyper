@@ -20,7 +20,7 @@ struct EngineOptions {
     int n_devices = 3;
     int max_pos = 32768;
     bool mtp = true;             // load the NextN head for speculative decoding
-    int n_draft = 2;             // MTP drafts per step (chained); verification runs n_draft + 1 tokens
+    int n_draft = 3;             // MTP drafts per step (chained); verification runs n_draft + 1 tokens (3: +6-15 % over 2)
     bool prompt_cache = false;   // reuse the common prefix with the previous sequence (recurrent-state snapshots)
     int max_snapshots = 48;      // pinned host snapshots (~50 MB per GPU each for the 27B model)
 };
@@ -82,6 +82,8 @@ public:
     int max_pos() const override { return opt_.max_pos; }
     int n_draft() const override { return opt_.n_draft; }
     bool has_mtp() const override { return opt_.mtp; }
+    // MTP drafts per step (<= MAX_NT - 1) and the run-probability floor (tests)
+    void set_draft(int k, double pmin) { opt_.n_draft = std::max(1, std::min(k, MAX_NT - 1)); mtp_pmin_ = pmin; }
 
     const Qwen35Config & config() const { return cfg_; }
 
@@ -112,6 +114,9 @@ private:
     void embed(const int * tokens, int nt, float * dst);
     int mtp_draft(const int * tokens, int nt, int pos);   // MTP over (tokens[t], main hidden row t) at pos+t; argmax of last
     int mtp_chain(int token, int pos);                   // MTP over (token, MTP's own last hidden) at pos
+    int mtp_result();                                    // the draft; mtp_p_ = its probability under the MTP head
+    double mtp_p_ = 1.0;
+    double mtp_pmin_ = 0.0;   // drafts while their run's MTP probability stays >= this (HYPER_MTP_PMIN; 0: always n_draft)
 
     EngineOptions opt_;
     std::unique_ptr<GGUF> gguf_;

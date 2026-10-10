@@ -136,6 +136,8 @@ void topk_pairs(const float * x, int xs, int n, int offset, float * out, int K, 
 constexpr int TOPK = 64;
 // out[t] = {max value, index + offset} (index stored as int bits)
 void argmax_pairs(const float * x, int xs, int n, int offset, float * out, int nt, cudaStream_t s);
+// one block: out[0] = max x[0..n), out[1] = sum exp(x - out[0]) (a vocab slice's share of the softmax normalizer)
+void max_sumexp(const float * x, int n, float * out, cudaStream_t s);
 
 // ---- multi-GPU allreduce without P2P (LL protocol, fp16 payload) ----
 // x[i] += sum_d part_d[i] for i < n (n = nt * n_embd, even); exchanged through host-mapped uint2 slots

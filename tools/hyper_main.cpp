@@ -91,6 +91,27 @@ static int cmd_gen(const char * model, const char * ref_path, int n_prompt, int 
     Engine eng(model, opt);
     GenStats a, b;
     const std::vector<int> plain = eng.generate(toks, n_gen, false, &a);
+    if (const char * sw = getenv("HYPER_SWEEP")) {   // "k:pmin,k:pmin,...": draft policies after one plain run
+        printf("GENSWEEP plain %.2f t/s\n", a.tokens / a.seconds);
+        for (const char * q = sw; *q;) {
+            const int k = atoi(q);
+            while (*q && *q != ':') ++q;
+            const double pm = *q ? atof(++q) : 0.0;
+            while (*q && *q != ',') ++q;
+            if (*q) ++q;
+            eng.set_draft(k, pm);
+            GenStats c;
+            const std::vector<int> o = eng.generate(toks, n_gen, true, &c);
+            int same = 0;
+            while (same < n_gen && plain[same] == o[same]) ++same;
+            printf("GENSWEEP K=%d pmin %.2f: %.2f t/s (%+.1f %%)  drafted/step %.2f  accepted/step %.2f  tokens/step %.2f  main %.2f ms  "
+                   "mtp %.2f ms  identical %d\n", k, pm, c.tokens / c.seconds, 100.0 * (c.tokens / c.seconds) / (a.tokens / a.seconds) - 100.0,
+                   (double) c.drafted / std::max(1, c.steps), (double) c.accepted / std::max(1, c.steps), (double) c.tokens / std::max(1, c.steps),
+                   1e3 * c.t_main / std::max(1, c.steps), 1e3 * c.t_mtp / std::max(1, c.steps), same);
+            fflush(stdout);
+        }
+        return 0;
+    }
     const std::vector<int> spec = eng.generate(toks, n_gen, true, &b);
     int same = 0;
     while (same < n_gen && plain[same] == spec[same]) ++same;

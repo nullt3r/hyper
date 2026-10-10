@@ -282,5 +282,23 @@ A/B s `HYPER5_ADAPT=0`: shodné počty draftů i hash výstupu).
 
 Výstup: s pevným rozmístěním (`HYPER5_ADAPT=0`) je spekulativní greedy výstup **token po tokenu shodný** s obyčejným
 (300/300, stejný hash pro všechny politiky draftů); hlavní cesta beze změny (CHECK4 KL 0,027086, PPL 7,6363).
-Nástroje: `mtpgen` s `HYPER5_SWEEP=k:pmin,...` (víc politik v jednom procesu), `deqtest` s Q3_K.
+Nástroje: `mtpgen` s `HYPER_SWEEP=k:pmin,...` (víc politik v jednom procesu), `deqtest` s Q3_K.
+
+## 2026-10-10 – MTP i pro ostatní modely: Uncensored, Flash-Next, 27B
+
+- **Uncensored (orcarouter Q4_K_M) s NextN hlavou základního Flash-Next** (`--mtp Qwen3.8-Flash-Next-MTP-Q4_K_M.gguf`,
+  beze změny kódu; výstup přesný, ověřuje hlavní model): prompt 9k **90 → 124 t/s**, s prahem 0,5 **130 t/s (+44 %)**;
+  1,5k 85 → 116 t/s (+36 %). Přijato 1,46 draftu/krok (základní model 1,73) – fine-tune skryté stavy mění jen málo.
+- **Flash-Next: MTP vrstva jako u GLM** – řádky promptu jen do cache bloku (K/V, klíče indexeru; bez attention, MoE
+  se streamováním expertů a hlavy), z ponechaných ověřovacích řádků jde celou vrstvou jen poslední (FFN v decode
+  režimu pro 1 řádek). MTP za krok 2,59 → 2,35 ms, prefill s MTP 5,44 → 5,37 s (9k). `HYPER4_MTP_FULL` = stará cesta.
+- **Práh pravděpodobnosti draftů i pro Flash-Next** (`HYPER4_MTP_PMIN`, výchozí 0,5): 9k 138 → 142,5 t/s,
+  1,5k 114 → 118 t/s; Uncensored 124 → 130 (9k), 111 → 116 (1,5k). Nižší práh (0,2) je horší než žádný.
+- **27B: 3 drafty místo 2** (výchozí): 11k 130 → **149 t/s**, 1,5k 119 → 126 t/s. Ověřovací řádky jsou u hustého
+  modelu ve VRAM skoro zadarmo, práh nepomáhá (±1–2 %, `HYPER_MTP_PMIN` zůstává 0).
+- **Oprava přesnosti: split-K attention dělila cache podle počtu řádků** (`256 / (n_kv · nt)`), takže 3- a 4-řádkové
+  ověření zaokrouhlovalo jinak než krok po jednom tokenu (27B se 3 drafty: shodný prefix jen 206/256, KL nt=4 0,000222
+  vs 0,000221). Teď dekódovací dávky (≤ 4 řádky) dělí jako jeden řádek: KL nt=1..4 shodné (27B 0,000221 / max
+  0,00134; Flash 0,048582 / 4,35564), výstup se 3 drafty 256/256, rychlost beze změny.
+- `mtpgen` / `hyper gen`: `HYPER_SWEEP=k:pmin,...` pro všechny enginy (víc politik v jednom procesu, hash výstupu, prefill).
 

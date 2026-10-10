@@ -184,6 +184,7 @@ std::pair<int64_t, int64_t> split(int64_t n, int ndev, int g, int64_t align = 1)
 } // namespace
 
 Engine::Engine(const std::string & model_path, const EngineOptions & opt) : opt_(opt) {
+    if (getenv("HYPER_MTP_PMIN")) mtp_pmin_ = atof(getenv("HYPER_MTP_PMIN"));
     gguf_ = std::make_unique<GGUF>(model_path);
     cfg_ = Qwen35Config::from_gguf(*gguf_);
     fprintf(stderr, "hyper: %s\n", cfg_.describe().c_str());
@@ -643,7 +644,8 @@ void Engine::record_mtp(int gi, int nt, bool chain) {
     Act a1 = act(d, 0, 0, s, d.mpos, false);
     mm(a1, d.output_q8, d.x + (size_t) (nt - 1) * n, n, d.logits, d.output.n, 1, nl);
     argmax_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.mres, 1, s);
-    CUDA_CHECK(cudaMemcpyAsync(h_mres_ + (size_t) gi * 2, d.mres, 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
+    max_sumexp(d.logits, d.output.n, d.mres + 2, s);   // (the draft's probability)
+    CUDA_CHECK(cudaMemcpyAsync(h_mres_ + (size_t) gi * 4, d.mres, 4 * sizeof(float), cudaMemcpyDeviceToHost, s));
 }
 
 // roll the recurrent state back to the snapshot taken after token keep-1 of the last multi-token forward
@@ -768,14 +770,27 @@ int Engine::mtp_draft(const int * tokens, int nt, int pos) {
     embed(tokens, nt, h_membd_);
     h_pos_[1] = pos;
     launch(1, nt);
-    return best_of(h_mres_, (int) devs_.size(), 0, 1);
+    return mtp_result();
 }
 
 int Engine::mtp_chain(int token, int pos) {
     embed(&token, 1, h_membd_);
     h_pos_[1] = pos;
     launch(3, 1);
-    return best_of(h_mres_, (int) devs_.size(), 0, 1);
+    return mtp_result();
+}
+
+int Engine::mtp_result() {
+    float best = -INFINITY; int bi = -1;
+    for (size_t g = 0; g < devs_.size(); ++g) {
+        const float v = h_mres_[g * 4];
+        const int idx = ((const int *) h_mres_)[g * 4 + 1];
+        if (v > best) { best = v; bi = idx; }
+    }
+    double z = 0;   // softmax normalizer relative to the best logit: [2] = slice max, [3] = sum exp(x - slice max)
+    for (size_t g = 0; g < devs_.size(); ++g) z += h_mres_[g * 4 + 3] * std::exp((double) h_mres_[g * 4 + 2] - best);
+    mtp_p_ = z > 0 ? 1.0 / z : 0.0;
+    return bi;
 }
 
 void Engine::get_logits(int t, std::vector<float> & out) {
@@ -987,37 +1002,50 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
             gen_snapshot();
         }
     } else {
-        auto make_drafts = [&](const int * mt, int nt, int pos) {   // first from the main hidden, the rest chained
-            auto ta = clk::now();
-            drafts[0] = mtp_draft(mt, nt, pos);
-            for (int j = 1; j < K; ++j) drafts[j] = mtp_chain(drafts[j - 1], pos + nt - 1 + j);
-            st.t_mtp += since(ta);
+        // drafts while the MTP head's probability of the drafted run stays >= mtp_pmin_ (0: always K)
+        const double pmin = mtp_pmin_;
+        auto extend = [&](int base) {   // drafts[0] just made by the MTP row at base: the chained ones, the count to verify
+            double pc = mtp_p_;
+            if (pc < pmin) return 0;
+            int k = 1;
+            for (; k < K; ++k) {
+                drafts[k] = mtp_chain(drafts[k - 1], base + k);
+                pc *= mtp_p_;
+                if (pc < pmin) break;
+            }
+            return k;
         };
-        for (int j = 1; j < K; ++j) drafts[j] = mtp_chain(drafts[j - 1], p - 1 + j);   // first draft came with the prompt
+        auto ta = clk::now();
+        int nd = extend(p - 1);                   // (the first draft came with the prompt)
+        st.t_mtp += since(ta);
         int cur = next;                           // token at position p, not yet in the main model
         std::vector<int> in(K + 1), mt(K + 1);
         while (!stop && p + K + 1 < opt_.max_pos) {
             in[0] = cur;
-            for (int j = 0; j < K; ++j) in[j + 1] = drafts[j];
-            auto ta = clk::now();
-            std::vector<int> a = forward(in.data(), K + 1, p);
+            for (int j = 0; j < nd; ++j) in[j + 1] = drafts[j];
+            ta = clk::now();
+            std::vector<int> a = forward(in.data(), nd + 1, p);
             st.t_main += since(ta);
             st.steps++;
+            st.drafted += nd;
             // verification: a draft is kept iff the token sampled (or argmax) at its row equals it, which
             // reproduces plain sampling exactly; rows are sampled lazily up to the first mismatch
             int m = 0;
-            if (sampling) { while (m < K && (a[m] = sample_row(m, sp)) == drafts[m]) ++m; if (m == K) a[K] = sample_row(K, sp); }
-            else while (m < K && a[m] == drafts[m]) ++m;
+            if (sampling) { while (m < nd && (a[m] = sample_row(m, sp)) == drafts[m]) ++m; if (m == nd) a[nd] = sample_row(nd, sp); }
+            else while (m < nd && a[m] == drafts[m]) ++m;
             st.accepted += m;
             if (emit(cur)) for (int j = 0; j < m; ++j) if (!emit(drafts[j])) break;
             if (stop) { state_ok = false; break; }   // (the state holds rows past the end of the output)
-            if (m < K) {                           // keep tokens 0..m of the verified block
+            if (m < nd) {                          // keep tokens 0..m of the verified block
                 ta = clk::now();
                 launch(2, m + 1);
                 st.t_restore += since(ta);
             }
             for (int i = 0; i <= m; ++i) mt[i] = i < m ? drafts[i] : a[m];
-            make_drafts(mt.data(), m + 1, p);      // positions p..p+m with main hidden rows 0..m
+            ta = clk::now();
+            drafts[0] = mtp_draft(mt.data(), m + 1, p);   // positions p..p+m with main hidden rows 0..m
+            nd = extend(p + m);
+            st.t_mtp += since(ta);
             cur = a[m];
             p += m + 1;
             gen_snapshot();

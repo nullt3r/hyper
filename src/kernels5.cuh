@@ -80,7 +80,4 @@ void moe_route_sig_publish(const float * logits, int ls, const float * bias, int
 // h[t][i] = silu(min(g, L)) * clamp(u, -L, L) with g = gu[t][i], u = gu[t][off + i]
 void swiglu_clamp(const float * gu, int gu_stride, int off, float * h, int h_stride, int n, float L, int nt, cudaStream_t s);
 
-// one block: out[0] = max x[0..n), out[1] = sum exp(x - out[0]) (a vocab slice's share of the softmax normalizer)
-void max_sumexp(const float * x, int n, float * out, cudaStream_t s);
-
 } // namespace hyper
