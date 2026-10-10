@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "sampling.h"
 
 #include <cuda_runtime.h>
 
@@ -65,6 +66,7 @@ struct Engine::Device {
     float * hn = nullptr, * mhn = nullptr, * me = nullptr, * cat = nullptr;   // mhn: MTP's last normed output
     int big_stride = 0;
     float * logits = nullptr, * res = nullptr, * mres = nullptr, * ss = nullptr, * topk = nullptr;
+    float * lstat = nullptr;   // sampling: a logit row slice's max and sum exp
     half * xh = nullptr;      // fp16 GEMM input scratch [MAX_ROWS][max k]
     // bulk (prefill) allreduce and micro-batching
     half * p16 = nullptr, * recv = nullptr;   // own part in fp16 [MAX_ROWS][n]; peers' parts [ndev-1][MAX_ROWS][n]
@@ -215,7 +217,7 @@ Engine::Engine(const std::string & model_path, const EngineOptions & opt) : opt_
     CUDA_CHECK(cudaHostAlloc(&h_res_, (size_t) nd * MAX_ROWS * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_topk_, (size_t) nd * MAX_NT * TOPK * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_mres_, (size_t) nd * MAX_ROWS * 2 * sizeof(float), cudaHostAllocPortable));
-    const size_t ll = (size_t) 2 * nd * DMA_MIN * n / 2;
+    const size_t ll = ll_slots(nd, DMA_MIN, n);   // (fp32 parts: a packet per element)
     CUDA_CHECK(cudaHostAlloc(&ar_ll_, ll * sizeof(uint2), cudaHostAllocPortable | cudaHostAllocMapped));
     memset(ar_ll_, 0xff, ll * sizeof(uint2));
 
@@ -416,6 +418,7 @@ void Engine::load_weights() {
         dev.res = dev.alloc<float>(MAX_ROWS * 2);
         dev.topk = dev.alloc<float>(MAX_NT * TOPK * 2);
         dev.mres = dev.alloc<float>(MAX_ROWS * 2);
+        dev.lstat = dev.alloc<float>(2);
         dev.ss = dev.alloc<float>(MAX_ROWS * 64);
         dev.xh = dev.alloc<half>((size_t) MAX_ROWS * std::max(c.n_ff, 2 * n));
         dev.p16 = dev.alloc<half>((size_t) MAX_ROWS * n);
@@ -889,20 +892,25 @@ int Engine::sample_row(int t, const SamplingParams & sp) {
         const float * p = h_topk_ + ((size_t) g * MAX_NT + t) * TOPK * 2;
         for (int i = 0; i < TOPK; ++i) { const int idx = ((const int *) p)[2 * i + 1]; if (idx >= 0) cand.push_back({p[2 * i], idx}); }
     }
-    std::sort(cand.begin(), cand.end(), [](auto & a, auto & b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
-    int k = std::min<int>((int) cand.size(), sp.top_k > 0 ? std::min(sp.top_k, TOPK) : TOPK);
-    if (sp.temp <= 0.0f || k == 1) return cand[0].second;
-    std::vector<double> pr(k);
-    double z = 0;
-    for (int i = 0; i < k; ++i) { pr[i] = std::exp((cand[i].first - cand[0].first) / sp.temp); z += pr[i]; }
-    for (auto & v : pr) v /= z;
-    if (sp.min_p > 0) { int kk = 1; while (kk < k && pr[kk] >= sp.min_p * pr[0]) ++kk; k = kk; }
-    if (sp.top_p < 1.0f) { double cum = 0; int kk = 0; while (kk < k) { cum += pr[kk++]; if (cum >= sp.top_p) break; } k = kk; }
-    double tot = 0;
-    for (int i = 0; i < k; ++i) tot += pr[i];
-    double u = std::uniform_real_distribution<double>(0.0, tot)(rng_);
-    for (int i = 0; i < k; ++i) { u -= pr[i]; if (u <= 0) return cand[i].second; }
-    return cand[k - 1].second;
+    // probabilities over the whole row when the candidates are not enough (top_k off): normalizer per vocab slice on the GPUs
+    auto stats = [&](double invT, float & M, double & Z) {
+        std::vector<float> ms(2 * devs_.size());
+        for (size_t g = 0; g < devs_.size(); ++g) {
+            Device & d = *devs_[g];
+            CUDA_CHECK(cudaSetDevice(d.id));
+            max_sumexp(d.logits + (size_t) t * d.output.n, d.output.n, d.lstat, d.stream, (float) invT);
+            CUDA_CHECK(cudaMemcpyAsync(&ms[2 * g], d.lstat, 2 * sizeof(float), cudaMemcpyDeviceToHost, d.stream));
+        }
+        M = -INFINITY;
+        for (size_t g = 0; g < devs_.size(); ++g) {
+            CUDA_CHECK(cudaSetDevice(devs_[g]->id));
+            CUDA_CHECK(cudaStreamSynchronize(devs_[g]->stream));
+            M = std::max(M, ms[2 * g]);
+        }
+        Z = 0;
+        for (size_t g = 0; g < devs_.size(); ++g) Z += ms[2 * g + 1] * std::exp(((double) ms[2 * g] - M) * invT);
+    };
+    return sample_candidates(cand, TOPK, sp, rng_, stats, [&](std::vector<float> & lg) { get_logits(t, lg); });
 }
 
 std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,

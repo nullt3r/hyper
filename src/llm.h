@@ -8,7 +8,7 @@ namespace hyper {
 
 struct SamplingParams {
     float temp = 0.0f;           // 0: greedy
-    int top_k = 0;               // 0 or > 64: the 64 best candidates
+    int top_k = 0;               // 0: off (exact: the whole row is read when the kept set reaches past the GPUs' candidates)
     float top_p = 1.0f, min_p = 0.0f;
     uint64_t seed = 0;           // 0: random
 };

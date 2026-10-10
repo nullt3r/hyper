@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -21,6 +22,35 @@ static bool dump_cb(struct ggml_tensor * t, bool ask, void *) {
     const std::string name = t->name;
     bool match = false;
     for (auto & p : g_dump) if (name.rfind(p, 0) == 0) match = true;
+    // REF_DUMPLAST=prefix: the last token's vector (last ne[ndims-1] slice) of every matching tensor to
+    // $REF_DUMPDIR/<name>.bin (rewritten per ubatch: the file holds the prompt's last token)
+    // (comma-separated prefixes; a name computed several times per graph gets .<occurrence> before .bin)
+    static std::map<std::string, int> occ;
+    if (ask && name == "hc_init") occ.clear();   // (a new graph)
+    bool want = false;
+    if (const char * last = getenv("REF_DUMPLAST")) {
+        std::string l = last;
+        for (size_t p = 0; p <= l.size();) {
+            const size_t q = std::min(l.find(',', p), l.size());
+            if (q > p && name.rfind(l.substr(p, q - p), 0) == 0) want = true;
+            p = q + 1;
+        }
+    }
+    if (want) {
+        if (ask) return true;
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) return true;
+        // REF_DUMPLAST_N: elements per token (a 1-token ubatch drops the token dimension, so it cannot be read off the shape)
+        const int nd = ggml_n_dims(t);
+        const int64_t per = getenv("REF_DUMPLAST_N") ? atoll(getenv("REF_DUMPLAST_N")) : ggml_nelements(t) / std::max<int64_t>(1, t->ne[nd - 1]);
+        if (per <= 0 || ggml_nelements(t) % per) return true;
+        std::vector<float> buf(per);
+        ggml_backend_tensor_get(t, buf.data(), (size_t) (ggml_nelements(t) - per) * sizeof(float), per * sizeof(float));
+        const char * dir = getenv("REF_DUMPDIR") ? getenv("REF_DUMPDIR") : "/tmp";
+        const int k = occ[name]++;
+        FILE * f = fopen((std::string(dir) + "/" + name + (k ? "." + std::to_string(k) : std::string()) + ".bin").c_str(), "wb");
+        if (f) { fwrite(buf.data(), sizeof(float), per, f); fclose(f); }
+        return true;
+    }
     const char * raw = getenv("REF_DUMPRAW");   // exact tensor name: raw data to /tmp/<name>.bin (+ shape on stderr)
     if (raw && name == raw) {
         if (ask) return true;
@@ -70,9 +100,29 @@ int main(int argc, char ** argv) {
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
     std::vector<llama_token> toks(prompt.size() + 16);
-    int n = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(), toks.data(), (int) toks.size(), true, false);
-    if (n < 0) { fprintf(stderr, "tokenize failed\n"); return 1; }
-    toks.resize(n);
+    int n = 0;
+    if (const char * tf = getenv("REF_TOKENS")) {   // the tokens of an existing reference file (the prompt file is not read)
+        FILE * fr = fopen(tf, "rb");
+        if (!fr) { fprintf(stderr, "cannot read %s\n", tf); return 1; }
+        int hd = 0, nv = 0, fst = 0;
+        if (fread(&hd, 4, 1, fr) != 1) return 1;
+        if (hd == 0x32464552 && fread(&hd, 4, 1, fr) != 1) return 1;
+        if (fread(&nv, 4, 1, fr) != 1) return 1;
+        (void) fst;
+        long pos = ftell(fr);
+        // (v2 files carry 'first' after n_vocab)
+        fseek(fr, 0, SEEK_SET);
+        int m = 0; if (fread(&m, 4, 1, fr) != 1) return 1;
+        fseek(fr, m == 0x32464552 ? 16 : pos, SEEK_SET);
+        toks.resize(hd);
+        if (fread(toks.data(), 4, hd, fr) != (size_t) hd) { fprintf(stderr, "short token file\n"); return 1; }
+        fclose(fr);
+        n = hd;
+    } else {
+        n = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(), toks.data(), (int) toks.size(), true, false);
+        if (n < 0) { fprintf(stderr, "tokenize failed\n"); return 1; }
+        toks.resize(n);
+    }
     if (max_tokens > 0 && (int) toks.size() > max_tokens) toks.resize(max_tokens);
     n = (int) toks.size();
 
@@ -81,7 +131,7 @@ int main(int argc, char ** argv) {
     cp.n_batch = n;
     cp.n_ubatch = n;
     if (getenv("REF_UBATCH")) cp.n_ubatch = atoi(getenv("REF_UBATCH"));   // other kernels / numerics (noise floor)
-    if (getenv("REF_DUMPRAW") && !getenv("REF_DUMP")) { cp.cb_eval = dump_cb; cp.cb_eval_user_data = nullptr; }
+    if ((getenv("REF_DUMPRAW") || getenv("REF_DUMPLAST")) && !getenv("REF_DUMP")) { cp.cb_eval = dump_cb; cp.cb_eval_user_data = nullptr; }
     if (const char * d = getenv("REF_DUMP")) {
         std::string s = d;
         size_t p = 0;

@@ -1,4 +1,5 @@
 #include "engine4.h"
+#include "sampling.h"
 
 #include "ggml.h"
 
@@ -80,6 +81,8 @@ struct Engine4::DevLayer {
     float * ple_wk = nullptr, * ple_wq = nullptr, * ple_wc = nullptr, * ple_conv = nullptr, * ple_state = nullptr, * ple_snap = nullptr;
 };
 
+constexpr int TRACE2_SLOTS = 10;   // HYPER4_TRACE stages: ple_embd, hc_init, 4 per layer for layers 0-1
+
 struct Engine4::Device {
     int id = 0, g = 0;
     cudaStream_t stream = nullptr;
@@ -111,6 +114,9 @@ struct Engine4::Device {
     float * conv_raw = nullptr;                               // prefill: raw conv inputs
     int * egrp = nullptr;                                     // prefill MoE: active experts (expert, start, count)
     float * topk = nullptr;                                   // sampling candidates [MAX_NT][TOPK][2]
+    float * lstat = nullptr;   // sampling: a logit row slice's max and sum exp
+    float * trace = nullptr;   // HYPER4_TRACE: the last row's residual after every layer [n_layer][hc * n_embd]
+    float * trace2 = nullptr;  // HYPER4_TRACE: stages of layers 0-1 (TRACE2_SLOTS slots of trace2_w floats)
     float * iq = nullptr, * ik = nullptr, * iqn = nullptr, * iscores = nullptr;   // QSA: projections, normed queries, scores
     int * ilist = nullptr, * ilist_n = nullptr;                                 // QSA: attended cells per token
     unsigned * ihist = nullptr;                                                 // QSA: score key histograms [rows][65536]
@@ -478,7 +484,7 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
     mtp_whole_norm_ = getenv("HYPER4_MTP_WHOLE_NORM") != nullptr;
     mtp_full_ = getenv("HYPER4_MTP_FULL") != nullptr;
     if (getenv("HYPER4_MTP_PMIN")) mtp_pmin_ = atof(getenv("HYPER4_MTP_PMIN"));
-    const size_t ll = (size_t) 2 * nd * MAX_NT * n / 2;
+    const size_t ll = ll_slots(nd, MAX_NT, n);   // (fp32 parts: a packet per element)
     CUDA_CHECK(cudaHostAlloc(&ar_ll_, ll * sizeof(uint2), cudaHostAllocPortable | cudaHostAllocMapped));
     memset(ar_ll_, 0xff, ll * sizeof(uint2));
     const int slots = cfg_.n_layer + 1;   // + the MTP block
@@ -876,6 +882,11 @@ void Engine4::load_weights() {
             dev.ecat = dev.alloc<float>((size_t) R * c.hc * 2 * n);
         }
         dev.counter = dev.alloc<int>(1);
+        dev.lstat = dev.alloc<float>(2);
+        if (getenv("HYPER4_TRACE")) {
+            dev.trace = dev.alloc<float>((size_t) c.n_layer * hcn);
+            dev.trace2 = dev.alloc<float>((size_t) TRACE2_SLOTS * std::max<size_t>(hcn, (size_t) c.ple_n_heads() * c.ple_dim));
+        }
     }
     // experts fill what is left on each GPU (minus a runtime reserve), capped at gpu_expert_frac of every layer
     {
@@ -1028,6 +1039,15 @@ void Engine4::record_main(int gi, int nt, int kind) {
         if (!kind) hc_init(ck[ci].R, d.x, n, hc, ck[ci].nt, s);
     }
     incr_counter(d.counter, s);
+    // HYPER4_TRACE (single-chunk passes): a stage's last row into trace2 slot `slot`
+    const size_t tr_w = std::max<size_t>(hcn, pe_row);
+    auto tr = [&](int slot, const float * buf, size_t width) {
+        if (!d.trace2 || kind || nck != 1) return;
+        CUDA_CHECK(cudaMemcpyAsync(d.trace2 + (size_t) slot * tr_w, buf + (size_t) (nt - 1) * width, width * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, s));
+    };
+    if (c.ple_layer >= 0) tr(0, ck[0].ple, pe_row);
+    tr(1, ck[0].R, hcn);
     // short chunks: the CPU computes its experts (the MTP block's FFN never runs over a whole chunk)
     const bool streaming = bulk && opt_.stream_experts && nt >= stream_min_ && (!kind || mtp_full_);
     if (streaming) {
@@ -1115,8 +1135,10 @@ void Engine4::record_main(int gi, int nt, int kind) {
                       c.ple_ngram, eps, nt, d.ple_sc, s);
         }
         if (L.ple) dbg("ple", il, R, (size_t) nt * hcn);
+        if (il < 2) tr(2 + 4 * il, R, hcn);
         // ---- token mixer ----
         hc_mix(L.hca_norm, L.hca_down, L.hca_up, L.hca_inj);
+        if (il < 2) tr(3 + 4 * il, d.mixed, n);
         dbg("hc_mix_attn", il, d.mixed, (size_t) nt * n);
         // decode: independent work on a second stream (indexer || q/k/v + attention prep, alpha/beta || the GDN input
         // projection, shared expert || routed experts): the small kernels' fixed latencies overlap. The second stream's
@@ -1231,6 +1253,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
         dbg(L.full ? "attn_part" : "gdn_part", il, d.part, (size_t) nt * n);
         if (bulk) { allreduce(); hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s); }
         else allreduce_hc_ll16(R, d.inj, n, hc, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
+        if (il < 2) tr(4 + 4 * il, R, hcn);
         if (last_only) {   // the last row moves to row 0 and continues alone, in decode mode
             CUDA_CHECK(cudaMemcpyAsync(R, R + (size_t) (nt - 1) * hcn, (size_t) hcn * sizeof(float), cudaMemcpyDeviceToDevice, s));
             nt = 1;
@@ -1238,6 +1261,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
         }
         // ---- MoE ----
         hc_mix(L.hcf_norm, L.hcf_down, L.hcf_up, L.hcf_inj);
+        if (il < 2) tr(5 + 4 * il, d.mixed, n);
         auto shexp = [&] {
             mm(L.sh_gu, d.mixed, n, d.shgu, 2 * L.n_sh_l, nt);
             if (nt <= MAX_NT) {   // silu(gate) * up on load
@@ -1308,6 +1332,9 @@ void Engine4::record_main(int gi, int nt, int kind) {
         if (bulk) { allreduce(); hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s); }
         else allreduce_hc_ll16(R, d.inj, n, hc, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
         dbg("l_last", il, R, (size_t) nt * hcn);
+        if (d.trace && !kind && last_ck)
+            CUDA_CHECK(cudaMemcpyAsync(d.trace + (size_t) il * hcn, R + (size_t) (nt - 1) * hcn, (size_t) hcn * sizeof(float),
+                                       cudaMemcpyDeviceToDevice, s));
     }
     if (kind) {   // drafts: the last row only; its residual feeds the next chained step
         if (cache_only) return;
@@ -1688,20 +1715,25 @@ int Engine4::sample_row(int t, const SamplingParams & sp) {
         const float * p = h_topk_ + ((size_t) g * MAX_NT + t) * TOPK * 2;
         for (int i = 0; i < TOPK; ++i) { const int idx = ((const int *) p)[2 * i + 1]; if (idx >= 0) cand.push_back({p[2 * i], idx}); }
     }
-    std::sort(cand.begin(), cand.end(), [](auto & a, auto & b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
-    int k = std::min<int>((int) cand.size(), sp.top_k > 0 ? std::min(sp.top_k, TOPK) : TOPK);
-    if (sp.temp <= 0.0f || k == 1) return cand[0].second;
-    std::vector<double> pr(k);
-    double z = 0;
-    for (int i = 0; i < k; ++i) { pr[i] = std::exp((cand[i].first - cand[0].first) / sp.temp); z += pr[i]; }
-    for (auto & v : pr) v /= z;
-    if (sp.min_p > 0) { int kk = 1; while (kk < k && pr[kk] >= sp.min_p * pr[0]) ++kk; k = kk; }
-    if (sp.top_p < 1.0f) { double cum = 0; int kk = 0; while (kk < k) { cum += pr[kk++]; if (cum >= sp.top_p) break; } k = kk; }
-    double tot = 0;
-    for (int i = 0; i < k; ++i) tot += pr[i];
-    double u = std::uniform_real_distribution<double>(0.0, tot)(rng_);
-    for (int i = 0; i < k; ++i) { u -= pr[i]; if (u <= 0) return cand[i].second; }
-    return cand[k - 1].second;
+    // probabilities over the whole row when the candidates are not enough (top_k off): normalizer per vocab slice on the GPUs
+    auto stats = [&](double invT, float & M, double & Z) {
+        std::vector<float> ms(2 * devs_.size());
+        for (size_t g = 0; g < devs_.size(); ++g) {
+            Device & d = *devs_[g];
+            CUDA_CHECK(cudaSetDevice(d.id));
+            max_sumexp(d.logits + (size_t) t * d.output.n(), d.output.n(), d.lstat, d.stream, (float) invT);
+            CUDA_CHECK(cudaMemcpyAsync(&ms[2 * g], d.lstat, 2 * sizeof(float), cudaMemcpyDeviceToHost, d.stream));
+        }
+        M = -INFINITY;
+        for (size_t g = 0; g < devs_.size(); ++g) {
+            CUDA_CHECK(cudaSetDevice(devs_[g]->id));
+            CUDA_CHECK(cudaStreamSynchronize(devs_[g]->stream));
+            M = std::max(M, ms[2 * g]);
+        }
+        Z = 0;
+        for (size_t g = 0; g < devs_.size(); ++g) Z += ms[2 * g + 1] * std::exp(((double) ms[2 * g] - M) * invT);
+    };
+    return sample_candidates(cand, TOPK, sp, rng_, stats, [&](std::vector<float> & lg) { get_logits(t, lg); });
 }
 
 std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, bool spec_req, GenStats * stats,
@@ -1885,6 +1917,39 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
     st.seconds = std::chrono::duration<double>(clk::now() - t0).count();
     if (stats) *stats = st;
     return out;
+}
+
+// HYPER4_TRACE: GPU 0's copy of the last forward's last-row residual after every layer, <dir>/hyper_l_last-<il>.bin
+void Engine4::dump_trace(const std::string & dir) {
+    Device & d = *devs_[0];
+    if (!d.trace) throw std::runtime_error("dump_trace: run with HYPER4_TRACE");
+    const size_t hcn = cfg_.hc_dim();
+    std::vector<float> h((size_t) cfg_.n_layer * hcn);
+    CUDA_CHECK(cudaSetDevice(d.id));
+    CUDA_CHECK(cudaMemcpy(h.data(), d.trace, h.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    for (int il = 0; il < cfg_.n_layer; ++il) {
+        FILE * f = fopen((dir + "/hyper_l_last-" + std::to_string(il) + ".bin").c_str(), "wb");
+        if (!f) throw std::runtime_error("dump_trace: cannot write to " + dir);
+        fwrite(h.data() + il * hcn, sizeof(float), hcn, f);
+        fclose(f);
+    }
+    // stages of layers 0-1, named like llama.cpp's tensors (.1: the second tensor of that name in a layer)
+    const size_t pe = (size_t) cfg_.ple_n_heads() * cfg_.ple_dim, tw = std::max(hcn, pe), n = cfg_.n_embd;
+    std::vector<float> t2((size_t) TRACE2_SLOTS * tw);
+    CUDA_CHECK(cudaMemcpy(t2.data(), d.trace2, t2.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    auto put = [&](int slot, const std::string & name, size_t w) {
+        FILE * f = fopen((dir + "/hyper_" + name + ".bin").c_str(), "wb");
+        if (f) { fwrite(t2.data() + slot * tw, sizeof(float), w, f); fclose(f); }
+    };
+    if (pe) put(0, "ple_embd", pe);
+    put(1, "hc_init", hcn);
+    for (int il = 0; il < 2; ++il) {
+        const std::string l = "-" + std::to_string(il);
+        put(2 + 4 * il, "ple_out" + l, hcn);
+        put(3 + 4 * il, "hc_mixed" + l, n);
+        put(4 + 4 * il, "hc_combine" + l, hcn);
+        put(5 + 4 * il, "hc_mixed" + l + ".1", n);
+    }
 }
 
 void Engine4::save_expert_stats(const std::string & path) {

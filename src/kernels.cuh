@@ -136,14 +136,18 @@ void topk_pairs(const float * x, int xs, int n, int offset, float * out, int K, 
 constexpr int TOPK = 64;
 // out[t] = {max value, index + offset} (index stored as int bits)
 void argmax_pairs(const float * x, int xs, int n, int offset, float * out, int nt, cudaStream_t s);
-// one block: out[0] = max x[0..n), out[1] = sum exp(x - out[0]) (a vocab slice's share of the softmax normalizer)
-void max_sumexp(const float * x, int n, float * out, cudaStream_t s);
+// one block: out[0] = max x[0..n), out[1] = sum exp((x - out[0]) * invT) (a vocab slice's share of the softmax normalizer)
+void max_sumexp(const float * x, int n, float * out, cudaStream_t s, float invT = 1.0f);
 
 // ---- multi-GPU allreduce without P2P (LL protocol, fp16 payload) ----
 // x[i] += sum_d part_d[i] for i < n (n = nt * n_embd, even); exchanged through host-mapped uint2 slots
 // [2][ndev][n/2]. ss_out (optional): partial sums of squares of the new x, AR_SS_SPAN elements per entry,
 // so token t's statistics are ss_out[t * (n_embd / AR_SS_SPAN) ...]
 constexpr int AR_SS_SPAN = 512;
+// HYPER_AR32=1: exact fp32 parts instead of fp16 (a packet per element: the slot arrays hold 2 * ndev * rows * n_embd
+// packets, see ll_slots)
+bool allreduce_f32();
+inline size_t ll_slots(int ndev, int rows, int n_embd) { return (size_t) 2 * ndev * rows * n_embd; }
 void allreduce_add_ll16(float * x, const float * part, uint2 * slots, int g, int ndev, int n,
                         const int * counter, int call, cudaStream_t s, float * ss_out = nullptr);
 // hyper-connection variant: no x; the sum of row t is scattered into the hc streams of res,

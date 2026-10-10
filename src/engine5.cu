@@ -1,4 +1,5 @@
 #include "engine5.h"
+#include "sampling.h"
 
 #include "ggml.h"
 
@@ -228,6 +229,7 @@ struct Engine5::Device {
     float * hf32 = nullptr;          // prefill: one layer's Q8_0 per-head matrix as exact fp32
     size_t hf32_n = 0;
     float * topk = nullptr;
+    float * lstat = nullptr;   // sampling: a logit row slice's max and sum exp
     int big_stride = 0;
     cublasHandle_t blas = nullptr;
     cudaStream_t cstream = nullptr;
@@ -332,7 +334,7 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
     if (getenv("HYPER5_PREDSTAT")) pred_k_ = std::max(1, std::min(MOE_MAX_USED, atoi(getenv("HYPER5_PREDSTAT"))));
     CUDA_CHECK(cudaHostAlloc(&h_pred_, (size_t) cfg_.n_layer * MOE_MAX_USED * sizeof(int), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_ids_, (size_t) nl_tot() * mc_max_ * R5 * cfg_.n_expert_used * sizeof(int), cudaHostAllocPortable));
-    const size_t ll = (size_t) 2 * nd * MAX_NT * n / 2;
+    const size_t ll = ll_slots(nd, MAX_NT, n);   // (fp32 parts: a packet per element)
     CUDA_CHECK(cudaHostAlloc(&ar_ll_, ll * sizeof(uint2), cudaHostAllocPortable | cudaHostAllocMapped));
     memset(ar_ll_, 0xff, ll * sizeof(uint2));
     const int slots = nl_tot();
@@ -884,6 +886,7 @@ void Engine5::load_weights() {
         dev.ihist = dev.alloc<unsigned>((size_t) GSCORE_ROWS * 65536);
         dev.pos = dev.alloc<int>(1);
         dev.counter = dev.alloc<int>(1);
+        dev.lstat = dev.alloc<float>(2);
     }
     // experts fill what is left on each GPU (minus a runtime reserve)
     {
@@ -1524,20 +1527,25 @@ int Engine5::sample_row(int t, const SamplingParams & sp) {
         const float * p = h_topk_ + ((size_t) g * MAX_NT + t) * TOPK * 2;
         for (int i = 0; i < TOPK; ++i) { const int idx = ((const int *) p)[2 * i + 1]; if (idx >= 0) cand.push_back({p[2 * i], idx}); }
     }
-    std::sort(cand.begin(), cand.end(), [](auto & a, auto & b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
-    int k = std::min<int>((int) cand.size(), sp.top_k > 0 ? std::min(sp.top_k, TOPK) : TOPK);
-    if (sp.temp <= 0.0f || k == 1) return cand[0].second;
-    std::vector<double> pr(k);
-    double z = 0;
-    for (int i = 0; i < k; ++i) { pr[i] = std::exp((cand[i].first - cand[0].first) / sp.temp); z += pr[i]; }
-    for (auto & v : pr) v /= z;
-    if (sp.min_p > 0) { int kk = 1; while (kk < k && pr[kk] >= sp.min_p * pr[0]) ++kk; k = kk; }
-    if (sp.top_p < 1.0f) { double cum = 0; int kk = 0; while (kk < k) { cum += pr[kk++]; if (cum >= sp.top_p) break; } k = kk; }
-    double tot = 0;
-    for (int i = 0; i < k; ++i) tot += pr[i];
-    double u = std::uniform_real_distribution<double>(0.0, tot)(rng_);
-    for (int i = 0; i < k; ++i) { u -= pr[i]; if (u <= 0) return cand[i].second; }
-    return cand[k - 1].second;
+    // probabilities over the whole row when the candidates are not enough (top_k off): normalizer per vocab slice on the GPUs
+    auto stats = [&](double invT, float & M, double & Z) {
+        std::vector<float> ms(2 * devs_.size());
+        for (size_t g = 0; g < devs_.size(); ++g) {
+            Device & d = *devs_[g];
+            CUDA_CHECK(cudaSetDevice(d.id));
+            max_sumexp(d.logits + (size_t) t * d.output.n(), d.output.n(), d.lstat, d.stream, (float) invT);
+            CUDA_CHECK(cudaMemcpyAsync(&ms[2 * g], d.lstat, 2 * sizeof(float), cudaMemcpyDeviceToHost, d.stream));
+        }
+        M = -INFINITY;
+        for (size_t g = 0; g < devs_.size(); ++g) {
+            CUDA_CHECK(cudaSetDevice(devs_[g]->id));
+            CUDA_CHECK(cudaStreamSynchronize(devs_[g]->stream));
+            M = std::max(M, ms[2 * g]);
+        }
+        Z = 0;
+        for (size_t g = 0; g < devs_.size(); ++g) Z += ms[2 * g + 1] * std::exp(((double) ms[2 * g] - M) * invT);
+    };
+    return sample_candidates(cand, TOPK, sp, rng_, stats, [&](std::vector<float> & lg) { get_logits(t, lg); });
 }
 
 std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, bool spec_req, GenStats * stats,

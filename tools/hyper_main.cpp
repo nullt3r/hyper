@@ -252,6 +252,8 @@ static int cmd_samptest(const char * model, const char * ref_path, int runs) {
     Engine eng(model, opt);
     SamplingParams sp;
     sp.temp = 1.0f; sp.top_k = 40;
+    if (getenv("HYPER_TOPK")) sp.top_k = atoi(getenv("HYPER_TOPK"));   // (0: off, exercises the whole-row sampling path)
+    if (getenv("HYPER_TOPP")) sp.top_p = (float) atof(getenv("HYPER_TOPP"));
     std::vector<std::map<int, int>> hp(4), hs(4);
     double acc = 0; int steps = 0;
     for (int r = 0; r < runs; ++r) {

@@ -71,6 +71,10 @@ $(BUILD)/ggbench: $(OBJ4) tools/ggbench.cu
 	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)
 
 # expert dequantization (deq8) vs ggml's reference
+$(BUILD)/samplertest: tools/samplertest.cpp src/sampling.h src/llm.h
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) tools/samplertest.cpp -o $@
+
 $(BUILD)/deqtest: $(OBJ4) tools/deqtest.cu
 	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/deqtest.cu $(OBJ4) -o $@ \
 	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)

@@ -79,6 +79,7 @@ public:
     bool has_mtp() const override { return mtp_g_ != nullptr; }
     // routing statistics: the loaded ones plus what the CPU side has seen since (decode routing of every layer)
     void save_expert_stats(const std::string & path);
+    void dump_trace(const std::string & dir);   // HYPER4_TRACE: per-layer residual of the last forward's last row
     // MTP drafts per step and the run-probability floor (tests)
     void set_draft(int k, double pmin) { opt_.n_draft = std::max(1, std::min(k, MAX_NT - 1)); mtp_pmin_ = pmin; }
 

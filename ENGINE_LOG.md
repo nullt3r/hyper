@@ -302,3 +302,26 @@ Nástroje: `mtpgen` s `HYPER_SWEEP=k:pmin,...` (víc politik v jednom procesu), 
   0,00134; Flash 0,048582 / 4,35564), výstup se 3 drafty 256/256, rychlost beze změny.
 - `mtpgen` / `hyper gen`: `HYPER_SWEEP=k:pmin,...` pro všechny enginy (víc politik v jednom procesu, hash výstupu, prefill).
 
+## 2026-10-10 – audit přesnosti
+
+- **Sampling byl ořezaný.** GPU posílají 64 kandidátů na řez slovníku a `top_k 0` znamenalo „64 nejlepších“;
+  navíc výchozí `top_k 20` serveru (doporučení Qwenu) platilo i pro GLM, kde je doporučeno jen T 1,0 / top_p 0,95.
+  Na referenčních logitech GLM: top_k 20 ořízlo nucleus na 34 % pozic (průměrná TV vzdálenost 0,089 na token),
+  limit 64 na 26 % (0,056). Nově `src/sampling.h` pro všechny enginy: když nabraná množina (top_k / min_p / top_p)
+  nemůže sahat za kandidáty, rozhodnou oni s přesným normalizátorem z GPU (`max_sumexp` s teplotou); jinak se načte
+  celý řádek logitů a množina se najde přesně (koše log-váhy, třídí se jen hraniční koš). `samplertest`: 90 nastavení
+  × řádky referencí, množina i pravděpodobnosti = úplné seřazení (rozdíl ≤ 3e-13). Při T 1 / top_p 0,95 se celý řádek
+  čte na ~28 % pozic. Server: GLM má výchozí T 1,0 / top_p 0,95 / top_k 0 (vypnuto), `/props` hlásí skutečné hodnoty.
+- **fp16 částečné součty mezi GPU** (LL i prefill) – hypotéza z dřívějška (růst KL s kontextem) **vyvrácena**:
+  varianta s přesnými fp32 částmi (`HYPER_AR32=1`, dvojnásobné sloty) nemění KL na žádném modelu (27B 0,000221 /
+  0,000653 → 0,000222 / 0,000651; Flash, Uncensored, GLM v šumu). Zůstává fp16.
+- **KL vs šum llama.cpp na stejném textu** (reference lišící se jen ubatch / CPU experty): GLM 0,038–0,040 vs 0,043
+  (v šumu); Flash 0,046–0,062 vs 0,029–0,038; Uncensored 0,104–0,111 vs 0,069. Trasování po vrstvách
+  (`hyper4 trace` + `ref` s `REF_DUMPLAST`/`REF_TOKENS`) na 256. tokenu: hyper se od llama.cpp liší už za první
+  vrstvou o 1,7 % (llama.cpp sama proti sobě 0,3–0,5 %), konkrétně v hc mixeru vrstvy 0 ze stejného vstupu.
+  Přesný výpočet mixeru v double z vah souboru: **hyper 3,3e-5 relativně, llama.cpp 1,7 %** – llama.cpp kvantizuje
+  aktivace na 8 bitů (q8_1 bloky po 32) a vstup mixeru má odlehlé hodnoty (max 12,9 při RMS 1,13); její varianty
+  sdílejí stejné zaokrouhlení, proto se shodují mezi sebou. Rozdíl je chyba reference, ne hyperu.
+- Rozdíly podle umístění expertů (CPU: 8bitové aktivace jako llama.cpp, GPU: fp16/fp32) zůstávají: jsou vlastní
+  dělení CPU/GPU (llama.cpp GPU vs CPU experty: KL 0,069) a na kvalitu nemají vliv.
+

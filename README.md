@@ -66,11 +66,31 @@ in VRAM on the CPU). The contexts are the closest ones that were measured on bot
 
 ### Correctness
 
-Output is checked against llama.cpp logits (`ref` + `hyper4 check` / `hyper check`): the KL divergence is at the level
-llama.cpp shows against itself with a different batch size (the noise floor). Speed changes are additionally required to
-leave the output unchanged: the same KL / PPL on the reference text, the same chunked-prefill result and the same
-speculative output hash before and after; kernel rewrites are compared bit for bit in microbenchmarks.
+Output is checked against llama.cpp logits (`ref` + `hyper4 check` / `hyper check`). Speed changes are additionally
+required to leave the output unchanged: the same KL / PPL on the reference text, the same chunked-prefill result and the
+same speculative output hash before and after; kernel rewrites are compared bit for bit in microbenchmarks.
 [ENGINE_LOG.md](ENGINE_LOG.md) (Czech) has the step-by-step log with every measurement.
+
+| Model | KL hyper vs llama.cpp | KL llama.cpp vs itself (other batch size / CPU experts) |
+|---|---|---|
+| GLM-5.3-Flash (512 tokens) | 0.038–0.040 | 0.043 |
+| Qwen3.8-Flash-Next (256 tokens) | 0.046–0.062 | 0.029–0.038 |
+| Flash-Next Uncensored (256 tokens) | 0.104–0.111 | 0.069 |
+| Qwen3.8-27B (64 / 700 tokens) | 0.00022 / 0.00065 | – |
+
+Flash-Next sits above llama.cpp's own spread, and a layer-by-layer trace (`hyper4 trace`, `ref` with `REF_DUMPLAST`)
+shows where: the first hyper-connection mixer, from identical inputs. Computed exactly (double precision, the file's
+weights), hyper's result there is off by 3·10⁻⁵ (relative), llama.cpp's by 1.7 %: llama.cpp quantizes activations
+to 8 bits for its Q8_0 products, and the mixer's inputs have outliers. Its batch-size variants share that rounding,
+which is why they agree with each other. Other checks:
+
+- Speculative verification rows round exactly like single-token steps (KL identical for 1–4 rows), so greedy
+  speculative output equals plain greedy output.
+- Sampling is exact for any `top_k` / `top_p` / `min_p` (`samplertest`: the kept set equals a full sort of the row).
+- Partial sums cross the GPUs in fp16; fp32 (`HYPER_AR32=1`) measured: no KL change.
+- MoE models compute a CPU-held expert from 8-bit activations (as llama.cpp does) and a GPU-held one in fp16 / fp32,
+  so output depends slightly on where the experts were placed (startup VRAM, adaptive placement); llama.cpp shows the
+  same effect (Uncensored: GPU vs CPU experts KL 0.069).
 
 ## How it works
 
@@ -187,7 +207,7 @@ Options:
 | `--host`, `--port` | `0.0.0.0`, `8080` | listen address |
 | `--ctx` | 262144 (Flash-Next 131072, GLM 65536 when not given) | maximum context; KV / latent caches are allocated for it, which takes VRAM from experts |
 | `--alias` | file name | model name reported by the API |
-| `--temp`, `--top-p`, `--top-k`, `--min-p` | 0.6, 0.95, 20, 0 | sampling defaults (request fields override them) |
+| `--temp`, `--top-p`, `--top-k`, `--min-p` | Qwen: 0.6, 0.95, 20, 0; GLM: 1.0, 0.95, 0 (off), 0 | sampling defaults (request fields override them); exact for any top_k: when the kept set reaches past the GPUs' 64 candidates per slice, the whole logit row is read |
 | `--draft` | 3 | speculative tokens per step (MTP or n-gram); `0` disables |
 | `--mtp file` | — | Flash-Next (and its fine-tunes): separate NextN GGUF; GLM: a GGUF with the NextN block `blk.<n_layer>` (the original split files) |
 | `--cpu-threads` | 30 | CPU expert threads (MoE models) |
@@ -211,10 +231,11 @@ Selected environment variables:
 
 | Tool | Purpose |
 |---|---|
-| `ref` | runs mainline llama.cpp on a prompt and dumps the token ids and full logits (the reference). Supports experts on the CPU (`REF_CPU_MOE=1`) and only the last N rows (`REF_LAST=N`) |
-| `hyper4` | MoE engines (Flash-Next, GLM): `check` / `checkpf` (KL vs the reference), `bench`, `tfbench` (fixed-content decode), `pfbench` (prefill), `ntbench`, `calib` (routing statistics), `mtpgen` (plain vs speculative, must match; GLM with `HYPER5_ADAPT=0`, `HYPER_SWEEP=k:pmin,...` compares draft policies in one run), `cachetest` |
+| `ref` | runs mainline llama.cpp on a prompt and dumps the token ids and full logits (the reference). Supports experts on the CPU (`REF_CPU_MOE=1`), only the last N rows (`REF_LAST=N`), another batch size (`REF_UBATCH`), the tokens of an existing reference (`REF_TOKENS=file`) and the last token's value of named tensors (`REF_DUMPLAST=prefix,...`) |
+| `hyper4` | MoE engines (Flash-Next, GLM): `check` / `checkpf` (KL vs the reference), `bench`, `tfbench` (fixed-content decode), `pfbench` (prefill), `ntbench`, `calib` (routing statistics), `mtpgen` (plain vs speculative, must match; GLM with `HYPER5_ADAPT=0`, `HYPER_SWEEP=k:pmin,...` compares draft policies in one run), `cachetest`, `trace` (Flash-Next, `HYPER4_TRACE=dir`: residuals after every layer and stages of layers 0–1, named like llama.cpp's tensors) |
 | `hyper` | 27B engine: `check`, `checkn`, `gen`, `pfbench`, `cachetest`, `samptest` |
 | `gemvbench`, `arbench`, `arbulk`, `iqkbench`, `bwtest`, `zctest` | microbenchmarks: Q8 GEMV per shape, allreduce, CPU expert dot products (mainline vs ik_llama), PCIe and zero-copy bandwidth |
+| `samplertest` | exact sampling: the kept token set and probabilities from the GPUs' candidates or the whole row vs a full sort, on reference logits, for 90 settings |
 | `cpumoebench`, `iq3bench` | the CPU expert decode job on real expert weights (time per job, bandwidth, output bit hash); IQ3_S / IQ4_XS kernels vs ggml, bit for bit |
 | `moebench`, `mlabench`, `topkbench`, `f32bench` | GPU expert kernels for 1–4 local experts, GLM MLA decode attention, sampling candidates (top-64), fp32 router GEMV |
 

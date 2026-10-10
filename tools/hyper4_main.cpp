@@ -213,6 +213,14 @@ static int run_cmd(int argc, char ** argv) {
                 while (same < n_gen && plain[same] == parked[same]) ++same;
                 printf("CACHE4 %-9s reused %d (without side request %d)  identical %d / %d\n", "parked", r1, r0, same, n_gen);
             }
+        } else if (cmd == "trace") {   // HYPER4_TRACE=dir: tokens 0..n-1 one per forward, then every layer's last-row residual
+            if constexpr (std::is_same_v<Engine, Engine4>) {
+                const int n = std::min<int>(argc > 4 ? atoi(argv[4]) : (int) toks.size(), (int) toks.size());
+                eng.reset();
+                for (int i = 0; i < n; ++i) eng.forward(&toks[i], 1, i);
+                eng.dump_trace(getenv("HYPER4_TRACE"));
+                printf("TRACE %d tokens, residuals in %s\n", n, getenv("HYPER4_TRACE"));
+            } else throw std::runtime_error("trace: Flash-Next engine only");
         } else if (cmd == "mtpgen") {   // HYPER4_MTP=file: greedy plain vs MTP speculative (identical output), speed
             const int n_gen = argc > 4 ? atoi(argv[4]) : 256;
             const size_t np = getenv("HYPER4_GENP") ? atoi(getenv("HYPER4_GENP")) : 128;   // prompt length

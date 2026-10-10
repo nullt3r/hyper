@@ -560,7 +560,7 @@ int main(int argc, char ** argv) {
     std::string stats_path;   // qwen4exp: routing statistics, read at start and updated after every request
     std::string mtp_path;     // qwen4exp: separate NextN (MTP) GGUF; glm5-next: a GGUF with blk.<n_layer> (the original split files)
     std::string template_file;   // chat template (jinja) instead of the GGUF's
-    bool ctx_given = false;
+    bool ctx_given = false, temp_given = false, top_p_given = false, top_k_given = false;
     SamplingParams defaults;   // Qwen's recommendation for thinking mode
     defaults.temp = 0.6f; defaults.top_p = 0.95f; defaults.top_k = 20; defaults.min_p = 0.0f;
     for (int i = 2; i + 1 < argc; i += 2) {
@@ -570,8 +570,8 @@ int main(int argc, char ** argv) {
         else if (k == "--expert-stats") { setenv("HYPER4_STATS", v.c_str(), 1); stats_path = v; }
         else if (k == "--mtp") mtp_path = v;
         else if (k == "--draft") draft = std::stoi(v); else if (k == "--alias") alias = v;
-        else if (k == "--temp") defaults.temp = std::stof(v); else if (k == "--top-p") defaults.top_p = std::stof(v);
-        else if (k == "--top-k") defaults.top_k = std::stoi(v); else if (k == "--min-p") defaults.min_p = std::stof(v);
+        else if (k == "--temp") { defaults.temp = std::stof(v); temp_given = true; } else if (k == "--top-p") { defaults.top_p = std::stof(v); top_p_given = true; }
+        else if (k == "--top-k") { defaults.top_k = std::stoi(v); top_k_given = true; } else if (k == "--min-p") defaults.min_p = std::stof(v);
         else if (k == "--snapshots") snaps = std::stoi(v);
         else if (k == "--reasoning-effort") g_reasoning_effort = v;
         else if (k == "--chat-template-file") template_file = v;
@@ -622,6 +622,10 @@ int main(int argc, char ** argv) {
         engine = std::move(e4);
     } else if (arch == "glm5-next") {
         if (!ctx_given) ctx = 65536;
+        // GLM's recommended sampling: temperature 1.0, top_p 0.95, no top_k (the defaults above are Qwen's)
+        if (!temp_given) c.defaults.temp = 1.0f;
+        if (!top_p_given) c.defaults.top_p = 0.95f;
+        if (!top_k_given) c.defaults.top_k = 0;
         Engine5Options o5;
         o5.max_pos = ctx;
         o5.gpu_expert_frac = gpu_frac;
@@ -692,8 +696,8 @@ int main(int argc, char ** argv) {
     srv.Get("/v1/models", models);
     srv.Get("/props", [&](const httplib::Request &, httplib::Response & res) {   // (web UI: the server's sampling defaults)
         cors(res);
-        res.set_content(ojson({{"model", c.alias}, {"sampling", {{"temp", defaults.temp}, {"top_p", defaults.top_p}, {"top_k", defaults.top_k},
-                                                                  {"min_p", defaults.min_p}}}}).dump(), "application/json");
+        res.set_content(ojson({{"model", c.alias}, {"sampling", {{"temp", c.defaults.temp}, {"top_p", c.defaults.top_p}, {"top_k", c.defaults.top_k},
+                                                                  {"min_p", c.defaults.min_p}}}}).dump(), "application/json");
     });
     srv.Get("/stats", [&](const httplib::Request &, httplib::Response & res) { cors(res); res.set_content(c.live.json().dump(), "application/json"); });
     srv.Get("/", [&](const httplib::Request &, httplib::Response & res) { res.set_content(CHAT_PAGE, "text/html; charset=utf-8"); });
