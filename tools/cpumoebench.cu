@@ -90,6 +90,7 @@ int main(int argc, char ** argv) {
     std::vector<float> x((size_t) nt * n);
     for (auto & v : x) v = std::normal_distribution<float>(0, 1)(rng);
     double sum_t = 0, cs = 0;
+    unsigned long long hb = 1469598103934665603ull;   // bits of every output
     long long hits = 0;
     for (int it = -50; it < jobs; ++it) {   // (50 warm-up jobs)
         const unsigned counter = (unsigned) (it + 100);
@@ -121,11 +122,15 @@ int main(int argc, char ** argv) {
             if (!f) uniq.push_back(r.ids[t][j]);
         }
         hits += (long long) uniq.size();
-        for (int t = 0; t < nt; ++t) for (int i = 0; i < n; ++i) cs += outs[0].y[t][i] * (1 + (i % 7)) * (1 + it % 5);
+        for (int t = 0; t < nt; ++t) for (int i = 0; i < n; ++i) {
+            cs += outs[0].y[t][i] * (1 + (i % 7)) * (1 + it % 5);
+            unsigned u; memcpy(&u, &outs[0].y[t][i], 4); hb = (hb ^ u) * 1099511628211ull;
+        }
     }
     cpu.drain();
     const double per = sum_t / jobs, bpj = (double) hits / jobs * (2 * gb + db);
     printf("CPUMOE %s gate %s down %s  %d threads, %d experts x %d tokens: %.1f us/job  %.1f GB/s  checksum %.10e\n",
            p.c_str(), gtype_name(tg.type), gtype_name(td.type), nth, epj, nt, per * 1e6, bpj / per / 1e9, cs);
+    printf("CPUMOE output bits hash %016llx\n", hb);
     return 0;
 }

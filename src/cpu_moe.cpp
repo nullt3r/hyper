@@ -383,7 +383,7 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
         };
         // balanced: a multiple of the team size of near-equal tasks (dynamic claiming then ends a phase with every thread
         // finishing at about the same time; 128 tasks for 30 threads left 4.3 rounds)
-        static const bool bal = !getenv("HYPER_CPU_NOBAL");
+        static const bool bal = getenv("HYPER_CPU_BAL") != nullptr;   // (measured: equal or slightly slower; off)
         auto add = [&](std::vector<int> & v, int g, int a, int b, int R, bool dn, int part) {
             if (bal && tail_mult == 0 && part < 0 && (b - a) % 4 == 0) {
                 const int units = (b - a) / 4, nth = n_threads_;
