@@ -1189,6 +1189,108 @@ __global__ void k_topk(const float * __restrict__ x, int xs, int n, int offset, 
     for (int s = base + neq + threadIdx.x; s < K; s += blockDim.x) { o[2 * s] = -FLT_MAX; ((int *) o)[2 * s + 1] = -1; }
 }
 
+// two-stage top-K for long rows (the vocabulary slice): blocks select the top K of their chunk, one block selects from
+// the chunks' candidates. The selected values are those of k_topk (every global top-K element is in its chunk's top K);
+// as in k_topk, which of several elements equal to the K-th value fill the last slots is unspecified.
+constexpr int TOPK_CHUNKS = 64, TOPK_MAXK = 64;
+__device__ float2 g_topk_cand[4][TOPK_CHUNKS * TOPK_MAXK];   // per device: [row][chunk * K + j] = {value, index bits}
+// block-wide K-th largest key over m keys produced by key(i) (radix, 8 bits per pass; warp-parallel bin walk)
+template <typename F>
+__device__ unsigned topk_threshold(int m, int K, F key, unsigned & need_out) {
+    __shared__ unsigned hist[256];
+    __shared__ unsigned prefix, need;
+    if (threadIdx.x == 0) { prefix = 0; need = K; }
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
+        __syncthreads();
+        const unsigned mask_hi = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+        const unsigned pre = prefix;
+        for (int i = threadIdx.x; i < m; i += blockDim.x) {
+            const unsigned k = key(i);
+            if ((k & mask_hi) == (pre & mask_hi)) atomicAdd(&hist[(k >> shift) & 255], 1u);
+        }
+        __syncthreads();
+        if (threadIdx.x < 32) {   // bins 255 - 8 lane - (0..7); the crossing lane resolves its bins in order
+            const unsigned nd = need;
+            unsigned c[8], tot = 0;
+#pragma unroll
+            for (int q = 0; q < 8; ++q) { c[q] = hist[255 - 8 * threadIdx.x - q]; tot += c[q]; }
+            unsigned incl = tot;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) { const unsigned v = __shfl_up_sync(0xffffffff, incl, o); if (threadIdx.x >= o) incl += v; }
+            const unsigned excl = incl - tot;
+            if (excl < nd && incl >= nd) {
+                unsigned acc = excl;
+#pragma unroll
+                for (int q = 0; q < 8; ++q) {
+                    if (acc + c[q] >= nd) { prefix = pre | ((unsigned) (255 - 8 * threadIdx.x - q) << shift); need = nd - acc; break; }
+                    acc += c[q];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    need_out = need;
+    return prefix;
+}
+// stage 1: grid (TOPK_CHUNKS, rows), 256 threads
+__global__ void __launch_bounds__(256) k_topk_chunk(const float * __restrict__ x, int xs, int n, int K) {
+    const int row = blockIdx.y, b = blockIdx.x;
+    const int c0 = (int) ((long long) n * b / TOPK_CHUNKS), c1 = (int) ((long long) n * (b + 1) / TOPK_CHUNKS), m = c1 - c0;
+    __shared__ float v[(262144 / 3 + TOPK_CHUNKS) / TOPK_CHUNKS + 64];
+    const float * xr = x + (size_t) row * xs + c0;
+    for (int i = threadIdx.x; i < m; i += blockDim.x) v[i] = xr[i];
+    __syncthreads();
+    float2 * o = g_topk_cand[row] + (size_t) b * K;
+    if (m <= K) {   // the whole chunk
+        for (int i = threadIdx.x; i < K; i += blockDim.x) o[i] = i < m ? make_float2(v[i], __int_as_float(c0 + i)) : make_float2(-FLT_MAX, __int_as_float(-1));
+        return;
+    }
+    unsigned need;
+    const unsigned t = topk_threshold(m, K, [&](int i) { return fkey(v[i]); }, need);
+    __shared__ int ngt, neq;
+    if (threadIdx.x == 0) { ngt = 0; neq = 0; }
+    __syncthreads();
+    for (int i = threadIdx.x; i < m; i += blockDim.x)
+        if (fkey(v[i]) > t) { const int s = atomicAdd(&ngt, 1); if (s < K) o[s] = make_float2(v[i], __int_as_float(c0 + i)); }
+    __syncthreads();
+    const int base = min(ngt, K);
+    for (int i = threadIdx.x; i < m; i += blockDim.x)
+        if (fkey(v[i]) == t) { const int s = base + atomicAdd(&neq, 1); if (s < K) o[s] = make_float2(v[i], __int_as_float(c0 + i)); }
+    __syncthreads();
+    for (int s = base + neq + threadIdx.x; s < K; s += blockDim.x) o[s] = make_float2(-FLT_MAX, __int_as_float(-1));
+}
+// stage 2: block per row (1024 threads) over the TOPK_CHUNKS * K candidates; out as k_topk
+__global__ void __launch_bounds__(1024) k_topk_merge(int offset, float * __restrict__ out, int K) {
+    const int row = blockIdx.x, m = TOPK_CHUNKS * K;
+    const float2 * cand = g_topk_cand[row];
+    float * o = out + (size_t) row * K * 2;
+    // (padding slots hold -FLT_MAX with index -1: they sort below every real value)
+    unsigned need;
+    const unsigned t = topk_threshold(m, K, [&](int i) { return fkey(cand[i].x); }, need);
+    __shared__ int ngt, neq;
+    if (threadIdx.x == 0) { ngt = 0; neq = 0; }
+    __syncthreads();
+    for (int i = threadIdx.x; i < m; i += blockDim.x) {
+        const float2 c = cand[i];
+        if (__float_as_int(c.y) >= 0 && fkey(c.x) > t) {
+            const int s = atomicAdd(&ngt, 1);
+            if (s < K) { o[2 * s] = c.x; ((int *) o)[2 * s + 1] = __float_as_int(c.y) + offset; }
+        }
+    }
+    __syncthreads();
+    const int base = min(ngt, K);
+    for (int i = threadIdx.x; i < m; i += blockDim.x) {
+        const float2 c = cand[i];
+        if (__float_as_int(c.y) >= 0 && fkey(c.x) == t) {
+            const int s = base + atomicAdd(&neq, 1);
+            if (s < K) { o[2 * s] = c.x; ((int *) o)[2 * s + 1] = __float_as_int(c.y) + offset; }
+        }
+    }
+    __syncthreads();
+    for (int s = base + neq + threadIdx.x; s < K; s += blockDim.x) { o[2 * s] = -FLT_MAX; ((int *) o)[2 * s + 1] = -1; }
+}
+
 // thread per element pair: {half2(part[2i], part[2i+1]), seq} in one 8-byte packet; readers spin on packets
 __global__ void k_allreduce_add_ll16(float * x, const float * __restrict__ part, uint2 * slots, int g, int ndev, int n2,
                                      const int * counter, int call, float * ss_out) {
@@ -1853,6 +1955,12 @@ void add_parts(float * x, const half * own, const half * recv, size_t stride, in
     k_add_parts<<<(n / 8 + 255) / 256, 256, 0, s>>>(x, own, recv, stride, nparts, n);
 }
 void topk_pairs(const float * x, int xs, int n, int offset, float * out, int K, int nt, cudaStream_t s) {
+    static const bool one = getenv("HYPER_TOPK_ONEBLOCK") != nullptr;
+    if (!one && nt <= 4 && K <= TOPK_MAXK && n >= 4 * TOPK_CHUNKS * K && n <= 262144 / 3 + TOPK_CHUNKS) {
+        k_topk_chunk<<<dim3(TOPK_CHUNKS, nt), 256, 0, s>>>(x, xs, n, K);
+        k_topk_merge<<<nt, 1024, 0, s>>>(offset, out, K);
+        return;
+    }
     k_topk<<<nt, 1024, 0, s>>>(x, xs, n, offset, out, K);
 }
 void allreduce_mhc_ll16(float * res, const float * hcw, int width, const float * part, uint2 * slots, int g, int ndev, int n,
