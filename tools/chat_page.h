@@ -203,6 +203,19 @@ body.wrap .cb .wrp{color:#fff;background:#333333}
 .tool{margin:0 0 14px;border:1px solid var(--line);border-radius:12px;overflow:hidden}
 .tool .hd{padding:8px 12px;font-size:13px;color:var(--fg2);background:var(--bg2);display:flex;gap:6px;align-items:center;font-weight:550}
 .tool pre{margin:0;padding:10px 12px;font:12.5px/1.5 "JetBrains Mono",monospace;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--fg2)}
+.tcs{margin:0 0 12px}
+.tc{margin:0 0 8px;border:1px solid var(--line);border-radius:12px;background:var(--bg2);overflow:hidden}
+.tch{display:flex;align-items:center;gap:8px;width:100%;min-height:38px;padding:6px 12px;font-size:13.5px;color:var(--fg2);text-align:left}
+.tch .tl2{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tch b{font-weight:600;color:var(--fg)}.tch svg{width:15px;height:15px}
+.tch .chev{width:14px;height:14px;transition:transform .2s}.tc.open .tch .chev{transform:rotate(90deg)}
+.tcb{display:none;margin:0;padding:8px 12px 12px;font:12px/1.5 "JetBrains Mono",ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--fg2);max-height:320px;overflow-y:auto;border-top:1px solid var(--line)}
+.tsr{display:none;padding:4px 12px 8px;border-top:1px solid var(--line);max-height:340px;overflow-y:auto}
+.tc.open .tcb,.tc.open .tsr{display:block}
+.tsr a{display:block;padding:6px 0;font-size:13.5px;line-height:1.35;color:var(--fg);text-decoration:none;border-bottom:1px solid var(--line)}.tsr a:last-child{border-bottom:0}
+.tsr a small{display:block;color:var(--mut);font-size:12px}
+.tc.err .tch{color:var(--danger)}
+.msg.ai.round{margin-bottom:6px}
 .livebar{display:flex;align-items:center;flex-wrap:wrap;gap:6px 10px;min-height:24px;margin-top:8px;font-size:12.5px;color:var(--mut);font-variant-numeric:tabular-nums}
 .livebar:empty{display:none}
 .pd{width:7px;height:7px;border-radius:50%;background:var(--acc);animation:pulse 1s infinite}
@@ -296,7 +309,7 @@ input[type=range]{width:100%;accent-color:var(--acc);height:28px;margin:0}
   <button class="jump" id="jump" aria-label="Scroll to the latest message" onclick="toBottom(true)" data-i="down"></button>
   <div class="sugs" id="sugs"></div>
   <div class="comp"><textarea id="in" rows="1" placeholder="Message hyper" aria-label="Message"></textarea>
-   <div class="crow"><button class="pill" id="thinkb" onclick="toggleThinkMode()"><span data-i="brain"></span>Thinking</button><span class="sp"></span>
+   <div class="crow"><button class="pill" id="thinkb" onclick="toggleThinkMode()"><span data-i="brain"></span>Thinking</button><button class="pill" id="webb" onclick="toggleWeb()" style="display:none"><span data-i="globe"></span>Web</button><span class="sp"></span>
     <button class="send" id="send" onclick="sendMsg()" aria-label="Send"></button></div></div>
   <div class="hint" id="hint"></div>
  </div>
@@ -311,6 +324,7 @@ input[type=range]{width:100%;accent-color:var(--acc);height:28px;margin:0}
   <div class="sec">Response</div>
   <div class="card">
    <div class="row"><div class="lb">Thinking<small>Reason before answering (slower, better on hard questions)</small></div><label class="sw"><input type="checkbox" id="s-think"><i></i></label></div>
+   <div class="row" id="s-webrow" style="display:none"><div class="lb">Web search &amp; browsing<small id="s-webtools"></small></div><label class="sw"><input type="checkbox" id="s-web"><i></i></label></div>
    <div class="row v"><div class="lb">System prompt</div><textarea id="sys" placeholder="You are a helpful assistant."></textarea></div>
   </div>
   <div class="sec">Sampling</div>
@@ -319,7 +333,7 @@ input[type=range]{width:100%;accent-color:var(--acc);height:28px;margin:0}
    <div class="row v"><div class="top"><div class="lb">Top-p</div><span class="val" id="toppv"></span></div><input type="range" id="topp" min="0.05" max="1" step="0.05"></div>
    <div class="row"><div class="lb">Top-k<small>0 = off, empty = server default</small></div><input type="number" id="topk" min="0" step="1" inputmode="numeric"></div>
    <div class="row"><div class="lb">Min-p<small>Empty = server default</small></div><input type="number" id="minp" min="0" max="1" step="0.01" inputmode="decimal"></div>
-   <div class="row"><div class="lb">Max new tokens</div><input type="number" id="maxt" min="16" step="256" inputmode="numeric"></div>
+   <div class="row"><div class="lb">Max new tokens<small>Empty = up to the context size</small></div><input type="number" id="maxt" min="16" step="256" inputmode="numeric" placeholder="no limit"></div>
    <div class="row"><div class="lb"><small id="s-def"></small></div><button class="btn sm" onclick="resetSampling()">Use defaults</button></div>
   </div>
   <div class="sec">Interface</div>
@@ -361,11 +375,14 @@ const IC={menu:sv('<path d="M4 8h16M4 16h11"/>'),side:sv('<rect x="3" y="4" widt
  moon:sv('<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>'),auto:sv('<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" style="fill:currentColor"/>'),
  wrap:sv('<path d="M3 6h18M3 12h14a3 3 0 0 1 0 6h-4"/><path d="m15 16-2 2 2 2M3 18h6"/>'),
  more:sv('<circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/>',' style="fill:currentColor;stroke:none"'),
- alert:sv('<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.5v.01"/>')};
+ alert:sv('<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.5v.01"/>'),
+ globe:sv('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>')};
 document.querySelectorAll('[data-i]').forEach(e=>e.insertAdjacentHTML('beforeend',IC[e.dataset.i]));
 const touch=matchMedia('(hover:none)').matches,narrow=()=>innerWidth<=768;
 let convs=S.get('hyper.convs',[]).filter(c=>c.msgs&&c.msgs.length),cur=S.get('hyper.cur',null),busy=null,gen=null,live={},defaults={},online=true,editing=-1,renaming=null,menuId=null;
-const cfg=Object.assign({sys:'',temp:'',topp:'',topk:'',minp:'',maxt:16384,think:true,theme:'system',enter:!touch,wrap:false},S.get('hyper.cfg',{}));
+const cfg=Object.assign({sys:'',temp:'',topp:'',topk:'',minp:'',maxt:'',think:true,web:true,theme:'system',enter:!touch,wrap:false},S.get('hyper.cfg',{}));
+if(cfg.maxt===16384)cfg.maxt='';   // (the old default limit: now none, up to the context)
+const MCP={tools:[],map:{},servers:[]};   // tools of the MCP servers the server forwards to (--mcp)
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtS=s=>s<10?s.toFixed(1)+'s':s<60?Math.round(s)+'s':Math.floor(s/60)+'m '+Math.round(s%60)+'s';
 const fmtK=n=>n<1000?String(n):n<1e5?(n/1000).toFixed(1)+'k':Math.round(n/1000)+'k';
@@ -399,10 +416,11 @@ function syncSet(){const dT=defaults.temp??1,dP=defaults.top_p??.95;
  $('topk').placeholder=defaults.top_k??'';$('minp').placeholder=defaults.min_p!=null?num(defaults.min_p):'';
  $('temp').value=cfg.temp===''?dT:cfg.temp;$('tempv').textContent=cfg.temp===''?(+dT).toFixed(2)+' · default':(+cfg.temp).toFixed(2);
  $('topp').value=cfg.topp===''?dP:cfg.topp;$('toppv').textContent=cfg.topp===''?(+dP).toFixed(2)+' · default':(+cfg.topp).toFixed(2);
- $('s-think').checked=!!cfg.think;$('s-enter').checked=!!cfg.enter;$('s-wrap').checked=!!cfg.wrap;$('thinkb').classList.toggle('on',!!cfg.think);
+ $('s-think').checked=!!cfg.think;$('s-web').checked=!!cfg.web;$('webb').classList.toggle('on',!!cfg.web);$('s-enter').checked=!!cfg.enter;$('s-wrap').checked=!!cfg.wrap;$('thinkb').classList.toggle('on',!!cfg.think);
  $('s-def').textContent=`Server defaults: temperature ${num(defaults.temp)} · top-p ${num(defaults.top_p)} · top-k ${num(defaults.top_k)} · min-p ${num(defaults.min_p)}`}
 $('sys').oninput=()=>{cfg.sys=$('sys').value;saveCfg()};
-$('maxt').onchange=()=>{cfg.maxt=Math.max(16,parseInt($('maxt').value)||16384);saveCfg();syncSet()};
+$('maxt').onchange=()=>{const v=$('maxt').value.trim();cfg.maxt=v===''?'':Math.max(16,parseInt(v)||16);saveCfg();syncSet()};
+$('s-web').onchange=()=>{cfg.web=$('s-web').checked;saveCfg();syncSet()};
 $('temp').oninput=()=>{cfg.temp=$('temp').value;saveCfg();syncSet()};$('topp').oninput=()=>{cfg.topp=$('topp').value;saveCfg();syncSet()};
 $('topk').onchange=()=>{const v=$('topk').value.trim();cfg.topk=v===''?'':String(Math.max(0,parseInt(v)||0));saveCfg();syncSet()};
 $('minp').onchange=()=>{const v=$('minp').value.trim();cfg.minp=v===''?'':String(Math.min(1,Math.max(0,+v||0)));saveCfg();syncSet()};
@@ -486,7 +504,7 @@ function mdLite(src){const L=src.split('\n');let o='',i=0;
 const VF=['content','reasoning','thinkSecs','t','err','tool','stopped','model'];
 function snap(m){const o={};for(const f of VF)if(m[f]!=null&&m[f]!=='')o[f]=m[f];return o}
 const isGen=(c,k)=>!!gen&&gen.c===c&&k===c.msgs.length-1;
-const shp=(m,st)=>`${+st}${+!!m.reasoning}${+!!m.tool}${+!!m.err}${+!!m.thinking}${m.phase||''}`;
+const shp=(m,st)=>`${+st}${+!!m.reasoning}${+!!m.tool}${+!!m.err}${+!!m.thinking}${m.phase||''}${m.calls?m.calls.length:0}`;
 function thinkLabel(m,st){const on=st&&m.thinking;const s=on?(Date.now()-m.thinkStart)/1000:(m.thinkSecs||0);
  return on?`<span class="shimmer">Thinking</span> <span class="tsec">${fmtS(s)}</span>`:`Thought for ${fmtS(s)}`}
 function thinkHTML(m,k,st){if(!m.reasoning)return'';
@@ -505,12 +523,13 @@ function statHTML(m){const t=m.t;if(!t||t.predicted_n==null)return'';
  if(t.prompt_ms!=null&&t.prompt_n!=null)h+=`<span class="x">${IC.inbox}${t.prompt_n.toLocaleString()} prompt @ ${Math.round(t.prompt_per_second).toLocaleString()} t/s</span>`;
  if(t.cache_n)h+=`<span class="x">${IC.db}${t.cache_n.toLocaleString()} cached</span>`;
  return `<button class="stat" onclick="this.classList.toggle('more')" title="${esc(m.model||'')}">${h}</button>`}
-function footHTML(c,m,k){const last=k===c.msgs.length-1;let h=`<div class="foot"><div class="acts"><button class="ib sm" aria-label="Copy" title="Copy" onclick="cpMsg(${k},this)">${IC.copy}</button>`;
+function footHTML(c,m,k){const last=k===c.msgs.length-1;
+ if(m.calls&&m.calls.length&&!last&&c.msgs[k+1].role==='assistant')return '';   /* (a tool round: the turn's last message has the actions) */let h=`<div class="foot"><div class="acts"><button class="ib sm" aria-label="Copy" title="Copy" onclick="cpMsg(${k},this)">${IC.copy}</button>`;
  if(last)h+=`<button class="ib sm" aria-label="Regenerate" title="Regenerate" onclick="regen()">${IC.regen}</button>`;
  if(m.vers&&m.vers.length>1){const i=m.vi||0;h+=`<span class="pager"><button onclick="ver(${k},-1)" aria-label="Previous answer"${i?'':' disabled'}>${IC.chl}</button>${i+1} / ${m.vers.length}`+
   `<button onclick="ver(${k},1)" aria-label="Next answer"${i<m.vers.length-1?'':' disabled'}>${IC.chr}</button></span>`}
  h+='</div>'+(m.stopped?'<span class="tag">Stopped</span>':'')+statHTML(m);return h+'</div>'}
-function aiInner(c,m,k,st){let h=thinkHTML(m,k,st);
+function aiInner(c,m,k,st){let h=thinkHTML(m,k,st)+toolHTML(m);
  if(m.tool)h+=`<div class="tool"><div class="hd">${IC.tool}Tool call</div><pre>${esc(m.tool)}</pre></div>`;
  h+=`<div class="md${st&&m.phase==='write'?' streaming':''}">${md(st&&gen?m.content.slice(0,gen.sc):(m.content||''),st)}</div>`;
  if(st)h+='<div class="livebar"></div>';
@@ -525,7 +544,8 @@ function msgHTML(c,m,k){
   return `<div class="msg user" data-k="${k}"><div class="ububble${long?' clamp':''}">${esc(m.content)}</div><div class="acts">`+(long?'<button class="btn sm ghost" onclick="expandU(this)">Show more</button>':'')+
    `<button class="ib sm" aria-label="Copy" title="Copy" onclick="cpMsg(${k},this)">${IC.copy}</button>`+
    (busy?'':`<button class="ib sm" aria-label="Edit" title="Edit" onclick="editMsg(${k})">${IC.pencil}</button>`)+'</div></div>'}
- const st=isGen(c,k);return `<div class="msg ai" data-k="${k}" data-sh="${shp(m,st)}">${aiInner(c,m,k,st)}</div>`}
+ const st=isGen(c,k),rd=m.calls&&m.calls.length&&k<c.msgs.length-1&&c.msgs[k+1].role==='assistant';
+ return `<div class="msg ai${rd?' round':''}" data-k="${k}" data-sh="${shp(m,st)}">${aiInner(c,m,k,st)}</div>`}
 const SUG=[['Explain','how mixture-of-experts models route tokens'],['Write','a Python script that resizes new images in a folder'],['Compare','Rust and Go for a small CLI tool'],['Plan','a 3-day trip to Prague']];
 function render(){renderSide();const c=conv(),empty=!c||!c.msgs.length,col=$('col');$('main').classList.toggle('empty',empty);
  if(empty){col.innerHTML=`<div class="hero"><span class="mark">${IC.boltf}</span><h1>What can I help with?</h1><p id="hsub">${esc(live.model||'hyper')} · running locally</p></div>`;document.title='hyper'}
@@ -558,6 +578,59 @@ function updSend(){const b=$('send'),stop=!!busy;b.disabled=!stop&&!IN.value.tri
 IN.value=S.get('hyper.draft','');
 IN.addEventListener('input',()=>{autosz(IN);updSend();S.set('hyper.draft',IN.value)});
 IN.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing&&(cfg.enter||e.ctrlKey||e.metaKey)){e.preventDefault();if(!busy)sendMsg()}});
+/* ---------- web tools (MCP servers behind the server's /mcp/<name>) ---------- */
+let rpcId=0;
+async function mcpRpc(server,method,params){const id=++rpcId;
+ const r=await fetch('/mcp/'+encodeURIComponent(server),{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json, text/event-stream'},
+  body:JSON.stringify({jsonrpc:'2.0',id,method,params:params||{}})});
+ const t=await r.text();let j=null;
+ if((r.headers.get('content-type')||'').includes('event-stream')){for(const l of t.split('\n'))if(l.startsWith('data:')){try{const x=JSON.parse(l.slice(5));if(x.id===id)j=x}catch(e){}}}
+ else{try{j=JSON.parse(t)}catch(e){}}
+ if(!j)throw new Error(`MCP ${server}: HTTP ${r.status} ${t.slice(0,200)}`);
+ if(j.error)throw new Error(j.error.message||JSON.stringify(j.error));
+ return j.result}
+async function loadTools(){try{const j=await (await fetch('/v1/mcp')).json();const tools=[],map={},names=[];
+  for(const sv of j.servers||[]){try{
+   await mcpRpc(sv.name,'initialize',{protocolVersion:'2025-03-26',capabilities:{},clientInfo:{name:'hyper-chat',version:'1'}});
+   const r=await mcpRpc(sv.name,'tools/list');
+   for(const t of r.tools||[]){let n=t.name;if(map[n])n=sv.name+'__'+t.name;map[n]={server:sv.name,name:t.name};names.push(t.name);
+    tools.push({type:'function',function:{name:n,description:t.description||'',parameters:t.inputSchema||{type:'object',properties:{}}}})}
+  }catch(e){console.warn('MCP server',sv.name,e)}}
+  MCP.tools=tools;MCP.map=map;MCP.servers=j.servers||[];
+  $('webb').style.display=tools.length?'':'none';$('s-webrow').style.display=tools.length?'':'none';$('s-webtools').textContent=names.join(', ')}catch(e){}}
+function toggleWeb(){cfg.web=!cfg.web;saveCfg();syncSet();toast(cfg.web?'Web search on':'Web search off')}
+function toolPrompt(){const n=MCP.tools.map(t=>t.function.name);
+ return `You have web access through tools (${n.join(', ')}): search the web for anything recent, for facts you are not sure about and when the user asks about a site or a page; then read the most relevant results. Cite the pages you used as markdown links. Today is ${new Date().toISOString().slice(0,10)}.`}
+function hostOf(u){try{return new URL(u).hostname.replace(/^www\./,'')}catch(e){return u||''}}
+function toolHTML(m){if(!m.calls||!m.calls.length)return'';
+ return '<div class="tcs">'+m.calls.map(x=>{let a={};try{a=JSON.parse(x.args||'{}')}catch(e){}
+  const t=(MCP.map[x.name]||{}).name||x.name,done=x.result!=null,run=x.state==='run';
+  const w=t==='web_search'?['Searching','Searched',a.query?'“'+a.query+'”':'']:t==='fetch_url'?['Reading','Read',hostOf(a.url)]:['Running','Ran',t||'tool'];
+  const lbl=done?`${w[1]} <b>${esc(w[2])}</b>`:`<span class="shimmer">${w[0]} ${esc(w[2])}${run?'…':''}</span>`;
+  let body='';
+  if(done){const items=t==='web_search'&&!x.isError?x.result.split(/\n\n(?=\[\d+\])/).map(b=>{const L=b.split('\n'),mt=/^\[\d+\]\s*(.*)$/.exec(L[0]);return mt&&L[1]?{title:mt[1],url:L[1].trim()}:null}).filter(Boolean):[];
+   body=items.length?`<div class="tsr">${items.map(it=>`<a href="${esc(it.url)}" target="_blank" rel="noopener">${esc(it.title||it.url)}<small>${esc(hostOf(it.url))}</small></a>`).join('')}</div>`
+    :`<pre class="tcb">${esc(x.result.slice(0,6000))}${x.result.length>6000?'\n…':''}</pre>`}
+  return `<div class="tc${x.isError?' err':''}"><button class="tch" onclick="this.parentElement.classList.toggle('open')">${t==='web_search'?IC.search:t==='fetch_url'?IC.globe:IC.tool}<span class="tl2">${lbl}</span>${done?IC.chev:''}</button>${body}</div>`}).join('')+'</div>'}
+// the request history: an assistant turn with tool calls is followed by one tool message per call
+function pushHist(msgs,m){if(m.role==='user'){msgs.push({role:'user',content:m.content});return}
+ const calls=(m.calls||[]).filter(x=>x.name);
+ if(m.err&&!m.content&&!calls.length)return;
+ const o={role:'assistant',content:m.content||''};if(m.reasoning)o.reasoning_content=m.reasoning;
+ if(!calls.length){msgs.push(o);return}
+ o.tool_calls=calls.map((x,i)=>({id:x.id||'call_'+i,type:'function',function:{name:x.name,arguments:x.args||'{}'}}));msgs.push(o);
+ calls.forEach((x,i)=>msgs.push({role:'tool',tool_call_id:x.id||'call_'+i,content:x.result!=null?x.result:'(no result: interrupted)'}))}
+async function runTools(c,a,ctl){const k=c.msgs.indexOf(a);
+ for(const x of a.calls){if(ctl.signal.aborted)return false;if(!x.name)continue;
+  x.state='run';if(conv()===c)rerender(k);
+  try{const m=MCP.map[x.name];if(!m)throw new Error('unknown tool '+x.name);let args={};
+   try{args=x.args?JSON.parse(x.args):{}}catch(e){throw new Error('arguments are not valid JSON: '+x.args)}
+   const r=await mcpRpc(m.server,'tools/call',{name:m.name,arguments:args});
+   x.result=(r.content||[]).map(p=>p.type==='text'?p.text:'['+p.type+']').join('\n')||'(empty result)';x.isError=!!r.isError}
+  catch(e){x.result='Error: '+(e.message||e);x.isError=true}
+  x.result=x.result.slice(0,40000);delete x.state;save();if(conv()===c){const st=nearBottom();rerender(k);if(st)toBottom()}}
+ return !ctl.signal.aborted}
+const MAX_TOOL_ROUNDS=10;
 /* ---------- generation ---------- */
 // smooth streaming: received text is revealed at a steady pace that follows its backlog (token bursts are spread
 // out), the newest characters fade in, and the markdown is re-rendered at most once per frame (less often when slow)
@@ -580,23 +653,26 @@ function updLast(){if(!gen||conv()!==gen.c)return;const g=gen,c=g.c,k=c.msgs.len
   const tb=el.querySelector('.think .tb');if(tb&&tb._n!==g.sr){const keep=tb.scrollHeight-tb.scrollTop-tb.clientHeight<40;
    if(tb.firstChild&&tb._n!=null&&tb._n<g.sr)tb.firstChild.appendData(m.reasoning.slice(tb._n,g.sr));else tb.textContent=m.reasoning.slice(0,g.sr);tb._n=g.sr;if(keep)tb.scrollTop=tb.scrollHeight}
   const d=el.querySelector('.md');if(d&&d._n!==g.sc){d.innerHTML=md(m.content.slice(0,g.sc),true);fadeTail(d);d._n=g.sc}
-  const tp=el.querySelector('.tool pre');if(tp&&tp.textContent!==m.tool)tp.textContent=m.tool}
+  const tp=el.querySelector('.tool pre');if(tp&&tp.textContent!==m.tool)tp.textContent=m.tool;
+  const tw=el.querySelector('.tcs');if(tw){const h=toolHTML(m);if(el._th!==h){tw.outerHTML=h;el._th=h}}}
  fillLive(el.querySelector('.livebar'),m);peek(el);if(stick)toBottom()}
 async function pollPrompt(a){try{const s=await (await fetch('/stats',{cache:'no-store'})).json();if(a.phase!=='prompt')return;
  if(s.phase!=='idle')a.pp={done:s.prompt_done,total:s.prompt_total,cached:s.cached}}catch(e){}}
-async function generate(vers){const c=conv();
+async function generate(vers,round){round=round||0;const c=conv();
  const a={role:'assistant',content:'',reasoning:'',phase:'prompt',thinking:false,model:live.model};if(vers&&vers.length)a.vers=vers;
- const msgs=[];if(cfg.sys.trim())msgs.push({role:'system',content:cfg.sys});
- for(const m of c.msgs){if(m.role==='user')msgs.push({role:'user',content:m.content});
-  else if(!m.err||m.content)msgs.push(Object.assign({role:'assistant',content:m.content||''},m.reasoning?{reasoning_content:m.reasoning}:{}))}
+ const tools=cfg.web&&MCP.tools.length?MCP.tools:null;
+ const msgs=[],sys=[cfg.sys.trim(),tools?toolPrompt():''].filter(Boolean).join('\n\n');if(sys)msgs.push({role:'system',content:sys});
+ for(const m of c.msgs)pushHist(msgs,m);
  c.msgs.push(a);
- const body={messages:msgs,stream:true,timings_per_token:true,max_tokens:+cfg.maxt||16384,chat_template_kwargs:{enable_thinking:!!cfg.think}};
+ const body={messages:msgs,stream:true,timings_per_token:true,chat_template_kwargs:{enable_thinking:!!cfg.think}};
+ if(cfg.maxt!==''&&+cfg.maxt>0)body.max_tokens=+cfg.maxt;
+ if(tools){body.tools=tools;body.tool_choice='auto'}
  if(cfg.temp!=='')body.temperature=+cfg.temp;if(cfg.topp!=='')body.top_p=+cfg.topp;if(cfg.topk!=='')body.top_k=parseInt(cfg.topk);if(cfg.minp!=='')body.min_p=+cfg.minp;
- busy=new AbortController();const g=gen={c,a,t0:Date.now(),sc:0,sr:0,lr:0,iv:0};render();markNew(vers?1:2);toBottom();setDot();g.raf=requestAnimationFrame(t=>tick(g,t));
+ const ctl=busy=new AbortController();const g=gen={c,a,t0:Date.now(),sc:0,sr:0,lr:0,iv:0};render();markNew(vers||round?1:2);toBottom();setDot();g.raf=requestAnimationFrame(t=>tick(g,t));
  const timer=setInterval(()=>{if(a.phase==='prompt')pollPrompt(a)},500);let aborted=false;
  try{const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:busy.signal});
   if(!r.ok){let t=await r.text();try{t=JSON.parse(t).error.message||t}catch(e){}throw new Error(`Server error ${r.status}: ${t}`)}
-  const rd=r.body.getReader(),dec=new TextDecoder();let buf='',tool='';
+  const rd=r.body.getReader(),dec=new TextDecoder();let buf='';
   for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;
    while((i=buf.indexOf('\n\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+2);if(!line.startsWith('data:'))continue;
     const d=line.slice(5).trim();if(d==='[DONE]')continue;let j;try{j=JSON.parse(d)}catch(e){continue}
@@ -604,21 +680,27 @@ async function generate(vers){const c=conv();
     const ch=j.choices&&j.choices[0];if(ch&&ch.delta){const dl=ch.delta;
      if(dl.reasoning_content){if(!a.thinking&&!a.content){a.thinking=true;a.thinkStart=a.thinkStart||Date.now()}a.phase='think';a.reasoning+=dl.reasoning_content}
      if(dl.content){if(a.thinking){a.thinking=false;a.thinkSecs=(Date.now()-a.thinkStart)/1000}a.phase='write';a.content+=dl.content}
-     if(dl.tool_calls)for(const tc of dl.tool_calls){const f=tc.function||{};if(f.name)tool+=(tool?'\n':'')+f.name+' ';if(f.arguments)tool+=f.arguments}
-     if(tool)a.tool=tool}
+     if(dl.tool_calls){a.calls=a.calls||[];for(const tc of dl.tool_calls){const i=tc.index||0,x=a.calls[i]||(a.calls[i]={id:'',name:'',args:''});
+      if(tc.id)x.id=tc.id;const f=tc.function||{};if(f.name&&!x.name)x.name=f.name;if(f.arguments)x.args+=f.arguments}}}
     if(j.timings)a.t=Object.assign(a.t||{},j.timings)}}
  }catch(e){if(e.name==='AbortError')aborted=true;else a.err=String(e.message||e)}
  clearInterval(timer);g.done=true;   // let the reveal catch up (fast) before the final render
  await Promise.race([new Promise(r=>g.fin=r),new Promise(r=>setTimeout(r,3000))]);cancelAnimationFrame(g.raf);
  if(a.thinking){a.thinking=false;a.thinkSecs=(Date.now()-a.thinkStart)/1000}
  delete a.phase;delete a.pp;a.open=false;if(aborted)a.stopped=true;if(a.vers){a.vi=a.vers.length;a.vers.push(snap(a))}
+ if(a.calls)a.calls=a.calls.filter(Boolean);
+ if(!aborted&&!a.err&&a.calls&&a.calls.length&&tools&&round<MAX_TOOL_ROUNDS){   // the model called tools: run them, then continue
+  gen=null;save();if(conv()===c){const st=nearBottom();render();if(st)toBottom()}
+  if(await runTools(c,a,ctl)&&busy===ctl){c.t=Date.now();save();return generate(undefined,round+1)}}
  busy=null;gen=null;c.t=Date.now();convs.sort((x,y)=>(y.t||0)-(x.t||0));save();
  const stick=conv()===c&&nearBottom();render();if(stick)toBottom();setDot();refreshLive();if(!touch&&editing<0)IN.focus()}
 function sendMsg(){if(busy){busy.abort();return}const t=IN.value.trim();if(!t)return;let c=conv();
  if(!c){c={id:Date.now().toString(36)+Math.random().toString(36).slice(2,6),title:'New chat',msgs:[],t:Date.now()};convs.unshift(c);cur=c.id}
  c.msgs.push({role:'user',content:t});if(c.title==='New chat')c.title=t.replace(/\s+/g,' ').slice(0,60);c.t=Date.now();
  IN.value='';S.set('hyper.draft','');autosz(IN);if(touch)IN.blur();editing=-1;save();generate()}
-function regen(){const c=conv();if(busy||!c)return;let vers;const l=c.msgs[c.msgs.length-1];
+function regen(){const c=conv();if(busy||!c)return;let t=0;for(let i=c.msgs.length-1;i>=0&&c.msgs[i].role==='assistant';--i)++t;
+ if(t>1||(t===1&&c.msgs[c.msgs.length-1].calls)){c.msgs.splice(c.msgs.length-t);return generate()}
+ let vers;const l=c.msgs[c.msgs.length-1];
  if(l&&l.role==='assistant'){c.msgs.pop();vers=(l.vers||[]).slice();
   if(l.err&&!l.content)vers.splice(l.vi||0,1);else vers[l.vi||0]=snap(l)}generate(vers)}
 /* ---------- server status ---------- */
@@ -631,6 +713,7 @@ async function refreshLive(){try{const s=await (await fetch('/stats',{cache:'no-
 function ctxInfo(){if(!live.ctx_max)return;toast(`Context: ${(live.ctx_used||0).toLocaleString()} / ${live.ctx_max.toLocaleString()} tokens (${(100*(live.ctx_used||0)/live.ctx_max).toFixed(1)} %)`,null,null,3200)}
 fetch('/v1/models').then(r=>r.json()).then(j=>{live.model=j.data[0].id;$('mdl').textContent=live.model;const h=$('hsub');if(h)h.textContent=live.model+' · running locally';updState()}).catch(()=>{});
 fetch('/props').then(r=>r.ok?r.json():{}).then(j=>{defaults=j.sampling||{};syncSet()}).catch(()=>syncSet());
+loadTools();
 /* ---------- global events ---------- */
 document.addEventListener('click',e=>{const b=e.target.closest('.cb .cpy');if(b)copyText(b.closest('.cb').querySelector('code').innerText).then(ok=>ok&&flash(b,'<span class="tx">Copy</span>'));
  if(e.target.closest('.cb .wrp')){cfg.wrap=!cfg.wrap;saveCfg();applyWrap();syncSet()}

@@ -1,0 +1,27 @@
+# Web tools for hyper's chat (outside hyper): SearXNG metasearch + an MCP server with web_search / fetch_url.
+# Both listen on localhost only; hyper-server forwards the chat page's MCP requests (--mcp web=http://127.0.0.1:8890/mcp).
+# CPU and memory are capped so a search never competes with inference (it runs while the model waits anyway).
+services:
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+    ports:
+      - "127.0.0.1:8888:8080"
+    cpus: 2
+    mem_limit: 1g
+  webmcp:
+    build: ./webmcp
+    restart: unless-stopped
+    environment:
+      - SEARXNG_URL=http://searxng:8080
+    ports:
+      - "127.0.0.1:8890:8890"
+    depends_on:
+      - searxng
+    cpus: 2
+    mem_limit: 3g
+    shm_size: 1g

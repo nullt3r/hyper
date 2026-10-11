@@ -4,7 +4,7 @@
 // decoding (exact: drafts are accepted when they equal the token sampled at their row), prompt cache with
 // recurrent-state snapshots; requests are served one at a time.
 //
-// usage: hyper-server <model.gguf> [--host 0.0.0.0] [--port 8080] [--ctx 262144] [--draft 3] [--alias name]
+// usage: hyper-server <model.gguf> [--host 0.0.0.0] [--port 8080] [--ctx 262144] [--draft 3] [--alias name] [--mcp name=url ...]
 //                     [--temp 0.6] [--top-p 0.95] [--top-k 20] [--min-p 0] [--snapshots 48]   (request fields override)
 //                     qwen4exp: [--gpu-frac 1.0] [--cpu-threads 30] [--expert-stats file] [--mtp nextn.gguf]   (context default 131072)
 //                     glm5-next: [--gpu-frac 1.0] [--cpu-threads 30] [--expert-stats file]   (context default 65536)
@@ -21,6 +21,7 @@
 #include "cpp-httplib/httplib.h"
 #include "nlohmann/json.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -28,6 +29,7 @@
 #include <condition_variable>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <set>
@@ -142,7 +144,64 @@ struct Request {
     bool stream = false, include_usage = true, timings_per_token = false;
     std::string id;
     SamplingParams sp;
+    std::map<std::string, std::map<std::string, std::string>> arg_types;   // tool -> argument -> JSON schema type
 };
+
+// GLM-style tool calls (<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>) when the template's
+// parser rejects them: llama.cpp's parser wants the arguments in schema order and only string values, while GLM writes
+// them in any order (alphabetical) and numbers / booleans bare. Values of non-string arguments are read as JSON.
+bool glm_tool_fallback(const std::string & text, const Request & r, common_chat_msg & out) {
+    const size_t t0 = text.find("<tool_call>");
+    if (t0 == std::string::npos || (text.find("<arg_key>", t0) == std::string::npos && text.find("</tool_call>", t0) == std::string::npos)) return false;
+    try {
+        out = common_chat_parse(text.substr(0, t0), false, r.pp);   // reasoning and content before the calls
+    } catch (const std::exception &) {
+        out = common_chat_msg();
+        out.role = "assistant";
+        out.content = text.substr(0, t0);
+    }
+    out.tool_calls.clear();
+    auto trim = [](std::string v) {
+        const size_t a = v.find_first_not_of(" \t\r\n"), b = v.find_last_not_of(" \t\r\n");
+        return a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
+    };
+    for (size_t p = t0; (p = text.find("<tool_call>", p)) != std::string::npos;) {
+        const size_t e = text.find("</tool_call>", p);
+        if (e == std::string::npos) return false;   // (still being generated)
+        const std::string body = text.substr(p + 11, e - p - 11);
+        size_t k = body.find("<arg_key>");
+        common_chat_tool_call tc;
+        tc.name = trim(body.substr(0, k));
+        ojson args = ojson::object();
+        const auto ti = r.arg_types.find(tc.name);
+        while (k != std::string::npos) {
+            const size_t ke = body.find("</arg_key>", k), v0 = body.find("<arg_value>", ke == std::string::npos ? k : ke);
+            const size_t ve = v0 == std::string::npos ? v0 : body.find("</arg_value>", v0);
+            if (ke == std::string::npos || v0 == std::string::npos || ve == std::string::npos) return false;
+            const std::string key = trim(body.substr(k + 9, ke - k - 9)), val = body.substr(v0 + 11, ve - v0 - 11);
+            std::string type;
+            if (ti != r.arg_types.end()) { const auto a = ti->second.find(key); if (a != ti->second.end()) type = a->second; }
+            if (type.empty() || type == "string") args[key] = val;
+            else { try { args[key] = ojson::parse(val); } catch (const std::exception &) { args[key] = val; } }
+            k = body.find("<arg_key>", ve);
+        }
+        if (tc.name.empty()) return false;
+        tc.arguments = args.dump();
+        out.tool_calls.push_back(tc);
+        p = e + 12;
+    }
+    return !out.tool_calls.empty();
+}
+
+common_chat_msg parse_out(const std::string & text, bool partial, const Request & r) {
+    try {
+        return common_chat_parse(text, partial, r.pp);
+    } catch (const std::exception &) {
+        common_chat_msg m;
+        if (r.pp.parse_tool_calls && glm_tool_fallback(text, r, m)) return m;
+        throw;
+    }
+}
 
 bool is_image_part(const ojson & p);
 std::string part_text(const ojson & c);
@@ -174,8 +233,20 @@ Request prepare(Ctx & c, const ojson & body) {
                         tc["function"]["arguments"].is_string())
                         tc["function"]["arguments"] = valid_args(tc["function"]["arguments"].get<std::string>(), "request history");
     in.messages = common_chat_msgs_parse_oaicompat(to_cjson(msgs_in));
-    if (body.contains("tools") && body["tools"].is_array() && !body["tools"].empty())
+    if (body.contains("tools") && body["tools"].is_array() && !body["tools"].empty()) {
         in.tools = common_chat_tools_parse_oaicompat(to_cjson(body["tools"]));
+        for (const auto & t : body["tools"]) {   // argument types (the GLM tool-call fallback parser)
+            if (!t.is_object() || !t.contains("function") || !t["function"].is_object()) continue;
+            const auto & fn = t["function"];
+            if (!fn.contains("parameters") || !fn["parameters"].is_object() || !fn["parameters"].contains("properties")) continue;
+            auto & m = r.arg_types[fn.value("name", "")];
+            for (const auto & [k, v] : fn["parameters"]["properties"].items()) {
+                std::string ty;
+                if (v.is_object() && v.contains("type")) ty = v["type"].is_string() ? v["type"].get<std::string>() : v["type"].is_array() && !v["type"].empty() ? v["type"][0].get<std::string>() : "";
+                m[k] = ty;
+            }
+        }
+    }
     if (body.contains("tool_choice") && body["tool_choice"].is_string())
         in.tool_choice = common_chat_tool_choice_parse_oaicompat(body["tool_choice"].get<std::string>());
     in.parallel_tool_calls = body.value("parallel_tool_calls", true);
@@ -560,6 +631,7 @@ int main(int argc, char ** argv) {
     std::string stats_path;   // qwen4exp: routing statistics, read at start and updated after every request
     std::string mtp_path;     // qwen4exp: separate NextN (MTP) GGUF; glm5-next: a GGUF with blk.<n_layer> (the original split files)
     std::string template_file;   // chat template (jinja) instead of the GGUF's
+    std::vector<std::pair<std::string, std::string>> mcps;   // --mcp name=url: tool servers for the chat page
     bool ctx_given = false, temp_given = false, top_p_given = false, top_k_given = false;
     SamplingParams defaults;   // Qwen's recommendation for thinking mode
     defaults.temp = 0.6f; defaults.top_p = 0.95f; defaults.top_k = 20; defaults.min_p = 0.0f;
@@ -573,6 +645,11 @@ int main(int argc, char ** argv) {
         else if (k == "--temp") { defaults.temp = std::stof(v); temp_given = true; } else if (k == "--top-p") { defaults.top_p = std::stof(v); top_p_given = true; }
         else if (k == "--top-k") { defaults.top_k = std::stoi(v); top_k_given = true; } else if (k == "--min-p") defaults.min_p = std::stof(v);
         else if (k == "--snapshots") snaps = std::stoi(v);
+        else if (k == "--mcp") {
+            const size_t eq = v.find('=');
+            if (eq == std::string::npos || eq == 0) { fprintf(stderr, "--mcp expects name=url\n"); return 1; }
+            mcps.push_back({v.substr(0, eq), v.substr(eq + 1)});
+        }
         else if (k == "--reasoning-effort") g_reasoning_effort = v;
         else if (k == "--chat-template-file") template_file = v;
         else { fprintf(stderr, "unknown option %s\n", k.c_str()); return 1; }
@@ -702,6 +779,41 @@ int main(int argc, char ** argv) {
     srv.Get("/stats", [&](const httplib::Request &, httplib::Response & res) { cors(res); res.set_content(c.live.json().dump(), "application/json"); });
     srv.Get("/", [&](const httplib::Request &, httplib::Response & res) { res.set_content(CHAT_PAGE, "text/html; charset=utf-8"); });
     srv.Get("/live", [&](const httplib::Request &, httplib::Response & res) { res.set_content(STATS_PAGE, "text/html; charset=utf-8"); });
+    // MCP tool servers for the chat page (--mcp name=url, streamable HTTP): the page runs the tool loop itself; hyper only
+    // lists the configured servers and forwards the page's JSON-RPC requests (same origin: the tool servers need no CORS
+    // and can listen on localhost)
+    srv.Get("/v1/mcp", [&](const httplib::Request &, httplib::Response & res) {
+        cors(res);
+        ojson a = ojson::array();
+        for (const auto & m : mcps) a.push_back({{"name", m.first}});
+        res.set_content(ojson({{"servers", a}}).dump(), "application/json");
+    });
+    srv.Post(R"(/mcp/([A-Za-z0-9_.-]+))", [&](const httplib::Request & req, httplib::Response & res) {
+        const std::string name = req.matches[1];
+        const auto it = std::find_if(mcps.begin(), mcps.end(), [&](const auto & m) { return m.first == name; });
+        if (it == mcps.end()) { res.status = 404; res.set_content(R"({"error":"unknown MCP server"})", "application/json"); return; }
+        const std::string & url = it->second;
+        const size_t sch = url.find("://"), slash = url.find('/', sch == std::string::npos ? 0 : sch + 3);
+        const std::string base = slash == std::string::npos ? url : url.substr(0, slash), path = slash == std::string::npos ? "/" : url.substr(slash);
+        httplib::Client cli(base);
+        cli.set_connection_timeout(10);
+        cli.set_read_timeout(240);   // (a page behind bot protection opens in a browser: tens of seconds)
+        httplib::Headers h;
+        for (const char * k : {"Mcp-Session-Id", "MCP-Protocol-Version", "Last-Event-ID"})
+            if (req.has_header(k)) h.emplace(k, req.get_header_value(k));
+        h.emplace("Accept", req.has_header("Accept") ? req.get_header_value("Accept") : "application/json, text/event-stream");
+        const std::string ct = req.get_header_value("Content-Type");
+        auto r = cli.Post(path, h, req.body, ct.empty() ? "application/json" : ct);
+        if (!r) {
+            res.status = 502;
+            res.set_content(ojson({{"error", "MCP server " + name + " unreachable (" + httplib::to_string(r.error()) + ")"}}).dump(), "application/json");
+            return;
+        }
+        res.status = r->status;
+        if (r->has_header("Mcp-Session-Id")) res.set_header("Mcp-Session-Id", r->get_header_value("Mcp-Session-Id"));
+        const std::string rct = r->get_header_value("Content-Type");
+        res.set_content(r->body, rct.empty() ? "application/json" : rct);
+    });
     srv.Get("/models", models);
 
     auto chat = [&](const httplib::Request & req, httplib::Response & res) {
@@ -728,7 +840,7 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> lk(c.mu);
             GenOut o;
             try { o = run(c, *r, {}); } catch (const std::exception & e) { fail(500, e.what()); return; }
-            common_chat_msg msg = common_chat_parse(o.text, false, r->pp);
+            common_chat_msg msg = parse_out(o.text, false, *r);
             long tc = 0;
             for (auto & t : msg.tool_calls) if (t.id.empty()) t.id = random_id("call_", tc++);
             ojson m = to_ojson(msg.to_json_oaicompat());
@@ -759,7 +871,7 @@ int main(int argc, char ** argv) {
             auto gen_id = [&] { return random_id("call_", tc++); };
             auto push = [&](const std::string & text, bool partial) {
                 common_chat_msg msg;
-                try { msg = common_chat_parse(text, partial, r->pp); } catch (const std::exception &) { return true; }
+                try { msg = parse_out(text, partial, *r); } catch (const std::exception &) { return true; }
                 msg.set_tool_call_ids(ids, gen_id);
                 // a partial parse can briefly see fewer tool calls than the previous one (a call whose arguments are
                 // still just "{"): compute_diffs throws then; skip this snapshot, a later one (or the final parse) catches up
@@ -854,7 +966,7 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> lk(c.mu);
             GenOut o;
             try { o = run(c, *r, {}); } catch (const std::exception & e) { fail(500, e.what()); return; }
-            common_chat_msg msg = common_chat_parse(o.text, false, r->pp);
+            common_chat_msg msg = parse_out(o.text, false, *r);
             long n = 0;
             for (auto & t : msg.tool_calls) if (t.id.empty()) t.id = random_id("call_", n++);
             res.set_content(finish_obj(final_output(msg, n), o).dump(-1, ' ', false, ojson::error_handler_t::replace), "application/json");
@@ -915,7 +1027,7 @@ int main(int argc, char ** argv) {
             };
             auto push = [&](const std::string & text, bool partial) {
                 common_chat_msg msg;
-                try { msg = common_chat_parse(text, partial, r->pp); } catch (const std::exception &) { return true; }
+                try { msg = parse_out(text, partial, *r); } catch (const std::exception &) { return true; }
                 msg.set_tool_call_ids(ids, gen_id);
                 // a partial parse can briefly see fewer tool calls than the previous one (a call whose arguments are
                 // still just "{"): compute_diffs throws then; skip this snapshot, a later one (or the final parse) catches up
