@@ -871,15 +871,22 @@ int main(int argc, char ** argv) {
             auto gen_id = [&] { return random_id("call_", tc++); };
             auto push = [&](const std::string & text, bool partial) {
                 common_chat_msg msg;
-                try { msg = parse_out(text, partial, *r); } catch (const std::exception &) { return true; }
+                auto final_fail = [&](const char * what, const std::exception & e) {
+                    if (!partial)
+                        fprintf(stderr, "[%s] stream: final %s failed (%s); text tail: %s\n", r->id.c_str(), what, e.what(),
+                                text.substr(text.size() > 300 ? text.size() - 300 : 0).c_str());
+                    return true;
+                };
+                try { msg = parse_out(text, partial, *r); } catch (const std::exception & e) { return final_fail("parse", e); }
                 msg.set_tool_call_ids(ids, gen_id);
-                // tool-call arguments go out with the final parse only: a partial parse can render them in a way the
-                // finished call does not extend (no later diff applies, and the client keeps a fragment such as "{")
-                if (partial) for (auto & t : msg.tool_calls) t.arguments.clear();
+                // the arguments of the call still being generated (the last one) go out once it is complete: a partial
+                // parse can render them in a way the finished call does not extend (no later diff applies, and the client
+                // keeps a fragment such as "{"). Earlier calls are finished (compute_diffs only extends the last call)
+                if (partial && !msg.tool_calls.empty()) msg.tool_calls.back().arguments.clear();
                 // a partial parse can briefly see fewer tool calls than the previous one (a call whose arguments are
                 // still just "{"): compute_diffs throws then; skip this snapshot, a later one (or the final parse) catches up
                 std::vector<common_chat_msg_diff> diffs;
-                try { diffs = common_chat_msg_diff::compute_diffs(prev, msg); } catch (const std::exception &) { return true; }
+                try { diffs = common_chat_msg_diff::compute_diffs(prev, msg); } catch (const std::exception & e) { return final_fail("diff", e); }
                 for (const auto & d : diffs) {
                     ojson ch = chunk(diff_to_delta(d), nullptr);
                     if (r->timings_per_token) {
@@ -1030,15 +1037,22 @@ int main(int argc, char ** argv) {
             };
             auto push = [&](const std::string & text, bool partial) {
                 common_chat_msg msg;
-                try { msg = parse_out(text, partial, *r); } catch (const std::exception &) { return true; }
+                auto final_fail = [&](const char * what, const std::exception & e) {
+                    if (!partial)
+                        fprintf(stderr, "[%s] stream: final %s failed (%s); text tail: %s\n", r->id.c_str(), what, e.what(),
+                                text.substr(text.size() > 300 ? text.size() - 300 : 0).c_str());
+                    return true;
+                };
+                try { msg = parse_out(text, partial, *r); } catch (const std::exception & e) { return final_fail("parse", e); }
                 msg.set_tool_call_ids(ids, gen_id);
-                // tool-call arguments go out with the final parse only: a partial parse can render them in a way the
-                // finished call does not extend (no later diff applies, and the client keeps a fragment such as "{")
-                if (partial) for (auto & t : msg.tool_calls) t.arguments.clear();
+                // the arguments of the call still being generated (the last one) go out once it is complete: a partial
+                // parse can render them in a way the finished call does not extend (no later diff applies, and the client
+                // keeps a fragment such as "{"). Earlier calls are finished (compute_diffs only extends the last call)
+                if (partial && !msg.tool_calls.empty()) msg.tool_calls.back().arguments.clear();
                 // a partial parse can briefly see fewer tool calls than the previous one (a call whose arguments are
                 // still just "{"): compute_diffs throws then; skip this snapshot, a later one (or the final parse) catches up
                 std::vector<common_chat_msg_diff> diffs;
-                try { diffs = common_chat_msg_diff::compute_diffs(prev, msg); } catch (const std::exception &) { return true; }
+                try { diffs = common_chat_msg_diff::compute_diffs(prev, msg); } catch (const std::exception & e) { return final_fail("diff", e); }
                 for (const auto & d : diffs) {
                     if (!d.reasoning_content_delta.empty()) {
                         if (open != 1) {
