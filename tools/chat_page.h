@@ -600,7 +600,7 @@ async function loadTools(){try{const j=await (await fetch('/v1/mcp')).json();con
   $('webb').style.display=tools.length?'':'none';$('s-webrow').style.display=tools.length?'':'none';$('s-webtools').textContent=names.join(', ')}catch(e){}}
 function toggleWeb(){cfg.web=!cfg.web;saveCfg();syncSet();toast(cfg.web?'Web search on':'Web search off')}
 function toolPrompt(){const n=MCP.tools.map(t=>t.function.name);
- return `You have web access through tools (${n.join(', ')}): search the web for anything recent, for facts you are not sure about and when the user asks about a site or a page; then read the most relevant results. Cite the pages you used as markdown links. Today is ${new Date().toISOString().slice(0,10)}.`}
+ return `You have web access through tools (${n.join(', ')}): search the web for anything recent, for facts you are not sure about and when the user asks about a site or a page; then read the most relevant results. Open only URLs that appeared in search results or on pages you read: never construct or guess links. Cite the pages you used as markdown links. Today is ${new Date().toISOString().slice(0,10)}.`}
 function hostOf(u){try{return new URL(u).hostname.replace(/^www\./,'')}catch(e){return u||''}}
 function toolHTML(m){if(!m.calls||!m.calls.length)return'';
  return '<div class="tcs">'+m.calls.map(x=>{let a={};try{a=JSON.parse(x.args||'{}')}catch(e){}
@@ -630,7 +630,7 @@ async function runTools(c,a,ctl){const k=c.msgs.indexOf(a);
   catch(e){x.result='Error: '+(e.message||e);x.isError=true}
   x.result=x.result.slice(0,40000);delete x.state;save();if(conv()===c){const st=nearBottom();rerender(k);if(st)toBottom()}}
  return !ctl.signal.aborted}
-const MAX_TOOL_ROUNDS=10;
+const MAX_TOOL_ROUNDS=25;   // (then one more answer without tools, from what was found)
 /* ---------- generation ---------- */
 // smooth streaming: received text is revealed at a steady pace that follows its backlog (token bursts are spread
 // out), the newest characters fade in, and the markdown is re-rendered at most once per frame (less often when slow)
@@ -658,9 +658,9 @@ function updLast(){if(!gen||conv()!==gen.c)return;const g=gen,c=g.c,k=c.msgs.len
  fillLive(el.querySelector('.livebar'),m);peek(el);if(stick)toBottom()}
 async function pollPrompt(a){try{const s=await (await fetch('/stats',{cache:'no-store'})).json();if(a.phase!=='prompt')return;
  if(s.phase!=='idle')a.pp={done:s.prompt_done,total:s.prompt_total,cached:s.cached}}catch(e){}}
-async function generate(vers,round){round=round||0;const c=conv();
+async function generate(vers,round,final){round=round||0;const c=conv();
  const a={role:'assistant',content:'',reasoning:'',phase:'prompt',thinking:false,model:live.model};if(vers&&vers.length)a.vers=vers;
- const tools=cfg.web&&MCP.tools.length?MCP.tools:null;
+ const tools=!final&&cfg.web&&MCP.tools.length?MCP.tools:null;
  const msgs=[],sys=[cfg.sys.trim(),tools?toolPrompt():''].filter(Boolean).join('\n\n');if(sys)msgs.push({role:'system',content:sys});
  for(const m of c.msgs)pushHist(msgs,m);
  c.msgs.push(a);
@@ -689,9 +689,12 @@ async function generate(vers,round){round=round||0;const c=conv();
  if(a.thinking){a.thinking=false;a.thinkSecs=(Date.now()-a.thinkStart)/1000}
  delete a.phase;delete a.pp;a.open=false;if(aborted)a.stopped=true;if(a.vers){a.vi=a.vers.length;a.vers.push(snap(a))}
  if(a.calls)a.calls=a.calls.filter(Boolean);
- if(!aborted&&!a.err&&a.calls&&a.calls.length&&tools&&round<MAX_TOOL_ROUNDS){   // the model called tools: run them, then continue
+ if(!aborted&&!a.err&&a.calls&&a.calls.length&&tools){   // the model called tools: run them, then continue
   gen=null;save();if(conv()===c){const st=nearBottom();render();if(st)toBottom()}
-  if(await runTools(c,a,ctl)&&busy===ctl){c.t=Date.now();save();return generate(undefined,round+1)}}
+  if(round>=MAX_TOOL_ROUNDS){   // the tool budget is used up: the calls are answered with a note, then a final answer without tools
+   for(const x of a.calls)x.result=`Not run: the limit of ${MAX_TOOL_ROUNDS} tool rounds was reached. Answer now from what you have found so far.`;
+   save();if(busy===ctl){c.t=Date.now();return generate(undefined,round+1,true)}}
+  else if(await runTools(c,a,ctl)&&busy===ctl){c.t=Date.now();save();return generate(undefined,round+1)}}
  busy=null;gen=null;c.t=Date.now();convs.sort((x,y)=>(y.t||0)-(x.t||0));save();
  const stick=conv()===c&&nearBottom();render();if(stick)toBottom();setDot();refreshLive();if(!touch&&editing<0)IN.focus()}
 function sendMsg(){if(busy){busy.abort();return}const t=IN.value.trim();if(!t)return;let c=conv();

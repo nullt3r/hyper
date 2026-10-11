@@ -4,9 +4,11 @@
 #                         SeleniumBase UC mode, headful in Xvfb) for bot challenges (Cloudflare, Turnstile, ...) and
 #                         JavaScript-only pages, or when asked (browser=True)
 import asyncio
+import base64
 import os
 import re
 import threading
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 import httpx
 import trafilatura
@@ -56,6 +58,43 @@ def extract(html: str, url: str) -> str:
     return text
 
 
+def _bing_url(href: str) -> str:
+    """Bing's click-tracking links (bing.com/ck/a?...&u=a1<base64url>) to the target URL."""
+    if "bing.com/ck/a" not in href:
+        return href
+    u = parse_qs(urlparse(href).query).get("u", [""])[0]
+    if u.startswith("a1"):
+        try:
+            return base64.urlsafe_b64decode(u[2:] + "=" * (-len(u[2:]) % 4)).decode()
+        except Exception:
+            pass
+    return href
+
+
+def _browser_search(query: str, n: int) -> list[tuple[str, str, str]]:
+    """Bing in the real browser: when every SearXNG engine is rate-limited or captcha-blocked."""
+    from lxml import html as lh
+    from seleniumbase import SB
+    with _lock, SB(uc=True, xvfb=True, locale="en") as sb:
+        sb.activate_cdp_mode("https://www.bing.com/search?q=" + quote_plus(query))
+        sb.sleep(2.5)
+        if CHALLENGE.search(sb.get_page_source()[:200000]):
+            try:
+                sb.uc_gui_click_captcha()
+            except Exception:
+                pass
+            sb.sleep(3)
+        src = sb.get_page_source()
+    out = []
+    for li in lh.fromstring(src).xpath("//li[contains(concat(' ', normalize-space(@class), ' '), ' b_algo ')]"):
+        a = li.xpath(".//h2//a")
+        if not a:
+            continue
+        snippet = " ".join(" ".join(li.xpath(".//p//text()")).split())
+        out.append((a[0].text_content().strip(), _bing_url(a[0].get("href", "")), snippet))
+    return out[:n]
+
+
 @mcp.tool()
 async def web_search(query: str, max_results: int = 8, language: str = "auto") -> str:
     """Search the web. Returns numbered results: title, URL and a snippet. Read promising pages with fetch_url.
@@ -64,12 +103,19 @@ async def web_search(query: str, max_results: int = 8, language: str = "auto") -
         r = await c.get(f"{SEARX}/search", params={"q": query, "format": "json", "language": language, "safesearch": 0})
         r.raise_for_status()
         data = r.json()
+    n = max(1, min(max_results, 20))
     out = []
     for a in data.get("answers", [])[:2]:
         out.append("Answer: " + (a if isinstance(a, str) else str(a.get("answer", a))))
-    for i, it in enumerate(data.get("results", [])[: max(1, min(max_results, 20))], 1):
+    for i, it in enumerate(data.get("results", [])[:n], 1):
         snippet = " ".join((it.get("content") or "").split())
         out.append(f"[{i}] {it.get('title', '').strip()}\n{it.get('url', '')}\n{snippet}")
+    if not data.get("results"):   # every engine blocked or empty: Bing in the browser
+        try:
+            res = await asyncio.wait_for(asyncio.to_thread(_browser_search, query, n), timeout=60)
+            out += [f"[{i}] {t}\n{u}\n{sn}" for i, (t, u, sn) in enumerate(res, 1)]
+        except Exception:
+            pass
     return "\n\n".join(out) if out else f"No results for: {query}"
 
 

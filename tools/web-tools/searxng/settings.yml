@@ -8,3 +8,27 @@ search:
   formats:
     - html
     - json
+  # engines that block us (rate limit, captcha) come back after minutes, not hours (defaults: 1 h / 1 day)
+  suspended_times:
+    SearxEngineAccessDenied: 300
+    SearxEngineCaptcha: 600
+    SearxEngineTooManyRequests: 180
+    cf_SearxEngineCaptcha: 600
+    cf_SearxEngineAccessDenied: 600
+    recaptcha_SearxEngineCaptcha: 600
+# more general engines: the load is spread and one blocked engine does not empty the results
+engines:
+  - name: bing
+    disabled: false
+  - name: startpage
+    disabled: false
+  - name: mojeek
+    disabled: false
+  - name: qwant
+    disabled: false
+  - name: yahoo
+    disabled: false
+  - name: google
+    disabled: false
+  - name: github
+    disabled: false
