@@ -147,12 +147,16 @@ struct Request {
     std::map<std::string, std::map<std::string, std::string>> arg_types;   // tool -> argument -> JSON schema type
 };
 
-// GLM-style tool calls (<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>) when the template's
-// parser rejects them: llama.cpp's parser wants the arguments in schema order and only string values, while GLM writes
-// them in any order (alphabetical) and numbers / booleans bare. Values of non-string arguments are read as JSON.
-bool glm_tool_fallback(const std::string & text, const Request & r, common_chat_msg & out) {
-    const size_t t0 = text.find("<tool_call>");
-    if (t0 == std::string::npos || (text.find("<arg_key>", t0) == std::string::npos && text.find("</tool_call>", t0) == std::string::npos)) return false;
+// Tool calls the template's parser misses or rejects, in either XML syntax:
+//   Qwen:  <tool_call><function=name><parameter=k>v</parameter>...</function></tool_call>
+//   GLM:   <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>
+// llama.cpp's parsers want the arguments in schema order (and GLM's only string values); the models write them in any
+// order (often alphabetical) and numbers / booleans bare. Values of non-string arguments are read as JSON. Only complete
+// calls (closed blocks after the reasoning) are taken.
+bool xml_tool_fallback(const std::string & text, const Request & r, common_chat_msg & out) {
+    const size_t think_end = text.rfind("</think>");
+    const size_t t0 = text.find("<tool_call>", think_end == std::string::npos ? 0 : think_end);
+    if (t0 == std::string::npos || text.find("</tool_call>", t0) == std::string::npos) return false;
     try {
         out = common_chat_parse(text.substr(0, t0), false, r.pp);   // reasoning and content before the calls
     } catch (const std::exception &) {
@@ -161,29 +165,46 @@ bool glm_tool_fallback(const std::string & text, const Request & r, common_chat_
         out.content = text.substr(0, t0);
     }
     out.tool_calls.clear();
-    auto trim = [](std::string v) {
-        const size_t a = v.find_first_not_of(" \t\r\n"), b = v.find_last_not_of(" \t\r\n");
-        return a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
+    auto trim = [](const std::string & v) {
+        const size_t x = v.find_first_not_of(" \t\r\n"), y = v.find_last_not_of(" \t\r\n");
+        return x == std::string::npos ? std::string() : v.substr(x, y - x + 1);
+    };
+    auto value = [&](const std::string & name, const std::string & key, const std::string & raw, ojson & args) {
+        std::string type;
+        const auto ti = r.arg_types.find(name);
+        if (ti != r.arg_types.end()) { const auto a = ti->second.find(key); if (a != ti->second.end()) type = a->second; }
+        if (type.empty() || type == "string") { args[key] = raw; return; }
+        try { args[key] = ojson::parse(trim(raw)); } catch (const std::exception &) { args[key] = raw; }
     };
     for (size_t p = t0; (p = text.find("<tool_call>", p)) != std::string::npos;) {
         const size_t e = text.find("</tool_call>", p);
-        if (e == std::string::npos) return false;   // (still being generated)
-        const std::string body = text.substr(p + 11, e - p - 11);
-        size_t k = body.find("<arg_key>");
+        if (e == std::string::npos) break;   // (an unfinished call at the end: left out)
+        const std::string body = trim(text.substr(p + 11, e - p - 11));
         common_chat_tool_call tc;
-        tc.name = trim(body.substr(0, k));
         ojson args = ojson::object();
-        const auto ti = r.arg_types.find(tc.name);
-        while (k != std::string::npos) {
-            const size_t ke = body.find("</arg_key>", k), v0 = body.find("<arg_value>", ke == std::string::npos ? k : ke);
-            const size_t ve = v0 == std::string::npos ? v0 : body.find("</arg_value>", v0);
-            if (ke == std::string::npos || v0 == std::string::npos || ve == std::string::npos) return false;
-            const std::string key = trim(body.substr(k + 9, ke - k - 9)), val = body.substr(v0 + 11, ve - v0 - 11);
-            std::string type;
-            if (ti != r.arg_types.end()) { const auto a = ti->second.find(key); if (a != ti->second.end()) type = a->second; }
-            if (type.empty() || type == "string") args[key] = val;
-            else { try { args[key] = ojson::parse(val); } catch (const std::exception &) { args[key] = val; } }
-            k = body.find("<arg_key>", ve);
+        if (body.rfind("<function=", 0) == 0) {   // Qwen
+            const size_t ne = body.find('>');
+            if (ne == std::string::npos) return false;
+            tc.name = trim(body.substr(10, ne - 10));
+            for (size_t k = body.find("<parameter=", ne); k != std::string::npos; k = body.find("<parameter=", k)) {
+                const size_t ke = body.find('>', k), ve = ke == std::string::npos ? ke : body.find("</parameter>", ke);
+                if (ke == std::string::npos || ve == std::string::npos) return false;
+                std::string raw = body.substr(ke + 1, ve - ke - 1);
+                if (!raw.empty() && raw.front() == '\n') raw.erase(0, 1);   // (the template puts the value on its own line)
+                if (!raw.empty() && raw.back() == '\n') raw.pop_back();
+                value(tc.name, trim(body.substr(k + 11, ke - k - 11)), raw, args);
+                k = ve + 12;
+            }
+        } else {   // GLM
+            size_t k = body.find("<arg_key>");
+            tc.name = trim(body.substr(0, k));
+            while (k != std::string::npos) {
+                const size_t ke = body.find("</arg_key>", k), v0 = ke == std::string::npos ? ke : body.find("<arg_value>", ke);
+                const size_t ve = v0 == std::string::npos ? v0 : body.find("</arg_value>", v0);
+                if (ke == std::string::npos || v0 == std::string::npos || ve == std::string::npos) return false;
+                value(tc.name, trim(body.substr(k + 9, ke - k - 9)), body.substr(v0 + 11, ve - v0 - 11), args);
+                k = body.find("<arg_key>", ve);
+            }
         }
         if (tc.name.empty()) return false;
         tc.arguments = args.dump();
@@ -193,14 +214,28 @@ bool glm_tool_fallback(const std::string & text, const Request & r, common_chat_
     return !out.tool_calls.empty();
 }
 
+// the template's parser; its result is replaced by the fallback when it rejects the text, or (final parse) when it found
+// fewer calls than the text has complete <tool_call> blocks after the reasoning
 common_chat_msg parse_out(const std::string & text, bool partial, const Request & r) {
+    common_chat_msg m;
     try {
-        return common_chat_parse(text, partial, r.pp);
+        m = common_chat_parse(text, partial, r.pp);
     } catch (const std::exception &) {
-        common_chat_msg m;
-        if (r.pp.parse_tool_calls && glm_tool_fallback(text, r, m)) return m;
+        common_chat_msg f;
+        if (r.pp.parse_tool_calls && xml_tool_fallback(text, r, f)) return f;
         throw;
     }
+    if (!partial && r.pp.parse_tool_calls) {
+        const size_t think_end = text.rfind("</think>");
+        size_t blocks = 0;
+        for (size_t q = think_end == std::string::npos ? 0 : think_end; (q = text.find("</tool_call>", q)) != std::string::npos; ++q) ++blocks;
+        common_chat_msg f;
+        if (blocks > m.tool_calls.size() && xml_tool_fallback(text, r, f) && f.tool_calls.size() > m.tool_calls.size()) {
+            fprintf(stderr, "request: %zu of %zu tool calls recovered by the fallback parser\n", f.tool_calls.size() - m.tool_calls.size(), blocks);
+            return f;
+        }
+    }
+    return m;
 }
 
 bool is_image_part(const ojson & p);
@@ -272,6 +307,7 @@ Request prepare(Ctx & c, const ojson & body) {
     r.pp.parse_tool_calls = !in.tools.empty() && in.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
     if (!cp.parser.empty()) r.pp.parser.load(cp.parser);
     r.stops = cp.additional_stops;
+    if (!r.stops.empty()) { std::string l; for (auto & x : r.stops) l += ojson(x).dump() + " "; fprintf(stderr, "request: template stop strings %s\n", l.c_str()); }
     if (body.contains("stop")) {
         if (body["stop"].is_string()) r.stops.push_back(body["stop"]);
         else if (body["stop"].is_array()) for (auto & s : body["stop"]) r.stops.push_back(s);
@@ -379,7 +415,13 @@ GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::strin
             std::lock_guard<std::mutex> lk(lv.mu);
             lv.phase = "generating"; lv.t_gen = now; lv.t_win = now; lv.win_n = 0;
         }
-        if (llama_vocab_is_eog(c.vocab, tok)) { o.finish = "stop"; return false; }
+        if (llama_vocab_is_eog(c.vocab, tok)) {
+            size_t open = 0, closed = 0;   // (an end-of-generation token inside a tool call: logged)
+            for (size_t q = 0; (q = o.text.find("<tool_call>", q)) != std::string::npos; ++q) ++open;
+            for (size_t q = 0; (q = o.text.find("</tool_call>", q)) != std::string::npos; ++q) ++closed;
+            if (open > closed) fprintf(stderr, "[%s] end-of-generation token %d inside a tool call\n", r.id.c_str(), tok);
+            o.finish = "stop"; return false;
+        }
         ++o.n_gen;
         {
             std::lock_guard<std::mutex> lk(lv.mu);
@@ -397,7 +439,10 @@ GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::strin
         o.text += piece(c.vocab, tok);
         for (const auto & s : r.stops) {
             const size_t at = o.text.find(s, o.text.size() > s.size() + 64 ? o.text.size() - s.size() - 64 : 0);
-            if (at != std::string::npos) { o.text.resize(at); o.finish = "stop"; return false; }
+            if (at != std::string::npos) {
+                fprintf(stderr, "[%s] stop string %s at %zu of %zu\n", r.id.c_str(), ojson(s).dump().c_str(), at, o.text.size());
+                o.text.resize(at); o.finish = "stop"; return false;
+            }
         }
         if (on_text && !streamer.offer(o.text)) { o.finish = "cancelled"; return false; }
         return true;
