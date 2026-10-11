@@ -7,10 +7,12 @@
 #include "llm.h"
 #include "park.h"
 #include "model4.h"
+#include "vmm.h"
 
 #include <atomic>
 #include <functional>
 #include <random>
+#include <thread>
 #include <memory>
 #include <vector>
 
@@ -168,6 +170,7 @@ private:
         std::vector<std::vector<int>> slot;   // [ndev][E]
         std::vector<double> score;            // decayed routing counts
         std::vector<uint64_t> last_count;     // CPU side's counts at the last rebalance
+        std::vector<char> pend;               // elastic: being copied into an extra slot (a CPU expert until applied)
         bool tables_dirty = false, stream_dirty = false;
     };
     std::vector<ExpertHost> ehost_;   // [n_layer + 1]: the MTP block last
@@ -183,6 +186,31 @@ private:
     int mtp_src_ = 0;              // MTP pass: residual rows of chunk mtp_src_ of the last multi-chunk forward
     int * h_cpos_ = nullptr;       // pinned: positions of the chunks
     int stream_min_ = 256;   // prefill chunks this long stream the CPU experts to the GPUs; shorter ones use the CPU
+    // elastic placement (HYPER4_ELASTIC=0: off): the attention caches (K / V, indexer keys) live on the CUDA virtual memory
+    // API and map only the positions in use (kv_pos_); the rest of their full-context memory holds extra expert slots
+    // (hottest CPU experts, copied from the host copy), handed back to the caches when the context grows (the expert
+    // just turns into a CPU expert again). Caches + extra slots never take more than the full-context caches would.
+    bool elastic_ = false, elastic_log_ = false;
+    int kv_pos_ = 0;            // positions mapped in every attention cache
+    int elastic_fill_ = 1 << 20;   // extra-slot fills per background batch (HYPER4_ELASTIC_FILL)
+    int kv_step_ = 8192;        // the caches grow in steps of this many positions
+    double elastic_min_ = 1.0;  // fills: any CPU expert the recent routing used (no exchange: only the copy costs)
+    template <typename T> T * kv_alloc(Device & dev, int heads, size_t pitch_elems, size_t row_elems, int div);
+    size_t lend_free(const Device & d) const;   // bytes of the full-context cache size neither mapped nor lent
+    void ensure_kv(int need);   // map the caches up to `need` positions (evicting extra experts as needed)
+    void shrink_kv(int keep);   // a shorter conversation: release cache memory beyond `keep` for experts
+    void evict_extra(Device & d, size_t bytes);
+    int fill_extra(int budget);
+    // fills run in the background (a host thread maps the slots and copies on each GPU's fill stream; the CPU keeps
+    // computing those experts meanwhile); the copied experts take over at the next forward boundary
+    struct Fill { int il, e, g, k; bool copied; };
+    std::vector<Fill> fill_list_;
+    std::thread fill_th_;
+    std::atomic<bool> fill_busy_{false}, fill_cancel_{false};
+    void fill_apply();             // (between forwards) the copied experts take over; the rest of a cancelled batch drops
+    void fill_wait(bool cancel);   // wait for (or cancel) the running batch, then fill_apply
+    int req_steps_ = 0;            // decode forwards of the current request (the caches shrink after 32: not for side requests)
+    long dec_steps_ = 0, fill_due_ = 0;   // decode forwards so far; the running batch takes over at fill_due_
 };
 
 } // namespace hyper

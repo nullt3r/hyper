@@ -128,6 +128,14 @@ which is why they agree with each other. Other checks:
   so the GPU set follows what the conversation actually uses (prose, code, tool JSON, …). The swaps are decided from
   complete counts only (the CPU queue is drained first), so the placement does not depend on timing. Flash-Next at
   262k context (59–63 % of its experts in VRAM): decode +5.5 % on code, Codex replay +4.4 % decode / +8.3 % prefill.
+- **Elastic attention caches (Flash-Next).** The 262k-context K / V and indexer caches are reserved as virtual address ranges
+  (CUDA virtual memory API) and only the positions in use are backed by memory, mapped in 8k-position steps. The rest of
+  their full size holds extra expert slots: the hottest CPU experts are copied there in the background (the copies switch
+  over at a fixed decode step, so the result does not depend on timing). When the conversation grows, the coldest extra
+  experts turn back into CPU experts (no copy: the host keeps every expert) and their memory goes to the cache. Caches
+  plus extra slots never exceed what the full-context caches would take, so 262k still fits. At short and medium
+  contexts ~55 more experts per layer sit on the GPUs (59 % → ~70 %). Codex replay at 262k: decode 155 → 176 t/s, plain
+  decode +4 %, KL against llama.cpp unchanged (noise level), outputs identical between runs. `HYPER4_ELASTIC=0` disables it.
 - **Prompt cache for recurrent models.** Linear-attention layers (Gated DeltaNet, KDA) cannot be truncated like a KV
   cache, so the engine keeps snapshots of their state:
   - at message starts in the prompt,
@@ -234,6 +242,8 @@ Selected environment variables:
 | Variable | Effect |
 |---|---|
 | `HYPER5_ADAPT=0`, `HYPER4_ADAPT=0` | GLM / Flash-Next: disable adaptive expert placement (fully deterministic placement) |
+| `HYPER4_ELASTIC=0` | Flash-Next: fully allocated attention caches, no extra expert slots (`HYPER4_ELASTIC_LOG=1`: log mapping / fills / evictions) |
+| `HYPER_CPU_RG`, `HYPER_CPU_RD`, `HYPER_CPU_LEAD` | CPU expert tasks: rows per gate/up and down task (32 / 128), experts gate/up runs ahead (2) |
 | `HYPER_GUMBEL_DRAFT=0/1` | sampled MTP drafts coupled to the sampling noise (default on for Flash-Next and GLM, off for the 27B) |
 | `HYPER5_MTP_PMIN`, `HYPER4_MTP_PMIN`, `HYPER_MTP_PMIN` | MTP drafts while the drafted run's MTP probability is at least this: GLM (default 0.85), Flash-Next (0.5), 27B; 0: count from recent acceptance (Flash-Next, GLM) or always `--draft` (27B) |
 | `HYPER4_STREAM_MIN`, `HYPER5_STREAM_MIN` | shortest prefill chunk that streams CPU experts to the GPUs (default 256 / 280) |

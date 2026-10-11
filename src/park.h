@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -35,6 +36,8 @@ public:
     // swap thresholds: a conversation is worth parking from `min_park` tokens; the parked one comes back when it shares
     // `min_gain` more tokens with the prompt than the current one
     int min_park = 2048, min_gain = 512;
+    // called before a parked conversation of n positions is copied back (elastic caches: map them first)
+    std::function<void(int)> before_restore;
 
     ~ConvPark() { for (auto * set : {&host_, &tmp_}) for (auto & b : *set) if (b.p) cudaFreeHost(b.p); }
 
@@ -53,6 +56,7 @@ public:
         if (Lp > L + min_gain) {
             const bool keep = cur >= min_park;   // the current conversation is parked in turn
             if (keep) copy(tmp_, cur, true, devs);
+            if (before_restore) before_restore((int) hist_.size());
             copy(host_, (int) hist_.size(), false, devs);
             std::swap(host_, tmp_);
             fprintf(stderr, "%s: resumed a parked conversation of %zu tokens\n", tag, hist_.size());

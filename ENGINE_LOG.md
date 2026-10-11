@@ -395,3 +395,35 @@ na GPU (262k KV rezervováno) → 9,4 % routovaných expertů na CPU; 340 → 6,
 MTP krok se 4 řádky: ~3,7 CPU expertů / vrstvu ≈ 167 µs proti ~60 µs GPU části MoE → CPU je kritická cesta MoE.
 Nápad: **pružná KV cache** – nevyužitou část rezervy 262k (GPU1/2 po 3,2 GB) půjčit expertům a vracet je, když kontext
 roste (hostovská kopie expertů už existuje, vrácení = jen změna tabulky). Kapacita 262k zůstává.
+
+Ověření na modelu (replay 20 požadavků Codexu, greedy, 262k, MTP 3, rozmístění ze zmrazených statistik; `~/rp_ab.sh`):
+staré RG/RD 148,4 / 151,9 t/s → nové **157,5 / 156,4 t/s (+4,5 %)**, prefill beze změny (~1400 t/s), výstupy 20/20
+identické (porovnání bez náhodných id položek odpovědi – hash v `replay.py` je zahrnuje). `HYPER4_NOCPU` (CPU experty
+vynechány, jen čas): 184,8 t/s → CPU experty stojí ~15 % dekódování. Server s `--ctx 65536` (68 % expertů na GPU místo
+59 %, horní mez pro pružnou KV cache): 180,6 t/s, na krok +9 % (jiný výstup → jiná míra přijetí), prefill +4,5 %.
+
+**Pružná KV cache (Flash-Next, `HYPER4_ELASTIC`, výchozí zapnuto)** – `src/vmm.h`: K / V a klíče indexeru jako virtuální
+rozsahy (CUDA VMM, granule 2 MB), mapované jen pozice v užívání (kroky 8192 pozic). Zbytek plné velikosti 262k (GPU1/2 po
+~4,1 GB) = sloty navíc pro nejteplejší CPU experty (pole expertů rezervovaná pro všech 512 slotů, mapuje se jen
+používaný začátek). Invariant: cache + sloty navíc ≤ plná rezerva cache → 262k se vždy vejde.
+- Doplňování na pozadí: vlákno mapuje sloty a kopíruje na vlastním streamu (CPU ty experty mezitím počítá dál);
+  převzetí v **pevném kroku dekódování** (16 kroků na 256 expertů), zrušená dávka se zahodí celá → deterministické
+  (s převzetím „až dokopíruje“ bylo jen 6/20 shodných výstupů mezi dvěma stejnými běhy).
+- Růst kontextu: nejstudenější expert ve slotu navíc se stane CPU expertem (bez kopie, host má kopii všech), paměť jde
+  cache. Kratší konverzace vrátí paměť expertům až po 32 krocích dekódování (vedlejší požadavky agenta nic nemění).
+- Mapování 75 µs / granule, odmapování 90 µs, H2D 13 GB/s na x8 (GPU1).
+
+Měření (vše v jedné relaci, GPU bez capu, rozmístění ze zmrazených statistik):
+
+| | vypnuto | zapnuto |
+|---|---|---|
+| replay 20 požadavků Codexu, 262k, MTP, greedy – dekódování | 155,2 t/s | **176,8 / 176,2 t/s (+14 %)**; na krok +6 % |
+| – prefill | 1399 t/s | 1416–1424 t/s |
+| tfbench 10k, 2000 tokenů po jednom | 103,7 t/s | **107,6 t/s (+3,8 %)** |
+| KL ref4 (256) | 0,047464 | 0,045267–0,047469 |
+| checkpf ref7_5k (prefill 3801, 1199 dekódovaných přes hranici vracení; krok 256, bez rezervy) | 0,040484 | 0,041279 |
+
+Experty ve slotech navíc: ~2600 (~55 na vrstvu) při krátkém kontextu. Vypnuto = bitově stejné jako dřív (20/20).
+Simulace n-gram draftů s čerstvým nákladovým modelem (krok 9,6 ms + ~4,0 ms / řádek, s pružnou cache ~3,1 ms / řádek):
+nejlépe +6,5 % / +7,5 % (draft 5, shoda ≥ 24 tokenů).
+

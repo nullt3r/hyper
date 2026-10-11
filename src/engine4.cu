@@ -70,6 +70,10 @@ struct Engine4::DevLayer {
     DW sh_gu, sh_down;
     int n_sh_l = 0;
     MoeDev moe;
+    VmmBuf * xg = nullptr, * xu = nullptr, * xd = nullptr;   // elastic: expert arrays with room for extra slots
+    int nbase = 0;             // elastic: base slots (mapped for good); extra slots nbase.. hold xe (-1: free)
+    size_t xbase = 0;          // elastic: bytes mapped for the base slots
+    std::vector<int> xe;
     int * owner = nullptr;     // [n_expert]: device or CPU_OWNER
     // prefill streaming: this GPU's share of the layer's CPU experts (st_list, ascending) is copied into a staging buffer;
     // st_slot[e] = index in the share or -1; owner_bulk[e] = the GPU that computes e in a prefill chunk
@@ -123,6 +127,7 @@ struct Engine4::Device {
     half * ggs = nullptr;            // native dense weights: fp16 slice for prefill GEMMs
     size_t ggs_elems = 0;
     cudaStream_t cstream = nullptr;                           // prefill expert uploads
+    cudaStream_t fstream = nullptr;                           // elastic: background fills of extra expert slots
     cudaEvent_t ev_up[2] = {}, ev_free[2] = {};
     uint8_t * stage[2] = {};                                  // staging buffers for streamed experts
     size_t stage_bytes = 0;
@@ -132,6 +137,11 @@ struct Engine4::Device {
     int big_stride = 0;
     size_t used = 0;
     std::vector<void *> allocs;
+    // elastic placement: the per-position caches as segments of virtual-memory buffers, and their full-context size
+    struct KvSeg { VmmBuf * b; size_t pitch, row_bytes; int heads, div; };
+    std::vector<KvSeg> kvs;
+    size_t lend_limit = 0;
+    std::vector<std::unique_ptr<VmmBuf>> vmm;
 
     template <typename T> T * alloc(size_t n) {
         void * p = nullptr;
@@ -158,6 +168,7 @@ struct Engine4::Device {
         for (auto & ev : ev_up) if (ev) cudaEventDestroy(ev);
         for (auto & ev : ev_free) if (ev) cudaEventDestroy(ev);
         if (cstream) cudaStreamDestroy(cstream);
+        if (fstream) cudaStreamDestroy(fstream);
         if (s2) cudaStreamDestroy(s2);
         if (ev_fork) cudaEventDestroy(ev_fork);
         if (ev_join) cudaEventDestroy(ev_join);
@@ -454,6 +465,7 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
         gemv_init(g);
         for (auto & ev : dev->ev_ar) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         CUDA_CHECK(cudaStreamCreateWithFlags(&dev->cstream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&dev->fstream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaStreamCreateWithFlags(&dev->s2, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&dev->ev_fork, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&dev->ev_join, cudaEventDisableTiming));
@@ -509,8 +521,14 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
     adapt_ = !getenv("HYPER4_ADAPT") || atoi(getenv("HYPER4_ADAPT")) != 0;
     if (getenv("HYPER4_ADAPT_EVERY")) adapt_every_ = std::max(1, atoi(getenv("HYPER4_ADAPT_EVERY")));
     if (getenv("HYPER4_ADAPT_BUDGET")) adapt_budget_ = atoi(getenv("HYPER4_ADAPT_BUDGET"));
+    elastic_ = adapt_ && (!getenv("HYPER4_ELASTIC") || atoi(getenv("HYPER4_ELASTIC")) != 0);
+    elastic_log_ = getenv("HYPER4_ELASTIC_LOG") != nullptr;
+    if (getenv("HYPER4_ELASTIC_FILL")) elastic_fill_ = atoi(getenv("HYPER4_ELASTIC_FILL"));
+    if (getenv("HYPER4_ELASTIC_MIN")) elastic_min_ = atof(getenv("HYPER4_ELASTIC_MIN"));
+    if (getenv("HYPER4_KV_STEP")) kv_step_ = std::max(64, atoi(getenv("HYPER4_KV_STEP")));   // (tests: frequent growth)
+    park_.before_restore = [this](int n) { ensure_kv(n + 2 * MAX_NT); };
     ehost_.resize(slots);
-    for (auto & H : ehost_) { H.score.assign(cfg_.n_expert, 0.0); H.last_count.assign(1024, 0); }
+    for (auto & H : ehost_) { H.score.assign(cfg_.n_expert, 0.0); H.last_count.assign(1024, 0); H.pend.assign(cfg_.n_expert, 0); }
     CUDA_CHECK(cudaHostAlloc(&h_ids_, (size_t) slots * mc_max_ * R4 * cfg_.n_expert_used * sizeof(int), cudaHostAllocPortable));
     load_weights();
 }
@@ -524,7 +542,261 @@ void * Engine4::host_huge_alloc(size_t bytes) {
     return p;
 }
 
+// elastic placement --------------------------------------------------------------------------------------------------
+
+// a per-position cache: `heads` blocks of pitch_elems, rows of row_elems (div 4: one pooled row per 4 positions, + 1)
+template <typename T> T * Engine4::kv_alloc(Device & dev, int heads, size_t pitch_elems, size_t row_elems, int div) {
+    if (!elastic_ || heads <= 0) return dev.alloc<T>((size_t) std::max(heads, 1) * pitch_elems);
+    CUDA_CHECK(cudaSetDevice(dev.id));
+    auto b = std::make_unique<VmmBuf>();
+    b->reserve(dev.id, (size_t) heads * pitch_elems * sizeof(T));
+    dev.kvs.push_back({b.get(), pitch_elems * sizeof(T), row_elems * sizeof(T), heads, div});
+    dev.lend_limit += b->reserved();
+    dev.used += b->reserved();
+    T * p = (T *) b->ptr();
+    dev.vmm.push_back(std::move(b));
+    return p;
+}
+
+namespace {
+size_t kv_rows(int div, int n) { return div == 1 ? (size_t) n : (size_t) (n / div + 1); }
+}
+
+size_t Engine4::lend_free(const Device & d) const {
+    size_t used = 0;
+    for (auto & k : d.kvs) used += k.b->mapped();
+    for (int il = 0; il <= cfg_.n_layer; ++il) {
+        const DevLayer & L = il < cfg_.n_layer ? d.layers[il] : d.mtp;
+        if (L.xg) used += L.xg->mapped() + L.xu->mapped() + L.xd->mapped() - L.xbase;
+    }
+    return d.lend_limit > used ? d.lend_limit - used : 0;
+}
+
+// map every cache up to `need` positions (in kv_step_ steps); extra expert slots give the memory back first
+void Engine4::ensure_kv(int need) {
+    if (!elastic_ || need <= kv_pos_) return;
+    const int target = std::min(opt_.max_pos, (need + kv_step_ - 1) / kv_step_ * kv_step_);
+    fill_wait(true);
+    cpu_->drain();
+    for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaDeviceSynchronize()); }
+    for (auto & dp : devs_) {
+        Device & d = *dp;
+        if (d.kvs.empty()) continue;
+        size_t add = 0;
+        for (auto & k : d.kvs)
+            for (int h = 0; h < k.heads; ++h) add += k.b->cost(h * k.pitch, std::min(kv_rows(k.div, target) * k.row_bytes, k.pitch));
+        const size_t fr = lend_free(d);
+        if (add > fr) evict_extra(d, add - fr);
+        CUDA_CHECK(cudaSetDevice(d.id));
+        for (auto & k : d.kvs)
+            for (int h = 0; h < k.heads; ++h) k.b->map(h * k.pitch, std::min(kv_rows(k.div, target) * k.row_bytes, k.pitch), true, d.stream);
+        CUDA_CHECK(cudaStreamSynchronize(d.stream));
+    }
+    if (elastic_log_) {
+        fprintf(stderr, "hyper4: elastic: caches mapped to %d positions; lendable free", target);
+        for (auto & dp : devs_) if (!dp->kvs.empty()) fprintf(stderr, " %.0f MiB", lend_free(*dp) / 1048576.0);
+        fprintf(stderr, "\n");
+    }
+    kv_pos_ = target;
+}
+
+// a conversation shorter than the mapped caches by two steps or more: the caches beyond `keep` go back to the lending pool
+void Engine4::shrink_kv(int keep) {
+    if (!elastic_) return;
+    const int target = std::min(opt_.max_pos, (keep + kv_step_ - 1) / kv_step_ * kv_step_);
+    if (target + 2 * kv_step_ > kv_pos_) return;
+    fill_wait(true);
+    for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaDeviceSynchronize()); }
+    size_t freed = 0;
+    for (auto & dp : devs_)
+        for (auto & k : dp->kvs)
+            for (int h = 0; h < k.heads; ++h) freed += k.b->unmap(h * k.pitch + kv_rows(k.div, target) * k.row_bytes, (h + 1) * k.pitch);
+    if (elastic_log_) fprintf(stderr, "hyper4: elastic: caches %d -> %d positions (%.0f MiB to lend)\n", kv_pos_, target, freed / 1048576.0);
+    kv_pos_ = target;
+}
+
+// give back at least `bytes` of extra expert slots on device d: the top extra slot of the layer whose expert there is the
+// coldest, one at a time (the expert becomes a CPU expert again; the host copy is the CPU's copy)
+void Engine4::evict_extra(Device & d, size_t bytes) {
+    const int nl = cfg_.n_layer + (mtp_g_ ? 1 : 0), g = d.g, E = cfg_.n_expert;
+    size_t freed = 0;
+    int n = 0;
+    while (freed < bytes) {
+        int best = -1;
+        double bs = 0;
+        for (int il = 0; il < nl; ++il) {
+            DevLayer & L = lay(d, il);
+            if (!L.xg || L.xe.empty()) continue;
+            const int e = L.xe.back();
+            const double sc = e < 0 ? -1.0 : ehost_[il].score[e];
+            if (best < 0 || sc < bs) { best = il; bs = sc; }
+        }
+        if (best < 0) break;
+        DevLayer & L = lay(d, best);
+        ExpertHost & H = ehost_[best];
+        const int e = L.xe.back(), k = L.nbase + (int) L.xe.size() - 1;
+        if (e >= 0) {
+            H.owner[e] = CPU_OWNER;
+            H.slot[g][e] = -1;
+            cpu_->set_owned(best, e, true);
+            H.tables_dirty = H.stream_dirty = true;
+            ++n;
+        }
+        L.xe.pop_back();
+        freed += L.xg->unmap((size_t) k * H.gb, L.xg->reserved()) + L.xu->unmap((size_t) k * H.gb, L.xu->reserved()) +
+                 L.xd->unmap((size_t) k * H.db, L.xd->reserved());
+    }
+    for (int il = 0; il < nl; ++il) {   // placement tables of the changed layers
+        ExpertHost & H = ehost_[il];
+        if (!H.tables_dirty) continue;
+        for (auto & dp : devs_) {
+            DevLayer & L2 = lay(*dp, il);
+            CUDA_CHECK(cudaSetDevice(dp->id));
+            CUDA_CHECK(cudaMemcpy((void *) L2.moe.slot, H.slot[dp->g].data(), E * sizeof(int), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(L2.owner, H.owner.data(), E * sizeof(int), cudaMemcpyHostToDevice));
+        }
+        H.tables_dirty = false;
+    }
+    if (elastic_log_) fprintf(stderr, "hyper4: elastic: device %d gave back %d experts (%.0f MiB)\n", d.id, n, freed / 1048576.0);
+}
+
+// hottest CPU experts into new extra slots (no exchange: memory the caches do not use), the device with the most room
+// first; keeps one cache growth step free per device. The slots are reserved here; a host thread maps and copies them in
+// the background (fill_apply switches the copied ones over between forwards)
+int Engine4::fill_extra(int budget) {
+    if (!elastic_ || budget <= 0 || fill_busy_.load() || !fill_list_.empty()) return 0;
+    const int nl = cfg_.n_layer + (mtp_g_ ? 1 : 0), E = cfg_.n_expert, nd = (int) devs_.size();
+    std::vector<size_t> fr(nd, 0), headroom(nd, 0);
+    bool any = false;
+    for (auto & dp : devs_) {
+        if (dp->kvs.empty()) continue;
+        fr[dp->g] = lend_free(*dp);
+        for (auto & k : dp->kvs) headroom[dp->g] += (kv_rows(k.div, kv_step_) * k.row_bytes + k.b->granule()) * k.heads;
+        static const bool no_head = getenv("HYPER4_ELASTIC_NOHEADROOM") != nullptr;   // (tests: every growth step evicts)
+        if (no_head) headroom[dp->g] = 0;
+        any |= fr[dp->g] > headroom[dp->g];
+    }
+    if (!any) return 0;
+    struct C { double s; int il, e; };
+    std::vector<C> cand;
+    for (int il = 0; il < nl; ++il) {
+        const ExpertHost & H = ehost_[il];
+        for (int e = 0; e < E; ++e) if (H.owner[e] == CPU_OWNER && H.score[e] >= elastic_min_) cand.push_back({H.score[e], il, e});
+    }
+    std::sort(cand.begin(), cand.end(), [](const C & a, const C & b) { return a.s > b.s; });
+    for (const C & c : cand) {
+        if ((int) fill_list_.size() >= budget) break;
+        ExpertHost & H = ehost_[c.il];
+        Device * best = nullptr;
+        size_t bleft = 0, bcost = 0;
+        for (auto & dp : devs_) {
+            DevLayer & L = lay(*dp, c.il);
+            if (!L.xg) continue;
+            const int k = L.nbase + (int) L.xe.size();
+            if (k >= E) continue;
+            // (reserved slots are not mapped yet: the cost counts their granules once, slot by slot in order)
+            const size_t cost = L.xg->cost((size_t) k * H.gb, H.gb) + L.xu->cost((size_t) k * H.gb, H.gb) + L.xd->cost((size_t) k * H.db, H.db);
+            const int g = dp->g;
+            if (fr[g] < cost + headroom[g]) continue;
+            const size_t left = fr[g] - cost;
+            if (!best || left > bleft) { best = dp.get(); bleft = left; bcost = cost; }
+        }
+        if (!best) continue;
+        DevLayer & L = lay(*best, c.il);
+        const int k = L.nbase + (int) L.xe.size();
+        L.xe.push_back(c.e);
+        H.pend[c.e] = 1;
+        fill_list_.push_back({c.il, c.e, best->g, k, false});
+        fr[best->g] -= bcost;
+    }
+    if (fill_list_.empty()) return 0;
+    // (cost above is approximate for consecutive reserved slots sharing a granule: it can only overcount)
+    // deterministic hand-over: at a fixed decode step (16 per 256 experts: ~0.8 GB, done long before on any link), not
+    // when the copies happen to finish; a cancelled batch is dropped as a whole
+    fill_due_ = dec_steps_ + 16 * (int) ((fill_list_.size() + 255) / 256);
+    fill_busy_.store(true);
+    fill_cancel_.store(false);
+    if (fill_th_.joinable()) fill_th_.join();
+    fill_th_ = std::thread([this] {
+        try {
+            for (Fill & f : fill_list_) {
+                if (fill_cancel_.load()) break;
+                Device & d = *devs_[f.g];
+                DevLayer & L = lay(d, f.il);
+                const ExpertHost & H = ehost_[f.il];
+                CUDA_CHECK(cudaSetDevice(d.id));
+                L.xg->map((size_t) f.k * H.gb, H.gb, false);
+                L.xu->map((size_t) f.k * H.gb, H.gb, false);
+                L.xd->map((size_t) f.k * H.db, H.db, false);
+                CUDA_CHECK(cudaMemcpyAsync((uint8_t *) L.moe.gate + (size_t) f.k * H.gb, H.gate + (size_t) f.e * H.gb, H.gb, cudaMemcpyHostToDevice, d.fstream));
+                CUDA_CHECK(cudaMemcpyAsync((uint8_t *) L.moe.up + (size_t) f.k * H.gb, H.up + (size_t) f.e * H.gb, H.gb, cudaMemcpyHostToDevice, d.fstream));
+                CUDA_CHECK(cudaMemcpyAsync((uint8_t *) L.moe.down + (size_t) f.k * H.db, H.down + (size_t) f.e * H.db, H.db, cudaMemcpyHostToDevice, d.fstream));
+                f.copied = true;
+            }
+            for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->fstream)); }
+        } catch (const std::exception & ex) {
+            fprintf(stderr, "hyper4: elastic fill failed: %s\n", ex.what());
+            for (Fill & f : fill_list_) f.copied = false;
+        }
+        fill_busy_.store(false);
+    });
+    return 0;   // (nothing changes hands until fill_apply)
+}
+
+// between forwards: the copied experts of a finished batch take over their extra slots; reservations that were not
+// copied (cancelled batch) become free slots
+void Engine4::fill_apply() {
+    if (fill_list_.empty() || fill_busy_.load()) return;
+    if (fill_th_.joinable()) fill_th_.join();
+    if (fill_cancel_.load()) for (Fill & f : fill_list_) f.copied = false;   // (how far it got depends on timing)
+    cpu_->drain();
+    const int E = cfg_.n_expert;
+    int n = 0;
+    std::vector<char> dirty(ehost_.size(), 0);
+    for (const Fill & f : fill_list_) {
+        ExpertHost & H = ehost_[f.il];
+        DevLayer & L = lay(*devs_[f.g], f.il);
+        H.pend[f.e] = 0;
+        if (f.copied) {
+            H.slot[f.g][f.e] = f.k;
+            H.owner[f.e] = f.g;
+            cpu_->set_owned(f.il, f.e, false);
+            H.stream_dirty = true;
+            dirty[f.il] = 1;
+            ++n;
+        } else {
+            L.xe[f.k - L.nbase] = -1;   // (a free slot: evictions pop it, fills only append)
+        }
+    }
+    for (int il = 0; il < (int) ehost_.size(); ++il) {
+        if (!dirty[il]) continue;
+        const ExpertHost & H = ehost_[il];
+        for (auto & dp : devs_) {
+            DevLayer & L = lay(*dp, il);
+            CUDA_CHECK(cudaSetDevice(dp->id));
+            CUDA_CHECK(cudaMemcpy((void *) L.moe.slot, H.slot[dp->g].data(), E * sizeof(int), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(L.owner, H.owner.data(), E * sizeof(int), cudaMemcpyHostToDevice));
+        }
+    }
+    if (elastic_log_) {
+        int ex = 0;
+        const int nl = cfg_.n_layer + (mtp_g_ ? 1 : 0);
+        for (auto & dp : devs_) for (int il = 0; il < nl; ++il) for (int e : lay(*dp, il).xe) ex += e >= 0;
+        fprintf(stderr, "hyper4: elastic: %d experts moved to extra slots (%zu reserved; %d in extra slots, %.1f per layer)\n", n,
+                fill_list_.size(), ex, (double) ex / nl);
+    }
+    fill_list_.clear();
+}
+
+void Engine4::fill_wait(bool cancel) {
+    if (fill_list_.empty()) return;
+    if (cancel) fill_cancel_.store(true);
+    if (fill_th_.joinable()) fill_th_.join();
+    fill_apply();
+}
+
 Engine4::~Engine4() {
+    if (fill_th_.joinable()) { fill_cancel_.store(true); fill_th_.join(); }
     for (auto & sn : snaps_) snap_pool_.push_back(sn.h);
     park_.release(snap_pool_);
     for (auto & v : snap_pool_) for (float * p : v) cudaFreeHost(p);
@@ -582,17 +854,16 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
                          {{(int64_t) L.head_off * hd / 32, (int64_t) (L.head_off + L.n_head_l) * hd / 32}});
         L.q_norm = f32(p + "attn_q_norm.weight");
         L.k_norm = f32(p + "attn_k_norm.weight");
-        const size_t kv = (size_t) L.n_kv_l * opt_.max_pos * hd;
-        L.kcache = dev.alloc<half>(kv);
-        L.vcache = dev.alloc<half>(kv);
+        L.kcache = kv_alloc<half>(dev, L.n_kv_l, (size_t) opt_.max_pos * hd, hd, 1);
+        L.vcache = kv_alloc<half>(dev, L.n_kv_l, (size_t) opt_.max_pos * hd, hd, 1);
         if (c.compress[il] > 0) {
             if (c.compress[il] != 4 || c.idx_dim != 128 || c.idx_n_head > 4) throw std::runtime_error("QSA: only kpool 4, 128-dim, <= 4 heads");
             L.idx_q = upload_bf16(A, dev.id, src_->need(p + "indexer.q_proj.weight"));
             L.idx_k = upload_bf16(A, dev.id, src_->need(p + "indexer.k_proj.weight"));
             L.idx_qn = f32(p + "indexer.q_norm.weight");
             L.idx_kn = f32(p + "indexer.k_norm.weight");
-            L.kraw = dev.alloc<half>((size_t) opt_.max_pos * 128);
-            L.kpool = dev.alloc<half>((size_t) (opt_.max_pos / 4 + 1) * 128);
+            L.kraw = kv_alloc<half>(dev, 1, (size_t) opt_.max_pos * 128, 128, 1);
+            L.kpool = kv_alloc<half>(dev, 1, (size_t) (opt_.max_pos / 4 + 1) * 128, 128, 4);
         }
     } else if (!L.full) {
         auto [k0, k1] = split(nk, nd, g);
@@ -716,8 +987,27 @@ void Engine4::load_experts(int il, const std::vector<int> & quota) {
         std::vector<int> slot(E, -1);
         int nl = 0;
         for (int e = 0; e < E; ++e) if (owner[e] == g) slot[e] = nl++;
-        uint8_t * dg = dev.alloc<uint8_t>(gb * std::max(nl, 1)), * du = dev.alloc<uint8_t>(gb * std::max(nl, 1));
-        uint8_t * dd = dev.alloc<uint8_t>(db * std::max(nl, 1));
+        uint8_t * dg, * du, * dd;
+        if (elastic_ && dev.lend_limit > 0) {   // virtual ranges for every expert, the base slots mapped
+            CUDA_CHECK(cudaSetDevice(dev.id));
+            auto mk = [&](size_t per) {
+                auto b = std::make_unique<VmmBuf>();
+                b->reserve(dev.id, per * E);
+                b->map(0, per * nl, false);
+                VmmBuf * r = b.get();
+                dev.vmm.push_back(std::move(b));
+                dev.used += r->mapped();
+                return r;
+            };
+            L.xg = mk(gb); L.xu = mk(gb); L.xd = mk(db);
+            L.nbase = nl;
+            L.xbase = L.xg->mapped() + L.xu->mapped() + L.xd->mapped();
+            L.xe.clear();
+            dg = (uint8_t *) L.xg->ptr(); du = (uint8_t *) L.xu->ptr(); dd = (uint8_t *) L.xd->ptr();
+        } else {
+            dg = dev.alloc<uint8_t>(gb * std::max(nl, 1)); du = dev.alloc<uint8_t>(gb * std::max(nl, 1));
+            dd = dev.alloc<uint8_t>(db * std::max(nl, 1));
+        }
         for (int e = 0; e < E; ++e) {
             if (slot[e] < 0) continue;
             CUDA_CHECK(cudaMemcpy(dg + slot[e] * gb, tg.data + (size_t) e * gb, gb, cudaMemcpyHostToDevice));
@@ -920,6 +1210,9 @@ void Engine4::load_weights() {
             CUDA_CHECK(cudaSetDevice(devs_[g]->id));
             size_t tot = 0;
             CUDA_CHECK(cudaMemGetInfo(&freeb[g], &tot));
+            // (elastic caches are not mapped yet: their full-context size is set aside, as the plain allocation would take it)
+            const size_t pend = devs_[g]->lend_limit;
+            freeb[g] = freeb[g] > pend ? freeb[g] - pend : 0;
         }
         // staging for prefill streaming: two buffers of this GPU's share of a layer's CPU experts (fixed point: the
         // share depends on how many experts stay on the CPU, which depends on the quotas)
@@ -1430,12 +1723,16 @@ void Engine4::rebalance(int max_swaps) {
         auto & last = ehost_[il].last_count;
         for (int e = 0; e < E; ++e) { sc[e] = sc[e] * adapt_decay_ + (double) (cnt[e] - last[e]); last[e] = cnt[e]; }
     }
+    fill_extra(elastic_fill_);   // free extra slots first (a background batch; the rest of this rebalance is unaffected)
     struct Sw { double gain; int il, ein, eout, g; };
     std::vector<Sw> cand;
     for (int il = 0; il < nl; ++il) {
         ExpertHost & H = ehost_[il];
         std::vector<int> cpu, gpu;
-        for (int e = 0; e < E; ++e) (H.owner[e] == CPU_OWNER ? cpu : gpu).push_back(e);
+        for (int e = 0; e < E; ++e) {
+            if (!H.pend.empty() && H.pend[e]) continue;   // (on its way into an extra slot)
+            (H.owner[e] == CPU_OWNER ? cpu : gpu).push_back(e);
+        }
         std::sort(cpu.begin(), cpu.end(), [&](int a, int b) { return H.score[a] > H.score[b]; });
         std::sort(gpu.begin(), gpu.end(), [&](int a, int b) { return H.score[a] < H.score[b]; });
         for (size_t i = 0; i < std::min(cpu.size(), gpu.size()); ++i) {
@@ -1452,6 +1749,7 @@ void Engine4::rebalance(int max_swaps) {
         Device & d = *devs_[w.g];
         DevLayer & L = lay(d, w.il);
         const int k = H.slot[w.g][w.eout];
+        if (L.xg && k >= L.nbase) L.xe[k - L.nbase] = w.ein;   // (elastic: an extra slot changes hands)
         CUDA_CHECK(cudaSetDevice(d.id));
         CUDA_CHECK(cudaMemcpyAsync((uint8_t *) L.moe.gate + (size_t) k * H.gb, H.gate + (size_t) w.ein * H.gb, H.gb, cudaMemcpyHostToDevice, d.cstream));
         CUDA_CHECK(cudaMemcpyAsync((uint8_t *) L.moe.up + (size_t) k * H.gb, H.up + (size_t) w.ein * H.gb, H.gb, cudaMemcpyHostToDevice, d.cstream));
@@ -1659,6 +1957,7 @@ void Engine4::run(int kind, int nt) {
 std::vector<int> Engine4::forward(const int * tokens, int nt, int pos) {
     if (nt < 1 || nt > R4) throw std::runtime_error("forward: bad token count");
     if (pos + nt > opt_.max_pos) throw std::runtime_error("forward: position exceeds max_pos");
+    ensure_kv(pos + nt + 2 * MAX_NT);   // (MTP drafts run up to MAX_NT positions further)
     const bool bulk = nt > MAX_NT;
     static const bool hprof = getenv("HYPER4_HOSTPROF") != nullptr;   // host time per decode forward (GPUs idle meanwhile)
     static double h_embed = 0, h_run = 0, h_gap = 0; static long h_n = 0;
@@ -1666,6 +1965,13 @@ std::vector<int> Engine4::forward(const int * tokens, int nt, int pos) {
     const auto th0 = std::chrono::steady_clock::now();
     embed(tokens, nt, pos);
     h_pos_[0] = pos;
+    if (elastic_ && !bulk) {
+        ++dec_steps_;
+        if (!fill_list_.empty() && dec_steps_ >= fill_due_) fill_wait(false);   // (the batch's due step: waits if needed)
+        // a conversation much shorter than the mapped caches gives the rest to experts once it is under way (side
+        // requests of an agent -- a title, a summary -- end before that and leave the main conversation's room alone)
+        if (++req_steps_ == 32) shrink_kv(pos + nt + 2 * MAX_NT);
+    }
     if (adapt_ && !bulk) {   // placement follows the routing: after a prompt, then every adapt_every_ decode steps
         if (prompt_routed_) { rebalance(1 << 20); prompt_routed_ = false; steps_ = 0; }
         else if (++steps_ % adapt_every_ == 0) rebalance(adapt_budget_);
@@ -1716,6 +2022,7 @@ int Engine4::forward_multi(const int * tokens, const int * lens, int nck, int po
         return r;
     }
     if (pos + total > opt_.max_pos) throw std::runtime_error("forward_multi: position exceeds max_pos");
+    ensure_kv(pos + total + 2 * MAX_NT);
     for (int ci = 0, off = 0; ci < nck; off += lens[ci++]) {
         embed(tokens + off, lens[ci], pos + off, ci);
         mc_nt_[ci] = lens[ci]; mc_pos_[ci] = pos + off; h_cpos_[ci] = pos + off;
@@ -1925,6 +2232,8 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
         if (best) { s = best->pos; snap_copy(*best, false); }
     }
     if (s == 0) reset();
+    req_steps_ = 0;
+    ensure_kv(P + 2 * MAX_NT);
     seq_.assign(prompt.begin(), prompt.begin() + s);   // PLE n-gram history
     hist_.assign(prompt.begin(), prompt.begin() + s);
     std::vector<int> snap_at;

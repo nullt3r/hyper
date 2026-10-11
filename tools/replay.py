@@ -11,6 +11,12 @@ import argparse, glob, hashlib, json, os, sys, time, urllib.request
 from collections import Counter
 
 
+def strip_ids(o):
+    if isinstance(o, dict): return {k: strip_ids(v) for k, v in o.items() if k not in ("id", "call_id")}
+    if isinstance(o, list): return [strip_ids(x) for x in o]
+    return o
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("url")
@@ -48,7 +54,7 @@ def main():
         with urllib.request.urlopen(req, timeout=3600) as r:
             resp = json.load(r)
         dt = time.time() - t0
-        text = json.dumps(resp.get("output", []), sort_keys=True)
+        text = json.dumps(strip_ids(resp.get("output", [])), sort_keys=True)   # (item ids are random per run)
         h = hashlib.sha1(text.encode()).hexdigest()[:12]
         usage = resp.get("usage", {})
         print(f"{os.path.basename(f)}  {dt:7.2f} s  out {usage.get('output_tokens', '?'):>5}  hash {h}", flush=True)
