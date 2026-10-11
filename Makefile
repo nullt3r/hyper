@@ -35,6 +35,12 @@ $(BUILD)/ref: tools/ref.cpp
 	$(CXX) $(CXXFLAGS) -I$(LLAMA)/include -I$(LLAMA)/ggml/include tools/ref.cpp -o $@ \
 	  -Wl,--start-group $(LLAMA_LIBS) -Wl,--end-group $(LIBS)
 
+# tokenizer only (offline experiments on request dumps)
+$(BUILD)/tokdump: tools/tokdump.cpp
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) -I$(LLAMA)/include -I$(LLAMA)/ggml/include tools/tokdump.cpp -o $@ \
+	  -Wl,--start-group $(LLAMA_LIBS) -Wl,--end-group $(LIBS)
+
 clean:
 	rm -rf $(BUILD)
 

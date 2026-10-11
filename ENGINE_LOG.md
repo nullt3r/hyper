@@ -365,3 +365,33 @@ z dekódování (decay 0,92), výměna nejteplejších CPU expertů za nejstuden
 
 Výměny za celý replay 1,3 s (14k výměn). Na obsahu vzdálenějším od statistik (jiný jazyk, chat) čekám víc.
 
+
+## 2026-10-11 – offline experimenty: n-gram drafty, CPU experty, rezerva KV cache
+
+Bez spuštění modelu (server běžel dál): simulace na skutečných datech + mikrobenchmarky CPU expertů.
+
+**N-gram drafty (prompt lookup) k MTP – simulace na 35 sezeních z Codexu** (`tools/spec_render.py`, `tokdump`,
+`tools/spec_sim.py`): 521k tokenů, z toho 183k vygenerovaných (tool cally 103k, reasoning 75k). Draft se počítá jen
+když se shoduje s tím, co model skutečně vygeneroval. Nákladový model z replaye Flash-Next (262k, T 1): krok s R
+ověřovanými řádky ≈ 5,9 + 4,4·R ms (+1,2 ms řetěz MTP), MTP 1,88 přijatých / krok. Nejlepší hybrid (n-gram draft 3–5
+tokenů, jen při shodě ≥ 12 tokenů, jinak MTP): **+5–6 %**; delší drafty ztrácejí (každý řádek navíc stojí 4,4 ms =
+43 % tokenu – MoE: každý řádek čte jiné experty). Neimplementováno, malý zisk.
+
+**CPU experty (cpumoebench, reálné váhy vrstvy 10, 30 vláken, výstup bitově stejný – hash):**
+
+| úloha | RG 16 / RD 32 (dosud) | RG 32 / RD 128, předstih gate/up 2 |
+|---|---|---|
+| Flash 3 experti × 1 token | ~61–64 GB/s | 63–67 GB/s |
+| Flash 3 × 4 (MTP ověřování) | ~63 GB/s | **68–69,5 GB/s** |
+| Flash 6 × 4 | ~62 GB/s | **68–69 GB/s** |
+| GLM 5 × 1 | 68,6 GB/s | **70,1 GB/s** |
+| GLM 5 × 2 | 62,0 GB/s | 64,2 GB/s |
+
+Delší souvislé čtení na úlohu; profil 3 × 4: příprava 10 µs, ocas down posledního experta 45 → 30 µs. Strop RAM
+(čisté čtení) 77–80 GB/s → zbývá ~12 %. Vlákna: 24–48 stejné, 62 (SMT) polovina.
+
+**Kolik routingu jde na CPU (statistiky serveru `fn_stats.bin`, 1,6M routingů / vrstvu):** dnes 303 expertů na vrstvu
+na GPU (262k KV rezervováno) → 9,4 % routovaných expertů na CPU; 340 → 6,3 %; 380 → 3,7 %; 400 → 2,7 %.
+MTP krok se 4 řádky: ~3,7 CPU expertů / vrstvu ≈ 167 µs proti ~60 µs GPU části MoE → CPU je kritická cesta MoE.
+Nápad: **pružná KV cache** – nevyužitou část rezervy 262k (GPU1/2 po 3,2 GB) půjčit expertům a vracet je, když kontext
+roste (hostovská kopie expertů už existuje, vrácení = jen změna tabulky). Kapacita 262k zůstává.

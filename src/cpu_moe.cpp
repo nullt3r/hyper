@@ -369,7 +369,9 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
         for (int t = 0; t < nt; ++t) if (tok[t]) qt.push_back(t);
         const auto tj0 = std::chrono::steady_clock::now();   // (HYPER_CPUPROF: phase times of the decode job)
         for (int t : qt) from_g(x + (size_t) t * 4096, qx_.data() + t * qx_row, n);
-        static const int RG = getenv("HYPER_CPU_RG") ? atoi(getenv("HYPER_CPU_RG")) : 16, RD = getenv("HYPER_CPU_RD") ? atoi(getenv("HYPER_CPU_RD")) : 32;
+        // rows per gate/up and down task (cpumoebench, 30 threads: 16 / 32 -> 32 / 128 gives Flash-Next 3 experts x 4 rows 63 -> 68 GB/s,
+        // GLM 5 x 1 68.6 -> 70.1 GB/s; longer contiguous reads per task, bit-identical output)
+        static const int RG = getenv("HYPER_CPU_RG") ? atoi(getenv("HYPER_CPU_RG")) : 32, RD = getenv("HYPER_CPU_RD") ? atoi(getenv("HYPER_CPU_RD")) : 128;
         // guided chunking: full-size row chunks, except that the last ~2 chunks per thread of a phase are split in 4 (the
         // phase's tail, where threads idle for up to one chunk, shrinks accordingly)
         static const int tail_mult = getenv("HYPER_CPU_TAIL") ? atoi(getenv("HYPER_CPU_TAIL")) : 0;   // (measured: smaller tail chunks lose bandwidth)
@@ -414,9 +416,14 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
         std::vector<int> gcount(G);
         for (int g = 0; g < G; ++g) ready_[g].store(0, std::memory_order_relaxed);
         if (!split) {
-            gcount[0] = add(order, 0, 0, fa, RG, false, -1);
-            for (int g = 1; g < G; ++g) { gcount[g] = add(order, g, 0, fa, RG, false, -1); add(order, g - 1, 0, n, RD, true, -1); }
-            add(order, G - 1, 0, n, RD, true, -1);
+            // gate/up runs `lead` experts ahead of the down projections (1: gu(0) gu(1) down(0) gu(2) down(1) ...)
+            // (2: the last expert's down rows wait less for its gate/up; Flash-Next 3 x 1 64 -> 67 GB/s, GLM neutral)
+            static const int lead = getenv("HYPER_CPU_LEAD") ? std::max(1, atoi(getenv("HYPER_CPU_LEAD"))) : 2;
+            for (int g = 0; g < std::min(lead, G); ++g) gcount[g] = add(order, g, 0, fa, RG, false, -1);
+            for (int g = 0; g < G; ++g) {
+                if (g + lead < G) gcount[g + lead] = add(order, g + lead, 0, fa, RG, false, -1);
+                add(order, g, 0, n, RD, true, -1);
+            }
         } else {
             if ((int) part_left_.size() < S) { part_left_ = std::vector<std::atomic<int>>(8); part_ready_ = std::vector<std::atomic<int>>(8); }
             if ((int) dprog_.size() < n / RD) dprog_ = std::vector<std::atomic<int>>(n / RD);
