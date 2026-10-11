@@ -768,6 +768,21 @@ void Engine4::fill_apply() {
             L.xe[f.k - L.nbase] = -1;   // (a free slot: evictions pop it, fills only append)
         }
     }
+    // a cancelled batch: its reservations are the tops of their layers' extra regions -- they give their memory back
+    for (const Fill & f : fill_list_) {
+        if (f.copied) continue;
+        Device & d = *devs_[f.g];
+        DevLayer & L = lay(d, f.il);
+        const ExpertHost & H = ehost_[f.il];
+        CUDA_CHECK(cudaSetDevice(d.id));
+        while (!L.xe.empty() && L.xe.back() < 0) {
+            const int k = L.nbase + (int) L.xe.size() - 1;
+            L.xe.pop_back();
+            L.xg->unmap((size_t) k * H.gb, L.xg->reserved());
+            L.xu->unmap((size_t) k * H.gb, L.xu->reserved());
+            L.xd->unmap((size_t) k * H.db, L.xd->reserved());
+        }
+    }
     for (int il = 0; il < (int) ehost_.size(); ++il) {
         if (!dirty[il]) continue;
         const ExpertHost & H = ehost_[il];

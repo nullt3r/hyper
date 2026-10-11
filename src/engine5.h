@@ -8,12 +8,14 @@
 #include "kernels5.cuh"
 #include "llm.h"
 #include "park.h"
+#include "vmm.h"
 #include "model5.h"
 
 #include <atomic>
 #include <functional>
 #include <memory>
 #include <random>
+#include <thread>
 #include <vector>
 
 namespace hyper {
@@ -138,6 +140,7 @@ private:
         std::vector<std::vector<int>> slot;   // [ndev][E]
         std::vector<double> score;            // decayed routing counts
         std::vector<uint64_t> last_count;     // CPU side's counts at the last rebalance
+        std::vector<char> pend;               // elastic: being copied into an extra slot (a CPU expert until applied)
         bool tables_dirty = false, stream_dirty = false;
     };
     std::vector<ExpertHost> ehost_;
@@ -159,6 +162,25 @@ private:
     int pred_k_ = 0;
     int * h_pred_ = nullptr;      // pinned [n_layer][MOE_MAX_USED]
     uint64_t pred_hit_ = 0, pred_tot_ = 0, pred_cpu_ = 0, pred_n_ = 0;
+    // elastic placement (as Engine4; HYPER5_ELASTIC=0: off): the MLA latent caches and pooled indexer keys (every GPU holds
+    // them) map only the positions in use; the rest of their full-context memory holds extra expert slots
+    bool elastic_ = false, elastic_log_ = false;
+    int kv_pos_ = 0, kv_step_ = 8192, elastic_fill_ = 1 << 20;
+    double elastic_min_ = 1.0;
+    template <typename T> T * kv_alloc(Device & dev, int heads, size_t pitch_elems, size_t row_elems, int div);
+    size_t lend_free(const Device & d) const;
+    void ensure_kv(int need);
+    void shrink_kv(int keep);
+    void evict_extra(Device & d, size_t bytes);
+    int fill_extra(int budget);
+    struct Fill { int il, e, g, k; bool copied; };
+    std::vector<Fill> fill_list_;
+    std::thread fill_th_;
+    std::atomic<bool> fill_busy_{false}, fill_cancel_{false};
+    void fill_apply();
+    void fill_wait(bool cancel);
+    int req_steps_ = 0;
+    long dec_steps_ = 0, fill_due_ = 0;
 };
 
 } // namespace hyper
