@@ -427,3 +427,22 @@ Experty ve slotech navíc: ~2600 (~55 na vrstvu) při krátkém kontextu. Vypnut
 Simulace n-gram draftů s čerstvým nákladovým modelem (krok 9,6 ms + ~4,0 ms / řádek, s pružnou cache ~3,1 ms / řádek):
 nejlépe +6,5 % / +7,5 % (draft 5, shoda ≥ 24 tokenů).
 
+**Pružná KV cache i pro GLM** (Engine5): latentní cache MLA (512 × fp16 na pozici) a pooled klíče indexeru jsou na
+každé GPU → půjčuje se na všech třech (~2,9 GB na GPU při krátkém kontextu). Experty GLM ~11,7 MB → ~17 navíc na MoE
+vrstvu (29 % → ~35 %). Převzetí dávky 16 kroků na 64 expertů. Oprava (obě enginy): zrušená dávka (růst kontextu během
+doplňování) teď odmapuje své rezervované sloty – předtím v nich zůstala paměť a GLM v replayi dostal jen 143 expertů
+navíc místo ~700.
+
+| GLM, 262k, vše v jedné relaci | vypnuto | zapnuto |
+|---|---|---|
+| tfbench 16k (glm_ref5L, 512 tokenů) | 26,4 / 25,8 t/s | **28,7 / 28,7 t/s (+10 %)** |
+| replay 20 požadavků Codexu, greedy, bez MTP | 24,4 t/s | **27,0 t/s (+11 %)** |
+| KL glm_ref5 (2048) | 0,026341 | 0,027519 (šum) |
+| replay, dva běhy | | 20/20 shodných |
+
+Pozn.: dřívější GLM „30,7 t/s @16k“ bylo s `HYPER_MAXPOS=24576` (rezerva KV jen na 24k → víc expertů na GPU), ne s 262k.
+
+Flash-Next znovu, čistě (zahřáté, vypnuto–zapnuto–vypnuto): 156,0 / **177,8** / 154,7 t/s, prefill 1386 / 1436 / 1391.
+První běh po vypnutí produkčního serveru je zkreslený (jádro uvolňuje ~100 GB a vytlačuje page cache: prefill prvního
+požadavku 69 s místo 16 s) → při A/B vždy jeden zahřívací běh.
+
