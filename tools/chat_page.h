@@ -95,7 +95,8 @@ header.sc{border-bottom-color:var(--line)}
 @media (hover:hover){.model:hover,.ctx:hover{background:var(--bg3)}}
 @media (max-width:768px){.hside{display:inline-grid}.hdesk{display:none}}
 @media (max-width:420px){.ctx .mx{display:none}}
-#scroll{flex:1;overflow-y:auto;overflow-x:hidden;overscroll-behavior-y:contain;padding-top:var(--hh);display:flex;flex-direction:column}
+#scroll{flex:1;overflow-y:auto;overflow-x:hidden;overscroll-behavior-y:contain;display:flex;flex-direction:column}
+.hsp{flex:0 0 var(--hh)}   /* (room under the header: a spacer, not padding -- sticky offsets count from the content edge) */
 .col{flex:1 0 auto;width:100%;max-width:768px;margin:0 auto;padding:16px 20px 26px}
 @media (max-width:768px){.col{padding:12px 16px 20px}}
 /* empty state */
@@ -290,7 +291,7 @@ input[type=range]{width:100%;accent-color:var(--acc);height:28px;margin:0}
   <button class="ib hside" aria-label="New chat" onclick="newConv()" data-i="newc"></button>
   <button class="ib hdesk" aria-label="Settings" onclick="openSet(true)" data-i="sliders"></button>
  </header>
- <div id="scroll"><div class="col" id="col"></div></div>
+ <div id="scroll"><div class="hsp"></div><div class="col" id="col"></div></div>
  <div class="dock" id="dock">
   <button class="jump" id="jump" aria-label="Scroll to the latest message" onclick="toBottom(true)" data-i="down"></button>
   <div class="sugs" id="sugs"></div>
