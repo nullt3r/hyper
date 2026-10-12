@@ -468,9 +468,11 @@ $('s-wrap').onchange=()=>{cfg.wrap=$('s-wrap').checked;saveCfg();applyWrap()};
 function resetSampling(){cfg.temp=cfg.topp=cfg.topk=cfg.minp='';saveCfg();syncSet();toast('Using the server defaults')}
 function effortMenu(e){e.stopPropagation();const r=e.currentTarget.getBoundingClientRect(),a=$('app').getBoundingClientRect(),m=$('effmenu');
  m.style.left=Math.max(8,r.left-a.left)+'px';m.style.top='auto';m.style.bottom=(a.bottom-r.top+6)+'px';m.classList.add('on')}
+// (the effort and the tools are at the start of the prompt: changing them in a long chat makes the server re-read all of it)
+const longChat=()=>{const c=conv();return !!c&&c.msgs.reduce((n,m)=>n+(m.content||'').length+(m.reasoning||'').length+(m.calls||[]).reduce((k,x)=>k+(x.result||'').length,0),0)>20000};
+const reread=(msg)=>{const long=longChat();toast(msg+(long?' · this chat is re-read once':''),null,null,long?3000:1600)};
 function setEffort(v){$('effmenu').classList.remove('on');if(cfg.effort===v)return;cfg.effort=v;saveCfg();syncSet();
- const c=conv(),long=c&&c.msgs.reduce((n,m)=>n+(m.content||'').length+(m.reasoning||'').length,0)>20000;
- toast('Thinking: '+{off:'off',low:'low',medium:'medium',high:'high'}[v]+(long?' · this chat is re-read once':''),null,null,long?3000:1600)}
+ reread('Thinking: '+{off:'off',low:'low',medium:'medium',high:'high'}[v])}
 function updState(){$('s-model').textContent=live.model||'hyper';
  $('s-state').textContent=!online?'Server not reachable':(busy||(live.phase&&live.phase!=='idle')?(live.phase==='prompt'?'Reading a prompt':'Generating'):'Idle')+
   (live.ctx_max?` · context ${fmtK(live.ctx_used||0)} / ${fmtK(live.ctx_max)}`:'')+(live.requests!=null?` · ${live.requests} requests`:'')}
@@ -653,7 +655,7 @@ let PEND=[];
 function renderAtts(){const a=$('atts');a.style.display=PEND.length?'':'none';
  a.innerHTML=PEND.map((f,i)=>`<span class="fchip">${IC.file}<span>${esc(f.name)}</span><small>${fmtB(f.size)}</small><button class="x" aria-label="Remove" onclick="unattach(${i})">${IC.x}</button></span>`).join('');updSend()}
 function attach(list){for(const f of list){if(f.size>64*1048576){toast(f.name+' is larger than 64 MB');continue}PEND.push(f)}
- if(PEND.length&&!cfg.code){cfg.code=true;saveCfg();syncSet();toast('Python is on: it works with the files')}renderAtts()}
+ if(PEND.length&&!cfg.code){cfg.code=true;saveCfg();syncSet();reread('Python is on: it works with the files')}renderAtts()}
 function unattach(i){PEND.splice(i,1);renderAtts()}
 $('fpick').onchange=()=>{attach([...$('fpick').files]);$('fpick').value=''};
 IN.addEventListener('paste',e=>{const f=e.clipboardData?[...e.clipboardData.files]:[];if(f.length){e.preventDefault();attach(f)}});
@@ -855,7 +857,7 @@ async function runPython(c,x,signal,k){let a={};try{a=JSON.parse(x.args||'{}')}c
  if(x.files.length)r.push('Saved in /mnt/data (offered to the user for download): '+x.files.map(f=>`${f.name} (${fmtB(f.size)})`).join(', '));
  if(x.figs.length)r.push(x.figs.length+(x.figs.length>1?' figures':' figure')+' shown to the user');
  return {text:r.join('\n\n')||'(no output)',isError:!!d.error}}
-function toggleCode(){cfg.code=!cfg.code;saveCfg();syncSet();toast(cfg.code?'Python on':'Python off')}
+function toggleCode(){cfg.code=!cfg.code;saveCfg();syncSet();reread(cfg.code?'Python on':'Python off')}
 /* ---------- web tools (MCP servers behind the server's /mcp/<name>) ---------- */
 let rpcId=0;
 async function mcpRpc(server,method,params){const id=++rpcId;
@@ -876,7 +878,7 @@ async function loadTools(){try{const j=await (await fetch('/v1/mcp')).json();con
   }catch(e){console.warn('MCP server',sv.name,e)}}
   MCP.tools=tools;MCP.map=map;MCP.servers=j.servers||[];
   $('webb').style.display=tools.length?'':'none';$('s-webrow').style.display=tools.length?'':'none';$('s-webtools').textContent=names.join(', ')}catch(e){}}
-function toggleWeb(){cfg.web=!cfg.web;saveCfg();syncSet();toast(cfg.web?'Web search on':'Web search off')}
+function toggleWeb(){cfg.web=!cfg.web;saveCfg();syncSet();reread(cfg.web?'Web search on':'Web search off')}
 function toolPrompt(day){const n=MCP.tools.map(t=>t.function.name);
  return `You have web access through tools (${n.join(', ')}): search the web for anything recent, for facts you are not sure about and when the user asks about a site or a page; then read the most relevant results. Open only URLs that appeared in search results or on pages you read: never construct or guess links. Cite the pages you used as markdown links. Today is ${day}.`}
 function hostOf(u){try{return new URL(u).hostname.replace(/^www\./,'')}catch(e){return u||''}}
