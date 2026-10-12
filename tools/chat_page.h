@@ -273,7 +273,9 @@ input[type=range]{width:100%;accent-color:var(--acc);height:28px;margin:0}
 .menu{position:absolute;z-index:50;min-width:176px;background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--sh2);padding:5px;opacity:0;transform:scale(.96);transform-origin:top right;pointer-events:none;transition:opacity .12s,transform .12s}
 .menu.on{opacity:1;transform:none;pointer-events:auto}
 .menu button{display:flex;align-items:center;gap:10px;width:100%;height:40px;padding:0 10px;border-radius:9px;font-size:14px;text-align:left}
-.menu button.danger{color:var(--danger)}.menu svg{width:16px;height:16px}
+.menu button.danger{color:var(--danger)}
+.menu button small{margin-left:auto;padding-left:12px;color:var(--mut);font-size:12px}.menu button.sel{font-weight:650}
+#effmenu{transform-origin:bottom left}.menu svg{width:16px;height:16px}
 @media (hover:hover){.menu button:hover{background:var(--bg3)}}
 #toast{position:absolute;z-index:60;left:50%;bottom:calc(var(--dockh,110px) + 14px);transform:translate(-50%,10px);opacity:0;pointer-events:none;display:flex;align-items:center;gap:14px;
  background:var(--fg);color:var(--bg);padding:9px 16px;border-radius:12px;font-size:13.5px;box-shadow:var(--sh2);transition:opacity .2s,transform .2s;max-width:calc(100% - 32px);white-space:nowrap}
@@ -309,7 +311,7 @@ input[type=range]{width:100%;accent-color:var(--acc);height:28px;margin:0}
   <button class="jump" id="jump" aria-label="Scroll to the latest message" onclick="toBottom(true)" data-i="down"></button>
   <div class="sugs" id="sugs"></div>
   <div class="comp"><textarea id="in" rows="1" placeholder="Message hyper" aria-label="Message"></textarea>
-   <div class="crow"><button class="pill" id="thinkb" onclick="toggleThinkMode()"><span data-i="brain"></span>Thinking</button><button class="pill" id="webb" onclick="toggleWeb()" style="display:none"><span data-i="globe"></span>Web</button><span class="sp"></span>
+   <div class="crow"><button class="pill" id="thinkb" onclick="effortMenu(event)" aria-label="Thinking effort"><span data-i="brain"></span><span id="effl">High</span></button><button class="pill" id="webb" onclick="toggleWeb()" style="display:none"><span data-i="globe"></span>Web</button><span class="sp"></span>
     <button class="send" id="send" onclick="sendMsg()" aria-label="Send"></button></div></div>
   <div class="hint" id="hint"></div>
  </div>
@@ -323,7 +325,8 @@ input[type=range]{width:100%;accent-color:var(--acc);height:28px;margin:0}
    <a class="lnk" href="/live" target="_blank" rel="noopener">Live stats</a></div></div>
   <div class="sec">Response</div>
   <div class="card">
-   <div class="row"><div class="lb">Thinking<small>Reason before answering (slower, better on hard questions)</small></div><label class="sw"><input type="checkbox" id="s-think"><i></i></label></div>
+   <div class="row v"><div class="top"><div class="lb">Thinking effort<small>Changing it in a long conversation re-reads the conversation once (the setting is at the start of the prompt)</small></div></div>
+    <div class="seg" id="s-effort" style="width:100%"><button data-e="off">Off</button><button data-e="low">Low</button><button data-e="medium">Medium</button><button data-e="high">High</button></div></div>
    <div class="row" id="s-webrow" style="display:none"><div class="lb">Web search &amp; browsing<small id="s-webtools"></small></div><label class="sw"><input type="checkbox" id="s-web"><i></i></label></div>
    <div class="row v"><div class="lb">System prompt</div><textarea id="sys" placeholder="You are a helpful assistant."></textarea></div>
   </div>
@@ -349,6 +352,7 @@ input[type=range]{width:100%;accent-color:var(--acc);height:28px;margin:0}
   </div>
  </div>
 </div>
+<div class="menu" id="effmenu"><button data-e="off" onclick="setEffort('off')">Off<small>answer right away</small></button><button data-e="low" onclick="setEffort('low')">Low<small>brief thinking</small></button><button data-e="medium" onclick="setEffort('medium')">Medium</button><button data-e="high" onclick="setEffort('high')">High<small>the model's default, most careful</small></button></div>
 <div class="menu" id="menu"><button onclick="menuAct('ren')"><span data-i="pencil"></span>Rename</button><button class="danger" onclick="menuAct('del')"><span data-i="trash"></span>Delete</button></div>
 <div id="toast" role="status"></div>
 </div>
@@ -381,7 +385,8 @@ document.querySelectorAll('[data-i]').forEach(e=>e.insertAdjacentHTML('beforeend
 const touch=matchMedia('(hover:none)').matches,narrow=()=>innerWidth<=768;
 let convs=S.get('hyper.convs',[]).filter(c=>c.msgs&&c.msgs.length),cur=S.get('hyper.cur',null),busy=null,gen=null,live={},defaults={},online=true,editing=-1,renaming=null,menuId=null;
 const cfg=Object.assign({sys:'',temp:'',topp:'',topk:'',minp:'',maxt:'',think:true,web:true,theme:'system',enter:!touch,wrap:false},S.get('hyper.cfg',{}));
-if(cfg.maxt===16384)cfg.maxt='';   // (the old default limit: now none, up to the context)
+if(cfg.maxt===16384)cfg.maxt='';
+if(!cfg.effort)cfg.effort=cfg.think===false?'off':'high';   // (thinking effort: off / low / medium / high = the model's default)
 const MCP={tools:[],map:{},servers:[]};   // tools of the MCP servers the server forwards to (--mcp)
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtS=s=>s<10?s.toFixed(1)+'s':s<60?Math.round(s)+'s':Math.floor(s/60)+'m '+Math.round(s%60)+'s';
@@ -416,7 +421,8 @@ function syncSet(){const dT=defaults.temp??1,dP=defaults.top_p??.95;
  $('topk').placeholder=defaults.top_k??'';$('minp').placeholder=defaults.min_p!=null?num(defaults.min_p):'';
  $('temp').value=cfg.temp===''?dT:cfg.temp;$('tempv').textContent=cfg.temp===''?(+dT).toFixed(2)+' · default':(+cfg.temp).toFixed(2);
  $('topp').value=cfg.topp===''?dP:cfg.topp;$('toppv').textContent=cfg.topp===''?(+dP).toFixed(2)+' · default':(+cfg.topp).toFixed(2);
- $('s-think').checked=!!cfg.think;$('s-web').checked=!!cfg.web;$('webb').classList.toggle('on',!!cfg.web);$('s-enter').checked=!!cfg.enter;$('s-wrap').checked=!!cfg.wrap;$('thinkb').classList.toggle('on',!!cfg.think);
+ $('effl').textContent={off:'Off',low:'Low',medium:'Medium',high:'High'}[cfg.effort]||'High';
+ document.querySelectorAll('#s-effort button,#effmenu button').forEach(b=>{b.classList.toggle('on',b.dataset.e===cfg.effort);b.classList.toggle('sel',b.dataset.e===cfg.effort)});$('s-web').checked=!!cfg.web;$('webb').classList.toggle('on',!!cfg.web);$('s-enter').checked=!!cfg.enter;$('s-wrap').checked=!!cfg.wrap;$('thinkb').classList.toggle('on',!!cfg.think);
  $('s-def').textContent=`Server defaults: temperature ${num(defaults.temp)} · top-p ${num(defaults.top_p)} · top-k ${num(defaults.top_k)} · min-p ${num(defaults.min_p)}`}
 $('sys').oninput=()=>{cfg.sys=$('sys').value;saveCfg()};
 $('maxt').onchange=()=>{const v=$('maxt').value.trim();cfg.maxt=v===''?'':Math.max(16,parseInt(v)||16);saveCfg();syncSet()};
@@ -424,11 +430,15 @@ $('s-web').onchange=()=>{cfg.web=$('s-web').checked;saveCfg();syncSet()};
 $('temp').oninput=()=>{cfg.temp=$('temp').value;saveCfg();syncSet()};$('topp').oninput=()=>{cfg.topp=$('topp').value;saveCfg();syncSet()};
 $('topk').onchange=()=>{const v=$('topk').value.trim();cfg.topk=v===''?'':String(Math.max(0,parseInt(v)||0));saveCfg();syncSet()};
 $('minp').onchange=()=>{const v=$('minp').value.trim();cfg.minp=v===''?'':String(Math.min(1,Math.max(0,+v||0)));saveCfg();syncSet()};
-$('s-think').onchange=()=>{cfg.think=$('s-think').checked;saveCfg();syncSet()};
+document.querySelectorAll('#s-effort button').forEach(b=>b.onclick=()=>setEffort(b.dataset.e));
 $('s-enter').onchange=()=>{cfg.enter=$('s-enter').checked;saveCfg();updSend()};
 $('s-wrap').onchange=()=>{cfg.wrap=$('s-wrap').checked;saveCfg();applyWrap()};
 function resetSampling(){cfg.temp=cfg.topp=cfg.topk=cfg.minp='';saveCfg();syncSet();toast('Using the server defaults')}
-function toggleThinkMode(){cfg.think=!cfg.think;saveCfg();syncSet();toast(cfg.think?'Thinking on':'Thinking off')}
+function effortMenu(e){e.stopPropagation();const r=e.currentTarget.getBoundingClientRect(),a=$('app').getBoundingClientRect(),m=$('effmenu');
+ m.style.left=Math.max(8,r.left-a.left)+'px';m.style.top='auto';m.style.bottom=(a.bottom-r.top+6)+'px';m.classList.add('on')}
+function setEffort(v){$('effmenu').classList.remove('on');if(cfg.effort===v)return;cfg.effort=v;saveCfg();syncSet();
+ const c=conv(),long=c&&c.msgs.reduce((n,m)=>n+(m.content||'').length+(m.reasoning||'').length,0)>20000;
+ toast('Thinking: '+{off:'off',low:'low',medium:'medium',high:'high'}[v]+(long?' · this chat is re-read once':''),null,null,long?3000:1600)}
 function updState(){$('s-model').textContent=live.model||'hyper';
  $('s-state').textContent=!online?'Server not reachable':(busy||(live.phase&&live.phase!=='idle')?(live.phase==='prompt'?'Reading a prompt':'Generating'):'Idle')+
   (live.ctx_max?` · context ${fmtK(live.ctx_used||0)} / ${fmtK(live.ctx_max)}`:'')+(live.requests!=null?` · ${live.requests} requests`:'')}
@@ -666,7 +676,8 @@ async function generate(vers,round,final){round=round||0;const c=conv();
  const msgs=[],sys=[cfg.sys.trim(),tools?toolPrompt(c.day):''].filter(Boolean).join('\n\n');if(sys)msgs.push({role:'system',content:sys});
  for(const m of c.msgs)pushHist(msgs,m);
  c.msgs.push(a);
- const body={messages:msgs,stream:true,timings_per_token:true,chat_template_kwargs:{enable_thinking:!!cfg.think}};
+ const body={messages:msgs,stream:true,timings_per_token:true,chat_template_kwargs:{enable_thinking:cfg.effort!=='off'}};
+ if(cfg.effort==='low'||cfg.effort==='medium')body.reasoning_effort=cfg.effort;   // (high: the template's default -- Qwen xhigh, GLM max)
  if(cfg.maxt!==''&&+cfg.maxt>0)body.max_tokens=+cfg.maxt;
  if(tools){body.tools=tools;body.tool_choice='auto'}
  if(cfg.temp!=='')body.temperature=+cfg.temp;if(cfg.topp!=='')body.top_p=+cfg.topp;if(cfg.topk!=='')body.top_k=parseInt(cfg.topk);if(cfg.minp!=='')body.min_p=+cfg.minp;
@@ -722,7 +733,7 @@ loadTools();
 /* ---------- global events ---------- */
 document.addEventListener('click',e=>{const b=e.target.closest('.cb .cpy');if(b)copyText(b.closest('.cb').querySelector('code').innerText).then(ok=>ok&&flash(b,'<span class="tx">Copy</span>'));
  if(e.target.closest('.cb .wrp')){cfg.wrap=!cfg.wrap;saveCfg();applyWrap();syncSet()}
- if(!e.target.closest('#menu'))$('menu').classList.remove('on')});
+ if(!e.target.closest('#menu'))$('menu').classList.remove('on');if(!e.target.closest('#effmenu'))$('effmenu').classList.remove('on')});
 document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.shiftKey&&e.key.toLowerCase()==='o'){e.preventDefault();newConv()}
  else if(e.key==='Escape'){if($('menu').classList.contains('on'))$('menu').classList.remove('on');else if($('sheet').classList.contains('on'))openSet(false);
   else if(document.body.classList.contains('side-on'))side(false);else if(busy&&editing<0)busy.abort()}
