@@ -1,17 +1,21 @@
-// One parked conversation for an engine's prompt cache (shared by the engines).
+// Parked conversations for an engine's prompt cache (shared by the engines).
 //
 // The prompt cache keeps one conversation on the GPUs: its tokens (hist), the attention-side caches of those positions and
-// recurrent-state snapshots. A request from another conversation (an agent's side request for a title or a summary) would
-// throw that away, and the next request of the main conversation would recompute its whole prompt. Instead the current
-// conversation is parked: its attention caches go to pinned RAM and its snapshots are kept aside; a later request that
-// matches the parked conversation better swaps it back.
+// recurrent-state snapshots. A request from another conversation (another chat, an agent's side request for a title or a
+// summary) would throw that away, and the next request of the first conversation would recompute its whole prompt.
+// Instead the current conversation is parked: its attention caches go to pinned RAM and its latest snapshots are kept
+// aside. Several conversations stay parked (least recently used out first); a request that matches one of them better
+// than the current conversation swaps it back.
 //
 // An engine describes its per-position GPU buffers as spans (per device) and calls resolve() before matching snapshots.
 #pragma once
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -33,15 +37,23 @@ public:
     };
     struct Dev { int id = 0; cudaStream_t stream = nullptr; std::vector<Span> spans; };
 
-    // swap thresholds: a conversation is worth parking from `min_park` tokens; the parked one comes back when it shares
+    // swap thresholds: a conversation is worth parking from `min_park` tokens; a parked one comes back when it shares
     // `min_gain` more tokens with the prompt than the current one
     int min_park = 2048, min_gain = 512;
+    // parked conversations (HYPER_PARK_SLOTS), their pinned caches at most this many bytes (HYPER_PARK_GB), snapshots kept
+    // per parked conversation (the latest: a conversation that comes back continues where it stopped)
+    int max_slots = getenv("HYPER_PARK_SLOTS") ? std::max(1, atoi(getenv("HYPER_PARK_SLOTS"))) : 4;
+    size_t max_bytes = (size_t) ((getenv("HYPER_PARK_GB") ? atof(getenv("HYPER_PARK_GB")) : 32.0) * 1073741824.0);
+    int park_snaps = 4;
     // called before a parked conversation of n positions is copied back (elastic caches: map them first)
     std::function<void(int)> before_restore;
 
-    ~ConvPark() { for (auto * set : {&host_, &tmp_}) for (auto & b : *set) if (b.p) cudaFreeHost(b.p); }
+    ~ConvPark() {
+        for (auto & s : slots_) free_bufs(s.host);
+        free_bufs(tmp_);
+    }
 
-    // Before the snapshot match of a new prompt: parks the current conversation or swaps the parked one back.
+    // Before the snapshot match of a new prompt: parks the current conversation or swaps a parked one back.
     // Returns the length of the common prefix of the prompt with the (possibly swapped-in) current conversation.
     int resolve(const std::vector<int> & prompt, std::vector<int> & hist, std::vector<Snap> & snaps,
                 std::vector<std::vector<float *>> & pool, const std::vector<Dev> & devs, const char * tag) {
@@ -50,42 +62,105 @@ public:
             while (n < prompt.size() && n < h.size() && prompt[n] == h[n]) ++n;
             return (int) n;
         };
-        int L = common(hist);
-        const int Lp = hist_.empty() ? -1 : common(hist_);
-        const int cur = (int) hist.size();
-        if (Lp > L + min_gain) {
-            const bool keep = cur >= min_park;   // the current conversation is parked in turn
+        const int L = common(hist), cur = (int) hist.size();
+        int best = -1, Lp = -1;
+        for (int i = 0; i < (int) slots_.size(); ++i) {
+            const int l = common(slots_[i].hist);
+            if (l > Lp) { Lp = l; best = i; }
+        }
+        if (best >= 0 && Lp > L + min_gain) {   // a parked conversation comes back; the current one takes its slot
+            Slot & s = slots_[best];
+            const bool keep = cur >= min_park;
             if (keep) copy(tmp_, cur, true, devs);
-            if (before_restore) before_restore((int) hist_.size());
-            copy(host_, (int) hist_.size(), false, devs);
-            std::swap(host_, tmp_);
-            fprintf(stderr, "%s: resumed a parked conversation of %zu tokens\n", tag, hist_.size());
-            std::swap(hist, hist_);
-            std::swap(snaps, snaps_);
-            if (!keep) clear(pool);
-            L = Lp;
-        } else if (cur >= min_park && L + min_park < cur) {
-            clear(pool);
-            copy(host_, cur, true, devs);
-            hist_ = hist;
-            snaps_.swap(snaps);
-            fprintf(stderr, "%s: parked a conversation of %zu tokens (%zu snapshots)\n", tag, hist_.size(), snaps_.size());
+            if (before_restore) before_restore((int) s.hist.size());
+            copy(s.host, (int) s.hist.size(), false, devs);
+            fprintf(stderr, "%s: resumed a parked conversation of %zu tokens (%zu parked)\n", tag, s.hist.size(), slots_.size());
+            std::swap(hist, s.hist);
+            std::swap(snaps, s.snaps);
+            std::swap(s.host, tmp_);   // (the slot keeps the parked caches; the restored ones' buffers become the staging set)
+            if (keep) {
+                thin(s.snaps, pool);
+                s.used = ++clock_;
+            } else {
+                for (auto & sn : s.snaps) pool.push_back(sn.h);
+                free_bufs(tmp_);
+                std::swap(tmp_, s.host);
+                slots_.erase(slots_.begin() + best);
+            }
+            return Lp;
+        }
+        if (cur >= min_park && L + min_park < cur) {   // another conversation: the current one is parked
+            int k = -1;
+            for (int i = 0; i < (int) slots_.size() && k < 0; ++i)   // an earlier state of this conversation is replaced
+                if (!slots_[i].hist.empty() && common_with(slots_[i].hist, hist) == slots_[i].hist.size()) k = i;
+            if (k < 0 && (int) slots_.size() < max_slots) { slots_.emplace_back(); k = (int) slots_.size() - 1; }
+            if (k < 0)
+                k = (int) (std::min_element(slots_.begin(), slots_.end(), [](const Slot & a, const Slot & b) { return a.used < b.used; }) -
+                           slots_.begin());
+            Slot & s = slots_[k];
+            for (auto & sn : s.snaps) pool.push_back(sn.h);
+            s.snaps.clear();
+            copy(s.host, cur, true, devs);
+            s.hist = hist;
+            s.snaps.swap(snaps);
+            thin(s.snaps, pool);
+            s.used = ++clock_;
+            // the pinned memory budget: least recently used conversations out (never the one just parked)
+            for (;;) {
+                size_t tot = 0;
+                for (auto & x : slots_) for (auto & b : x.host) tot += b.bytes;
+                if (tot <= max_bytes || slots_.size() <= 1) break;
+                int lru = -1;
+                for (int i = 0; i < (int) slots_.size(); ++i)
+                    if (i != k && (lru < 0 || slots_[i].used < slots_[lru].used)) lru = i;
+                for (auto & sn : slots_[lru].snaps) pool.push_back(sn.h);
+                free_bufs(slots_[lru].host);
+                slots_.erase(slots_.begin() + lru);
+                if (lru < k) --k;
+            }
+            fprintf(stderr, "%s: parked a conversation of %zu tokens (%zu snapshots kept, %zu parked)\n", tag, slots_[k].hist.size(),
+                    slots_[k].snaps.size(), slots_.size());
         }
         return L;
     }
 
-    void clear(std::vector<std::vector<float *>> & pool) {
-        for (auto & sn : snaps_) pool.push_back(sn.h);
-        snaps_.clear();
-        hist_.clear();
+    void clear(std::vector<std::vector<float *>> & pool) {   // every parked conversation dropped (snapshots back)
+        for (auto & s : slots_) {
+            for (auto & sn : s.snaps) pool.push_back(sn.h);
+            free_bufs(s.host);
+        }
+        slots_.clear();
     }
-    void release(std::vector<std::vector<float *>> & pool) { clear(pool); }   // (destructor of the engine: snapshots back)
+    void release(std::vector<std::vector<float *>> & pool) {   // (destructor of the engine: snapshots back)
+        for (auto & s : slots_) {
+            for (auto & sn : s.snaps) pool.push_back(sn.h);
+            s.snaps.clear();
+        }
+    }
 
 private:
     struct HostBuf { void * p = nullptr; size_t bytes = 0; };
-    std::vector<int> hist_;
-    std::vector<Snap> snaps_;
-    std::vector<HostBuf> host_, tmp_;   // per device
+    struct Slot { std::vector<int> hist; std::vector<Snap> snaps; std::vector<HostBuf> host; uint64_t used = 0; };
+    std::vector<Slot> slots_;
+    std::vector<HostBuf> tmp_;   // per device: staging for a swap
+    uint64_t clock_ = 0;
+
+    static size_t common_with(const std::vector<int> & a, const std::vector<int> & b) {
+        size_t n = 0;
+        while (n < a.size() && n < b.size() && a[n] == b[n]) ++n;
+        return n;
+    }
+    // a parked conversation keeps its latest snapshots only (it comes back to continue)
+    void thin(std::vector<Snap> & snaps, std::vector<std::vector<float *>> & pool) const {
+        if ((int) snaps.size() <= park_snaps) return;
+        std::sort(snaps.begin(), snaps.end(), [](const Snap & a, const Snap & b) { return a.pos > b.pos; });
+        for (size_t i = park_snaps; i < snaps.size(); ++i) pool.push_back(snaps[i].h);
+        snaps.resize(park_snaps);
+    }
+    static void free_bufs(std::vector<HostBuf> & set) {
+        for (auto & b : set) if (b.p) cudaFreeHost(b.p);
+        set.clear();
+    }
 
     static void check(cudaError_t e, const char * what) {
         if (e != cudaSuccess) throw std::runtime_error(std::string("ConvPark: ") + what + ": " + cudaGetErrorString(e));
@@ -119,4 +194,4 @@ private:
     }
 };
 
-}  // namespace hyper
+} // namespace hyper

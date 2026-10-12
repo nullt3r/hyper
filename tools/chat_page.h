@@ -599,8 +599,8 @@ async function loadTools(){try{const j=await (await fetch('/v1/mcp')).json();con
   MCP.tools=tools;MCP.map=map;MCP.servers=j.servers||[];
   $('webb').style.display=tools.length?'':'none';$('s-webrow').style.display=tools.length?'':'none';$('s-webtools').textContent=names.join(', ')}catch(e){}}
 function toggleWeb(){cfg.web=!cfg.web;saveCfg();syncSet();toast(cfg.web?'Web search on':'Web search off')}
-function toolPrompt(){const n=MCP.tools.map(t=>t.function.name);
- return `You have web access through tools (${n.join(', ')}): search the web for anything recent, for facts you are not sure about and when the user asks about a site or a page; then read the most relevant results. Open only URLs that appeared in search results or on pages you read: never construct or guess links. Cite the pages you used as markdown links. Today is ${new Date().toISOString().slice(0,10)}.`}
+function toolPrompt(day){const n=MCP.tools.map(t=>t.function.name);
+ return `You have web access through tools (${n.join(', ')}): search the web for anything recent, for facts you are not sure about and when the user asks about a site or a page; then read the most relevant results. Open only URLs that appeared in search results or on pages you read: never construct or guess links. Cite the pages you used as markdown links. Today is ${day}.`}
 function hostOf(u){try{return new URL(u).hostname.replace(/^www\./,'')}catch(e){return u||''}}
 function toolHTML(m){if(!m.calls||!m.calls.length)return'';
  return '<div class="tcs">'+m.calls.map(x=>{let a={};try{a=JSON.parse(x.args||'{}')}catch(e){}
@@ -661,7 +661,9 @@ async function pollPrompt(a){try{const s=await (await fetch('/stats',{cache:'no-
 async function generate(vers,round,final){round=round||0;const c=conv();
  const a={role:'assistant',content:'',reasoning:'',phase:'prompt',thinking:false,model:live.model};if(vers&&vers.length)a.vers=vers;
  const tools=!final&&cfg.web&&MCP.tools.length?MCP.tools:null;
- const msgs=[],sys=[cfg.sys.trim(),tools?toolPrompt():''].filter(Boolean).join('\n\n');if(sys)msgs.push({role:'system',content:sys});
+ // (the date is the conversation's first day: a prompt that changed at midnight would lose the server's prompt cache)
+ if(!c.day)c.day=new Date().toISOString().slice(0,10);
+ const msgs=[],sys=[cfg.sys.trim(),tools?toolPrompt(c.day):''].filter(Boolean).join('\n\n');if(sys)msgs.push({role:'system',content:sys});
  for(const m of c.msgs)pushHist(msgs,m);
  c.msgs.push(a);
  const body={messages:msgs,stream:true,timings_per_token:true,chat_template_kwargs:{enable_thinking:!!cfg.think}};
