@@ -1,7 +1,9 @@
 // hyper-server web UI: chat at "/" (conversations in the browser's localStorage, streaming with live speed and prompt
 // progress, reasoning, answer versions, markdown with syntax highlighting and math when the CDN libraries load, a built-in
 // renderer otherwise). Mobile first: safe areas, the on-screen keyboard (visual viewport), touch actions, bottom sheet.
-// Live statistics at "/live".
+// Tools run by the page: the MCP servers the server forwards (web), and Python (Pyodide in a sandboxed frame in this browser)
+// with a per-conversation /mnt/data for attached files and files to download (IndexedDB). Finished html / svg / mermaid code
+// blocks show a sandboxed preview. Live statistics at "/live".
 #pragma once
 
 static const char * CHAT_PAGE = R"HTML(<!doctype html>
@@ -216,6 +218,28 @@ body.wrap .cb .wrp{color:#fff;background:#333333}
 .tsr a{display:block;padding:6px 0;font-size:13.5px;line-height:1.35;color:var(--fg);text-decoration:none;border-bottom:1px solid var(--line)}.tsr a:last-child{border-bottom:0}
 .tsr a small{display:block;color:var(--mut);font-size:12px}
 .tc.err .tch{color:var(--danger)}
+.tcode{display:none}.tc.open .tcode{display:block}
+.tcode .cb{margin:0;border:0;border-top:1px solid var(--line);border-radius:0}.tcode .cb .hd{position:static}
+.tfig img{display:block;max-width:100%;border-radius:12px;border:1px solid var(--line);background:#fff;margin:0 0 8px}
+.fchips{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}
+.fchip{display:inline-flex;align-items:center;gap:7px;max-width:100%;height:34px;padding:0 10px;border-radius:10px;border:1px solid var(--line2);background:var(--card);font-size:13px;color:var(--fg)}
+.fchip svg{width:15px;height:15px;color:var(--fg2)}.fchip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.fchip small{color:var(--mut);white-space:nowrap}
+.fchip .x{margin:0 -5px 0 0;width:24px;height:24px;display:grid;place-items:center;border-radius:6px;color:var(--mut)}
+.msg.user .fchips{justify-content:flex-end;margin:6px 0 0}
+.comp .fchips{margin:0 0 8px -6px}
+@media (hover:hover){.fchip:hover{border-color:var(--acc2)}.fchip .x:hover{background:var(--bg3);color:var(--fg)}}
+#app.drop::after{content:"Drop files to attach";position:absolute;inset:12px;z-index:80;display:grid;place-items:center;border:2px dashed var(--acc2);border-radius:20px;
+ background:color-mix(in srgb,var(--bg) 88%,transparent);font-weight:600;color:var(--fg2);pointer-events:none}
+/* previews of html / svg / mermaid code blocks (sandboxed frames) */
+.cb.art .seg2{display:flex;background:#2a2a2a;border-radius:8px;padding:2px;margin-right:2px}
+.cb.art .hd .seg2 button{height:24px;padding:0 10px;border-radius:6px;color:#9a9a9a}
+.cb.art.pv .hd .art-p,.cb.art:not(.pv) .hd .art-c{background:#454545;color:#fff}
+.cb.art.pv pre,.cb.art:not(.pv) .artv{display:none}
+.artv{background:#fff}.artv iframe{display:block;width:100%;height:360px;border:0;background:#fff}
+.cb.art.full{position:fixed;inset:0;z-index:70;margin:0;border:0;border-radius:0;display:flex;flex-direction:column}
+.cb.art.full .hd{position:static;height:auto;min-height:44px;padding-top:env(safe-area-inset-top)}
+.cb.art.full .artv,.cb.art.full pre{flex:1;min-height:0;overflow:auto}.cb.art.full .artv iframe{height:100%!important}
+@media (max-width:420px){#webb .pt,#codeb .pt{display:none}#webb,#codeb{padding:0 9px}}
 .msg.ai.round{margin-bottom:6px}
 .livebar{display:flex;align-items:center;flex-wrap:wrap;gap:6px 10px;min-height:24px;margin-top:8px;font-size:12.5px;color:var(--mut);font-variant-numeric:tabular-nums}
 .livebar:empty{display:none}
@@ -311,10 +335,11 @@ input[type=range]{width:100%;accent-color:var(--acc);height:28px;margin:0}
  <div class="dock" id="dock">
   <button class="jump" id="jump" aria-label="Scroll to the latest message" onclick="toBottom(true)" data-i="down"></button>
   <div class="sugs" id="sugs"></div>
-  <div class="comp"><textarea id="in" rows="1" placeholder="Message hyper" aria-label="Message"></textarea>
-   <div class="crow"><button class="pill" id="thinkb" onclick="effortMenu(event)" aria-label="Thinking effort"><span data-i="brain"></span><span id="effl">High</span></button><button class="pill" id="webb" onclick="toggleWeb()" style="display:none"><span data-i="globe"></span>Web</button><span class="sp"></span>
+  <div class="comp"><div class="fchips" id="atts" style="display:none"></div><textarea id="in" rows="1" placeholder="Message hyper" aria-label="Message"></textarea>
+   <div class="crow"><button class="ib sm" id="attb" aria-label="Attach files" title="Attach files" onclick="$('fpick').click()" data-i="clip"></button><button class="pill" id="thinkb" onclick="effortMenu(event)" aria-label="Thinking effort"><span data-i="brain"></span><span id="effl">High</span></button><button class="pill" id="webb" onclick="toggleWeb()" style="display:none" aria-label="Web search"><span data-i="globe"></span><span class="pt">Web</span></button><button class="pill" id="codeb" onclick="toggleCode()" aria-label="Python"><span data-i="term"></span><span class="pt">Python</span></button><span class="sp"></span>
     <button class="send" id="send" onclick="sendMsg()" aria-label="Send"></button></div></div>
   <div class="hint" id="hint"></div>
+  <input type="file" id="fpick" multiple hidden>
  </div>
 </main>
 <div class="scrim" id="scrim" onclick="openSet(false)"></div>
@@ -329,6 +354,7 @@ input[type=range]{width:100%;accent-color:var(--acc);height:28px;margin:0}
    <div class="row v"><div class="top"><div class="lb">Thinking effort<small>Changing it in a long conversation re-reads the conversation once (the setting is at the start of the prompt)</small></div></div>
     <div class="seg" id="s-effort" style="width:100%"><button data-e="off">Off</button><button data-e="low">Low</button><button data-e="medium">Medium</button><button data-e="high">High</button></div></div>
    <div class="row" id="s-webrow" style="display:none"><div class="lb">Web search &amp; browsing<small id="s-webtools"></small></div><label class="sw"><input type="checkbox" id="s-web"><i></i></label></div>
+   <div class="row"><div class="lb">Python &amp; files<small>Code runs in a sandbox in this browser (Pyodide): calculations, charts, documents. Attached files and the files it makes are kept in this browser</small></div><label class="sw"><input type="checkbox" id="s-code"><i></i></label></div>
    <div class="row v"><div class="lb">System prompt</div><textarea id="sys" placeholder="You are a helpful assistant."></textarea></div>
   </div>
   <div class="sec">Sampling</div>
@@ -381,11 +407,15 @@ const IC={menu:sv('<path d="M4 8h16M4 16h11"/>'),side:sv('<rect x="3" y="4" widt
  wrap:sv('<path d="M3 6h18M3 12h14a3 3 0 0 1 0 6h-4"/><path d="m15 16-2 2 2 2M3 18h6"/>'),
  more:sv('<circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/>',' style="fill:currentColor;stroke:none"'),
  alert:sv('<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.5v.01"/>'),
- globe:sv('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>')};
+ globe:sv('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>'),
+ term:sv('<rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7.5 9.5 3 2.5-3 2.5M13 15h4"/>'),
+ clip:sv('<path d="m20.5 11.5-8.4 8.4a5.2 5.2 0 0 1-7.4-7.4l8.4-8.4a3.5 3.5 0 0 1 4.9 4.9l-8.4 8.4a1.7 1.7 0 0 1-2.5-2.5l7.8-7.8"/>'),
+ file:sv('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>'),
+ dl:sv('<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>'),expand:sv('<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>')};
 document.querySelectorAll('[data-i]').forEach(e=>e.insertAdjacentHTML('beforeend',IC[e.dataset.i]));
 const touch=matchMedia('(hover:none)').matches,narrow=()=>innerWidth<=768;
 let convs=S.get('hyper.convs',[]).filter(c=>c.msgs&&c.msgs.length),cur=S.get('hyper.cur',null),busy=null,gen=null,live={},defaults={},online=true,editing=-1,renaming=null,menuId=null;
-const cfg=Object.assign({sys:'',temp:'',topp:'',topk:'',minp:'',maxt:'',think:true,web:true,theme:'system',enter:!touch,wrap:false},S.get('hyper.cfg',{}));
+const cfg=Object.assign({sys:'',temp:'',topp:'',topk:'',minp:'',maxt:'',think:true,web:true,code:true,theme:'system',enter:!touch,wrap:false},S.get('hyper.cfg',{}));
 if(cfg.maxt===16384)cfg.maxt='';
 if(!cfg.effort)cfg.effort=cfg.think===false?'off':'high';   // (thinking effort: off / low / medium / high = the model's default)
 const MCP={tools:[],map:{},servers:[]};   // tools of the MCP servers the server forwards to (--mcp)
@@ -423,11 +453,12 @@ function syncSet(){const dT=defaults.temp??1,dP=defaults.top_p??.95;
  $('temp').value=cfg.temp===''?dT:cfg.temp;$('tempv').textContent=cfg.temp===''?(+dT).toFixed(2)+' · default':(+cfg.temp).toFixed(2);
  $('topp').value=cfg.topp===''?dP:cfg.topp;$('toppv').textContent=cfg.topp===''?(+dP).toFixed(2)+' · default':(+cfg.topp).toFixed(2);
  $('effl').textContent={off:'Off',low:'Low',medium:'Medium',high:'High'}[cfg.effort]||'High';
- document.querySelectorAll('#s-effort button,#effmenu button').forEach(b=>{b.classList.toggle('on',b.dataset.e===cfg.effort);b.classList.toggle('sel',b.dataset.e===cfg.effort)});$('s-web').checked=!!cfg.web;$('webb').classList.toggle('on',!!cfg.web);$('s-enter').checked=!!cfg.enter;$('s-wrap').checked=!!cfg.wrap;$('thinkb').classList.toggle('on',!!cfg.think);
+ document.querySelectorAll('#s-effort button,#effmenu button').forEach(b=>{b.classList.toggle('on',b.dataset.e===cfg.effort);b.classList.toggle('sel',b.dataset.e===cfg.effort)});$('s-web').checked=!!cfg.web;$('webb').classList.toggle('on',!!cfg.web);$('s-code').checked=!!cfg.code;$('codeb').classList.toggle('on',!!cfg.code);$('s-enter').checked=!!cfg.enter;$('s-wrap').checked=!!cfg.wrap;$('thinkb').classList.toggle('on',!!cfg.think);
  $('s-def').textContent=`Server defaults: temperature ${num(defaults.temp)} · top-p ${num(defaults.top_p)} · top-k ${num(defaults.top_k)} · min-p ${num(defaults.min_p)}`}
 $('sys').oninput=()=>{cfg.sys=$('sys').value;saveCfg()};
 $('maxt').onchange=()=>{const v=$('maxt').value.trim();cfg.maxt=v===''?'':Math.max(16,parseInt(v)||16);saveCfg();syncSet()};
 $('s-web').onchange=()=>{cfg.web=$('s-web').checked;saveCfg();syncSet()};
+$('s-code').onchange=()=>{cfg.code=$('s-code').checked;saveCfg();syncSet()};
 $('temp').oninput=()=>{cfg.temp=$('temp').value;saveCfg();syncSet()};$('topp').oninput=()=>{cfg.topp=$('topp').value;saveCfg();syncSet()};
 $('topk').onchange=()=>{const v=$('topk').value.trim();cfg.topk=v===''?'':String(Math.max(0,parseInt(v)||0));saveCfg();syncSet()};
 $('minp').onchange=()=>{const v=$('minp').value.trim();cfg.minp=v===''?'':String(Math.min(1,Math.max(0,+v||0)));saveCfg();syncSet()};
@@ -481,8 +512,33 @@ function codeBlock(code,lang){const key=lang+'\u0001'+code;let hl=HL.get(key);
  if(hl==null){hl=esc(code);if(window.hljs&&code.length<300000){try{if(lang&&hljs.getLanguage(lang))hl=hljs.highlight(code,{language:lang,ignoreIllegals:true}).value;
    else if(!mdLive)hl=hljs.highlightAuto(code).value}catch(e){}}
   if(!mdLive||lang){if(HL.size>256)HL.clear();HL.set(key,hl)}}
+ const ak=!mdLive&&artKind(lang,code);
+ if(ak){let a=ART.get(code);if(!a){if(ART.size>200){ART.clear();ARTI.clear()}a={id:'a'+(++artN),kind:ak,code};ART.set(code,a);ARTI.set(a.id,a)}
+  const pv=ak!=='html'||/<!doctype|<html|<body|<script|<svg|<canvas|<style/i.test(code);   // (a whole page opens as a preview, a snippet as code)
+  return `<div class="cb art${pv?' pv':''}" data-art="${a.id}"><div class="hd"><span class="ln">${esc(lang)}</span><span class="seg2"><button class="art-p">Preview</button><button class="art-c">Code</button></span>`+
+   `<button class="art-f" aria-label="Full screen" title="Full screen">${IC.expand}</button><button class="cpy" aria-label="Copy code">${IC.copy}<span class="tx">Copy</span></button></div>`+
+   `<div class="artv"></div><pre><code class="hljs">${hl}</code></pre></div>`}
  return `<div class="cb"><div class="hd"><span class="ln">${esc(lang||'code')}</span><button class="wrp" aria-label="Wrap lines" title="Wrap lines">${IC.wrap}</button>`+
   `<button class="cpy" aria-label="Copy code">${IC.copy}<span class="tx">Copy</span></button></div><pre><code class="hljs">${hl}</code></pre></div>`}
+// previews: finished html / svg / mermaid blocks render in a sandboxed frame (opaque origin: no access to this page, its storage or
+// the server; the CSP allows only libraries from the CDN and no other network). The frame reports its height.
+const ART=new Map(),ARTI=new Map();let artN=0;
+function artKind(lang,code){lang=(lang||'').toLowerCase();
+ if(lang==='html'||lang==='htm')return /<[a-z!]/i.test(code)?'html':'';
+ if(lang==='svg'||(lang==='xml'&&/^\s*<svg[\s>]/i.test(code)))return 'svg';
+ return lang==='mermaid'?'mermaid':''}
+const ART_CSP="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; style-src 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "+
+ "font-src https://fonts.gstatic.com https://cdn.jsdelivr.net data:; img-src data: blob:; media-src data: blob:; connect-src https://cdn.jsdelivr.net; worker-src blob:";
+function artDoc(kind,code){
+ const h=`<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${ART_CSP}"><meta name="viewport" content="width=device-width,initial-scale=1">`+
+  `<script>(()=>{const p=()=>{const b=document.body;if(!b)return;const s=getComputedStyle(b);parent.postMessage({hyperArt:Math.ceil(Math.max(b.scrollHeight,b.offsetHeight)+parseFloat(s.marginTop)+parseFloat(s.marginBottom))},'*')};`+
+  `addEventListener('load',()=>{p();new ResizeObserver(p).observe(document.body)});setTimeout(p,300);setTimeout(p,1500)})()<\/script>`;
+ if(kind==='svg')return h+`<style>body{margin:0;padding:12px;display:flex;justify-content:center;background:#fff}svg{max-width:100%;height:auto}</style></head><body>${code}</body></html>`;
+ if(kind==='mermaid')return h+`<style>body{margin:0;padding:16px;display:flex;justify-content:center;background:#fff}</style></head><body><pre class="mermaid">${esc(code)}</pre>`+
+  `<script type="module">import m from 'https://cdn.jsdelivr.net/npm/mermaid@12/dist/mermaid.esm.min.mjs';m.initialize({startOnLoad:false});await m.run()<\/script></body></html>`;
+ return h+code}
+function mountArts(root){(root||$('col')).querySelectorAll('.cb.art.pv .artv:empty').forEach(v=>{const a=ARTI.get(v.parentElement.dataset.art);if(!a)return;
+ const f=document.createElement('iframe');f.setAttribute('sandbox','allow-scripts');f.title='Preview';f.srcdoc=artDoc(a.kind,a.code);v.appendChild(f)})}
 function mathify(s){if(!window.katex)return s;const out=[];
  s=s.replace(/\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]/g,(m,a,b)=>{try{out.push(katex.renderToString(a||b,{displayMode:true,throwOnError:false}))}catch(e){return m}return `@@M${out.length-1}@@`})
   .replace(/\\\(([\s\S]+?)\\\)|(^|[^\\$\w])\$([^\s$](?:[^$\n]*?[^\s$])?)\$(?![\w$])/g,(m,a,p,b)=>{const t=a||b;try{out.push(katex.renderToString(t,{throwOnError:false}))}catch(e){return m}return (p||'')+`@@M${out.length-1}@@`});
@@ -490,7 +546,10 @@ function mathify(s){if(!window.katex)return s;const out=[];
 let mdR=null;
 function md(src,streaming){mdLive=!!streaming;if(window.marked&&window.DOMPurify){
   if(!mdR){mdR=new marked.Renderer();mdR.code=(c,l)=>{if(typeof c==='object'){l=c.lang;c=c.text}return codeBlock(c,(l||'').split(/\s/)[0])};
-   mdR.link=(h,t,x)=>{if(typeof h==='object'){x=h.text;h=h.href}return `<a href="${esc(h||'')}" target="_blank" rel="noopener">${x}</a>`}}
+   mdR.link=(h,t,x)=>{if(typeof h==='object'){x=h.text;h=h.href}
+    const fp=/^(?:sandbox:)?\/?mnt\/data\/(.+)$/.exec(h||'');   // (a file of the Python sandbox: downloaded from this browser's storage)
+    if(fp){let p=fp[1];try{p=decodeURIComponent(p)}catch(e){}return `<a href="#" data-dl="${esc(p)}">${x}</a>`}
+    return `<a href="${esc(h||'')}" target="_blank" rel="noopener">${x}</a>`}}
   // math only outside fenced / inline code
   const parts=src.split(/(```[\s\S]*?(?:```|$)|`[^`\n]*`)/);let M=[];
   const txt=parts.map((p,k)=>{if(k%2)return p;const r=mathify(p);if(typeof r==='string')return r;const base=M.length;M=M.concat(r.out);
@@ -552,7 +611,8 @@ function msgHTML(c,m,k){
   if(editing===k)return `<div class="msg user" data-k="${k}"><div class="edit"><textarea id="edt" rows="1" aria-label="Edit message">${esc(m.content)}</textarea>`+
    `<div class="erow"><button class="btn" onclick="editCancel()">Cancel</button><button class="btn pri" onclick="editSave(${k})">Send</button></div></div></div>`;
   const long=m.content.length>1200||m.content.split('\n').length>18;
-  return `<div class="msg user" data-k="${k}"><div class="ububble${long?' clamp':''}">${esc(m.content)}</div><div class="acts">`+(long?'<button class="btn sm ghost" onclick="expandU(this)">Show more</button>':'')+
+  return `<div class="msg user" data-k="${k}">`+(m.content?`<div class="ububble${long?' clamp':''}">${esc(m.content)}</div>`:'')+
+   (m.files&&m.files.length?`<div class="fchips">${m.files.map(dlChip).join('')}</div>`:'')+`<div class="acts">`+(long?'<button class="btn sm ghost" onclick="expandU(this)">Show more</button>':'')+
    `<button class="ib sm" aria-label="Copy" title="Copy" onclick="cpMsg(${k},this)">${IC.copy}</button>`+
    (busy?'':`<button class="ib sm" aria-label="Edit" title="Edit" onclick="editMsg(${k})">${IC.pencil}</button>`)+'</div></div>'}
  const st=isGen(c,k),rd=m.calls&&m.calls.length&&k<c.msgs.length-1&&c.msgs[k+1].role==='assistant';
@@ -563,10 +623,10 @@ function render(){renderSide();const c=conv(),empty=!c||!c.msgs.length,col=$('co
  else{col.innerHTML=c.msgs.map((m,k)=>msgHTML(c,m,k)).join('');document.title=c.title+' · hyper'}
  $('sugs').innerHTML=empty?SUG.map((s,i)=>`<button class="sug" onclick="useSug(${i})"><b>${esc(s[0])}</b>${esc(s[1])}</button>`).join(''):'';
  $('sugs').style.display=empty?'':'none';if(gen&&c===gen.c){const lm=col.lastElementChild,d=lm&&lm.querySelector('.md'),tb=lm&&lm.querySelector('.think .tb');if(d){fadeTail(d);d._n=gen.sc}if(tb)tb._n=gen.sr;
-  fillLive(col.querySelector('.livebar'),gen.a)}updSend();peek();onScroll()}
+  fillLive(col.querySelector('.livebar'),gen.a)}mountArts(col);mountMedia(col);updSend();peek();onScroll()}
 function expandU(b){const c=b.closest('.msg').querySelector('.ububble').classList.toggle('clamp');b.textContent=c?'Show more':'Show less'}
 function rerender(k){const c=conv(),el=document.querySelector(`#col>.msg[data-k="${k}"]`);if(!c||!el||!c.msgs[k])return render();
- const t=document.createElement('div');t.innerHTML=msgHTML(c,c.msgs[k],k);el.replaceWith(t.firstElementChild)}
+ const t=document.createElement('div');t.innerHTML=msgHTML(c,c.msgs[k],k);const n=t.firstElementChild;el.replaceWith(n);mountArts(n);mountMedia(n)}
 function markNew(n){const l=[...$('col').children].slice(-n);l.forEach(e=>e.classList.add('new'))}
 function peek(root){const p=(root||$('col')).querySelector('.think.live:not(.open) .tb');if(p)p.scrollTop=p.scrollHeight}
 function useSug(i){IN.value=SUG[i][0]+' '+SUG[i][1];sendMsg()}
@@ -583,12 +643,215 @@ function ver(k,d){if(busy)return;const m=conv().msgs[k],i=(m.vi||0)+d;if(!m.vers
  m.vers[m.vi||0]=snap(m);for(const f of VF)delete m[f];Object.assign(m,m.vers[i]);m.vi=i;save();rerender(k)}
 /* ---------- composer ---------- */
 function autosz(t){t.style.height='auto';t.style.height=t.scrollHeight+'px'}
-function updSend(){const b=$('send'),stop=!!busy;b.disabled=!stop&&!IN.value.trim();b.classList.toggle('stop',stop);b.innerHTML=stop?IC.stop:IC.send;
+function updSend(){const b=$('send'),stop=!!busy;b.disabled=!stop&&!IN.value.trim()&&!PEND.length;b.classList.toggle('stop',stop);b.innerHTML=stop?IC.stop:IC.send;
  b.setAttribute('aria-label',stop?'Stop':'Send');b.title=stop?'Stop (Esc)':'Send';IN.enterKeyHint=cfg.enter?'send':'enter';
  $('hint').textContent=cfg.enter?'Enter to send · Shift+Enter for a new line':'Ctrl+Enter to send · Enter for a new line'}
 IN.value=S.get('hyper.draft','');
 IN.addEventListener('input',()=>{autosz(IN);updSend();S.set('hyper.draft',IN.value)});
+// attachments: kept for the next message, then stored with the conversation (its /mnt/data in the Python sandbox)
+let PEND=[];
+function renderAtts(){const a=$('atts');a.style.display=PEND.length?'':'none';
+ a.innerHTML=PEND.map((f,i)=>`<span class="fchip">${IC.file}<span>${esc(f.name)}</span><small>${fmtB(f.size)}</small><button class="x" aria-label="Remove" onclick="unattach(${i})">${IC.x}</button></span>`).join('');updSend()}
+function attach(list){for(const f of list){if(f.size>64*1048576){toast(f.name+' is larger than 64 MB');continue}PEND.push(f)}
+ if(PEND.length&&!cfg.code){cfg.code=true;saveCfg();syncSet();toast('Python is on: it works with the files')}renderAtts()}
+function unattach(i){PEND.splice(i,1);renderAtts()}
+$('fpick').onchange=()=>{attach([...$('fpick').files]);$('fpick').value=''};
+IN.addEventListener('paste',e=>{const f=e.clipboardData?[...e.clipboardData.files]:[];if(f.length){e.preventDefault();attach(f)}});
+(()=>{let n=0;const has=e=>e.dataTransfer&&[...e.dataTransfer.types].includes('Files');
+ addEventListener('dragenter',e=>{if(has(e)){n++;$('app').classList.add('drop')}});
+ addEventListener('dragleave',e=>{if(has(e)&&--n<=0){n=0;$('app').classList.remove('drop')}});
+ addEventListener('dragover',e=>{if(has(e))e.preventDefault()});
+ addEventListener('drop',e=>{n=0;$('app').classList.remove('drop');if(e.dataTransfer&&e.dataTransfer.files.length){e.preventDefault();attach([...e.dataTransfer.files])}})})();
 IN.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing&&(cfg.enter||e.ctrlKey||e.metaKey)){e.preventDefault();if(!busy)sendMsg()}});
+/* ---------- files (IndexedDB): each conversation's /mnt/data (attachments, files the Python code writes) and figures ---------- */
+let fdbP=null;
+function fdb(){return fdbP||(fdbP=new Promise((res,rej)=>{const r=indexedDB.open('hyper-files',1);r.onupgradeneeded=()=>r.result.createObjectStore('f');
+ r.onsuccess=()=>res(r.result);r.onerror=()=>{fdbP=null;rej(r.error)}}))}
+function fop(mode,fn){return fdb().then(db=>new Promise((res,rej)=>{const t=db.transaction('f',mode),r=fn(t.objectStore('f'));
+ t.oncomplete=()=>res(r&&r.result);t.onerror=t.onabort=()=>rej(t.error||new Error('browser storage'))}))}
+const FK=(cid,p)=>'f:'+cid+'/'+p;
+function fput(cid,p,data){const t=Date.now();return fop('readwrite',s=>s.put({name:p,data,size:data.byteLength,t},FK(cid,p))).then(()=>t)}
+const fget=(cid,p)=>fop('readonly',s=>s.get(FK(cid,p)));
+const fdel=(cid,p)=>fop('readwrite',s=>s.delete(FK(cid,p)));
+const flist=cid=>fop('readonly',s=>s.getAll(IDBKeyRange.bound('f:'+cid+'/','f:'+cid+'/￿')));
+const fmtB=n=>n<1024?n+' B':n<1048576?Math.round(n/1024)+' KB':(n/1048576).toFixed(1)+' MB';
+const dlChip=f=>`<button class="fchip" data-dl="${esc(f.name)}" title="Download">${IC.dl}<span>${esc(f.name)}</span><small>${fmtB(f.size)}</small></button>`;
+async function dl(name){const c=conv();let f=null;try{f=c&&await fget(c.id,name)}catch(e){}
+ if(!f)return toast('The file is not in this browser');const u=URL.createObjectURL(new Blob([f.data],{type:'application/octet-stream'})),a=document.createElement('a');
+ a.href=u;a.download=name.split('/').pop();document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),5000)}
+const GU=new Map();   // figure id -> object URL
+function mountMedia(root){(root||$('col')).querySelectorAll('img[data-g]:not([src])').forEach(im=>{const id=im.dataset.g;if(GU.has(id)){im.src=GU.get(id);return}
+ fop('readonly',s=>s.get('g:'+id)).then(v=>{if(!v)return;const u=URL.createObjectURL(new Blob([v.data],{type:'image/png'}));GU.set(id,u);im.src=u}).catch(()=>{})})}
+// (once after start: the files of deleted conversations and figures no message shows any more)
+setTimeout(()=>{const ids=new Set(convs.map(c=>c.id)),figs=new Set();for(const c of convs)for(const m of c.msgs)for(const x of m.calls||[])for(const g of x.figs||[])figs.add(g);
+ fop('readwrite',s=>{const r=s.openKeyCursor();r.onsuccess=()=>{const cu=r.result;if(!cu)return;const k=String(cu.key);
+  const g=k.slice(2);   // (a figure id starts with its time: one being saved right now is not in a message yet)
+  if(k.startsWith('f:')?!ids.has(k.slice(2,k.indexOf('/'))):!figs.has(g)&&Date.now()-parseInt(g.slice(0,8),36)>36e5)s.delete(cu.key);cu.continue()}}).catch(()=>{})},10000);
+/* ---------- Python: Pyodide in a Worker inside a sandboxed iframe (opaque origin: no access to this page, its storage or the
+   server; its CSP allows only the package CDNs). /mnt/data holds the conversation's files; variables persist per conversation ---------- */
+const PY_TOOL={type:'function',function:{name:'run_python',description:"Run Python code (Pyodide) in a sandbox in the user's browser. Returns what it prints, the value of the last expression and errors. Variables persist between calls in this conversation; files are in /mnt/data.",
+ parameters:{type:'object',properties:{code:{type:'string',description:'The Python code to run'}},required:['code']}}};
+function codePrompt(){return 'You can run Python with the run_python tool: Python 3.14 (Pyodide) in a sandbox in the user\'s browser, with numpy, pandas, scipy, matplotlib, scikit-learn, statsmodels, sympy, networkx, Pillow, lxml, opencv and polars. '+
+ 'Pure-Python packages from PyPI install automatically when imported (python-docx, openpyxl, python-pptx, pypdf, xlsxwriter, seaborn, ...); there is no other internet access. '+
+ 'Use it for calculations, data analysis, charts and files rather than working them out by hand. The working directory /mnt/data holds the files the user attached; save files for the user there '+
+ 'and link each one as [name](sandbox:/mnt/data/name) so the user can download it. Matplotlib figures are shown to the user as images (you do not see them: describe them from the data). '+
+ 'For an interactive chart, diagram or small app, write one self-contained HTML document in a ```html code block (or a ```mermaid diagram) instead: the user sees it rendered; it may load libraries only from https://cdn.jsdelivr.net.'}
+const PY_CSP="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https://cdn.jsdelivr.net blob:; worker-src blob:; connect-src https://cdn.jsdelivr.net https://pypi.org https://files.pythonhosted.org";
+const PY={f:null,up:null,ok:null,seq:0,wait:new Map(),sent:new Map()};   // sent: file key -> version the sandbox has
+function pyFrame(){if(PY.up)return PY.up;
+ PY.up=new Promise((res,rej)=>{const f=document.createElement('iframe');f.setAttribute('sandbox','allow-scripts');f.style.display='none';
+  f.srcdoc=`<!doctype html><meta http-equiv="Content-Security-Policy" content="${PY_CSP}"><script>(${pyFrameMain})()<\/script>`;PY.f=f;PY.ok=res;document.body.appendChild(f);
+  setTimeout(()=>rej(new Error('the Python sandbox did not start')),20000)});
+ PY.up.catch(()=>{if(PY.f)PY.f.remove();PY.f=PY.up=null});return PY.up}
+// (runs in the iframe: starts the worker, times cells out and restarts it, passes messages and files through)
+function pyFrameMain(){let src='',w=null,cur=null,tm=0;const up=(o,tr)=>parent.postMessage(o,'*',tr||[]);
+ function start(){w=new Worker(URL.createObjectURL(new Blob([src],{type:'text/javascript'})));
+  w.onmessage=e=>{const d=e.data||{};if(!cur||d.id!==cur.id)return;
+   if(d.type==='begin'){const L=cur.limit;clearTimeout(tm);tm=setTimeout(()=>reset('Stopped after '+L+' s'),L*1000)}
+   if(d.type==='done'){clearTimeout(tm);cur=null;up(d,(d.figs||[]).concat((d.written||[]).map(x=>x.data)))}else up(d)};
+  w.onerror=e=>{e.preventDefault();if(cur)reset('Python crashed ('+(e.message||'worker error')+')')}}
+ function reset(why){if(w)w.terminate();const id=cur&&cur.id;cur=null;clearTimeout(tm);start();up({type:'reset'});
+  if(id)up({type:'done',id,error:why+': the Python session was restarted (variables are gone, the files in /mnt/data are kept)'})}
+ addEventListener('message',e=>{if(e.source!==parent)return;const d=e.data||{};
+  if(d.type==='init'&&!w){src=d.src;start()}
+  else if(d.type==='run'&&w){cur=d;clearTimeout(tm);tm=setTimeout(()=>reset('Python did not start within 180 s'),180000);w.postMessage(d,(d.files||[]).map(f=>f.data))}
+  else if(d.type==='kill'&&cur)reset('Stopped by the user')});
+ up({type:'ready'})}
+// (runs in the worker)
+function pyWorker(){const BASE='https://cdn.jsdelivr.net/pyodide/v314.0.7/full/';
+ const SETUP=String.raw`
+import os, sys, io, linecache, traceback, warnings, importlib.util
+os.environ['MPLBACKEND'] = 'Agg'
+warnings.filterwarnings('ignore', message='.*(non-interactive|non-GUI|cannot be shown).*')
+warnings.filterwarnings('ignore', message='The [xy] parameter as float was deprecated')   # (every savefig in this matplotlib build)
+from pyodide.code import eval_code_async, find_imports
+DATA = '/mnt/data'
+os.makedirs(DATA, exist_ok=True)
+os.makedirs('/mnt/sessions', exist_ok=True)
+os.chdir(DATA)
+_spaces, _cur = {}, [None]
+_PIP = {'docx': 'python-docx', 'pptx': 'python-pptx', 'yaml': 'pyyaml', 'bs4': 'beautifulsoup4', 'dateutil': 'python-dateutil',
+        'sklearn': 'scikit-learn', 'PIL': 'pillow', 'cv2': 'opencv-python', 'Crypto': 'pycryptodome', 'dotenv': 'python-dotenv',
+        'jwt': 'pyjwt', 'attr': 'attrs', 'odf': 'odfpy', 'fitz': 'pymupdf'}
+
+def _hyper_enter(cid):
+    # /mnt/data is the conversation's folder; the other conversations' folders wait in /mnt/sessions
+    if _cur[0] != cid:
+        if _cur[0] is not None:
+            os.rename(DATA, '/mnt/sessions/' + _cur[0])
+        p = '/mnt/sessions/' + cid
+        if os.path.isdir(p):
+            os.rename(p, DATA)
+        else:
+            os.makedirs(DATA, exist_ok=True)
+        _cur[0] = cid
+    os.chdir(DATA)
+
+async def _hyper_pip(code):
+    # imported modules that are not Pyodide packages: pure-Python wheels from PyPI
+    try:
+        mods = find_imports(code)
+    except Exception:
+        return
+    need = [m for m in mods if importlib.util.find_spec(m) is None]
+    if need:
+        import micropip
+        for m in need:
+            try:
+                await micropip.install(_PIP.get(m, m))
+            except Exception:
+                pass   # (the import in the cell reports it)
+
+def _hyper_files():
+    out = {}
+    for root, _, files in os.walk(DATA):
+        for f in files:
+            p = os.path.join(root, f)
+            st = os.stat(p)
+            out[os.path.relpath(p, DATA)] = (st.st_size, st.st_mtime_ns)
+    return out
+
+async def _hyper_cell(code, cid):
+    ns = _spaces.setdefault(cid, {'__name__': '__main__'})
+    linecache.cache['<cell>'] = (len(code), None, code.splitlines(True), '<cell>')
+    before = _hyper_files()
+    res = err = None
+    try:
+        val = await eval_code_async(code, ns, filename='<cell>')
+        if val is not None:
+            res = repr(val)
+    except BaseException as e:
+        tb = traceback.extract_tb(e.__traceback__)
+        i = next((k for k, f in enumerate(tb) if f.filename == '<cell>'), len(tb))
+        err = ('Traceback (most recent call last):\n' + ''.join(traceback.format_list(tb[i:])) if i < len(tb) else '') + \
+              ''.join(traceback.format_exception_only(type(e), e))
+    figs = []
+    if 'matplotlib.pyplot' in sys.modules:
+        import matplotlib.pyplot as plt
+        for n in plt.get_fignums()[:8]:
+            b = io.BytesIO()
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                plt.figure(n).savefig(b, format='png', dpi=110, bbox_inches='tight')
+            figs.append(b.getvalue())
+        plt.close('all')
+    after = _hyper_files()
+    written = []
+    for p, v in after.items():
+        if before.get(p) != v and v[0] <= 64 << 20:
+            with open(os.path.join(DATA, p), 'rb') as f:
+                written.append((p, f.read()))
+    removed = [p for p in before if p not in after]
+    return [res, err, figs, written, removed]
+`;
+ let py=null,out=[],chain=Promise.resolve();
+ const boot=(async()=>{importScripts(BASE+'pyodide.js');py=await loadPyodide({indexURL:BASE,stdout:s=>out.push(s),stderr:s=>out.push(s)});
+  await py.loadPackage('micropip',{messageCallback:()=>{}});await py.runPythonAsync(SETUP)})();
+ boot.catch(()=>{});
+ onmessage=e=>{const d=e.data;chain=chain.then(()=>run(d))};
+ const call=async(n,...a)=>{const f=py.globals.get(n);try{return await f(...a)}finally{f.destroy()}};
+ async function run(d){const post=(o,tr)=>postMessage(Object.assign({id:d.id},o),tr||[]);
+  try{if(!py)post({type:'status',text:'Starting Python'});
+   try{await boot}catch(x){throw new Error('Python could not be loaded ('+(x&&x.message||x)+')')}
+   await call('_hyper_enter',d.cid);
+   for(const f of d.files||[]){const p='/mnt/data/'+f.path;py.FS.mkdirTree(p.slice(0,p.lastIndexOf('/')));py.FS.writeFile(p,new Uint8Array(f.data))}
+   await py.loadPackagesFromImports(d.code,{messageCallback:m=>post({type:'status',text:m}),errorCallback:()=>{}});
+   await call('_hyper_pip',d.code);
+   out=[];post({type:'begin'});
+   const r=await call('_hyper_cell',d.code,d.cid),v=r.toJs();r.destroy();
+   const figs=v[2].map(b=>b.slice().buffer),written=v[3].map(x=>({path:x[0],data:x[1].slice().buffer}));
+   post({type:'done',out:out.join('\n'),result:v[0],error:v[1],figs,written,removed:v[4]},figs.concat(written.map(x=>x.data)))}
+  catch(x){post({type:'done',out:out.join('\n'),error:String(x&&x.message||x)})}}}
+addEventListener('message',e=>{const d=e.data;if(!d||typeof d!=='object')return;
+ if(PY.f&&e.source===PY.f.contentWindow){
+  if(d.type==='ready'){PY.f.contentWindow.postMessage({type:'init',src:`(${pyWorker})()`},'*');PY.ok()}
+  else if(d.type==='reset')PY.sent.clear();
+  else{const w=PY.wait.get(d.id);if(!w)return;if(d.type==='status')w.status(String(d.text||'').slice(0,100));else if(d.type==='done'){PY.wait.delete(d.id);w.done(d)}}
+  return}
+ if(typeof d.hyperArt==='number')for(const f of document.querySelectorAll('.artv iframe'))if(f.contentWindow===e.source){
+  f.style.height=Math.round(Math.min(Math.max(d.hyperArt,120),Math.max(320,innerHeight*.75)))+'px';break}});
+const safePath=p=>{p=String(p||'').replace(/\\/g,'/').replace(/^\/+/,'').replace(/^mnt\/data\//,'');
+ return p&&p.length<=200&&!p.split('/').some(s=>!s||s==='.'||s==='..')?p:null};
+async function runPython(c,x,signal,k){let a={};try{a=JSON.parse(x.args||'{}')}catch(e){throw new Error('arguments are not valid JSON: '+x.args)}
+ const code=typeof a.code==='string'?a.code:'';if(!code.trim())throw new Error('no code given');
+ await pyFrame();
+ const files=[];   // (the conversation's files the sandbox does not have yet)
+ for(const f of await flist(c.id)){const key=c.id+'/'+f.name;if(PY.sent.get(key)!==f.t){files.push({path:f.name,data:f.data.slice(0)});PY.sent.set(key,f.t)}}
+ const d=await new Promise(res=>{const id=++PY.seq,kill=()=>PY.f&&PY.f.contentWindow.postMessage({type:'kill'},'*');signal.addEventListener('abort',kill);
+  PY.wait.set(id,{status:t=>{x.status=t;if(conv()===c)rerender(k)},done:v=>{signal.removeEventListener('abort',kill);res(v)}});
+  PY.f.contentWindow.postMessage({type:'run',id,cid:c.id,code,files,limit:120},'*',files.map(f=>f.data))});
+ delete x.status;x.figs=[];x.files=[];
+ for(const b of d.figs||[])if(b instanceof ArrayBuffer&&x.figs.length<8){const id=Date.now().toString(36)+Math.random().toString(36).slice(2,8);
+  await fop('readwrite',s=>s.put({data:b},'g:'+id));x.figs.push(id)}
+ for(const w of d.written||[]){const p=safePath(w&&w.path);if(!p||!(w.data instanceof ArrayBuffer))continue;
+  PY.sent.set(c.id+'/'+p,await fput(c.id,p,w.data));x.files.push({name:p,size:w.data.byteLength})}
+ for(const r of d.removed||[]){const p=safePath(r);if(p){await fdel(c.id,p);PY.sent.delete(c.id+'/'+p)}}
+ const cut=(s,n)=>s.length>n?s.slice(0,n/2)+`\n… (${s.length-n} characters left out) …\n`+s.slice(-n/2):s,r=[];
+ if(d.out)r.push(cut(String(d.out),16000));if(d.result!=null)r.push('Out: '+cut(String(d.result),8000));if(d.error)r.push(cut(String(d.error),8000));
+ if(x.files.length)r.push('Saved in /mnt/data (offered to the user for download): '+x.files.map(f=>`${f.name} (${fmtB(f.size)})`).join(', '));
+ if(x.figs.length)r.push(x.figs.length+(x.figs.length>1?' figures':' figure')+' shown to the user');
+ return {text:r.join('\n\n')||'(no output)',isError:!!d.error}}
+function toggleCode(){cfg.code=!cfg.code;saveCfg();syncSet();toast(cfg.code?'Python on':'Python off')}
 /* ---------- web tools (MCP servers behind the server's /mcp/<name>) ---------- */
 let rpcId=0;
 async function mcpRpc(server,method,params){const id=++rpcId;
@@ -615,16 +878,21 @@ function toolPrompt(day){const n=MCP.tools.map(t=>t.function.name);
 function hostOf(u){try{return new URL(u).hostname.replace(/^www\./,'')}catch(e){return u||''}}
 function toolHTML(m){if(!m.calls||!m.calls.length)return'';
  return '<div class="tcs">'+m.calls.map(x=>{let a={};try{a=JSON.parse(x.args||'{}')}catch(e){}
-  const t=(MCP.map[x.name]||{}).name||x.name,done=x.result!=null,run=x.state==='run';
-  const w=t==='web_search'?['Searching','Searched',a.query?'“'+a.query+'”':'']:t==='fetch_url'?['Reading','Read',hostOf(a.url)]:['Running','Ran',t||'tool'];
-  const lbl=done?`${w[1]} <b>${esc(w[2])}</b>`:`<span class="shimmer">${w[0]} ${esc(w[2])}${run?'…':''}</span>`;
-  let body='';
-  if(done){const items=t==='web_search'&&!x.isError?x.result.split(/\n\n(?=\[\d+\])/).map(b=>{const L=b.split('\n'),mt=/^\[\d+\]\s*(.*)$/.exec(L[0]);return mt&&L[1]?{title:mt[1],url:L[1].trim()}:null}).filter(Boolean):[];
+  const t=(MCP.map[x.name]||{}).name||x.name,done=x.result!=null,run=x.state==='run',py=t==='run_python'&&!MCP.map[x.name];
+  const w=t==='web_search'?['Searching','Searched',a.query?'“'+a.query+'”':'']:t==='fetch_url'?['Reading','Read',hostOf(a.url)]:py?[x.status||'Running Python','Ran Python','']:['Running','Ran',t||'tool'];
+  const lbl=done?`${w[1]}${w[2]?` <b>${esc(w[2])}</b>`:''}`:`<span class="shimmer">${esc(w[0])}${w[2]?' '+esc(w[2]):''}${run?'…':''}</span>`;
+  let body='',more='';
+  if(py){const code=typeof a.code==='string'?a.code.replace(/^\s*\n|\s+$/g,''):'';
+   body=`<div class="tcode">${code?codeBlock(code,'python'):''}${done?`<pre class="tcb">${esc(x.result.slice(0,6000))}${x.result.length>6000?'\n…':''}</pre>`:''}</div>`;
+   if(x.figs&&x.figs.length)more+=`<div class="tfig">${x.figs.map(g=>`<img data-g="${esc(g)}" alt="Figure"${GU.has(g)?` src="${GU.get(g)}"`:''}>`).join('')}</div>`;
+   if(x.files&&x.files.length)more+=`<div class="fchips">${x.files.map(dlChip).join('')}</div>`}
+  else if(done){const items=t==='web_search'&&!x.isError?x.result.split(/\n\n(?=\[\d+\])/).map(b=>{const L=b.split('\n'),mt=/^\[\d+\]\s*(.*)$/.exec(L[0]);return mt&&L[1]?{title:mt[1],url:L[1].trim()}:null}).filter(Boolean):[];
    body=items.length?`<div class="tsr">${items.map(it=>`<a href="${esc(it.url)}" target="_blank" rel="noopener">${esc(it.title||it.url)}<small>${esc(hostOf(it.url))}</small></a>`).join('')}</div>`
     :`<pre class="tcb">${esc(x.result.slice(0,6000))}${x.result.length>6000?'\n…':''}</pre>`}
-  return `<div class="tc${x.isError?' err':''}"><button class="tch" onclick="this.parentElement.classList.toggle('open')">${t==='web_search'?IC.search:t==='fetch_url'?IC.globe:IC.tool}<span class="tl2">${lbl}</span>${done?IC.chev:''}</button>${body}</div>`}).join('')+'</div>'}
+  return `<div class="tc${x.isError?' err':''}"><button class="tch" onclick="this.parentElement.classList.toggle('open')">${t==='web_search'?IC.search:t==='fetch_url'?IC.globe:py?IC.term:IC.tool}<span class="tl2">${lbl}</span>${done||py?IC.chev:''}</button>${body}</div>`+more}).join('')+'</div>'}
 // the request history: an assistant turn with tool calls is followed by one tool message per call
-function pushHist(msgs,m){if(m.role==='user'){msgs.push({role:'user',content:m.content});return}
+function pushHist(msgs,m){if(m.role==='user'){const f=m.files&&m.files.length?'[Attached: '+m.files.map(x=>`/mnt/data/${x.name} (${fmtB(x.size)})`).join(', ')+']':'';
+  msgs.push({role:'user',content:m.content&&f?m.content+'\n\n'+f:m.content||f});return}
  const calls=(m.calls||[]).filter(x=>x.name);
  if(m.err&&!m.content&&!calls.length)return;
  const o={role:'assistant',content:m.content||''};if(m.reasoning)o.reasoning_content=m.reasoning;
@@ -634,11 +902,13 @@ function pushHist(msgs,m){if(m.role==='user'){msgs.push({role:'user',content:m.c
 async function runTools(c,a,ctl){const k=c.msgs.indexOf(a);
  for(const x of a.calls){if(ctl.signal.aborted)return false;if(!x.name)continue;
   x.state='run';if(conv()===c)rerender(k);
-  try{const m=MCP.map[x.name];if(!m)throw new Error('unknown tool '+x.name);let args={};
-   try{args=x.args?JSON.parse(x.args):{}}catch(e){throw new Error('arguments are not valid JSON: '+x.args)}
-   const r=await mcpRpc(m.server,'tools/call',{name:m.name,arguments:args});
-   x.result=(r.content||[]).map(p=>p.type==='text'?p.text:'['+p.type+']').join('\n')||'(empty result)';x.isError=!!r.isError}
-  catch(e){x.result='Error: '+(e.message||e);x.isError=true}
+  try{const m=MCP.map[x.name];
+   if(!m&&x.name==='run_python'){const r=await runPython(c,x,ctl.signal,k);x.result=r.text;x.isError=r.isError}
+   else{if(!m)throw new Error('unknown tool '+x.name);let args={};
+    try{args=x.args?JSON.parse(x.args):{}}catch(e){throw new Error('arguments are not valid JSON: '+x.args)}
+    const r=await mcpRpc(m.server,'tools/call',{name:m.name,arguments:args});
+    x.result=(r.content||[]).map(p=>p.type==='text'?p.text:'['+p.type+']').join('\n')||'(empty result)';x.isError=!!r.isError}}
+  catch(e){delete x.status;x.result='Error: '+(e.message||e);x.isError=true}
   x.result=x.result.slice(0,40000);delete x.state;save();if(conv()===c){const st=nearBottom();rerender(k);if(st)toBottom()}}
  return !ctl.signal.aborted}
 const MAX_TOOL_ROUNDS=25;   // (then one more answer without tools, from what was found)
@@ -659,22 +929,22 @@ function fadeTail(root,N){N=N||48;const w=document.createTreeWalker(root,NodeFil
 function updLast(){if(!gen||conv()!==gen.c)return;const g=gen,c=g.c,k=c.msgs.length-1,m=c.msgs[k],el=$('col').lastElementChild;if(!el||+el.dataset.k!==k)return;
  const stick=nearBottom(),sh=shp(m,true);
  if(el.dataset.sh!==sh){el.dataset.sh=sh;el.innerHTML=aiInner(c,m,k,true);const tb=el.querySelector('.think .tb');if(tb){tb._n=g.sr;if(m.open)tb.scrollTop=tb.scrollHeight}
-  const d=el.querySelector('.md');if(d){fadeTail(d);d._n=g.sc}}
+  const d=el.querySelector('.md');if(d){fadeTail(d);d._n=g.sc}mountMedia(el)}
  else{const tl=el.querySelector('.think .tl');if(tl){const l=thinkLabel(m,true);if(tl._s!==l){tl.innerHTML=l;tl._s=l}}
   const tb=el.querySelector('.think .tb');if(tb&&tb._n!==g.sr){const keep=tb.scrollHeight-tb.scrollTop-tb.clientHeight<40;
    if(tb.firstChild&&tb._n!=null&&tb._n<g.sr)tb.firstChild.appendData(m.reasoning.slice(tb._n,g.sr));else tb.textContent=m.reasoning.slice(0,g.sr);tb._n=g.sr;if(keep)tb.scrollTop=tb.scrollHeight}
   const d=el.querySelector('.md');if(d&&d._n!==g.sc){d.innerHTML=md(m.content.slice(0,g.sc),true);fadeTail(d);d._n=g.sc}
   const tp=el.querySelector('.tool pre');if(tp&&tp.textContent!==m.tool)tp.textContent=m.tool;
-  const tw=el.querySelector('.tcs');if(tw){const h=toolHTML(m);if(el._th!==h){tw.outerHTML=h;el._th=h}}}
+  const tw=el.querySelector('.tcs');if(tw){const h=toolHTML(m);if(el._th!==h){tw.outerHTML=h;el._th=h;mountMedia(el)}}}
  fillLive(el.querySelector('.livebar'),m);peek(el);if(stick)toBottom()}
 async function pollPrompt(a){try{const s=await (await fetch('/stats',{cache:'no-store'})).json();if(a.phase!=='prompt')return;
  if(s.phase!=='idle')a.pp={done:s.prompt_done,total:s.prompt_total,cached:s.cached}}catch(e){}}
 async function generate(vers,round,final){round=round||0;const c=conv();
  const a={role:'assistant',content:'',reasoning:'',phase:'prompt',thinking:false,model:live.model};if(vers&&vers.length)a.vers=vers;
- const tools=!final&&cfg.web&&MCP.tools.length?MCP.tools:null;
+ const web=!final&&cfg.web&&MCP.tools.length>0,py=!final&&!!cfg.code,tl=(web?MCP.tools:[]).concat(py?[PY_TOOL]:[]),tools=tl.length?tl:null;
  // (the date is the conversation's first day: a prompt that changed at midnight would lose the server's prompt cache)
  if(!c.day)c.day=new Date().toISOString().slice(0,10);
- const msgs=[],sys=[cfg.sys.trim(),tools?toolPrompt(c.day):''].filter(Boolean).join('\n\n');if(sys)msgs.push({role:'system',content:sys});
+ const msgs=[],sys=[cfg.sys.trim(),web?toolPrompt(c.day):'',py?codePrompt():''].filter(Boolean).join('\n\n');if(sys)msgs.push({role:'system',content:sys});
  for(const m of c.msgs)pushHist(msgs,m);
  c.msgs.push(a);
  const body={messages:msgs,stream:true,timings_per_token:true,chat_template_kwargs:{enable_thinking:cfg.effort!=='off'}};
@@ -711,9 +981,15 @@ async function generate(vers,round,final){round=round||0;const c=conv();
   else if(await runTools(c,a,ctl)&&busy===ctl){c.t=Date.now();save();return generate(undefined,round+1)}}
  busy=null;gen=null;c.t=Date.now();convs.sort((x,y)=>(y.t||0)-(x.t||0));save();
  const stick=conv()===c&&nearBottom();render();if(stick)toBottom();setDot();refreshLive();if(!touch&&editing<0)IN.focus()}
-function sendMsg(){if(busy){busy.abort();return}const t=IN.value.trim();if(!t)return;let c=conv();
+let sending=false;
+async function sendMsg(){if(busy){busy.abort();return}const t=IN.value.trim(),fl=PEND.slice();if((!t&&!fl.length)||sending)return;let c=conv();
  if(!c){c={id:Date.now().toString(36)+Math.random().toString(36).slice(2,6),title:'New chat',msgs:[],t:Date.now()};convs.unshift(c);cur=c.id}
- c.msgs.push({role:'user',content:t});if(c.title==='New chat')c.title=t.replace(/\s+/g,' ').slice(0,60);c.t=Date.now();
+ const m={role:'user',content:t};
+ if(fl.length){sending=true;PEND=[];renderAtts();m.files=[];   // (into the conversation's /mnt/data; a file of the same name is replaced)
+  for(const f of fl){const name=f.name.replace(/[\\/:*?"<>|\u0000-\u001f]+/g,'_').replace(/^\.+/,'').slice(-120)||'file';
+   try{await fput(c.id,name,await f.arrayBuffer());m.files=m.files.filter(x=>x.name!==name).concat({name,size:f.size})}catch(e){toast('Could not store '+name)}}
+  sending=false}
+ c.msgs.push(m);if(c.title==='New chat')c.title=(t||m.files.map(f=>f.name).join(', ')).replace(/\s+/g,' ').slice(0,60);c.t=Date.now();
  IN.value='';S.set('hyper.draft','');autosz(IN);if(touch)IN.blur();editing=-1;save();generate()}
 function regen(){const c=conv();if(busy||!c)return;let t=0;for(let i=c.msgs.length-1;i>=0&&c.msgs[i].role==='assistant';--i)++t;
  if(t>1||(t===1&&c.msgs[c.msgs.length-1].calls)){c.msgs.splice(c.msgs.length-t);return generate()}
@@ -734,9 +1010,13 @@ loadTools();
 /* ---------- global events ---------- */
 document.addEventListener('click',e=>{const b=e.target.closest('.cb .cpy');if(b)copyText(b.closest('.cb').querySelector('code').innerText).then(ok=>ok&&flash(b,'<span class="tx">Copy</span>'));
  if(e.target.closest('.cb .wrp')){cfg.wrap=!cfg.wrap;saveCfg();applyWrap();syncSet()}
+ const fl=e.target.closest('[data-dl]');if(fl){e.preventDefault();dl(fl.dataset.dl)}
+ const ab=e.target.closest('.cb.art .hd button');if(ab){const cb=ab.closest('.cb');
+  if(ab.classList.contains('art-p')){cb.classList.add('pv');mountArts(cb.parentElement)}else if(ab.classList.contains('art-c'))cb.classList.remove('pv');
+  else if(ab.classList.contains('art-f'))cb.classList.toggle('full')}
  if(!e.target.closest('#menu'))$('menu').classList.remove('on');if(!e.target.closest('#effmenu'))$('effmenu').classList.remove('on')});
 document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.shiftKey&&e.key.toLowerCase()==='o'){e.preventDefault();newConv()}
- else if(e.key==='Escape'){if($('menu').classList.contains('on'))$('menu').classList.remove('on');else if($('sheet').classList.contains('on'))openSet(false);
+ else if(e.key==='Escape'){const fs=document.querySelector('.cb.art.full');if(fs)fs.classList.remove('full');else if($('menu').classList.contains('on'))$('menu').classList.remove('on');else if($('sheet').classList.contains('on'))openSet(false);
   else if(document.body.classList.contains('side-on'))side(false);else if(busy&&editing<0)busy.abort()}
  else if(e.key==='/'&&!e.ctrlKey&&!e.metaKey&&!e.target.closest('input,textarea')){e.preventDefault();IN.focus()}});
 // touch: swipe from the left edge opens the sidebar, swipe left closes it; drag the settings sheet's header down to close it

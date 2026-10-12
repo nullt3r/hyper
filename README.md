@@ -217,11 +217,19 @@ Endpoints:
 
 | Path | Purpose |
 |---|---|
-| `/` | web chat: conversations (stored in the browser), streaming with reasoning, markdown, code highlighting, math, per-message speed |
+| `/` | web chat: conversations (stored in the browser), streaming with reasoning, markdown, code highlighting, math, per-message speed; tools run by the page: the `--mcp` servers (web search and pages) and Python (below) |
 | `/live` | live statistics: generation and prompt-eval speed, context use, last request |
 | `/v1/chat/completions` | OpenAI-compatible chat API, streaming and non-streaming, tool calls, `reasoning_content` |
 | `/v1/responses` | OpenAI Responses API (used by Codex): messages, reasoning, function / custom tool calls, streaming `response.*` events |
 | `/v1/models`, `/health`, `/stats`, `/props` | model list, health, statistics JSON, sampling defaults |
+| `/v1/mcp`, `/mcp/<name>` | the configured MCP servers and a proxy to them (streamable HTTP), for the chat page |
+
+Python in the chat: the model gets a `run_python` tool that the page runs in the browser, not on the server.
+- **Runtime:** Pyodide (CPython 3.14 in WebAssembly, with numpy, pandas, scipy, matplotlib, scikit-learn, sympy and more). Pure-Python packages such as python-docx or openpyxl install from PyPI on import.
+- **Sandbox:** a Worker inside an iframe with `sandbox="allow-scripts"`. Its opaque origin has no access to the chat page, its storage or the server's API, and its CSP allows only the package CDNs. A cell is stopped after 120 s.
+- **Files:** each conversation has a `/mnt/data` folder. Attached files go there (paperclip, drag and drop, paste); files the code writes there are offered for download. Both are kept in the browser's IndexedDB.
+- **Figures:** matplotlib figures are shown under the tool call.
+- **Previews:** finished ```` ```html ````, `svg` and `mermaid` code blocks render in a sandboxed frame that may load libraries only from cdn.jsdelivr.net.
 
 Options:
 
@@ -238,6 +246,7 @@ Options:
 | `--expert-stats file` | — | routing statistics: read at start for placement, updated after every request |
 | `--snapshots` | 48 | prompt-cache snapshots kept in pinned RAM |
 | `--reasoning-effort` | template default | GLM: `low`, `high`, `max` or `none` (requests may override) |
+| `--mcp name=url` | — | an MCP server (streamable HTTP) whose tools the chat page offers the model; repeatable (`tools/web-tools`: search and a real browser in Docker) |
 
 Selected environment variables:
 
