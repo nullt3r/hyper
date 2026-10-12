@@ -720,7 +720,7 @@ function pyFrameMain(){let src='',w=null,cur=null,tm=0;const up=(o,tr)=>parent.p
 // (runs in the worker)
 function pyWorker(){const BASE='https://cdn.jsdelivr.net/pyodide/v314.0.7/full/';
  const SETUP=String.raw`
-import os, sys, io, linecache, traceback, warnings, importlib.util
+import os, sys, io, shutil, linecache, traceback, warnings, importlib.util
 os.environ['MPLBACKEND'] = 'Agg'
 warnings.filterwarnings('ignore', message='.*(non-interactive|non-GUI|cannot be shown).*')
 warnings.filterwarnings('ignore', message='The [xy] parameter as float was deprecated')   # (every savefig in this matplotlib build)
@@ -737,8 +737,12 @@ _PIP = {'docx': 'python-docx', 'pptx': 'python-pptx', 'yaml': 'pyyaml', 'bs4': '
 def _hyper_enter(cid):
     # /mnt/data is the conversation's folder; the other conversations' folders wait in /mnt/sessions
     if _cur[0] != cid:
+        os.chdir('/')   # (the working directory cannot be renamed)
         if _cur[0] is not None:
-            os.rename(DATA, '/mnt/sessions/' + _cur[0])
+            q = '/mnt/sessions/' + _cur[0]
+            if os.path.isdir(q):
+                shutil.rmtree(q)
+            os.rename(DATA, q)
         p = '/mnt/sessions/' + cid
         if os.path.isdir(p):
             os.rename(p, DATA)
@@ -810,7 +814,7 @@ async def _hyper_cell(code, cid):
  boot.catch(()=>{});
  onmessage=e=>{const d=e.data;chain=chain.then(()=>run(d))};
  const call=async(n,...a)=>{const f=py.globals.get(n);try{return await f(...a)}finally{f.destroy()}};
- async function run(d){const post=(o,tr)=>postMessage(Object.assign({id:d.id},o),tr||[]);
+ async function run(d){const post=(o,tr)=>postMessage(Object.assign({id:d.id},o),tr||[]);out=[];
   try{if(!py)post({type:'status',text:'Starting Python'});
    try{await boot}catch(x){throw new Error('Python could not be loaded ('+(x&&x.message||x)+')')}
    await call('_hyper_enter',d.cid);
