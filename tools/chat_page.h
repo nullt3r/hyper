@@ -880,12 +880,18 @@ async function loadTools(){try{const j=await (await fetch('/v1/mcp')).json();con
   $('webb').style.display=tools.length?'':'none';$('s-webrow').style.display=tools.length?'':'none';$('s-webtools').textContent=names.join(', ')}catch(e){}}
 function toggleWeb(){cfg.web=!cfg.web;saveCfg();syncSet();reread(cfg.web?'Web search on':'Web search off')}
 function toolPrompt(day){const n=MCP.tools.map(t=>t.function.name);
- return `You have web access through tools (${n.join(', ')}): search the web for anything recent, for facts you are not sure about and when the user asks about a site or a page; then read the most relevant results. Open only URLs that appeared in search results or on pages you read: never construct or guess links. Cite the pages you used as markdown links. Today is ${day}.`}
+ return `You have web access through tools (${n.join(', ')}): search the web for anything recent, for facts you are not sure about and when the user asks about a site or a page; then read the most relevant results. Open only URLs that appeared in search results or on pages you read: never construct or guess links. Cite the pages you used as markdown links. Today is ${day}.`+
+  (n.includes('browser_open')?' To use a site the way a person does (its own search, filters, forms, buttons, moving through pages), open it with browser_open and act on the numbered elements with browser_click, browser_type and browser_select; the browser stays open between calls.':'')}
+// (labels of the interactive browser's tool calls: running, done, detail)
+const BROWSER={browser_open:a=>['Opening','Opened',hostOf(a.url)],browser_click:a=>['Clicking','Clicked',a.element!=null?'['+a.element+']':''],
+ browser_type:a=>['Typing','Typed',a.text?'“'+String(a.text).slice(0,40)+'”':''],browser_select:a=>['Selecting','Selected',a.option||''],
+ browser_scroll:a=>['Scrolling','Scrolled',a.direction||'down'],browser_back:()=>['Going back','Went back',''],browser_read:()=>['Reading','Read','the page']};
 function hostOf(u){try{return new URL(u).hostname.replace(/^www\./,'')}catch(e){return u||''}}
 function toolHTML(m){if(!m.calls||!m.calls.length)return'';
  return '<div class="tcs">'+m.calls.map(x=>{let a={};try{a=JSON.parse(x.args||'{}')}catch(e){}
   const t=(MCP.map[x.name]||{}).name||x.name,done=x.result!=null,run=x.state==='run',py=t==='run_python'&&!MCP.map[x.name];
-  const w=t==='web_search'?['Searching','Searched',a.query?'“'+a.query+'”':'']:t==='fetch_url'?['Reading','Read',hostOf(a.url)]:py?[x.status||'Running Python','Ran Python','']:['Running','Ran',t||'tool'];
+  const w=t==='web_search'?['Searching','Searched',a.query?'“'+a.query+'”':'']:t==='fetch_url'?['Reading','Read',hostOf(a.url)]:py?[x.status||'Running Python','Ran Python','']:
+   BROWSER[t]?BROWSER[t](a):['Running','Ran',t||'tool'];
   const lbl=done?`${w[1]}${w[2]?` <b>${esc(w[2])}</b>`:''}`:`<span class="shimmer">${esc(w[0])}${w[2]?' '+esc(w[2]):''}${run?'…':''}</span>`;
   let body='',more='';
   if(py){const code=typeof a.code==='string'?a.code.replace(/^\s*\n|\s+$/g,''):'';
@@ -895,7 +901,7 @@ function toolHTML(m){if(!m.calls||!m.calls.length)return'';
   else if(done){const items=t==='web_search'&&!x.isError?x.result.split(/\n\n(?=\[\d+\])/).map(b=>{const L=b.split('\n'),mt=/^\[\d+\]\s*(.*)$/.exec(L[0]);return mt&&L[1]?{title:mt[1],url:L[1].trim()}:null}).filter(Boolean):[];
    body=items.length?`<div class="tsr">${items.map(it=>`<a href="${esc(it.url)}" target="_blank" rel="noopener">${esc(it.title||it.url)}<small>${esc(hostOf(it.url))}</small></a>`).join('')}</div>`
     :`<pre class="tcb">${esc(x.result.slice(0,6000))}${x.result.length>6000?'\n…':''}</pre>`}
-  return `<div class="tc${x.isError?' err':''}"><button class="tch" onclick="this.parentElement.classList.toggle('open')">${t==='web_search'?IC.search:t==='fetch_url'?IC.globe:py?IC.term:IC.tool}<span class="tl2">${lbl}</span>${done||py?IC.chev:''}</button>${body}</div>`+more}).join('')+'</div>'}
+  return `<div class="tc${x.isError?' err':''}"><button class="tch" onclick="this.parentElement.classList.toggle('open')">${t==='web_search'?IC.search:t==='fetch_url'||BROWSER[t]?IC.globe:py?IC.term:IC.tool}<span class="tl2">${lbl}</span>${done||py?IC.chev:''}</button>${body}</div>`+more}).join('')+'</div>'}
 // the request history: an assistant turn with tool calls is followed by one tool message per call
 function pushHist(msgs,m){if(m.role==='user'){const f=m.files&&m.files.length?'[Attached: '+m.files.map(x=>`/mnt/data/${x.name} (${fmtB(x.size)})`).join(', ')+']':'';
   msgs.push({role:'user',content:m.content&&f?m.content+'\n\n'+f:m.content||f});return}
