@@ -390,7 +390,7 @@ if(cfg.maxt===16384)cfg.maxt='';
 if(!cfg.effort)cfg.effort=cfg.think===false?'off':'high';   // (thinking effort: off / low / medium / high = the model's default)
 const MCP={tools:[],map:{},servers:[]};   // tools of the MCP servers the server forwards to (--mcp)
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const fmtS=s=>s<10?s.toFixed(1)+'s':s<60?Math.round(s)+'s':Math.floor(s/60)+'m '+Math.round(s%60)+'s';
+const fmtS=s=>{if(s<10)return s.toFixed(1)+'s';s=Math.round(s);return s<60?s+'s':Math.floor(s/60)+'m '+s%60+'s'};
 const fmtK=n=>n<1000?String(n):n<1e5?(n/1000).toFixed(1)+'k':Math.round(n/1000)+'k';
 const num=v=>v==null||v===''?'–':String(+(+v).toFixed(3));
 const IN=$('in');

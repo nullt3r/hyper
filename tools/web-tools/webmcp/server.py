@@ -1,10 +1,13 @@
 # MCP server (streamable HTTP, stateless, JSON responses) with two tools for hyper's chat:
 #   web_search(query)  -- SearXNG metasearch (Google, Bing, DuckDuckGo, Brave, Wikipedia, ...)
-#   fetch_url(url)     -- a page's main text as markdown. Plain HTTP first; a real browser (Google Chrome over CDP,
+#   fetch_url(url)     -- a page's main text as markdown (product pages: schema.org price / availability / parameters
+#                         first). Plain HTTP first; a real browser (Google Chrome over CDP,
 #                         SeleniumBase UC mode, headful in Xvfb) for bot challenges (Cloudflare, Turnstile, ...) and
 #                         JavaScript-only pages, or when asked (browser=True)
 import asyncio
 import base64
+import html as htmllib
+import json
 import os
 import re
 import threading
@@ -51,11 +54,77 @@ async def fetch_browser(url: str) -> tuple[str, str]:
     return await asyncio.wait_for(asyncio.to_thread(_browser_fetch, url), timeout=90)
 
 
+LD_JSON = re.compile(r"<script[^>]*application/ld\+json[^>]*>(.*?)</script>", re.S | re.I)
+
+
+def _ld_nodes(node):
+    """schema.org objects of a JSON-LD block (lists and @graph flattened)"""
+    if isinstance(node, list):
+        for x in node:
+            yield from _ld_nodes(x)
+    elif isinstance(node, dict):
+        yield node
+        yield from _ld_nodes(node.get("@graph", []))
+
+
+def _ld_str(v) -> str:
+    if isinstance(v, dict):
+        v = v.get("name", "")
+    return htmllib.unescape(str(v)).replace("\xa0", " ").strip()
+
+
+def _offer(o: dict) -> str:
+    price, cur = o.get("price"), o.get("priceCurrency", "")
+    spec = o.get("priceSpecification")
+    for s in (spec if isinstance(spec, list) else [spec] if isinstance(spec, dict) else []):
+        price, cur = price if price is not None else s.get("price"), cur or s.get("priceCurrency", "")
+    if price is None and o.get("lowPrice") is not None:   # AggregateOffer (marketplaces, price comparison sites)
+        price = f"{o['lowPrice']}–{o.get('highPrice', '?')}"
+        if o.get("offerCount"):
+            cur = f"{cur} ({o['offerCount']} offers)"
+    parts = [f"{price} {cur}".strip() if price is not None else "price not given"]
+    for k in ("availability", "itemCondition"):
+        if o.get(k):
+            parts.append(str(o[k]).rsplit("/", 1)[-1])
+    if o.get("seller"):
+        parts.append("seller " + _ld_str(o["seller"]))
+    return ", ".join(parts)
+
+
+def product_data(html: str) -> str:
+    """schema.org Product data from the page's JSON-LD (name, price, availability, rating, parameters): e-shops show
+    prices outside the main text that trafilatura keeps."""
+    out = []
+    for m in LD_JSON.finditer(html):
+        try:
+            data = json.loads(m.group(1), strict=False)
+        except ValueError:
+            continue
+        for d in _ld_nodes(data):
+            t = d.get("@type", "")
+            if "Product" not in (t if isinstance(t, list) else [t]) or len(out) >= 3:
+                continue
+            ids = ", ".join(f"{k} {_ld_str(d[k])}" for k in ("brand", "sku", "mpn", "gtin13") if d.get(k))
+            lines = [f"Product: {_ld_str(d.get('name', '?'))}" + (f" ({ids})" if ids else "")]
+            offers = d.get("offers")
+            for o in (offers if isinstance(offers, list) else [offers] if isinstance(offers, dict) else [])[:5]:
+                lines.append("Offer: " + _offer(o))
+            r = d.get("aggregateRating")
+            if isinstance(r, dict) and r.get("ratingValue") is not None:
+                lines.append(f"Rating: {r['ratingValue']} ({r.get('reviewCount') or r.get('ratingCount') or '?'} reviews)")
+            props = [p for p in d.get("additionalProperty", []) if isinstance(p, dict) and p.get("name")][:40]
+            if props:
+                lines.append("Parameters: " + "; ".join(f"{_ld_str(p['name'])}: {_ld_str(p.get('value', ''))}" for p in props))
+            out.append("\n".join(lines))
+    return "\n\n".join(out)
+
+
 def extract(html: str, url: str) -> str:
     text = trafilatura.extract(html, output_format="markdown", include_links=True, include_tables=True, url=url)
     if not text:
         text = trafilatura.extract(html, favor_recall=True, url=url) or ""
-    return text
+    data = product_data(html)
+    return f"[structured product data]\n{data}\n\n[page text]\n{text}" if data else text
 
 
 def _bing_url(href: str) -> str:
@@ -122,6 +191,7 @@ async def web_search(query: str, max_results: int = 8, language: str = "auto") -
 @mcp.tool()
 async def fetch_url(url: str, max_chars: int = 20000, browser: bool = False) -> str:
     """Fetch a web page and return its main text as markdown (articles, documentation, READMEs, forum posts).
+    Product pages of e-shops also give the product's structured data (price, availability, parameters).
     Pages behind bot protection or built with JavaScript are opened in a real (stealth) browser automatically;
     browser=True forces that. Long pages are cut at max_chars."""
     final, text, how = url, "", "http"
