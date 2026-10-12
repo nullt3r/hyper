@@ -48,7 +48,7 @@ public:
     const Glm5Config & config() const { return cfg_; }
     std::vector<int> generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
                               const std::function<bool(int)> & on_token = {}, const SamplingParams & sp = {}) override;
-    void set_snapshot_token(int tok) override { snap_tokens_.push_back(tok); }   // every message-start token given
+    void set_snapshot_token(int tok) override { snap_tokens_.push_back(tok); park_.msg_tokens.push_back(tok); }   // every message-start token given
     void set_prefill_progress(std::function<void(int, int, int)> fn) override { prefill_cb_ = std::move(fn); }
     int max_pos() const override { return opt_.max_pos; }
     int n_draft() const override { return std::min(opt_.n_draft, MAX_NT - 1); }

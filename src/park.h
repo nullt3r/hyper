@@ -45,6 +45,10 @@ public:
     int max_slots = getenv("HYPER_PARK_SLOTS") ? std::max(1, atoi(getenv("HYPER_PARK_SLOTS"))) : 4;
     size_t max_bytes = (size_t) ((getenv("HYPER_PARK_GB") ? atof(getenv("HYPER_PARK_GB")) : 32.0) * 1073741824.0);
     int park_snaps = 4;
+    // the tokens that start a message (<|im_start|>; GLM: <|user|>, <|assistant|>, ...): a prompt that first differs inside
+    // the conversation's last message is the same conversation re-rendered (a template's text of an answer is not always
+    // the generated one)
+    std::vector<int> msg_tokens;
     // called before a parked conversation of n positions is copied back (elastic caches: map them first)
     std::function<void(int)> before_restore;
 
@@ -62,13 +66,26 @@ public:
             while (n < prompt.size() && n < h.size() && prompt[n] == h[n]) ++n;
             return (int) n;
         };
-        const int L = common(hist), cur = (int) hist.size();
-        int best = -1, Lp = -1;
-        for (int i = 0; i < (int) slots_.size(); ++i) {
-            const int l = common(slots_[i].hist);
-            if (l > Lp) { Lp = l; best = i; }
+        // (what a conversation saves: the latest snapshot inside the common prefix -- the recurrent state resumes there)
+        auto usable = [](const std::vector<Snap> & ss, int l) {
+            int u = 0;
+            for (auto & sn : ss) if (sn.pos <= l - 1 && sn.pos > u) u = sn.pos;
+            return u;
+        };
+        const int L = common(hist), cur = (int) hist.size(), U = usable(snaps, L);
+        if (L < cur && L < (int) prompt.size() && L > 0) {   // (where a re-rendered history leaves the generated tokens)
+            fprintf(stderr, "%s: prompt leaves the cached tokens at %d of %d: cached", tag, L, cur);
+            for (int q = std::max(0, L - 3); q < std::min(cur, L + 4); ++q) fprintf(stderr, " %d", hist[q]);
+            fprintf(stderr, " | prompt");
+            for (int q = std::max(0, L - 3); q < std::min((int) prompt.size(), L + 4); ++q) fprintf(stderr, " %d", prompt[q]);
+            fprintf(stderr, "\n");
         }
-        if (best >= 0 && Lp > L + min_gain) {   // a parked conversation comes back; the current one takes its slot
+        int best = -1, Lp = -1, Up = -1;
+        for (int i = 0; i < (int) slots_.size(); ++i) {
+            const int l = common(slots_[i].hist), u = usable(slots_[i].snaps, l);
+            if (u > Up) { Up = u; Lp = l; best = i; }
+        }
+        if (best >= 0 && Up > U + min_gain) {   // a parked conversation comes back; the current one takes its slot
             Slot & s = slots_[best];
             const bool keep = cur >= min_park;
             if (keep) copy(tmp_, cur, true, devs);
@@ -79,7 +96,7 @@ public:
             std::swap(snaps, s.snaps);
             std::swap(s.host, tmp_);   // (the slot keeps the parked caches; the restored ones' buffers become the staging set)
             if (keep) {
-                thin(s.snaps, pool);
+                thin(s.snaps, s.hist, pool);
                 s.used = ++clock_;
             } else {
                 for (auto & sn : s.snaps) pool.push_back(sn.h);
@@ -89,7 +106,16 @@ public:
             }
             return Lp;
         }
-        if (cur >= min_park && L + min_park < cur) {   // another conversation: the current one is parked
+        int last_msg = -1;   // (where the current conversation's last message starts; GLM's answer may end in <|user|>)
+        for (int q = cur - 2; q >= 0 && last_msg < 0 && !msg_tokens.empty(); --q) if (is_msg(hist[q])) last_msg = q;
+        if (cur >= min_park && L + min_park < cur && !(last_msg >= 0 && L > last_msg)) {   // another conversation: the current one is parked
+            // the prompt still shares [0, L): the latest snapshot inside it stays with the current conversation
+            // (an edited earlier message keeps its prefix; the parked copy keeps its latest snapshots to continue)
+            Snap kept{};
+            int ki = -1;
+            for (int i = 0; i < (int) snaps.size(); ++i)
+                if (snaps[i].pos <= L - 1 && (ki < 0 || snaps[i].pos > snaps[ki].pos)) ki = i;
+            if (ki >= 0) { kept = snaps[ki]; snaps.erase(snaps.begin() + ki); }
             int k = -1;
             for (int i = 0; i < (int) slots_.size() && k < 0; ++i)   // an earlier state of this conversation is replaced
                 if (!slots_[i].hist.empty() && common_with(slots_[i].hist, hist) == slots_[i].hist.size()) k = i;
@@ -103,7 +129,8 @@ public:
             copy(s.host, cur, true, devs);
             s.hist = hist;
             s.snaps.swap(snaps);
-            thin(s.snaps, pool);
+            if (ki >= 0) snaps.push_back(kept);
+            thin(s.snaps, s.hist, pool);
             s.used = ++clock_;
             // the pinned memory budget: least recently used conversations out (never the one just parked)
             for (;;) {
@@ -145,17 +172,26 @@ private:
     std::vector<HostBuf> tmp_;   // per device: staging for a swap
     uint64_t clock_ = 0;
 
+    bool is_msg(int t) const { return std::find(msg_tokens.begin(), msg_tokens.end(), t) != msg_tokens.end(); }
     static size_t common_with(const std::vector<int> & a, const std::vector<int> & b) {
         size_t n = 0;
         while (n < a.size() && n < b.size() && a[n] == b[n]) ++n;
         return n;
     }
-    // a parked conversation keeps its latest snapshots only (it comes back to continue)
-    void thin(std::vector<Snap> & snaps, std::vector<std::vector<float *>> & pool) const {
+    // a parked conversation keeps its latest snapshots only (it comes back to continue), and the one at its last message
+    // start (the next prompt re-renders the last answer, which may differ from the generated text early on)
+    void thin(std::vector<Snap> & snaps, const std::vector<int> & hist, std::vector<std::vector<float *>> & pool) const {
         if ((int) snaps.size() <= park_snaps) return;
         std::sort(snaps.begin(), snaps.end(), [](const Snap & a, const Snap & b) { return a.pos > b.pos; });
-        for (size_t i = park_snaps; i < snaps.size(); ++i) pool.push_back(snaps[i].h);
-        snaps.resize(park_snaps);
+        std::vector<Snap> keep(snaps.begin(), snaps.begin() + park_snaps);
+        bool msg = false;
+        for (size_t i = 0; i < snaps.size(); ++i) {
+            const bool start = snaps[i].pos < (int) hist.size() && is_msg(hist[snaps[i].pos]);
+            if (i < (size_t) park_snaps) { msg |= start; continue; }
+            if (start && !msg) { keep.push_back(snaps[i]); msg = true; }
+            else pool.push_back(snaps[i].h);
+        }
+        snaps.swap(keep);
     }
     static void free_bufs(std::vector<HostBuf> & set) {
         for (auto & b : set) if (b.p) cudaFreeHost(b.p);

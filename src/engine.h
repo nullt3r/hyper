@@ -73,7 +73,7 @@ public:
     std::vector<int> generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
                               const std::function<bool(int)> & on_token = {}, const SamplingParams & sp = {}) override;
     // token at which prompt-cache snapshots are taken (message start, e.g. <|im_start|>)
-    void set_snapshot_token(int tok) override { snap_token_ = tok; }
+    void set_snapshot_token(int tok) override { snap_token_ = tok; park_.msg_tokens = {tok}; }
     // called after every prefill chunk with (tokens done incl. reused, prompt length, reused tokens)
     void set_prefill_progress(std::function<void(int, int, int)> fn) override { prefill_cb_ = std::move(fn); }
     void clear_cache() { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); park_.clear(snap_pool_); }
