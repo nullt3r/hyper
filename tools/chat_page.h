@@ -47,6 +47,7 @@ svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.8;stroke
 .ib:active{transform:scale(.93)}
 .ib.sm{width:30px;height:30px;border-radius:8px}.ib.sm svg{width:16px;height:16px}
 .sp{flex:1}
+[data-i]{display:inline-flex;align-items:center;line-height:0}   /* (icon wrappers: no text line box under the svg) */
 .mark{width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:inline-grid;place-items:center;flex-shrink:0}
 .mark svg{width:15px;height:15px;fill:var(--markfg);stroke:none}
 @media (hover:hover){.ib:hover{background:var(--bg3);color:var(--fg)}
