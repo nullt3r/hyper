@@ -881,11 +881,12 @@ async function loadTools(){try{const j=await (await fetch('/v1/mcp')).json();con
 function toggleWeb(){cfg.web=!cfg.web;saveCfg();syncSet();reread(cfg.web?'Web search on':'Web search off')}
 function toolPrompt(day){const n=MCP.tools.map(t=>t.function.name);
  return `You have web access through tools (${n.join(', ')}): search the web for anything recent, for facts you are not sure about and when the user asks about a site or a page; then read the most relevant results. Open only URLs that appeared in search results or on pages you read: never construct or guess links. Cite the pages you used as markdown links. Today is ${day}.`+
-  (n.includes('browser_open')?' To use a site the way a person does (its own search, filters, forms, buttons, moving through pages), open it with browser_open and act on the numbered elements with browser_click, browser_type and browser_select; the browser stays open between calls.':'')}
+  (n.includes('browser_open')?' To use a site the way a person does (its own search, filters, forms, buttons, moving through pages), open it with browser_open and act on the numbered elements with browser_click, browser_type and browser_select (browser_find locates things on a long page); the browser stays open between calls.':'')}
 // (labels of the interactive browser's tool calls: running, done, detail)
 const BROWSER={browser_open:a=>['Opening','Opened',hostOf(a.url)],browser_click:a=>['Clicking','Clicked',a.element!=null?'['+a.element+']':''],
  browser_type:a=>['Typing','Typed',a.text?'“'+String(a.text).slice(0,40)+'”':''],browser_select:a=>['Selecting','Selected',a.option||''],
- browser_scroll:a=>['Scrolling','Scrolled',a.direction||'down'],browser_back:()=>['Going back','Went back',''],browser_read:()=>['Reading','Read','the page']};
+ browser_scroll:a=>['Scrolling','Scrolled',a.direction||'down'],browser_back:()=>['Going back','Went back',''],browser_read:()=>['Reading','Read','the page'],
+ browser_find:a=>['Finding','Found',a.text?'“'+String(a.text).slice(0,40)+'”':'']};
 function hostOf(u){try{return new URL(u).hostname.replace(/^www\./,'')}catch(e){return u||''}}
 function toolHTML(m){if(!m.calls||!m.calls.length)return'';
  return '<div class="tcs">'+m.calls.map(x=>{let a={};try{a=JSON.parse(x.args||'{}')}catch(e){}

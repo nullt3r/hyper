@@ -4,7 +4,7 @@
 #                         first). Plain HTTP first; a real browser (Google Chrome over CDP,
 #                         SeleniumBase UC mode, headful in Xvfb) for bot challenges (Cloudflare, Turnstile, ...) and
 #                         JavaScript-only pages, or when asked (browser=True)
-#   browser_open / click / type / select / scroll / back / read
+#   browser_open / click / type / select / scroll / back / read / find
 #                      -- an interactive browser kept open between calls: the page as text with numbered elements [n]
 import asyncio
 import base64
@@ -14,6 +14,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, quote_plus, urlparse
 
@@ -251,7 +252,7 @@ SNAP_JS = r"""(() => {
  const INTER = 'a[href],button,input:not([type=hidden]),select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],' +
   '[role=checkbox],[role=radio],[role=option],[role=switch],[role=combobox],[role=textbox],[contenteditable=""],[contenteditable=true],[onclick]';
  const BLOCK = /^(P|DIV|SECTION|ARTICLE|MAIN|HEADER|FOOTER|NAV|ASIDE|LI|UL|OL|DL|DT|DD|TR|TABLE|THEAD|TBODY|H[1-6]|FORM|FIELDSET|LEGEND|BR|HR|BLOCKQUOTE|PRE|FIGURE|FIGCAPTION|DETAILS|DIALOG)$/;
- const MAX = 400, out = [], els = []; let n = 0;
+ const MAX = 1500, out = [], els = []; let n = 0;
  document.querySelectorAll('[data-hid]').forEach(e => e.removeAttribute('data-hid'));
  const sq = t => (t || '').replace(/\s+/g, ' ').trim();
  const vis = e => { const s = getComputedStyle(e); if (s.display === 'none' || s.visibility === 'hidden' || s.visibility === 'collapse') return false;
@@ -480,6 +481,22 @@ def _b_back():
     return _page(sb)
 
 
+def _fold(t: str) -> str:   # (lower case without diacritics: "graficke" finds "Grafické")
+    return "".join(c for c in unicodedata.normalize("NFKD", t.lower()) if not unicodedata.combining(c))
+
+
+def _b_find(text):
+    if _S["sb"] is None or not _S["text"]:
+        return "No page is open in the browser: use browser_open first."
+    _S["last"] = time.time()
+    q = _fold(str(text)).strip()
+    hits = [ln.strip() for ln in _S["text"].split("\n") if q and q in _fold(ln)]
+    if not hits:
+        return f"Nothing on the page contains \u201c{text}\u201d."
+    return (f"{len(hits)} lines of the page contain \u201c{text}\u201d" + (" (the first 60)" if len(hits) > 60 else "") + ":\n\n" +
+            "\n".join(h[:500] for h in hits[:60]))
+
+
 def _b_read(start):
     if _S["sb"] is None or not _S["text"]:
         return "No page is open in the browser: use browser_open first."
@@ -500,7 +517,8 @@ async def _act(fn, *args) -> str:
 async def browser_open(url: str) -> str:
     """Open a page in a real web browser that stays open between calls (cookies, logins and form contents are kept).
     Returns the page as text in which interactive elements are numbered, like [12 link -> /pricing] or [7 input text "Search"].
-    Use it to click, fill in forms, use a site's own search or move through pages; to just read a page, fetch_url is faster."""
+    Use it to click, fill in forms, use a site's own search or move through pages; to just read a page, fetch_url is faster.
+    A long page comes in parts (the cut says how browser_read continues); browser_find lists the lines with a phrase."""
     return await _act(_b_open, url)
 
 
@@ -532,6 +550,13 @@ async def browser_scroll(direction: str = "down") -> str:
 async def browser_back() -> str:
     """Go back to the previous page in the browser."""
     return await _act(_b_back)
+
+
+@mcp.tool()
+async def browser_find(text: str) -> str:
+    """The lines of the page open in the browser that contain this text (any case, with or without diacritics), with their
+    element numbers: to find a product, link or button on a long page without reading all of it."""
+    return await _act(_b_find, text)
 
 
 @mcp.tool()
