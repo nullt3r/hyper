@@ -95,7 +95,7 @@ private:
     void load_weights();
     void load_layer(Device & dev, DevLayer & L, int il);
     void load_experts(int il, const std::vector<int> & quota);
-    void upload_stage(Device & d, int il);
+    void upload_stage(Device & d, int il, int p = 0, int np = 1);
     void rebuild_stream(int il);
     void rebalance(int max_swaps);
     void score_prompt(const int * lens, int nck);   // prefill routing of the last bulk pass into the placement scores
@@ -194,6 +194,7 @@ private:
     int mc_last_ = 1;              // chunks of the last forward_multi
     int mtp_src_ = 0;              // MTP pass: residual rows of chunk mtp_src_ of the last multi-chunk forward
     int * h_cpos_ = nullptr;       // pinned: positions of the chunks
+    int up_parts_ = 2;       // prefill expert uploads in parts, each after an allreduce's downloads (HYPER4_UP_PARTS; 1: whole)
     int stream_min_ = 256;   // prefill chunks this long stream the CPU experts to the GPUs; shorter ones use the CPU
     // elastic placement (HYPER4_ELASTIC=0: off): the attention caches (K / V, indexer keys) live on the CUDA virtual memory
     // API and map only the positions in use (kv_pos_); the rest of their full-context memory holds extra expert slots

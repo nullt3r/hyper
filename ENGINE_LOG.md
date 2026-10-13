@@ -537,3 +537,23 @@ MTP vrstvy ~0,55 ms na volání. GPU0 (bez attention) mezitím čeká ve spinu L
 Z produkčního logu: ani jednou (0 z 786 navazujících požadavků) se nevyužila cache až do konce předchozí odpovědi – předchozí odpověď
 se přepočítává (Flash průměrně 211 tokenů). Snapshot na konci generování nejde použít (historie končí před posledním tokenem,
 při spekulaci se navíc nebere). Na řadě.
+
+### Prefill: upload expertů už neblokuje allreduce (FIFO copy enginu)
+
+Časová osa GPU1 v prefillu přírůstku ukázala, že po MoE každé vrstvy GPU ~7,5 ms stojí. Upload studených expertů vrstvy l+2
+(~75 kopií, ~8 ms na x8) se zařadil do H2D fronty hned po MoE vrstvy l. H2D kopie následujícího allreduce (kritická cesta) pak
+čekaly ve FIFO copy enginu, až celý upload doběhne. Ve vrstvě tak stály kernely i linka zároveň (PCIe aktivní jen ~37 % prefillu).
+
+Oprava: upload vrstvy se dělí na části (`HYPER4_UP_PARTS`, výchozí 2). Každá část jde do fronty až za H2D kopie nejbližšího
+allreduce (událost na compute streamu, `cudaStreamWaitEvent` na copy streamu). Před MoE vrstvy se případný zbytek pošle hned.
+Pořadí výpočtu se nemění.
+
+| Hloubkový scénář (prefill přírůstků) | t/s | ms / požadavek |
+|---|---|---|
+| `HYPER4_UP_PARTS=1` (dosavadní) | 1153 | 1928 |
+| **2 části** | **1460** | **1522** |
+| 4 části | 1433 | 1551 |
+
+Výstupy 9/9 shodné ve všech třech během. Od začátku dne (staré kernely + celý upload): 860 → 1460 t/s (+70 %) a 2584 → 1522 ms
+na požadavek. GLM streamuje stejně, ale jeho prefill je čistě omezený PCIe (upload ~35 ms na vrstvu), takže pořadí ve frontě
+tam pomůže méně.

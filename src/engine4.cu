@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 
 #include <algorithm>
+#include <deque>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -130,6 +131,10 @@ struct Engine4::Device {
     cudaStream_t cstream = nullptr;                           // prefill expert uploads
     cudaStream_t fstream = nullptr;                           // elastic: background fills of extra expert slots
     cudaEvent_t ev_up[2] = {}, ev_free[2] = {};
+    // expert upload parts not yet enqueued (layer, part): each goes out after the next allreduce's downloads, so the copy
+    // engine (FIFO) never holds an allreduce copy -- on the critical path -- behind a layer's whole upload
+    std::deque<std::pair<int, int>> up_pend;
+    cudaEvent_t ev_arh = nullptr;
     uint8_t * stage[2] = {};                                  // staging buffers for streamed experts
     size_t stage_bytes = 0;
     cudaEvent_t ev_ar[2] = {};
@@ -168,6 +173,7 @@ struct Engine4::Device {
         if (blas) cublasDestroy(blas);
         for (auto & ev : ev_up) if (ev) cudaEventDestroy(ev);
         for (auto & ev : ev_free) if (ev) cudaEventDestroy(ev);
+        if (ev_arh) cudaEventDestroy(ev_arh);
         if (cstream) cudaStreamDestroy(cstream);
         if (fstream) cudaStreamDestroy(fstream);
         if (s2) cudaStreamDestroy(s2);
@@ -444,6 +450,7 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
     allrows_ = getenv("HYPER4_ALLROWS") != nullptr;
     grouped_decode_ = getenv("HYPER4_GROUPED") != nullptr;   // timing experiment only: CPU experts ignored (wrong output)
     if (getenv("HYPER4_STREAM_MIN")) stream_min_ = atoi(getenv("HYPER4_STREAM_MIN"));
+    if (getenv("HYPER4_UP_PARTS")) up_parts_ = std::max(1, atoi(getenv("HYPER4_UP_PARTS")));
     gguf_ = std::make_unique<GGUF>(model_path);
     cfg_ = Q4Config::from_gguf(*gguf_);
     src_ = gguf_.get();
@@ -472,6 +479,7 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
         CUDA_CHECK(cudaEventCreateWithFlags(&dev->ev_join, cudaEventDisableTiming));
         for (auto & ev : dev->ev_up) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         for (auto & ev : dev->ev_free) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&dev->ev_arh, cudaEventDisableTiming));
         if (cublasCreate(&dev->blas) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasCreate failed");
         cublasSetStream(dev->blas, dev->stream);
         cublasSetMathMode(dev->blas, CUBLAS_DEFAULT_MATH);   // plain fp32 (no TF32): routing must not move
@@ -1380,6 +1388,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
     // short chunks: the CPU computes its experts (the MTP block's FFN never runs over a whole chunk)
     const bool streaming = bulk && opt_.stream_experts && nt >= stream_min_ && (!kind || mtp_full_);
     if (streaming) {
+        d.up_pend.clear();
         if (!kind && d.layers[0].owner_bulk) { upload_stage(d, 0); if (c.n_layer > 1) upload_stage(d, 1); }
         if (kind && d.mtp.owner_bulk) upload_stage(d, c.n_layer);
     }
@@ -1420,6 +1429,13 @@ void Engine4::record_main(int gi, int nt, int kind) {
             CUDA_CHECK(cudaStreamWaitEvent(s, devs_[p]->ev_ar[par], 0));
             CUDA_CHECK(cudaMemcpyAsync(d.recv + (size_t) j * R4 * n, stage(p), N * sizeof(half), cudaMemcpyHostToDevice, s));
             ++j;
+        }
+        if (!d.up_pend.empty()) {   // the next expert upload part, behind these downloads
+            CUDA_CHECK(cudaEventRecord(d.ev_arh, s));
+            CUDA_CHECK(cudaStreamWaitEvent(d.cstream, d.ev_arh, 0));
+            const auto [l2, pp] = d.up_pend.front();
+            d.up_pend.pop_front();
+            upload_stage(d, l2, pp, up_parts_);
         }
         add_parts(d.bo, d.p16, d.recv, (size_t) R4 * n, nd - 1, (int) N, s);
     };
@@ -1637,13 +1653,21 @@ void Engine4::record_main(int gi, int nt, int kind) {
                 ms.up = d.stage[sb] + (size_t) cnt * L.moe.gate_bytes;
                 ms.down = d.stage[sb] + (size_t) 2 * cnt * L.moe.gate_bytes;
                 ms.slot = L.st_slot;
+                while (!d.up_pend.empty() && d.up_pend.front().first <= il) {   // (parts no allreduce took yet)
+                    const auto [l2, pp] = d.up_pend.front();
+                    d.up_pend.pop_front();
+                    upload_stage(d, l2, pp, up_parts_);
+                }
                 CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_up[sb], 0));
                 moe_order(ms, d.ids, nt * K, c.n_expert, d.order, d.order_n, s, d.egrp);
                 moe_gemm_gate_up(ms, d.mix16, n, K, d.order, d.order_n, d.egrp, c.n_expert, d.h16, s);
                 moe_gemm_down(ms, d.h16, d.order, d.order_n, d.egrp, c.n_expert, d.wts, d.yexp, s);
                 if (last_ck) {
                     CUDA_CHECK(cudaEventRecord(d.ev_free[sb], s));
-                    if (il + 2 < c.n_layer) upload_stage(d, il + 2);
+                    if (il + 2 < c.n_layer) {
+                        if (up_parts_ > 1) for (int pp = 0; pp < up_parts_; ++pp) d.up_pend.push_back({il + 2, pp});
+                        else upload_stage(d, il + 2);
+                    }
                 }
             }
         } else if (nt > 1 && grouped_decode_) {   // verification rows: each local expert read once (grouped GEMM)
@@ -1818,16 +1842,18 @@ void Engine4::score_prompt(const int * lens, int nck) {
 
 // copy this GPU's share of layer il's CPU experts into staging buffer il % 2 (on the copy stream, after the buffer's
 // previous user has finished)
-void Engine4::upload_stage(Device & d, int il) {
+// part p of np (the share split by expert index); the first part waits for the staging buffer, the last one signals ev_up
+void Engine4::upload_stage(Device & d, int il, int p, int np) {
     DevLayer & L = lay(d, il);
     const ExpertHost & H = ehost_[il];
     const std::vector<int> & lst = L.st_list;
     const int sb = il & 1, cnt = (int) lst.size();
-    CUDA_CHECK(cudaStreamWaitEvent(d.cstream, d.ev_free[sb], 0));
+    const int i0 = (int) ((int64_t) cnt * p / np), i1 = (int) ((int64_t) cnt * (p + 1) / np);
+    if (p == 0) CUDA_CHECK(cudaStreamWaitEvent(d.cstream, d.ev_free[sb], 0));
     const size_t gb = H.gb, db = H.db;
-    for (int i = 0; i < cnt;) {   // runs of consecutive experts in one copy each
+    for (int i = i0; i < i1;) {   // runs of consecutive experts in one copy each
         int j = i + 1;
-        while (j < cnt && lst[j] == lst[j - 1] + 1) ++j;
+        while (j < i1 && lst[j] == lst[j - 1] + 1) ++j;
         const size_t e = (size_t) lst[i], r = (size_t) (j - i);
         CUDA_CHECK(cudaMemcpyAsync(d.stage[sb] + (size_t) i * gb, H.gate + e * gb, r * gb, cudaMemcpyHostToDevice, d.cstream));
         CUDA_CHECK(cudaMemcpyAsync(d.stage[sb] + (size_t) (cnt + i) * gb, H.up + e * gb, r * gb, cudaMemcpyHostToDevice, d.cstream));
@@ -1835,7 +1861,7 @@ void Engine4::upload_stage(Device & d, int il) {
                                    d.cstream));
         i = j;
     }
-    CUDA_CHECK(cudaEventRecord(d.ev_up[sb], d.cstream));
+    if (p == np - 1) CUDA_CHECK(cudaEventRecord(d.ev_up[sb], d.cstream));
 }
 
 // roll the recurrent state (GDN conv + state, PLE conv) back to the snapshot after row keep-1 of the last verification
