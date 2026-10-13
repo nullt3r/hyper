@@ -908,6 +908,48 @@ __device__ __forceinline__ void ldsm_x4(unsigned * r, const void * smem) {
     const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(sa));
 }
+// 32 consecutive values (group c32 of the row) of one weight row, each with the same expression as deq8 (so the fp16 tiles
+// the GEMM multiplies are bit for bit those of the per-8 path), from a few wide loads instead of one header + data read per 8
+template <GType T> struct Deq32 { static constexpr bool ok = false; };
+template <> struct Deq32<GType::Q4_K> { static constexpr bool ok = true; };
+template <> struct Deq32<GType::Q5_1> { static constexpr bool ok = true; };
+template <> struct Deq32<GType::Q8_0> { static constexpr bool ok = true; };
+template <GType T> __device__ __forceinline__ void deq32(const uint8_t * __restrict__ row, int c32, float * v);
+template <> __device__ __forceinline__ void deq32<GType::Q4_K>(const uint8_t * __restrict__ row, int c32, float * v) {
+    const uint8_t * b = row + (size_t) (c32 >> 3) * 144;   // sub-block j of a 256-value super-block
+    const int j = c32 & 7;
+    int sc, m; scale_min_k4(j, b + 4, sc, m);
+    const float d = h2f(b) * sc, mn = h2f(b + 2) * m;
+    const uint4 q0 = *(const uint4 *) (b + 16 + 32 * (j >> 1)), q1 = *(const uint4 *) (b + 32 + 32 * (j >> 1));
+    const unsigned qw[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+    const int sh = 4 * (j & 1);
+#pragma unroll
+    for (int i = 0; i < 32; ++i) v[i] = d * ((qw[i >> 2] >> (8 * (i & 3) + sh)) & 0xF) - mn;
+}
+template <> __device__ __forceinline__ void deq32<GType::Q5_1>(const uint8_t * __restrict__ row, int c32, float * v) {
+    const uint8_t * b = row + (size_t) c32 * 24;   // d, m, qh[4], qs[16] (8-byte aligned)
+    const float d = h2f(b), m = h2f(b + 2);
+    const uint32_t qh = *(const uint32_t *) (b + 4);
+    const uint2 a = *(const uint2 *) (b + 8), c = *(const uint2 *) (b + 16);
+    const uint32_t qw[4] = {a.x, a.y, c.x, c.y};
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        const int x = ((qw[(i & 15) >> 2] >> (8 * (i & 3) + (i & 16 ? 4 : 0))) & 0xF) | (((qh >> i) & 1) << 4);
+        v[i] = x * d + m;
+    }
+}
+template <> __device__ __forceinline__ void deq32<GType::Q8_0>(const uint8_t * __restrict__ row, int c32, float * v) {
+    const uint8_t * b = row + (size_t) c32 * 34;   // d, 32 x int8 (2-byte aligned)
+    const float d = h2f(b);
+    const uint16_t * q16 = (const uint16_t *) (b + 2);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const uint16_t w = q16[i];
+        v[2 * i] = d * (int8_t) (w & 0xff);
+        v[2 * i + 1] = d * (int8_t) (w >> 8);
+    }
+}
+
 constexpr int GE_M = 64, GE_N = 32, GE_K = 128, GE_LD = GE_K + 8;
 
 // Block: one active expert (blockIdx.y < n_active), 64 weight rows (blockIdx.x), the expert's tokens in passes of 32.
@@ -917,7 +959,7 @@ template <GType T, bool GU>
 __global__ void __launch_bounds__(256) k_moe_gemm(MoeDev m, const half * __restrict__ in, int in_stride, const int * __restrict__ in_row,
                                                   int in_div, const int * __restrict__ order, const int * __restrict__ order_n,
                                                   const int * __restrict__ egrp, const float * __restrict__ wts,
-                                                  half * __restrict__ h16, float * __restrict__ y, int kdim, int rows_out) {
+                                                  half * __restrict__ h16, float * __restrict__ y, int kdim, int rows_out, bool old_fill) {
     if ((int) blockIdx.y >= order_n[1]) return;
     // the dequantized weight tile serves GE_NP token passes at a time (dequantization is the expensive part)
     constexpr int GE_NP = 2;
@@ -940,7 +982,26 @@ __global__ void __launch_bounds__(256) k_moe_gemm(MoeDev m, const half * __restr
         float acc[GE_NP][2][4] = {};
         for (int k0 = 0; k0 < kdim; k0 += GE_K) {
             __syncthreads();
-            // A: 64 rows x 128 cols = 1024 chunks of 8
+            // A: 64 rows x 128 cols = 1024 chunks of 8 (Deq32 types: a thread per row and 32-value group, same values)
+            static_assert(GE_M * (GE_K / 32) == 256, "deq32 tile: one group per thread");
+            bool filled = false;
+            if constexpr (Deq32<T>::ok) if (!old_fill) {
+                filled = true;
+                const int rr = threadIdx.x >> 2, part = threadIdx.x & 3;
+                int row; const uint8_t * base;
+                if (GU) { row = r_base + (rr & 31); base = rr < 32 ? W0 : W1; }
+                else { row = r_base + rr; base = W0; }
+                float v[32];
+                if (row < mrows) deq32<T>(base + (size_t) row * rb, (k0 >> 5) + part, v);
+                else for (int i = 0; i < 32; ++i) v[i] = 0.0f;
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    __half2 hv[4];
+                    for (int i = 0; i < 4; ++i) hv[i] = __floats2half2_rn(v[8 * u + 2 * i], v[8 * u + 2 * i + 1]);
+                    *(uint4 *) &As[rr * GE_LD + part * 32 + u * 8] = *(const uint4 *) hv;
+                }
+            }
+            if (!filled)
             for (int ci = threadIdx.x; ci < GE_M * (GE_K / 8); ci += blockDim.x) {
                 const int rr = ci / (GE_K / 8), cc = ci % (GE_K / 8);
                 int row; const uint8_t * base;
@@ -1003,6 +1064,170 @@ __global__ void __launch_bounds__(256) k_moe_gemm(MoeDev m, const half * __restr
                     if (row >= mrows) continue;
                     const int p = order[start + tb + tr];
                     y[(size_t) p * rows_out + row] = wts[p] * Cs[rr][tr];
+                }
+            }
+        }
+    }
+}
+
+// ---- the same GEMM with the next k-step's loads in flight during this step's MMAs (Deq32 weight types) ----
+// raw bytes of one row's 32-value group: loaded one k-step ahead, decoded into the tile with deq32's expressions
+template <GType T> struct Raw32;
+template <> struct Raw32<GType::Q4_K> {
+    uint4 hd, q0, q1;
+    __device__ __forceinline__ void load(const uint8_t * row, int c32) {
+        const uint8_t * b = row + (size_t) (c32 >> 3) * 144;
+        const int j = c32 & 7;
+        hd = *(const uint4 *) b; q0 = *(const uint4 *) (b + 16 + 32 * (j >> 1)); q1 = *(const uint4 *) (b + 32 + 32 * (j >> 1));
+    }
+    __device__ __forceinline__ void decode(int c32, float * v) const {
+        const int j = c32 & 7;
+        int sc, m; q4k_sm(hd.y, hd.z, hd.w, j, sc, m);
+        const float d = __half2float(__ushort_as_half((unsigned short) (hd.x & 0xffff))) * sc;
+        const float mn = __half2float(__ushort_as_half((unsigned short) (hd.x >> 16))) * m;
+        const unsigned qw[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+        const int sh = 4 * (j & 1);
+#pragma unroll
+        for (int i = 0; i < 32; ++i) v[i] = d * ((qw[i >> 2] >> (8 * (i & 3) + sh)) & 0xF) - mn;
+    }
+};
+template <> struct Raw32<GType::Q5_1> {
+    uint2 a, c, e;
+    __device__ __forceinline__ void load(const uint8_t * row, int c32) {
+        const uint8_t * b = row + (size_t) c32 * 24;
+        a = *(const uint2 *) b; c = *(const uint2 *) (b + 8); e = *(const uint2 *) (b + 16);
+    }
+    __device__ __forceinline__ void decode(int, float * v) const {
+        const float d = __half2float(__ushort_as_half((unsigned short) (a.x & 0xffff))), m = __half2float(__ushort_as_half((unsigned short) (a.x >> 16)));
+        const uint32_t qh = a.y;
+        const uint32_t qw[4] = {c.x, c.y, e.x, e.y};
+#pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            const int x = ((qw[(i & 15) >> 2] >> (8 * (i & 3) + (i & 16 ? 4 : 0))) & 0xF) | (((qh >> i) & 1) << 4);
+            v[i] = x * d + m;
+        }
+    }
+};
+template <> struct Raw32<GType::Q8_0> {
+    uint16_t q[17];
+    __device__ __forceinline__ void load(const uint8_t * row, int c32) {
+        const uint16_t * b = (const uint16_t *) (row + (size_t) c32 * 34);
+#pragma unroll
+        for (int i = 0; i < 17; ++i) q[i] = b[i];
+    }
+    __device__ __forceinline__ void decode(int, float * v) const {
+        const float d = __half2float(__ushort_as_half(q[0]));
+#pragma unroll
+        for (int i = 0; i < 16; ++i) { v[2 * i] = d * (int8_t) (q[1 + i] & 0xff); v[2 * i + 1] = d * (int8_t) (q[1 + i] >> 8); }
+    }
+};
+
+template <GType T, bool GU>
+__global__ void __launch_bounds__(256) k_moe_gemm2(MoeDev m, const half * __restrict__ in, int in_stride, const int * __restrict__ in_row,
+                                                   int in_div, const int * __restrict__ order, const int * __restrict__ order_n,
+                                                   const int * __restrict__ egrp, const float * __restrict__ wts,
+                                                   half * __restrict__ h16, float * __restrict__ y, int kdim, int rows_out) {
+    if ((int) blockIdx.y >= order_n[1]) return;
+    constexpr int GE_NP = 2, BCH = GE_NP * GE_N * (GE_K / 8) / 256;   // B chunks of 8 per thread
+    __shared__ __align__(16) half As[GE_M * GE_LD];
+    __shared__ __align__(16) half Bs[GE_NP][GE_N * GE_LD];
+    __shared__ float Cs[GE_M][GE_N + 1];
+    const int e = egrp[3 * blockIdx.y], start = egrp[3 * blockIdx.y + 1], cnt = egrp[3 * blockIdx.y + 2];
+    const int slot = m.slot[e];
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+    const int wm = w & 3, wn = w >> 2;
+    const int r_base = blockIdx.x * (GU ? GE_M / 2 : GE_M);
+    const size_t mbytes = GU ? m.gate_bytes : m.down_bytes;
+    const int mrows = GU ? m.ff : m.n;
+    const size_t rb = mbytes / mrows;
+    const uint8_t * W0 = (GU ? m.gate : m.down) + (size_t) slot * mbytes;
+    const uint8_t * W1 = GU ? m.up + (size_t) slot * mbytes : nullptr;
+    // this thread's A group: row rr, values 32 part .. of the k-step
+    const int rr = threadIdx.x >> 2, part = threadIdx.x & 3;
+    const int arow = GU ? r_base + (rr & 31) : r_base + rr;
+    const bool avalid = arow < mrows;
+    const uint8_t * arp = (GU ? (rr < 32 ? W0 : W1) : W0) + (size_t) (avalid ? arow : 0) * rb;
+    for (int t0 = 0; t0 < cnt; t0 += GE_N * GE_NP) {
+        const int np = min(GE_NP, (cnt - t0 + GE_N - 1) / GE_N);
+        // this thread's B chunks: token rows (fixed over k) and their tile positions
+        const half * bsrc[BCH];
+        int bdst[BCH];
+#pragma unroll
+        for (int i = 0; i < BCH; ++i) {
+            const int ci = threadIdx.x + 256 * i;
+            const int ps = ci / (GE_N * (GE_K / 8)), rem = ci % (GE_N * (GE_K / 8)), tr = rem / (GE_K / 8), cc = rem % (GE_K / 8);
+            const int tt = t0 + ps * GE_N + tr;
+            bdst[i] = ps * GE_N * GE_LD + tr * GE_LD + cc * 8;
+            bsrc[i] = nullptr;
+            if (ps < np && tt < cnt) {
+                const int p = order[start + tt];
+                const int src = in_row ? in_row[p] : p / in_div;
+                bsrc[i] = in + (size_t) src * in_stride + cc * 8;
+            }
+        }
+        float acc[GE_NP][2][4] = {};
+        Raw32<T> ra;
+        uint4 rbv[BCH];
+        if (avalid) ra.load(arp, part);
+#pragma unroll
+        for (int i = 0; i < BCH; ++i) rbv[i] = bsrc[i] ? *(const uint4 *) bsrc[i] : make_uint4(0, 0, 0, 0);
+        for (int k0 = 0; k0 < kdim; k0 += GE_K) {
+            __syncthreads();
+            {
+                float v[32];
+                if (avalid) ra.decode((k0 >> 5) + part, v);
+                else for (int i = 0; i < 32; ++i) v[i] = 0.0f;
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    __half2 hv[4];
+                    for (int i = 0; i < 4; ++i) hv[i] = __floats2half2_rn(v[8 * u + 2 * i], v[8 * u + 2 * i + 1]);
+                    *(uint4 *) &As[rr * GE_LD + part * 32 + u * 8] = *(const uint4 *) hv;
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < BCH; ++i) *(uint4 *) (&Bs[0][0] + bdst[i]) = rbv[i];
+            __syncthreads();
+            if (k0 + GE_K < kdim) {   // the next step's loads, in flight during the MMAs
+                if (avalid) ra.load(arp, ((k0 + GE_K) >> 5) + part);
+#pragma unroll
+                for (int i = 0; i < BCH; ++i) if (bsrc[i]) rbv[i] = *(const uint4 *) (bsrc[i] + k0 + GE_K);
+            }
+#pragma unroll
+            for (int kk = 0; kk < GE_K / 16; ++kk) {
+                unsigned a[4];
+                ldsm_x4(a, &As[(wm * 16 + (lane & 15)) * GE_LD + kk * 16 + (lane >> 4) * 8]);
+#pragma unroll
+                for (int ps = 0; ps < GE_NP; ++ps) {
+                    if (ps >= np) break;
+                    unsigned b[4];
+                    ldsm_x4(b, &Bs[ps][(wn * 16 + (lane & 7) + ((lane >> 4) << 3)) * GE_LD + kk * 16 + ((lane >> 3) & 1) * 8]);
+                    const unsigned b0[2] = {b[0], b[1]}, b1[2] = {b[2], b[3]};
+                    mma16816_4(acc[ps][0], a, b0);
+                    mma16816_4(acc[ps][1], a, b1);
+                }
+            }
+        }
+        for (int ps = 0; ps < np; ++ps) {
+            const int tb = t0 + ps * GE_N, nt = min(GE_N, cnt - tb);
+            __syncthreads();
+#pragma unroll
+            for (int ni = 0; ni < 2; ++ni)
+#pragma unroll
+                for (int q = 0; q < 4; ++q) Cs[wm * 16 + gid + (q >> 1) * 8][wn * 16 + ni * 8 + 2 * tig + (q & 1)] = acc[ps][ni][q];
+            __syncthreads();
+            if (GU) {
+                for (int i = threadIdx.x; i < 32 * nt; i += blockDim.x) {
+                    const int r2 = i % 32, tr = i / 32, row = r_base + r2;
+                    if (row >= mrows) continue;
+                    const int p = order[start + tb + tr];
+                    h16[(size_t) p * rows_out + row] = __float2half(swiglu4(Cs[r2][tr], Cs[r2 + 32][tr], m.clamp));
+                }
+            } else {
+                for (int i = threadIdx.x; i < GE_M * nt; i += blockDim.x) {
+                    const int r2 = i % GE_M, tr = i / GE_M, row = r_base + r2;
+                    if (row >= mrows) continue;
+                    const int p = order[start + tb + tr];
+                    y[(size_t) p * rows_out + row] = wts[p] * Cs[r2][tr];
                 }
             }
         }
@@ -1388,14 +1613,32 @@ void moe_gemm_gate_up(const MoeDev & m, const half * x16, int xs, int k, const i
                       int max_active, half * h16, cudaStream_t s) {
     const int kdim = (int) (m.gate_bytes / m.ff / gtype_block_bytes(m.tg) * gtype_block_elems(m.tg));
     if (kdim % GE_K) throw std::runtime_error("moe_gemm: k must be a multiple of 128");
+    static const bool old_fill = getenv("HYPER_MOEGEMM_OLD") != nullptr;   // (per-8 dequantization for every type)
+    static const bool v1 = old_fill || getenv("HYPER_MOEGEMM_V1") != nullptr;   // (no loads in flight across k-steps)
+    if (!v1 && (m.tg == GType::Q4_K || m.tg == GType::Q5_1 || m.tg == GType::Q8_0)) {
+        const dim3 g((m.ff + 31) / 32, max_active);
+        if (m.tg == GType::Q4_K) k_moe_gemm2<GType::Q4_K, true><<<g, 256, 0, s>>>(m, x16, xs, nullptr, k, order, order_n, egrp, nullptr, h16, nullptr, kdim, m.ff);
+        else if (m.tg == GType::Q5_1) k_moe_gemm2<GType::Q5_1, true><<<g, 256, 0, s>>>(m, x16, xs, nullptr, k, order, order_n, egrp, nullptr, h16, nullptr, kdim, m.ff);
+        else k_moe_gemm2<GType::Q8_0, true><<<g, 256, 0, s>>>(m, x16, xs, nullptr, k, order, order_n, egrp, nullptr, h16, nullptr, kdim, m.ff);
+        return;
+    }
     MOE_TYPE_SWITCH(m.tg, (k_moe_gemm<TT, true><<<dim3((m.ff + 31) / 32, max_active), 256, 0, s>>>(m, x16, xs, nullptr, k, order, order_n, egrp,
-                                                                                                   nullptr, h16, nullptr, kdim, m.ff)));
+                                                                                                   nullptr, h16, nullptr, kdim, m.ff, old_fill)));
 }
 void moe_gemm_down(const MoeDev & m, const half * h16, const int * order, const int * order_n, const int * egrp, int max_active,
                    const float * wts, float * y, cudaStream_t s) {
     if (m.ff % GE_K) throw std::runtime_error("moe_gemm: ff must be a multiple of 128");
+    static const bool old_fill = getenv("HYPER_MOEGEMM_OLD") != nullptr;
+    static const bool v1 = old_fill || getenv("HYPER_MOEGEMM_V1") != nullptr;
+    if (!v1 && (m.td == GType::Q4_K || m.td == GType::Q5_1 || m.td == GType::Q8_0)) {
+        const dim3 g((m.n + GE_M - 1) / GE_M, max_active);
+        if (m.td == GType::Q4_K) k_moe_gemm2<GType::Q4_K, false><<<g, 256, 0, s>>>(m, h16, m.ff, nullptr, 1, order, order_n, egrp, wts, nullptr, y, m.ff, m.n);
+        else if (m.td == GType::Q5_1) k_moe_gemm2<GType::Q5_1, false><<<g, 256, 0, s>>>(m, h16, m.ff, nullptr, 1, order, order_n, egrp, wts, nullptr, y, m.ff, m.n);
+        else k_moe_gemm2<GType::Q8_0, false><<<g, 256, 0, s>>>(m, h16, m.ff, nullptr, 1, order, order_n, egrp, wts, nullptr, y, m.ff, m.n);
+        return;
+    }
     MOE_TYPE_SWITCH(m.td, (k_moe_gemm<TT, false><<<dim3((m.n + GE_M - 1) / GE_M, max_active), 256, 0, s>>>(m, h16, m.ff, nullptr, 1, order, order_n,
-                                                                                                          egrp, wts, nullptr, y, m.ff, m.n)));
+                                                                                                          egrp, wts, nullptr, y, m.ff, m.n, old_fill)));
 }
 void moe_reduce(const float * shexp, const float * sg, const float * y, int k, float * out, int n, int nt,
                 const int * ids, const int * owner, int g, int cpu_owner, const volatile unsigned * cpu_flag, const float * cpu_y,

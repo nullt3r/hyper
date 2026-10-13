@@ -57,6 +57,14 @@ $(BUILD)/qsabench: tools/qsabench.cu $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BU
 $(BUILD)/gdnbench: tools/gdnbench.cu $(BUILD)/kernels.o
 	$(NVCC) $(NVFLAGS) tools/gdnbench.cu $(BUILD)/kernels.o -o $@ $(LIBS)
 
+# prefill grouped expert GEMMs (Flash-Next shapes), random blocks and routing (hashes of the outputs)
+$(BUILD)/moegemmbench: tools/moegemmbench.cu $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/gguf.o
+	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/moegemmbench.cu $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/gguf.o -o $@ $(LIBS)
+
+# dense Q8 tensor-core GEMM (prefill), random weights (hash of the output)
+$(BUILD)/gemmbench: tools/gemmbench.cu $(BUILD)/kernels.o
+	$(NVCC) $(NVFLAGS) tools/gemmbench.cu $(BUILD)/kernels.o -o $@ $(LIBS)
+
 # MoE routing kernel
 $(BUILD)/routebench: $(OBJ4) tools/routebench.cu
 	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/routebench.cu $(OBJ4) -o $@ \
