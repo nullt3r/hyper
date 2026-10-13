@@ -601,7 +601,7 @@ function footHTML(c,m,k){const last=k===c.msgs.length-1;
  if(m.vers&&m.vers.length>1){const i=m.vi||0;h+=`<span class="pager"><button onclick="ver(${k},-1)" aria-label="Previous answer"${i?'':' disabled'}>${IC.chl}</button>${i+1} / ${m.vers.length}`+
   `<button onclick="ver(${k},1)" aria-label="Next answer"${i<m.vers.length-1?'':' disabled'}>${IC.chr}</button></span>`}
  h+='</div>'+(m.stopped?'<span class="tag">Stopped</span>':'')+statHTML(m);return h+'</div>'}
-function aiInner(c,m,k,st){let h=thinkHTML(m,k,st)+toolHTML(m);
+function aiInner(c,m,k,st){let h=thinkHTML(m,k,st)+toolHTML(m,c,k);
  if(m.tool)h+=`<div class="tool"><div class="hd">${IC.tool}Tool call</div><pre>${esc(m.tool)}</pre></div>`;
  h+=`<div class="md${st&&m.phase==='write'?' streaming':''}">${md(st&&gen?m.content.slice(0,gen.sc):(m.content||''),st)}</div>`;
  if(st)h+='<div class="livebar"></div>';
@@ -883,16 +883,30 @@ function toolPrompt(day){const n=MCP.tools.map(t=>t.function.name);
  return `You have web access through tools (${n.join(', ')}): search the web for anything recent, for facts you are not sure about and when the user asks about a site or a page; then read the most relevant results. Open only URLs that appeared in search results or on pages you read: never construct or guess links. Cite the pages you used as markdown links. Today is ${day}.`+
   (n.includes('browser_open')?' To use a site the way a person does (its own search, filters, forms, buttons, moving through pages), open it with browser_open and act on the numbered elements with browser_click, browser_type and browser_select (browser_find locates things on a long page); the browser stays open between calls.':'')}
 // (labels of the interactive browser's tool calls: running, done, detail)
-const BROWSER={browser_open:a=>['Opening','Opened',hostOf(a.url)],browser_click:a=>['Clicking','Clicked',a.element!=null?'['+a.element+']':''],
- browser_type:a=>['Typing','Typed',a.text?'“'+String(a.text).slice(0,40)+'”':''],browser_select:a=>['Selecting','Selected',a.option||''],
+// (an element is shown by its text: lab(n) finds it in the page the browser showed last before the call)
+const qt=t=>'“'+String(t).slice(0,48)+(String(t).length>48?'…':'')+'”';
+const BROWSER={browser_open:a=>['Opening','Opened',hostOf(a.url)],browser_click:(a,lab)=>['Clicking','Clicked',lab(a.element)||(a.element!=null?'['+a.element+']':'')],
+ browser_type:(a,lab)=>{const t=lab(a.element);return ['Typing','Typed',(a.text?qt(a.text):'')+(t?' into '+t:'')]},
+ browser_select:(a,lab)=>{const t=lab(a.element);return ['Selecting','Selected',(a.option?qt(a.option):'')+(t?' in '+t:'')]},
  browser_scroll:a=>['Scrolling','Scrolled',a.direction||'down'],browser_back:()=>['Going back','Went back',''],browser_read:()=>['Reading','Read','the page'],
  browser_find:a=>['Finding','Found',a.text?'“'+String(a.text).slice(0,40)+'”':'']};
 function hostOf(u){try{return new URL(u).hostname.replace(/^www\./,'')}catch(e){return u||''}}
-function toolHTML(m){if(!m.calls||!m.calls.length)return'';
+// the text of element [n] as the browser showed it last before call x: the action's own result says what it acted on, else
+// the latest page text that numbers it (the numbers change with every page)
+function elText(c,k,x,n){if(n==null||!c)return '';n=parseInt(n);if(!(n>0))return '';
+ const own=x.result!=null&&new RegExp('^(?:Clicked|Typed into|Selected in) \\['+n+'\\] (.+)$','m').exec(x.result);
+ const cut=t=>{t=t.replace(/\s+/g,' ').trim();return t.length>60?t.slice(0,57)+'…':t};if(own)return cut(own[1]);
+ const re=new RegExp('\\['+n+' ([^\\]\\n]*)\\] ?([^\\n\\[]*)');
+ for(let i=k;i>=0;--i){const cs=(c.msgs[i]||{}).calls||[];for(let j=i===k?cs.indexOf(x)-1:cs.length-1;j>=0;--j){const y=cs[j];
+  if(y.result==null||!BROWSER[(MCP.map[y.name]||{}).name||y.name])continue;const mt=re.exec(y.result);if(!mt)continue;
+  if(/^(input|textarea|select)/.test(mt[1])){const ph=/"([^"]+)"/.exec(mt[1]);return cut(ph?ph[1]:mt[1].split(' ')[0])}
+  return cut(mt[2]||mt[1].replace(/^[a-z]+ ?(-> )?/,''))}}
+ return ''}
+function toolHTML(m,c,k){if(!m.calls||!m.calls.length)return'';
  return '<div class="tcs">'+m.calls.map(x=>{let a={};try{a=JSON.parse(x.args||'{}')}catch(e){}
   const t=(MCP.map[x.name]||{}).name||x.name,done=x.result!=null,run=x.state==='run',py=t==='run_python'&&!MCP.map[x.name];
   const w=t==='web_search'?['Searching','Searched',a.query?'“'+a.query+'”':'']:t==='fetch_url'?['Reading','Read',hostOf(a.url)]:py?[x.status||'Running Python','Ran Python','']:
-   BROWSER[t]?BROWSER[t](a):['Running','Ran',t||'tool'];
+   BROWSER[t]?BROWSER[t](a,n=>elText(c,k,x,n)):['Running','Ran',t||'tool'];
   const lbl=done?`${w[1]}${w[2]?` <b>${esc(w[2])}</b>`:''}`:`<span class="shimmer">${esc(w[0])}${w[2]?' '+esc(w[2]):''}${run?'…':''}</span>`;
   let body='',more='';
   if(py){const code=typeof a.code==='string'?a.code.replace(/^\s*\n|\s+$/g,''):'';
@@ -948,7 +962,7 @@ function updLast(){if(!gen||conv()!==gen.c)return;const g=gen,c=g.c,k=c.msgs.len
    if(tb.firstChild&&tb._n!=null&&tb._n<g.sr)tb.firstChild.appendData(m.reasoning.slice(tb._n,g.sr));else tb.textContent=m.reasoning.slice(0,g.sr);tb._n=g.sr;if(keep)tb.scrollTop=tb.scrollHeight}
   const d=el.querySelector('.md');if(d&&d._n!==g.sc){d.innerHTML=md(m.content.slice(0,g.sc),true);fadeTail(d);d._n=g.sc}
   const tp=el.querySelector('.tool pre');if(tp&&tp.textContent!==m.tool)tp.textContent=m.tool;
-  const tw=el.querySelector('.tcs');if(tw){const h=toolHTML(m);if(el._th!==h){tw.outerHTML=h;el._th=h;mountMedia(el)}}}
+  const tw=el.querySelector('.tcs');if(tw){const h=toolHTML(m,c,k);if(el._th!==h){tw.outerHTML=h;el._th=h;mountMedia(el)}}}
  fillLive(el.querySelector('.livebar'),m);peek(el);if(stick)toBottom()}
 async function pollPrompt(a){try{const s=await (await fetch('/stats',{cache:'no-store'})).json();if(a.phase!=='prompt')return;
  if(s.phase!=='idle')a.pp={done:s.prompt_done,total:s.prompt_total,cached:s.cached}}catch(e){}}

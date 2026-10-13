@@ -394,6 +394,12 @@ _REFIND = """((d) => { const sq = t => (t || '').replace(/\\s+/g, ' ').trim(); l
  if (best && bs >= 3) { best.setAttribute('data-hid', d.n); return true } return false })(%s)"""
 
 
+def _what(element) -> str:   # (the element as the last page showed it: what an action says it acted on)
+    d = _S.get("els", {}).get(int(element)) or {}
+    t = d.get("label") or d.get("ph") or d.get("aria") or d.get("name") or d.get("href") or d.get("tag") or "?"
+    return " ".join(str(t).split())[:100]
+
+
 def _missing(sb, element) -> str:
     return _page(sb, f"There is no element [{element}] on the page now (numbers change with every page). The current page:")
 
@@ -410,6 +416,7 @@ def _b_click(element):
     sel = _el(sb, element)
     if not sel:
         return _missing(sb, element)
+    what = f"Clicked [{element}] {_what(element)}"
     sb.cdp.evaluate(f"(() => {{ const a = document.querySelector('{sel}').closest('a'); if (a) a.removeAttribute('target') }})()")   # (stay in this tab)
     tabs = len(sb.cdp.get_tabs())
     try:
@@ -423,7 +430,7 @@ def _b_click(element):
     if len(sb.cdp.get_tabs()) > tabs:   # (a new window after all: continue there)
         sb.cdp.switch_to_newest_tab()
         _settle(sb, 0.5)
-    return _page(sb)
+    return _page(sb, what)
 
 
 def _b_type(element, text, submit):
@@ -431,6 +438,7 @@ def _b_type(element, text, submit):
     sel = _el(sb, element)
     if not sel:
         return _missing(sb, element)
+    what = f"Typed into [{element}] {_what(element)}"
     try:
         sb.cdp.type(sel, text, timeout=3)   # (replaces the old content)
         if submit:
@@ -444,7 +452,7 @@ def _b_type(element, text, submit):
         _settle(sb)
     else:
         sb.sleep(0.4)
-    return _page(sb)
+    return _page(sb, what)
 
 
 # (the native value setter, so that frameworks such as React see the change; submitting: the form, or Enter on the field)
@@ -460,9 +468,10 @@ def _b_select(element, option):
     sel = _el(sb, element)
     if not sel:
         return _missing(sb, element)
+    what = f"Selected in [{element}] {_what(element)}"
     sb.cdp.select_option_by_text(sel, option)
     _settle(sb, 0.6)
-    return _page(sb)
+    return _page(sb, what)
 
 
 def _b_scroll(direction):
