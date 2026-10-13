@@ -53,6 +53,10 @@ $(BUILD)/arbench: tools/arbench.cu $(BUILD)/kernels.o
 $(BUILD)/qsabench: tools/qsabench.cu $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/kernels5.o $(BUILD)/gguf.o
 	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/qsabench.cu $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/kernels5.o $(BUILD)/gguf.o -o $@ $(LIBS)
 
+# Gated DeltaNet prefill step, random inputs (hashes of output and state)
+$(BUILD)/gdnbench: tools/gdnbench.cu $(BUILD)/kernels.o
+	$(NVCC) $(NVFLAGS) tools/gdnbench.cu $(BUILD)/kernels.o -o $@ $(LIBS)
+
 # MoE routing kernel
 $(BUILD)/routebench: $(OBJ4) tools/routebench.cu
 	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/routebench.cu $(OBJ4) -o $@ \

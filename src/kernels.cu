@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <mutex>
+#include <map>
 
 namespace hyper {
 
@@ -1049,10 +1051,38 @@ __global__ void k_gdn_step(const float * __restrict__ in, int stride, int ab_off
 
 // warp per value column j of head h, the column S[:, j] (dk = 128) in registers (4 per lane): every reduction is a warp
 // shuffle, so tokens advance without block barriers; grid (n_v, dv / 8), 8 warps. Same arithmetic as k_gdn_step.
+// per token, once (k_gdn_step_w's warps of a head all computed them): the q / k scales of every k head and decay / beta of every
+// v head, with k_gdn_step_w's expressions and lane mapping (the xor-butterfly sums are the same in every lane), so the step
+// gets the same values bit for bit. pre[t] = [qs n_k | ks n_k | decay n_v | beta n_v]
+__global__ void __launch_bounds__(256) k_gdn_prep(const float * __restrict__ in, int stride, int ab_off, const float * __restrict__ dt_bias,
+                                                  const float * __restrict__ ssm_a, int n_k, int n_v, int dk, float eps,
+                                                  float * __restrict__ pre) {
+    const int t = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    const float * row = in + (size_t) t * stride;
+    float * pt = pre + (size_t) t * 2 * (n_k + n_v);
+    for (int hk = w; hk < n_k; hk += nw) {
+        const float4 q4 = *(const float4 *) (row + (size_t) hk * dk + lane * 4);
+        const float4 k4 = *(const float4 *) (row + (size_t) n_k * dk + (size_t) hk * dk + lane * 4);
+        const float q[4] = {q4.x, q4.y, q4.z, q4.w}, k[4] = {k4.x, k4.y, k4.z, k4.w};
+        float qq = 0.0f, kk = 0.0f;
+#pragma unroll
+        for (int ii = 0; ii < 4; ++ii) { qq += q[ii] * q[ii]; kk += k[ii] * k[ii]; }
+        qq = warp_sum(qq); kk = warp_sum(kk);
+        if (lane == 0) { pt[hk] = rsqrtf(qq + eps); pt[n_k + hk] = rsqrtf(kk + eps); }
+    }
+    for (int h = threadIdx.x; h < n_v; h += blockDim.x) {
+        const float dtb = dt_bias[h], sa = ssm_a[h];
+        const float g = softplusf(row[ab_off + h] + dtb) * sa;
+        pt[2 * n_k + h] = expf(g);
+        pt[2 * n_k + n_v + h] = sigmoidf(row[ab_off + n_v + h]);
+    }
+}
+
+template <bool PRE>
 __global__ void __launch_bounds__(256) k_gdn_step_w(const float * __restrict__ in, int stride, int ab_off, float * __restrict__ state,
                                                     float * __restrict__ snap, float * __restrict__ o, int o_stride,
                                                     const float * __restrict__ dt_bias, const float * __restrict__ ssm_a,
-                                                    int n_k, int n_v, int dk, int dv, float eps, int nt) {
+                                                    int n_k, int n_v, int dk, int dv, float eps, int nt, const float * __restrict__ pre) {
     const int h = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const int j = blockIdx.y * 8 + w;
     const int hk = h % n_k;
@@ -1067,14 +1097,23 @@ __global__ void __launch_bounds__(256) k_gdn_step_w(const float * __restrict__ i
         const float4 q4 = *(const float4 *) (row + (size_t) hk * dk + lane * 4);
         const float4 k4 = *(const float4 *) (row + (size_t) n_k * dk + (size_t) hk * dk + lane * 4);
         const float q[4] = {q4.x, q4.y, q4.z, q4.w}, k[4] = {k4.x, k4.y, k4.z, k4.w};
-        float qq = 0.0f, kk = 0.0f, part = 0.0f;
+        float qs, ks, decay, beta, part = 0.0f;
+        if (PRE) {
 #pragma unroll
-        for (int ii = 0; ii < 4; ++ii) { qq += q[ii] * q[ii]; kk += k[ii] * k[ii]; part += s[ii] * k[ii]; }
-        qq = warp_sum(qq); kk = warp_sum(kk); part = warp_sum(part);
-        const float qs = rsqrtf(qq + eps), ks = rsqrtf(kk + eps);
-        const float g = softplusf(row[ab_off + h] + dtb) * sa;
-        const float decay = expf(g);
-        const float beta = sigmoidf(row[ab_off + n_v + h]);
+            for (int ii = 0; ii < 4; ++ii) part += s[ii] * k[ii];
+            part = warp_sum(part);
+            const float * pt = pre + (size_t) t * 2 * (n_k + n_v);
+            qs = pt[hk]; ks = pt[n_k + hk]; decay = pt[2 * n_k + h]; beta = pt[2 * n_k + n_v + h];
+        } else {
+            float qq = 0.0f, kk = 0.0f;
+#pragma unroll
+            for (int ii = 0; ii < 4; ++ii) { qq += q[ii] * q[ii]; kk += k[ii] * k[ii]; part += s[ii] * k[ii]; }
+            qq = warp_sum(qq); kk = warp_sum(kk); part = warp_sum(part);
+            qs = rsqrtf(qq + eps); ks = rsqrtf(kk + eps);
+            const float g = softplusf(row[ab_off + h] + dtb) * sa;
+            decay = expf(g);
+            beta = sigmoidf(row[ab_off + n_v + h]);
+        }
         const float kv = part * ks * decay;
         const float delta = (row[(size_t) 2 * n_k * dk + (size_t) h * dv + j] - kv) * beta;
         float out = 0.0f;
@@ -1947,14 +1986,37 @@ void gdn_conv(float * in, int stride, float * conv_state, float * conv_snap, con
     }
     k_gdn_conv<<<(channels + 255) / 256, 256, 0, s>>>(in, stride, conv_state, conv_snap, conv_w, channels, K, nt);
 }
+// per-device scratch for k_gdn_prep (grown on demand; prefill chunks only, never inside a captured graph)
+static float * gdn_pre_scratch(size_t floats) {
+    static std::mutex mu;
+    static std::map<int, std::pair<float *, size_t>> bufs;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return nullptr;
+    std::lock_guard<std::mutex> lk(mu);
+    auto & b = bufs[dev];
+    if (b.second < floats) {
+        if (b.first) cudaFree(b.first);
+        b.first = nullptr; b.second = 0;
+        if (cudaMalloc(&b.first, floats * sizeof(float)) != cudaSuccess) { b.first = nullptr; return nullptr; }
+        b.second = floats;
+    }
+    return b.first;
+}
 void gdn_step(const float * in, int stride, int ab_off, float * state, float * state_snap, float * o, int o_stride,
               const float * dt_bias, const float * ssm_a, int n_k, int n_v, int dk, int dv, float eps, int nt,
               cudaStream_t s) {
     if (dk != 128 || dv % 32) throw std::runtime_error("gdn_step: expects dk = 128");
-    if (dk == 128 && dv % 8 == 0 && nt > 8 && !getenv("HYPER_GDN_OLD"))   // many tokens: warp per column
-        k_gdn_step_w<<<dim3(n_v, dv / 8), 256, 0, s>>>(in, stride, ab_off, state, state_snap, o, o_stride, dt_bias, ssm_a,
-                                                       n_k, n_v, dk, dv, eps, nt);
-    else
+    if (dk == 128 && dv % 8 == 0 && nt > 8 && !getenv("HYPER_GDN_OLD")) {   // many tokens: warp per column
+        static const bool nopre = getenv("HYPER_GDN_NOPRE") != nullptr;   // (every warp computes the per-token scales itself)
+        float * pre = nopre ? nullptr : gdn_pre_scratch((size_t) nt * 2 * (n_k + n_v));
+        if (pre) {
+            k_gdn_prep<<<nt, 256, 0, s>>>(in, stride, ab_off, dt_bias, ssm_a, n_k, n_v, dk, eps, pre);
+            k_gdn_step_w<true><<<dim3(n_v, dv / 8), 256, 0, s>>>(in, stride, ab_off, state, state_snap, o, o_stride, dt_bias, ssm_a,
+                                                                 n_k, n_v, dk, dv, eps, nt, pre);
+        } else
+            k_gdn_step_w<false><<<dim3(n_v, dv / 8), 256, 0, s>>>(in, stride, ab_off, state, state_snap, o, o_stride, dt_bias, ssm_a,
+                                                                  n_k, n_v, dk, dv, eps, nt, nullptr);
+    } else
         k_gdn_step<16><<<dim3(n_v, dv / 32), 256, 0, s>>>(in, stride, ab_off, state, state_snap, o, o_stride, dt_bias, ssm_a,
                                                           n_k, n_v, dk, dv, eps, nt);
 }

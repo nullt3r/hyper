@@ -557,3 +557,17 @@ Pořadí výpočtu se nemění.
 Výstupy 9/9 shodné ve všech třech během. Od začátku dne (staré kernely + celý upload): 860 → 1460 t/s (+70 %) a 2584 → 1522 ms
 na požadavek. GLM streamuje stejně, ale jeho prefill je čistě omezený PCIe (upload ~35 ms na vrstvu), takže pořadí ve frontě
 tam pomůže méně.
+
+### GDN krok v prefillu: škály tokenu jednou, ne v každém warpu
+
+`k_gdn_step_w` (warp na sloupec stavu, 8 warpů na blok, 128 sloupců na hlavu) počítal pro každý token v každém warpu znovu normy
+q/k (dva warp_sumy), softplus/exp decay a sigmoid beta. Ty jsou pro všechny warpy hlavy stejné. XOR motýlek dává ve všech lanech
+bitově stejný součet (každý pár sčítá stejné dva operandy), takže je jde předpočítat. `k_gdn_prep` je spočítá jednou na token
+a hlavu stejnými výrazy (scratch na zařízení, `gdn_pre_scratch`), krok je jen načte. `HYPER_GDN_NOPRE=1` = staré.
+
+- `tools/gdnbench`: 2048 tokenů, 5–6 k-hlav / 16 v-hlav (podíl jedné GPU): **3,04 → 1,80 ms**, hash výstupu i stavu shodný
+  (i pro 300 a 512 tokenů). Explicitní předčítání dalšího tokenu bylo pomalejší (1,91 ms).
+- Flash-Next hloubkový scénář: prefill 1462 → **1490 t/s**, 9/9 shodných výstupů. 27B replay: prefill 1130 → **1154 t/s**,
+  20/20 shodných (i s předchozím během).
+- Allreduce prefillu se stahováním dílů peerů na vlastním streamu (souběžně s vlastním D2H): 1461 → 1469 t/s, v šumu. Allreduce
+  čeká hlavně na nejpomalejší GPU, ne na pořadí kopií. Nezařazeno.
