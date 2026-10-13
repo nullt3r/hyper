@@ -717,7 +717,17 @@ std::string part_text(const ojson & c) {   // string, or an array of content par
 }
 
 // Responses request -> chat completions body; custom (freeform) tools become functions with one string argument "input"
-ojson responses_to_chat(const ojson & body, std::set<std::string> & custom_tools) {
+// Responses tools as chat functions. A namespace (Codex: one per MCP server, e.g. mcp__windows_vm) becomes its functions under
+// "<namespace>__<name>", its description goes into the system message; a call of such a function goes back with the
+// namespace and the plain name (Codex resolves calls by both)
+struct RespTools {
+    std::set<std::string> custom;                                       // freeform tools (flat names): one string argument "input"
+    std::map<std::string, std::pair<std::string, std::string>> ns;     // flat name -> (namespace, name)
+};
+std::string jstr(const ojson & j, const char * k) { return j.contains(k) && j[k].is_string() ? j[k].get<std::string>() : std::string(); }
+std::string flat_name(const ojson & it) { const std::string ns = jstr(it, "namespace"), n = jstr(it, "name"); return ns.empty() ? n : ns + "__" + n; }
+
+ojson responses_to_chat(const ojson & body, RespTools & rt) {
     ojson chat = ojson::object();
     std::string sys = body.contains("instructions") && body["instructions"].is_string() ? body["instructions"].get<std::string>() : "";
     ojson msgs = ojson::array();
@@ -771,9 +781,9 @@ ojson responses_to_chat(const ojson & body, std::set<std::string> & custom_tools
                 if (t.empty() && it.contains("summary")) t = part_text(it["summary"]);
                 pending_reasoning += t;
             } else if (type == "function_call") {
-                add_call(it.value("call_id", ""), it.value("name", ""), valid_args(it.value("arguments", "{}"), "responses history"));
+                add_call(it.value("call_id", ""), flat_name(it), valid_args(it.value("arguments", "{}"), "responses history"));
             } else if (type == "custom_tool_call") {
-                add_call(it.value("call_id", ""), it.value("name", ""), ojson({{"input", it.value("input", "")}}).dump());
+                add_call(it.value("call_id", ""), flat_name(it), ojson({{"input", it.value("input", "")}}).dump());
             } else if (type == "function_call_output" || type == "custom_tool_call_output") {
                 if (!msgs.empty() && msgs.back()["role"] == "assistant") msgs.back()["closed"] = true;
                 if (g_vision && it.contains("output") && it["output"].is_array()) {   // (a tool's output with images, e.g. a screenshot)
@@ -800,24 +810,38 @@ ojson responses_to_chat(const ojson & body, std::set<std::string> & custom_tools
     if (!sys.empty()) msgs.insert(msgs.begin(), ojson({{"role", "system"}, {"content", sys}}));
     chat["messages"] = msgs;
     ojson tools = ojson::array();
+    std::string groups;   // (the namespaces' descriptions)
+    auto add_tool = [&](const ojson & t, const std::string & ns) {
+        const std::string type = jstr(t, "type"), name = jstr(t, "name"), flat = ns.empty() ? name : ns + "__" + name;
+        if (!ns.empty() && (type == "function" || type == "custom")) rt.ns[flat] = {ns, name};
+        if (type == "function") {
+            ojson fn = {{"name", flat}, {"description", jstr(t, "description")}};
+            fn["parameters"] = t.contains("parameters") && t["parameters"].is_object() ? t["parameters"] : ojson({{"type", "object"}, {"properties", ojson::object()}});
+            tools.push_back({{"type", "function"}, {"function", fn}});
+        } else if (type == "custom") {
+            rt.custom.insert(flat);
+            std::string desc = jstr(t, "description");
+            if (t.contains("format") && t["format"].is_object() && t["format"].contains("definition"))
+                desc += "\n\nThe input must follow this grammar:\n" + t["format"].value("definition", "");
+            tools.push_back({{"type", "function"}, {"function", {{"name", flat}, {"description", desc},
+                {"parameters", {{"type", "object"}, {"properties", {{"input", {{"type", "string"}, {"description", "the raw tool input"}}}}},
+                                {"required", ojson::array({"input"})}}}}}});
+        }
+    };
     if (body.contains("tools") && body["tools"].is_array())
         for (const auto & t : body["tools"]) {
-            const std::string type = t.value("type", "");
-            if (type == "function") {
-                ojson fn = {{"name", t.value("name", "")}, {"description", t.value("description", "")}};
-                fn["parameters"] = t.contains("parameters") && t["parameters"].is_object() ? t["parameters"] : ojson({{"type", "object"}, {"properties", ojson::object()}});
-                tools.push_back({{"type", "function"}, {"function", fn}});
-            } else if (type == "custom") {
-                const std::string name = t.value("name", "");
-                custom_tools.insert(name);
-                std::string desc = t.value("description", "");
-                if (t.contains("format") && t["format"].is_object() && t["format"].contains("definition"))
-                    desc += "\n\nThe input must follow this grammar:\n" + t["format"].value("definition", "");
-                tools.push_back({{"type", "function"}, {"function", {{"name", name}, {"description", desc},
-                    {"parameters", {{"type", "object"}, {"properties", {{"input", {{"type", "string"}, {"description", "the raw tool input"}}}}},
-                                    {"required", ojson::array({"input"})}}}}}});
-            }
+            if (jstr(t, "type") == "namespace" && t.contains("tools") && t["tools"].is_array()) {
+                const std::string ns = jstr(t, "name"), desc = jstr(t, "description");
+                if (!desc.empty()) groups += "\n\n## Tools " + ns + "__*\n" + desc;
+                for (const auto & x : t["tools"]) add_tool(x, ns);
+            } else add_tool(t, "");
         }
+    if (!groups.empty()) {   // (what the namespaces say about their tools: how to use them)
+        ojson & m = chat["messages"];
+        const std::string g = "# Tool groups" + groups;
+        if (!m.empty() && m[0]["role"] == "system") m[0]["content"] = m[0]["content"].get<std::string>() + "\n\n" + g;
+        else m.insert(m.begin(), ojson({{"role", "system"}, {"content", g}}));
+    }
     if (!tools.empty()) chat["tools"] = tools;
     if (body.contains("tool_choice") && body["tool_choice"].is_string()) chat["tool_choice"] = body["tool_choice"];
     if (body.contains("parallel_tool_calls")) chat["parallel_tool_calls"] = body["parallel_tool_calls"];
@@ -834,15 +858,20 @@ ojson resp_usage(const Request & r, const GenOut & o) {
             {"output_tokens", o.n_gen}, {"output_tokens_details", {{"reasoning_tokens", 0}}},
             {"total_tokens", (int) r.prompt.size() + o.n_gen}};
 }
-ojson tool_call_item(const common_chat_tool_call & t, const std::string & item_id, const std::set<std::string> & custom, bool done) {
-    if (custom.count(t.name)) {
+ojson tool_call_item(const common_chat_tool_call & t, const std::string & item_id, const RespTools & rt, bool done) {
+    const auto ns = rt.ns.find(t.name);   // (a namespaced tool: its namespace and plain name)
+    ojson it;
+    if (rt.custom.count(t.name)) {
         std::string input = t.arguments;
         try { const ojson a = ojson::parse(t.arguments); if (a.contains("input") && a["input"].is_string()) input = a["input"].get<std::string>(); } catch (...) {}
-        return {{"type", "custom_tool_call"}, {"id", item_id}, {"call_id", t.id}, {"name", t.name}, {"input", done ? input : ""},
-                {"status", done ? "completed" : "in_progress"}};
+        it = {{"type", "custom_tool_call"}, {"id", item_id}, {"call_id", t.id}, {"name", t.name}, {"input", done ? input : ""},
+              {"status", done ? "completed" : "in_progress"}};
+    } else {
+        it = {{"type", "function_call"}, {"id", item_id}, {"call_id", t.id}, {"name", t.name},
+              {"arguments", done ? valid_args(t.arguments, "responses output") : ""}, {"status", done ? "completed" : "in_progress"}};
     }
-    return {{"type", "function_call"}, {"id", item_id}, {"call_id", t.id}, {"name", t.name},
-            {"arguments", done ? valid_args(t.arguments, "responses output") : ""}, {"status", done ? "completed" : "in_progress"}};
+    if (ns != rt.ns.end()) { it["name"] = ns->second.second; it["namespace"] = ns->second.first; }
+    return it;
 }
 ojson reasoning_item(const std::string & id, const std::string & text) {
     return {{"type", "reasoning"}, {"id", id}, {"summary", ojson::array({ojson({{"type", "summary_text"}, {"text", text}})})},
@@ -1201,7 +1230,7 @@ int main(int argc, char ** argv) {
             res.set_content(ojson({{"error", {{"message", msg}, {"type", code == 400 ? "invalid_request_error" : "server_error"}}}}).dump(), "application/json");
         };
         std::shared_ptr<Request> r;
-        auto custom = std::make_shared<std::set<std::string>>();
+        auto custom = std::make_shared<RespTools>();
         ojson rbody;
         try {
             rbody = ojson::parse(req.body);
@@ -1356,7 +1385,7 @@ int main(int argc, char ** argv) {
                             send("response.output_item.added", {{"output_index", out_index},
                                                                 {"item", tool_call_item(msg.tool_calls[open_tool], item_id, *custom, false)}});
                         }
-                        if (!d.tool_call_delta.arguments.empty() && !custom->count(msg.tool_calls[open_tool].name))
+                        if (!d.tool_call_delta.arguments.empty() && !custom->custom.count(msg.tool_calls[open_tool].name))
                             if (!send("response.function_call_arguments.delta", {{"item_id", item_id}, {"output_index", out_index},
                                                                                   {"delta", d.tool_call_delta.arguments}})) return false;
                     }
