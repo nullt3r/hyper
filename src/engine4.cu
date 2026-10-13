@@ -1936,13 +1936,6 @@ void Engine4::embed(const int * tokens, int nt, int pos, int chunk) {
 
 // M-RoPE positions of cells [s, P) (the prompt's: images' grid positions; text: the index) and of every cell after it (text
 // generation goes on from md->next), on every device before the prompt's forwards
-__global__ void k_rpos_fill(int * rp, int from, int to, int delta) {
-    const int c = from + blockIdx.x * blockDim.x + threadIdx.x;
-    if (c < to) { rp[3 * (size_t) c] = c + delta; rp[3 * (size_t) c + 1] = c + delta; rp[3 * (size_t) c + 2] = c + delta; }
-}
-void Engine4::rpos_fill(int * rp, int from, int to, int delta, cudaStream_t s) {
-    if (to > from) k_rpos_fill<<<(to - from + 255) / 256, 256, 0, s>>>(rp, from, to, delta);
-}
 bool Engine4::has_rpos() const { return !devs_.empty() && devs_[0]->rpos; }
 void Engine4::set_rpos(int s, int P, const PromptMedia * md) {
     for (auto & dp : devs_) {

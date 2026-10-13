@@ -484,3 +484,15 @@ Cena encoderu (replay 20 požadavků Codexu, greedy, 262k):
   jiným procesem) jsou výstupy 20/20 shodné a rychlost stejná: 176,8 / 176,8 t/s.
 - Encoder na CPU (`HYPER_MMPROJ_CPU=1`) má rozmístění 122, 20/20 shodné a 187,3 vs. 186,8 t/s.
 - První běh s encoderem (168,3 t/s) byl zkreslený, šlo o první běh po zastavení jiného serveru.
+
+Qwen3.8-27B (engine.cu) má totéž: unsloth `mmproj-F16.gguf` pro 27B (projektor `qwen3vl_merger`, výstup 5120), tabulku
+pozic na všech třech GPU (tensor parallel, `attn_prep`), obrazové řádky i pro MTP, klíče v prompt cache a park span.
+Kernel na plnění tabulky (`rpos_fill`) je teď sdílený v kernels.cu.
+
+| 27B | Výsledek |
+|---|---|
+| replay 20 požadavků Codexu, greedy, tabulka vs. `HYPER_NO_MROPE=1` | 20/20 shodných, 125,1 / 125,4 t/s, prefill 1118 / 1126 |
+| 4 obrazové testy vs. mainline (greedy) | 3× text úplně shodný, 1× rozchod po 68 znacích |
+
+Produkční skripty: `VISION=0 ~/run-hyper-fn.sh` (`~/run-hyper.sh`) spustí server bez encoderu, takže GPU 0 zase drží
+všechny experty.

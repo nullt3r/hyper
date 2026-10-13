@@ -93,6 +93,8 @@ void rmsnorm(const float * x, int xs, const float * w, float * y, int ys, int n,
 void attn_prep(float * qkv, int stride, const float * qnorm, const float * knorm, half * kcache, half * vcache,
                const int * pos, int max_pos, int n_head, int n_kv, int hd, int n_rot, float rope_base, float eps,
                int nt, cudaStream_t s, const int * rp = nullptr, int rsec = 0);
+// M-RoPE positions: cells [from, to) of rp [cells][3] get (c + delta) three times (text continuing after delta's shift)
+void rpos_fill(int * rp, int from, int to, int delta, cudaStream_t s);
 #ifdef __CUDACC__
 // the position by which frequency pair fi of cache cell `cell` turns. Interleaved M-RoPE (Qwen3-VL; images: a cell has
 // a t, h and w position) reads one of them from rp [cells][3] by the pair's section (rsec = s0 | s1 << 8 | s2 << 16);

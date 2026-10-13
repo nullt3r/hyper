@@ -1888,6 +1888,13 @@ void attn_prep(float * qkv, int stride, const float * qnorm, const float * knorm
     k_attn_prep<<<dim3(n_head + n_kv, nt), hd, 0, s>>>(qkv, stride, qnorm, knorm, kcache, vcache, pos, max_pos, n_head, n_kv,
                                                        hd, n_rot, rope_base, eps, rp, rsec);
 }
+__global__ void k_rpos_fill(int * rp, int from, int to, int delta) {
+    const int c = from + blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < to) { rp[3 * (size_t) c] = c + delta; rp[3 * (size_t) c + 1] = c + delta; rp[3 * (size_t) c + 2] = c + delta; }
+}
+void rpos_fill(int * rp, int from, int to, int delta, cudaStream_t s) {
+    if (to > from) k_rpos_fill<<<(to - from + 255) / 256, 256, 0, s>>>(rp, from, to, delta);
+}
 void attn_decode(const float * qkv, int stride, const half * kcache, const half * vcache, float * out, int out_stride,
                  const int * pos, int max_pos, int n_head, int n_kv, int head_off, int group, int kv_off, int hd,
                  float scale, int nt, cudaStream_t s) {

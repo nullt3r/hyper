@@ -107,7 +107,6 @@ private:
     void embed_tok(const int * tokens, int nt, float * dst);
     void image_rows(int pos, int nt, float * dst);   // image positions of [pos, pos + nt): the encoder's rows
     int rpos_cells() const { return opt_.max_pos + 4 * MAX_NT + 8; }
-    static void rpos_fill(int * rp, int from, int to, int delta, cudaStream_t s);
     void set_rpos(int s, int P, const PromptMedia * md);
     void run(int kind, int nt);   // 0 main, 1 MTP, 2 MTP chain, 3 restore (nt = rows kept)
     int mtp_result();

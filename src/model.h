@@ -16,6 +16,7 @@ struct Qwen35Config {
     int head_dim = 0;         // 256
     int n_rot = 0;            // rotary dims (partial rotary)
     float rope_base = 0;
+    int rope_sec = 0;         // interleaved M-RoPE sections s0 | s1 << 8 | s2 << 16 (images; 0: plain rope)
     float rms_eps = 0;
     int full_attn_interval = 0;
     // gated delta net

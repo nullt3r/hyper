@@ -224,10 +224,12 @@ Endpoints:
 | `/v1/models`, `/health`, `/stats`, `/props` | model list, health, statistics JSON, sampling defaults |
 | `/v1/mcp`, `/mcp/<name>` | the configured MCP servers and a proxy to them (streamable HTTP), for the chat page |
 
-Images (Qwen3.8-Flash-Next with `--mmproj`): the encoder's rows replace the image token's at an image's positions. Those positions
+Images (Qwen3.8-Flash-Next and Qwen3.8-27B with `--mmproj`, each with its own encoder): the encoder's rows replace the image token's at an image's positions. Those positions
 carry interleaved M-RoPE coordinates (t, h, w), kept per cache cell on every GPU. A text cell's three coordinates are its index,
 so text output stays bit-identical. The prompt cache tells images apart by a hash of their content, and an encoded image is
 reused while it is cached. The chat page sends attached images to such a model, at most 1536 px on the long side.
+Without `--mmproj` the encoder is not loaded and its VRAM (~1 GB on GPU 0) stays with the model; text output is the same
+either way. The env switches `HYPER4_NO_MROPE=1` (Flash-Next) and `HYPER_NO_MROPE=1` (27B) turn off the position table too.
 
 Python in the chat: the model gets a `run_python` tool that the page runs in the browser, not on the server.
 - **Runtime:** Pyodide (CPython 3.14 in WebAssembly, with numpy, pandas, scipy, matplotlib, scikit-learn, sympy and more). Pure-Python packages such as python-docx or openpyxl install from PyPI on import.

@@ -17,6 +17,11 @@ Qwen35Config Qwen35Config::from_gguf(const GGUF & g) {
     c.head_dim = (int) g.get_int(a + "attention.key_length");
     c.n_rot = (int) g.get_int(a + "rope.dimension_count");
     c.rope_base = (float) g.get_float(a + "rope.freq_base");
+    if (g.has(a + "rope.dimension_sections")) {   // interleaved M-RoPE (images: t / h / w positions); text turns as plain rope
+        const auto sec = g.get_int_arr(a + "rope.dimension_sections");
+        if (sec.size() >= 3 && sec[0] + sec[1] + sec[2] > 0 && (sec.size() < 4 || sec[3] == 0))
+            c.rope_sec = (int) (sec[0] | sec[1] << 8 | sec[2] << 16);
+    }
     c.rms_eps = (float) g.get_float(a + "attention.layer_norm_rms_epsilon");
     c.full_attn_interval = (int) g.get_int(a + "full_attention_interval");
     c.ssm_conv = (int) g.get_int(a + "ssm.conv_kernel");

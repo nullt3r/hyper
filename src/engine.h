@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <random>
+#include <unordered_map>
 #include <vector>
 
 namespace hyper {
@@ -82,6 +83,9 @@ public:
     int max_pos() const override { return opt_.max_pos; }
     int n_draft() const override { return opt_.n_draft; }
     bool has_mtp() const override { return opt_.mtp; }
+    // images: a model with M-RoPE sections (Qwen3-VL style) takes them
+    bool set_media(const PromptMedia * m) override { if (m && !has_rpos()) return false; media_ = m; return true; }
+    bool has_rpos() const;
     // MTP drafts per step (<= MAX_NT - 1) and the run-probability floor (tests)
     void set_draft(int k, double pmin) { opt_.n_draft = std::max(1, std::min(k, MAX_NT - 1)); mtp_pmin_ = pmin; }
 
@@ -132,7 +136,12 @@ private:
     half * h_stage_ = nullptr;   // pinned bulk allreduce staging [micro-batch][parity][ndev][MAX_ROWS * n_embd]
     std::unique_ptr<Barrier> barrier_;
     float * h_topk_ = nullptr;   // pinned [ndev][MAX_NT][TOPK][2] sampling candidates
-    std::vector<int> hist_;      // tokens whose KV entries are valid (positions < size)
+    std::vector<int> hist_;      // tokens whose KV entries are valid (positions < size); image positions: the image's key
+    const PromptMedia * media_ = nullptr;           // images of the next generate()
+    std::unordered_map<int, const float *> mrows_;  // this prompt's image rows by position
+    void image_rows(int pos, int nt, float * dst);   // image positions of [pos, pos + nt): the encoder's rows
+    int rpos_cells() const;   // (the cells MTP drafts reach past max_pos included)
+    void set_rpos(int s, int P, const PromptMedia * md);
     std::vector<Snap> snaps_;
     std::vector<std::vector<float *>> snap_pool_;
     int snap_token_ = -1;

@@ -77,6 +77,7 @@ struct Engine::Device {
     float * attn_part = nullptr;   // split attention partials [2 micro-batches][attn_part_sz]
     size_t attn_part_sz = 0;
     int * pos = nullptr, * mpos = nullptr, * counter = nullptr;
+    int * rpos = nullptr;   // [cells][3]: M-RoPE positions (t, h, w) per cache cell (cfg_.rope_sec), see set_rpos
     size_t used = 0;
     std::vector<void *> allocs;
 
@@ -440,6 +441,10 @@ void Engine::load_weights() {
         dev.pos = dev.alloc<int>(1);
         dev.mpos = dev.alloc<int>(1);
         dev.counter = dev.alloc<int>(1);
+        if (c.rope_sec && !getenv("HYPER_NO_MROPE")) {   // (the switch: plain rope, text only)
+            dev.rpos = dev.alloc<int>((size_t) rpos_cells() * 3);
+            rpos_fill(dev.rpos, 0, rpos_cells(), 0, dev.stream);
+        }
         fprintf(stderr, "hyper: device %d holds %.2f GiB\n", dev.id, dev.used / 1073741824.0);
     }
     double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -524,7 +529,7 @@ void Engine::record_attn(Device & d, DevLayer & L, Act & a, int nt, int & call, 
     NormIn ni; ni.w = L.attn_norm; ni.ss = a.ss; ni.nss = nss; ni.eps = eps;
     mm(a, L.wqkv, a.x, n, a.big0, bs, nt, ni);
     attn_prep(a.big0, bs, L.q_norm, L.k_norm, L.kcache, L.vcache, a.pos, opt_.max_pos, L.n_head_l, L.n_kv_l, c.head_dim,
-              c.n_rot, c.rope_base, eps, nt, a.s);
+              c.n_rot, c.rope_base, eps, nt, a.s, d.rpos, c.rope_sec);
     if (dep.signal) CUDA_CHECK(cudaEventRecord(dep.signal, a.s));   // this micro-batch's K/V are in the cache
     if (dep.wait) CUDA_CHECK(cudaStreamWaitEvent(a.s, dep.wait, 0));
     const int ostride = L.n_head_l * c.head_dim;
@@ -749,6 +754,29 @@ void Engine::embed(const int * tokens, int nt, float * dst) {
     }
 }
 
+// an image's positions (this request's prompt): the vision encoder's rows instead of the image token's embedding
+void Engine::image_rows(int pos, int nt, float * dst) {
+    if (mrows_.empty()) return;
+    for (int t = 0; t < nt; ++t) {
+        const auto it = mrows_.find(pos + t);
+        if (it != mrows_.end()) memcpy(dst + (size_t) t * cfg_.n_embd, it->second, cfg_.n_embd * sizeof(float));
+    }
+}
+bool Engine::has_rpos() const { return !devs_.empty() && devs_[0]->rpos; }
+int Engine::rpos_cells() const { return opt_.max_pos + 4 * MAX_ROWS + 8; }
+// M-RoPE positions of cells [s, P) (the prompt's: images' grid positions; text: the index) and of every cell after it (text
+// generation goes on from md->next), on every device before the prompt's forwards
+void Engine::set_rpos(int s, int P, const PromptMedia * md) {
+    for (auto & dp : devs_) {
+        CUDA_CHECK(cudaSetDevice(dp->id));
+        if (md && P > s)
+            CUDA_CHECK(cudaMemcpyAsync(dp->rpos + 3 * (size_t) s, md->pos3.data() + 3 * (size_t) s, 3 * sizeof(int) * (size_t) (P - s),
+                                       cudaMemcpyHostToDevice, dp->stream));
+        rpos_fill(dp->rpos, md ? P : s, rpos_cells(), md ? md->next - P : 0, dp->stream);
+        CUDA_CHECK(cudaStreamSynchronize(dp->stream));   // (md's vectors are pageable and the caller's)
+    }
+}
+
 static int best_of(const float * res, int ndev, int t, int stride) {
     float best = -INFINITY; int bi = -1;
     for (int g = 0; g < ndev; ++g) {
@@ -763,6 +791,7 @@ std::vector<int> Engine::forward(const int * tokens, int nt, int pos) {
     if (pos + nt > opt_.max_pos) throw std::runtime_error("forward: position exceeds max_pos");
     if (nt < 1 || nt > MAX_ROWS) throw std::runtime_error("forward: bad token count");
     embed(tokens, nt, h_embd_);
+    image_rows(pos, nt, h_embd_);
     h_pos_[0] = pos;
     h_pos_[2] = pos + (nt / 2 + 63) / 64 * 64;   // second prefill micro-batch
     launch(0, nt);
@@ -775,6 +804,7 @@ std::vector<int> Engine::forward(const int * tokens, int nt, int pos) {
 int Engine::mtp_draft(const int * tokens, int nt, int pos) {
     if (nt < 1 || nt > MAX_ROWS) throw std::runtime_error("mtp_draft: bad token count");
     embed(tokens, nt, h_membd_);
+    image_rows(pos + 1, nt, h_membd_);   // (row t holds the token at pos + t + 1)
     h_pos_[1] = pos;
     draft_at(pos + nt + 1);   // (the row at q holds token q + 1 and drafts token q + 2)
     launch(1, nt);
@@ -870,6 +900,7 @@ std::vector<ConvPark<Engine::Snap>::Dev> Engine::park_devs() const {
         };
         for (auto & L : dp->layers) attn(L);
         attn(dp->mtp);
+        if (dp->rpos) pd.spans.push_back({dp->rpos, 3 * sizeof(int), 0, 1, 1});
         v.push_back(std::move(pd));
     }
     return v;
@@ -933,6 +964,8 @@ int Engine::sample_row(int t, const SamplingParams & sp, int64_t pos) {
 
 std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
                                   const std::function<bool(int)> & on_token, const SamplingParams & sp) {
+    const PromptMedia * md = media_;   // (taken first: a request that fails leaves none for the next)
+    media_ = nullptr;
     if (spec && !opt_.mtp) throw std::runtime_error("generate: MTP head not loaded");
     if (prompt.empty()) throw std::runtime_error("generate: empty prompt");
     if ((int) prompt.size() + 8 > opt_.max_pos) throw std::runtime_error("generate: prompt longer than the context");
@@ -945,9 +978,16 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
     const int P = (int) prompt.size();
     // prompt cache: KV entries are valid for the common prefix with the last sequence; the recurrent state is
     // restored from the latest snapshot at s <= L - 1 (MTP entry s - 1 used token s, so token s must match too)
+    // images (set_media): their rows by position, the cache compares keys (an image's hash at its positions)
+    mrows_.clear();
+    if (md) {
+        if ((int) md->keys.size() != P || (int) md->pos3.size() != 3 * P) throw std::runtime_error("generate: media do not match the prompt");
+        for (const auto & r : md->rows) mrows_[r.first] = r.second;
+    }
+    const std::vector<int> & key = md ? md->keys : prompt;
     int s = 0;
     if (opt_.prompt_cache) {
-        const int L = park_.resolve(prompt, hist_, snaps_, snap_pool_, park_devs(), "hyper");   // (see park.h)
+        const int L = park_.resolve(key, hist_, snaps_, snap_pool_, park_devs(), "hyper");   // (see park.h)
         for (size_t i = 0; i < snaps_.size();)
             if (snaps_[i].pos > L) { snap_pool_.push_back(snaps_[i].h); snaps_.erase(snaps_.begin() + i); } else ++i;
         const Snap * best = nullptr;
@@ -955,7 +995,8 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
         if (best) { s = best->pos; snap_copy(*const_cast<Snap *>(best), false); }
     }
     if (s == 0) reset();
-    hist_.assign(prompt.begin(), prompt.begin() + s);
+    hist_.assign(key.begin(), key.begin() + s);
+    if (has_rpos()) set_rpos(s, P, md);
     // prefill chunk ends: MAX_ROWS apart, plus snapshot points (message starts in the last ~16 messages, 4096 multiples)
     std::vector<int> snap_at;
     if (opt_.prompt_cache) {
@@ -1001,7 +1042,8 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
         if (prefill_cb_) prefill_cb_(end, P, s);
         c0 = end;
     }
-    hist_ = prompt;
+    hist_ = key;
+    mrows_.clear();   // (the caller's rows are not kept past the prefill)
     st.t_prefill = since(tp);
     st.prompt_reused = s;
     std::vector<int> out;
@@ -1083,7 +1125,7 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
     }
     if (opt_.prompt_cache && p > P && state_ok) take_snapshot(p);   // state after the last processed token
     {   // sequence whose KV entries are valid: positions < p
-        std::vector<int> seq = prompt;
+        std::vector<int> seq = key;
         seq.insert(seq.end(), out.begin(), out.end());
         seq.resize(std::min<size_t>(seq.size(), (size_t) p));
         hist_ = seq;
