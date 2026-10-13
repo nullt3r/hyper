@@ -1863,9 +1863,20 @@ template <typename Frag>
 static void gemm_launch(const uint4 * q, const half * sc, int n, int k, const half * xh, int T, float * y, int ys, const float * add,
                         cudaStream_t s) {
     const int gy = ((n + 15) / 16 + 7) / 8;
-    if (T <= 32)      k_gemm<Frag, 2><<<dim3((T + 31) / 32, gy), 256, 0, s>>>(q, sc, n, k, xh, T, y, ys, add);
-    else if (T <= 64) k_gemm<Frag, 4><<<dim3((T + 63) / 64, gy), 256, 0, s>>>(q, sc, n, k, xh, T, y, ys, add);
-    else              k_gemm<Frag, 8><<<dim3((T + 127) / 128, gy), 256, 0, s>>>(q, sc, n, k, xh, T, y, ys, add);
+    int bn = T <= 32 ? 32 : T <= 64 ? 64 : 128;
+    // few output rows (an hc down-projection: 320 rows, k 10240): narrower token tiles until the grid fills the GPU twice (each
+    // output's sum over k runs in the same order for any tile width: same values). HYPER_GEMM_BN=32|64|128 forces a width
+    static const int force_bn = getenv("HYPER_GEMM_BN") ? atoi(getenv("HYPER_GEMM_BN")) : 0;
+    static const bool wide = getenv("HYPER_GEMM_WIDE") != nullptr;   // (the old choice: by the token count only)
+    if (force_bn == 32 || force_bn == 64 || force_bn == 128) bn = force_bn;
+    else if (!wide) {
+        static int sms = 0;
+        if (!sms) { int dev = 0; cudaGetDevice(&dev); cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev); if (sms <= 0) sms = 82; }
+        while (bn > 32 && (T + bn - 1) / bn * gy < 2 * sms) bn /= 2;
+    }
+    if (bn == 32)      k_gemm<Frag, 2><<<dim3((T + 31) / 32, gy), 256, 0, s>>>(q, sc, n, k, xh, T, y, ys, add);
+    else if (bn == 64) k_gemm<Frag, 4><<<dim3((T + 63) / 64, gy), 256, 0, s>>>(q, sc, n, k, xh, T, y, ys, add);
+    else               k_gemm<Frag, 8><<<dim3((T + 127) / 128, gy), 256, 0, s>>>(q, sc, n, k, xh, T, y, ys, add);
 }
 void gemm_q8(const Q8W & W, const half * xh, int T, float * y, int ys, const float * add, cudaStream_t s) {
     gemm_launch<FragQ8>(W.q, W.s, W.n, W.k, xh, T, y, ys, add, s);
