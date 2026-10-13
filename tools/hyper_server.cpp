@@ -88,15 +88,90 @@ struct Ctx {
     size_t img_cache_bytes = 0;
     std::mutex mu;
     std::atomic<long> next_id{1};
+    // prompt tokenization reused across requests (see tokenize_prompt): the previous prompt's text and tokens, and the special
+    // tokens that start a message (llama.cpp tokenizes the text between special tokens piece by piece)
+    std::mutex tok_mu;
+    std::string tok_text;
+    std::vector<int> tok_ids;
+    std::vector<std::pair<std::string, int>> tok_marks;
 };
 
 std::vector<int> tokenize(const llama_vocab * vocab, const std::string & text) {
-    int n = -llama_tokenize(vocab, text.c_str(), (int) text.size(), nullptr, 0, true, true);
-    std::vector<llama_token> t(n);
-    n = llama_tokenize(vocab, text.c_str(), (int) text.size(), t.data(), n, true, true);
+    // one pass into a buffer of the upper bound (a token covers at least one byte; + BOS): a counting pass first doubled the
+    // time for a 150k-token prompt
+    std::vector<llama_token> t(text.size() + 8);
+    int n = llama_tokenize(vocab, text.c_str(), (int) text.size(), t.data(), (int) t.size(), true, true);
+    if (n < 0) {   // (never with the bound above; the counting pass as before)
+        t.resize(-n);
+        n = llama_tokenize(vocab, text.c_str(), (int) text.size(), t.data(), (int) t.size(), true, true);
+    }
     if (n < 0) throw std::runtime_error("tokenize failed");
     t.resize(n);
     return std::vector<int>(t.begin(), t.end());
+}
+
+// tokens of text[from, end) without the BOS (the continuation of a prompt from a special token on)
+static std::vector<int> tokenize_tail(const llama_vocab * vocab, const std::string & text, size_t from) {
+    std::vector<llama_token> t(text.size() - from + 8);
+    int n = llama_tokenize(vocab, text.c_str() + from, (int) (text.size() - from), t.data(), (int) t.size(), false, true);
+    if (n < 0) throw std::runtime_error("tokenize failed");
+    t.resize(n);
+    return std::vector<int>(t.begin(), t.end());
+}
+
+// A prompt's tokens, reusing the previous prompt's up to the last message-start special token inside the text both share
+// (llama.cpp splits the text at special tokens and tokenizes the pieces independently, so the tokens before that point
+// are the same): an agent's next request repeats ~600 KB of history, whose full tokenization took ~230 ms.
+// HYPER_TOKCACHE=0: always the whole text; HYPER_TOKCACHE_CHECK=1: also the whole text, compared (log on a mismatch)
+std::vector<int> tokenize_prompt(Ctx & c, const std::string & text) {
+    static const bool off = getenv("HYPER_TOKCACHE") && atoi(getenv("HYPER_TOKCACHE")) == 0;
+    static const bool check = getenv("HYPER_TOKCACHE_CHECK") != nullptr;
+    if (off) return tokenize(c.vocab, text);
+    std::lock_guard<std::mutex> lk(c.tok_mu);
+    if (c.tok_marks.empty())
+        for (const char * m : {"<|im_start|>", "<|user|>", "<|assistant|>", "<|system|>", "<|observation|>"}) {
+            const std::vector<int> t = tokenize_tail(c.vocab, m, 0);
+            if (t.size() == 1) c.tok_marks.push_back({m, t[0]});
+        }
+    // occurrences of the marks in a text (byte offsets) and in a token list (indices), in order
+    auto text_marks = [&](const std::string & s, size_t end) {
+        std::vector<size_t> o;
+        for (size_t q = s.find("<|", 0); q != std::string::npos && q < end; q = s.find("<|", q + 1))
+            for (auto & [m, id] : c.tok_marks) if (s.compare(q, m.size(), m) == 0) { o.push_back(q); break; }
+        return o;
+    };
+    std::vector<int> out;
+    size_t from = 0;
+    if (!c.tok_ids.empty() && !c.tok_marks.empty()) {
+        size_t lcp = 0;
+        const size_t lim = std::min(text.size(), c.tok_text.size());
+        while (lcp < lim && text[lcp] == c.tok_text[lcp]) ++lcp;
+        const std::vector<size_t> om = text_marks(c.tok_text, c.tok_text.size());
+        std::vector<size_t> ti;
+        for (size_t i = 0; i < c.tok_ids.size(); ++i)
+            for (auto & [m, id] : c.tok_marks) if (c.tok_ids[i] == id) { ti.push_back(i); break; }
+        if (om.size() == ti.size()) {   // (else the marks do not map one to one: the whole text)
+            int k = -1;   // the last mark starting inside the common prefix
+            for (size_t i = 0; i < om.size() && om[i] < lcp; ++i) k = (int) i;
+            if (k > 0) {
+                out.assign(c.tok_ids.begin(), c.tok_ids.begin() + ti[k]);
+                from = om[k];
+            }
+        }
+    }
+    if (from == 0) out = tokenize(c.vocab, text);
+    else {
+        const std::vector<int> tail = tokenize_tail(c.vocab, text, from);
+        out.insert(out.end(), tail.begin(), tail.end());
+    }
+    if (check && from > 0) {
+        const std::vector<int> full = tokenize(c.vocab, text);
+        if (full != out) fprintf(stderr, "tokenize_prompt: MISMATCH (reused %zu bytes; %zu vs %zu tokens)\n", from, out.size(), full.size());
+        else fprintf(stderr, "tokenize_prompt: reused %zu of %zu bytes, same tokens\n", from, text.size());
+    }
+    c.tok_text = text;
+    c.tok_ids = out;
+    return out;
 }
 
 std::string piece(const llama_vocab * vocab, int tok) {
@@ -160,6 +235,7 @@ struct Request {
     std::string id;
     SamplingParams sp;
     std::map<std::string, std::map<std::string, std::string>> arg_types;   // tool -> argument -> JSON schema type
+    double t_parse = 0, t_convert = 0, t_template = 0, t_tokenize = 0;    // request preprocessing (ms)
 };
 
 // Tool calls the template's parser misses or rejects, in either XML syntax:
@@ -479,10 +555,14 @@ Request prepare(Ctx & c, const ojson & body) {
         if (eff == "none") in.enable_thinking = false;
         else if (!eff.empty() && !in.chat_template_kwargs.count("reasoning_effort")) in.chat_template_kwargs["reasoning_effort"] = "\"" + eff + "\"";
     }
+    const auto tt0 = clk::now();
     const common_chat_params cp = common_chat_templates_apply(c.tmpls.get(), in);
+    const auto tt1 = clk::now();
     if (getenv("HYPER_SHOW_PROMPT")) fprintf(stderr, "request prompt (%zu images):\n%s\n---\n", images.size(), cp.prompt.c_str());
-    if (images.empty()) r.prompt = tokenize(c.vocab, cp.prompt);
+    if (images.empty()) r.prompt = tokenize_prompt(c, cp.prompt);
     else build_media(c, cp.prompt, images, r, "request");
+    r.t_template = 1e3 * secs(tt0, tt1);
+    r.t_tokenize = 1e3 * secs(tt1, clk::now());
     r.pp = common_chat_parser_params(cp);
     r.pp.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     r.pp.parse_tool_calls = !in.tools.empty() && in.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
@@ -574,7 +654,8 @@ GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::strin
         lv.phase = "prompt"; lv.id = r.id; lv.prompt_total = P; lv.prompt_done = 0; lv.cached = 0; lv.gen = 0;
         lv.prompt_tps = lv.gen_tps_now = lv.gen_tps_avg = 0; lv.t_start = t0; lv.requests++;
     }
-    fprintf(stderr, "[%s] prompt: %d tokens, max %d new\n", r.id.c_str(), P, r.max_tokens);
+    fprintf(stderr, "[%s] prompt: %d tokens, max %d new (request: parse %.0f, convert %.0f, template %.0f, tokenize %.0f ms)\n", r.id.c_str(), P,
+            r.max_tokens, r.t_parse, r.t_convert, r.t_template, r.t_tokenize);
     auto t_log = t0;
     c.eng->set_prefill_progress([&](int done, int total, int reused) {
         const auto now = clk::now();
@@ -1138,13 +1219,17 @@ int main(int argc, char ** argv) {
         };
         std::shared_ptr<Request> r;
         try {
+            const auto tp0 = clk::now();
             const ojson body = ojson::parse(req.body);
+            const auto tp1 = clk::now();
             if (const char * dump = getenv("HYPER_DUMP_REQUEST")) {   // request bodies <dir>/<time>.json (replay for benchmarks)
                 const std::string fn = std::string(dump) + "/" + std::to_string((long long) time(nullptr)) + ".json";
                 FILE * f = fopen(fn.c_str(), "wb");
                 if (f) { fwrite(req.body.data(), 1, req.body.size(), f); fclose(f); }
             }
             r = std::make_shared<Request>(prepare(c, body));
+            r->t_parse = 1e3 * secs(tp0, tp1);
+            r->t_convert = 1e3 * secs(tp1, clk::now()) - r->t_template - r->t_tokenize;
         } catch (const std::exception & e) { fail(400, e.what()); return; }
         const std::string id = random_id("chatcmpl-", c.next_id++);
         r->id = id.substr(9, 6) + id.substr(id.size() - 4);
@@ -1254,13 +1339,19 @@ int main(int argc, char ** argv) {
         auto custom = std::make_shared<RespTools>();
         ojson rbody;
         try {
+            const auto tp0 = clk::now();
             rbody = ojson::parse(req.body);
+            const auto tp1 = clk::now();
             if (const char * dump = getenv("HYPER_DUMP_REQUEST")) {
                 const std::string fn = std::string(dump) + "/" + std::to_string((long long) time(nullptr)) + "-responses.json";
                 FILE * f = fopen(fn.c_str(), "wb");
                 if (f) { fwrite(req.body.data(), 1, req.body.size(), f); fclose(f); }
             }
-            r = std::make_shared<Request>(prepare(c, responses_to_chat(rbody, *custom)));
+            ojson chat_body = responses_to_chat(rbody, *custom);
+            const auto tp2 = clk::now();
+            r = std::make_shared<Request>(prepare(c, chat_body));
+            r->t_parse = 1e3 * secs(tp0, tp1);
+            r->t_convert = 1e3 * secs(tp1, tp2) + 1e3 * secs(tp2, clk::now()) - r->t_template - r->t_tokenize;
         } catch (const std::exception & e) { fail(400, e.what()); return; }
         const std::string rid = random_id("resp_", c.next_id++);
         r->id = rid.substr(5, 6) + rid.substr(rid.size() - 4);

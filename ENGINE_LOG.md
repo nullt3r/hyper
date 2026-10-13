@@ -571,3 +571,21 @@ a hlavu stejnými výrazy (scratch na zařízení, `gdn_pre_scratch`), krok je j
   20/20 shodných (i s předchozím během).
 - Allreduce prefillu se stahováním dílů peerů na vlastním streamu (souběžně s vlastním D2H): 1461 → 1469 t/s, v šumu. Allreduce
   čeká hlavně na nejpomalejší GPU, ne na pořadí kopií. Nezařazeno.
+
+### Režie požadavku mimo engine: tokenizace
+
+Rozdíl mezi časem klienta a časem enginu na požadavek v hloubce ~160k byl **610–690 ms** (~16 % požadavku). Měření fází
+v `prepare` (řádek `prompt:` v logu): parse 8, převod Responses→chat 19, šablona ~150, tokenizace ~430 ms.
+- `tokenize` volal `llama_tokenize` dvakrát (nejdřív kvůli počtu tokenů): jeden průchod do bufferu horní meze → ~215 ms.
+- Inkrementálně (`tokenize_prompt`): llama.cpp dělí text na speciálních tokenech a kusy mezi nimi tokenizuje nezávisle,
+  takže tokeny předchozího promptu platí až po poslední značku začátku zprávy (`<|im_start|>`, u GLM `<|user|>` …)
+  ležící uvnitř společného prefixu textu. Tokenizuje se jen zbytek (~10 KB). `HYPER_TOKCACHE_CHECK=1` porovná s plnou
+  tokenizací: 8/8 shodných. `HYPER_TOKCACHE=0` = vždy celý text.
+
+| Hloubkový scénář | mimo engine / požadavek | tokenizace |
+|---|---|---|
+| původně | 610–690 ms | ~430 ms |
+| jeden průchod | 400–420 ms | ~230 ms |
+| **inkrementálně** | **180–195 ms** | **2–8 ms** |
+
+Výstupy 9/9 shodné. Zbývá šablona (~150 ms, minja v libcommon).
