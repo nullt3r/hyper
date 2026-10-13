@@ -477,3 +477,10 @@ Ověření:
 
 Úskalí: `mtmd_input_text` má pole `text_len`. `llama_model_n_embd_inp()` u modelu jen se slovníkem vrací 0, proto se šířka
 řádku bere z `clip.vision.projection_dim`.
+
+Cena encoderu (replay 20 požadavků Codexu, greedy, 262k):
+- Encoder na GPU 0: 114 místo 122 expertů na vrstvu na GPU 0, prefill 1283 vs. 1291–1299 t/s (~−1 %).
+- Výstupy se změnou rozmístění liší, a to je šum rozmístění. Se stejným rozmístěním (bez encoderu, 900 MiB obsazených
+  jiným procesem) jsou výstupy 20/20 shodné a rychlost stejná: 176,8 / 176,8 t/s.
+- Encoder na CPU (`HYPER_MMPROJ_CPU=1`) má rozmístění 122, 20/20 shodné a 187,3 vs. 186,8 t/s.
+- První běh s encoderem (168,3 t/s) byl zkreslený, šlo o první běh po zastavení jiného serveru.
