@@ -89,10 +89,21 @@ void rmsnorm(const float * x, int xs, const float * w, float * y, int ys, int n,
 // ---- gated attention (full-attention layers), local heads ----
 // per token row of qkv: [n_head x (q hd | gate hd)] [n_kv x k hd] [n_kv x v hd]
 // normalizes q,k per head, partial NEOX rope (first n_rot dims) at position *pos + t, keeps q in place and
-// appends k,v (fp16) to the caches [n_kv][max_pos][hd]
+// appends k,v (fp16) to the caches [n_kv][max_pos][hd]; rp / rsec: M-RoPE positions per cell (mrope_pos)
 void attn_prep(float * qkv, int stride, const float * qnorm, const float * knorm, half * kcache, half * vcache,
                const int * pos, int max_pos, int n_head, int n_kv, int hd, int n_rot, float rope_base, float eps,
-               int nt, cudaStream_t s);
+               int nt, cudaStream_t s, const int * rp = nullptr, int rsec = 0);
+#ifdef __CUDACC__
+// the position by which frequency pair fi of cache cell `cell` turns. Interleaved M-RoPE (Qwen3-VL; images: a cell has
+// a t, h and w position) reads one of them from rp [cells][3] by the pair's section (rsec = s0 | s1 << 8 | s2 << 16);
+// without rp it is the cell index (plain rope -- also what a text cell's three positions are when nothing else moves them)
+__device__ __forceinline__ int mrope_pos(const int * rp, int rsec, int cell, int fi) {
+    if (!rp) return cell;
+    const int s0 = rsec & 255, s1 = (rsec >> 8) & 255, s2 = (rsec >> 16) & 255, sector = fi % (s0 + s1 + s2);
+    const int c = sector % 3 == 1 && sector < 3 * s1 ? 1 : sector % 3 == 2 && sector < 3 * s2 ? 2 : 0;
+    return rp[(size_t) cell * 3 + c];
+}
+#endif
 // out[t][h][hd] = softmax(q k^T * scale) V over positions [0, *pos + t], times sigmoid(gate);
 // local q head h uses local kv head (head_off + h) / group - kv_off
 void attn_decode(const float * qkv, int stride, const half * kcache, const half * vcache, float * out, int out_stride,

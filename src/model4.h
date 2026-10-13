@@ -17,6 +17,7 @@ struct Q4Config {
     int n_embd = 0;              // 2560
     int n_head = 0, n_head_kv = 0, head_dim = 0, n_rot = 0;
     float rope_base = 0, rms_eps = 0;
+    int rope_sec = 0;   // interleaved M-RoPE sections s0 | s1 << 8 | s2 << 16 (0: plain rope)
     int full_attn_interval = 0;
     // gated delta net
     int ssm_conv = 0, ssm_d_state = 0, ssm_n_group = 0, ssm_dt_rank = 0, ssm_d_inner = 0;
@@ -28,7 +29,7 @@ struct Q4Config {
     int idx_n_head = 0, idx_dim = 0, idx_top_k = 0, kpool = 0;
     std::vector<int> compress;   // per layer, 0 = dense attention
     // PLE
-    int ple_layer = -1, ple_ngram = 0, ple_heads_per_ngram = 0, ple_conv = 0, ple_dim = 0, ple_eos = 0;
+    int ple_layer = -1, ple_ngram = 0, ple_heads_per_ngram = 0, ple_conv = 0, ple_dim = 0, ple_eos = 0, ple_image = 0;
     std::vector<uint64_t> ple_mult, ple_offsets, ple_vocab;
     int n_vocab = 0;
 

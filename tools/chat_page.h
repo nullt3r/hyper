@@ -226,6 +226,8 @@ body.wrap .cb .wrp{color:#fff;background:#333333}
 .fchip svg{width:15px;height:15px;color:var(--fg2)}.fchip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.fchip small{color:var(--mut);white-space:nowrap}
 .fchip .x{margin:0 -5px 0 0;width:24px;height:24px;display:grid;place-items:center;border-radius:6px;color:var(--mut)}
 .msg.user .fchips{justify-content:flex-end;margin:6px 0 0}
+.uimgs{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end;margin:6px 0 0;max-width:min(86%,600px)}
+.uimgs img{max-width:220px;max-height:220px;border-radius:14px;border:1px solid var(--line);cursor:pointer;object-fit:cover;background:var(--bg2)}
 .comp .fchips{margin:0 0 8px -6px}
 @media (hover:hover){.fchip:hover{border-color:var(--acc2)}.fchip .x:hover{background:var(--bg3);color:var(--fg)}}
 #app.drop::after{content:"Drop files to attach";position:absolute;inset:12px;z-index:80;display:grid;place-items:center;border:2px dashed var(--acc2);border-radius:20px;
@@ -614,7 +616,7 @@ function msgHTML(c,m,k){
    `<div class="erow"><button class="btn" onclick="editCancel()">Cancel</button><button class="btn pri" onclick="editSave(${k})">Send</button></div></div></div>`;
   const long=m.content.length>1200||m.content.split('\n').length>18;
   return `<div class="msg user" data-k="${k}">`+(m.content?`<div class="ububble${long?' clamp':''}">${esc(m.content)}</div>`:'')+
-   (m.files&&m.files.length?`<div class="fchips">${m.files.map(dlChip).join('')}</div>`:'')+`<div class="acts">`+(long?'<button class="btn sm ghost" onclick="expandU(this)">Show more</button>':'')+
+   userFiles(c,m)+`<div class="acts">`+(long?'<button class="btn sm ghost" onclick="expandU(this)">Show more</button>':'')+
    `<button class="ib sm" aria-label="Copy" title="Copy" onclick="cpMsg(${k},this)">${IC.copy}</button>`+
    (busy?'':`<button class="ib sm" aria-label="Edit" title="Edit" onclick="editMsg(${k})">${IC.pencil}</button>`)+'</div></div>'}
  const st=isGen(c,k),rd=m.calls&&m.calls.length&&k<c.msgs.length-1&&c.msgs[k+1].role==='assistant';
@@ -655,7 +657,7 @@ let PEND=[];
 function renderAtts(){const a=$('atts');a.style.display=PEND.length?'':'none';
  a.innerHTML=PEND.map((f,i)=>`<span class="fchip">${IC.file}<span>${esc(f.name)}</span><small>${fmtB(f.size)}</small><button class="x" aria-label="Remove" onclick="unattach(${i})">${IC.x}</button></span>`).join('');updSend()}
 function attach(list){for(const f of list){if(f.size>64*1048576){toast(f.name+' is larger than 64 MB');continue}PEND.push(f)}
- if(PEND.length&&!cfg.code){cfg.code=true;saveCfg();syncSet();reread('Python is on: it works with the files')}renderAtts()}
+ if(PEND.some(f=>!(live.vision&&isImg(f)))&&!cfg.code){cfg.code=true;saveCfg();syncSet();reread('Python is on: it works with the files')}renderAtts()}   // (a vision model sees images itself)
 function unattach(i){PEND.splice(i,1);renderAtts()}
 $('fpick').onchange=()=>{attach([...$('fpick').files]);$('fpick').value=''};
 IN.addEventListener('paste',e=>{const f=e.clipboardData?[...e.clipboardData.files]:[];if(f.length){e.preventDefault();attach(f)}});
@@ -682,7 +684,14 @@ async function dl(name){const c=conv();let f=null;try{f=c&&await fget(c.id,name)
  if(!f)return toast('The file is not in this browser');const u=URL.createObjectURL(new Blob([f.data],{type:'application/octet-stream'})),a=document.createElement('a');
  a.href=u;a.download=name.split('/').pop();document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),5000)}
 const GU=new Map();   // figure id -> object URL
-function mountMedia(root){(root||$('col')).querySelectorAll('img[data-g]:not([src])').forEach(im=>{const id=im.dataset.g;if(GU.has(id)){im.src=GU.get(id);return}
+const isImg=f=>/^image\//.test(f.type||'')||/\.(png|jpe?g|gif|webp|bmp)$/i.test(f.name||'');
+// a user message's files: images as thumbnails (click: download), the rest as chips
+function userFiles(c,m){if(!m.files||!m.files.length)return'';const im=m.files.filter(isImg),ot=m.files.filter(f=>!isImg(f));
+ return (im.length?`<div class="uimgs">${im.map(f=>{const k=c.id+'/'+f.name;return `<img data-fk="${esc(k)}" data-dl="${esc(f.name)}" alt="${esc(f.name)}" title="${esc(f.name)}"${GU.has('f:'+k)?` src="${GU.get('f:'+k)}"`:''}>`}).join('')}</div>`:'')+
+  (ot.length?`<div class="fchips">${ot.map(dlChip).join('')}</div>`:'')}
+function mountMedia(root){(root||$('col')).querySelectorAll('img[data-fk]:not([src])').forEach(im=>{const k=im.dataset.fk,i=k.indexOf('/');if(GU.has('f:'+k)){im.src=GU.get('f:'+k);return}
+ fget(k.slice(0,i),k.slice(i+1)).then(v=>{if(!v)return;const u=URL.createObjectURL(new Blob([v.data]));GU.set('f:'+k,u);im.src=u}).catch(()=>{})});
+ (root||$('col')).querySelectorAll('img[data-g]:not([src])').forEach(im=>{const id=im.dataset.g;if(GU.has(id)){im.src=GU.get(id);return}
  fop('readonly',s=>s.get('g:'+id)).then(v=>{if(!v)return;const u=URL.createObjectURL(new Blob([v.data],{type:'image/png'}));GU.set(id,u);im.src=u}).catch(()=>{})})}
 // (once after start: the files of deleted conversations and figures no message shows any more)
 setTimeout(()=>{const ids=new Set(convs.map(c=>c.id)),figs=new Set();for(const c of convs)for(const m of c.msgs)for(const x of m.calls||[])for(const g of x.figs||[])figs.add(g);
@@ -890,6 +899,19 @@ const BROWSER={browser_open:a=>['Opening','Opened',hostOf(a.url)],browser_click:
  browser_select:(a,lab)=>{const t=lab(a.element);return ['Selecting','Selected',(a.option?qt(a.option):'')+(t?' in '+t:'')]},
  browser_scroll:a=>['Scrolling','Scrolled',a.direction||'down'],browser_back:()=>['Going back','Went back',''],browser_read:()=>['Reading','Read','the page'],
  browser_find:a=>['Finding','Found',a.text?'“'+String(a.text).slice(0,40)+'”':'']};
+// an attached image as the model gets it (vision): at most 1536 px on the long side (an image costs ~1 token per 32x32 px),
+// JPEG unless it is a small enough PNG / JPEG already; data URLs cached per file
+const IMGU=new Map();
+function imgURL(cid,f){const key=cid+'/'+f.name+'/'+f.size;if(IMGU.has(key))return IMGU.get(key);
+ const p=fget(cid,f.name).then(async v=>{if(!v)return null;const blob=new Blob([v.data],{type:f.type||''}),bm=await createImageBitmap(blob),M=1536,sc=Math.min(1,M/Math.max(bm.width,bm.height));
+  if(sc===1&&/^image\/(png|jpeg)$/.test(f.type||'')&&v.data.byteLength<4e6)return await new Promise(r=>{const fr=new FileReader();fr.onload=()=>r(fr.result);fr.readAsDataURL(blob)});
+  const cv=document.createElement('canvas');cv.width=Math.max(1,Math.round(bm.width*sc));cv.height=Math.max(1,Math.round(bm.height*sc));
+  const g2=cv.getContext('2d');g2.fillStyle='#fff';g2.fillRect(0,0,cv.width,cv.height);g2.drawImage(bm,0,0,cv.width,cv.height);return cv.toDataURL('image/jpeg',.92)}).catch(()=>null);
+ IMGU.set(key,p);return p}
+async function convImages(c){const out=new Map();if(!live.vision)return out;
+ for(let k=0;k<c.msgs.length;++k){const m=c.msgs[k];if(m.role!=='user'||!m.files)continue;const im=m.files.filter(isImg);if(!im.length)continue;
+  out.set(k,(await Promise.all(im.map(f=>imgURL(c.id,f)))).filter(Boolean))}
+ return out}
 function hostOf(u){try{return new URL(u).hostname.replace(/^www\./,'')}catch(e){return u||''}}
 // the text of element [n] as the browser showed it last before call x: the action's own result says what it acted on, else
 // the latest page text that numbers it (the numbers change with every page)
@@ -918,8 +940,9 @@ function toolHTML(m,c,k){if(!m.calls||!m.calls.length)return'';
     :`<pre class="tcb">${esc(x.result.slice(0,6000))}${x.result.length>6000?'\n…':''}</pre>`}
   return `<div class="tc${x.isError?' err':''}"><button class="tch" onclick="this.parentElement.classList.toggle('open')">${t==='web_search'?IC.search:t==='fetch_url'||BROWSER[t]?IC.globe:py?IC.term:IC.tool}<span class="tl2">${lbl}</span>${done||py?IC.chev:''}</button>${body}</div>`+more}).join('')+'</div>'}
 // the request history: an assistant turn with tool calls is followed by one tool message per call
-function pushHist(msgs,m){if(m.role==='user'){const f=m.files&&m.files.length?'[Attached: '+m.files.map(x=>`/mnt/data/${x.name} (${fmtB(x.size)})`).join(', ')+']':'';
-  msgs.push({role:'user',content:m.content&&f?m.content+'\n\n'+f:m.content||f});return}
+function pushHist(msgs,m,imgs){if(m.role==='user'){const f=m.files&&m.files.length?'[Attached: '+m.files.map(x=>`/mnt/data/${x.name} (${fmtB(x.size)})`).join(', ')+']':'';
+  const t=m.content&&f?m.content+'\n\n'+f:m.content||f;
+  msgs.push({role:'user',content:imgs&&imgs.length?[{type:'text',text:t}].concat(imgs.map(u=>({type:'image_url',image_url:{url:u}}))):t});return}
  const calls=(m.calls||[]).filter(x=>x.name);
  if(m.err&&!m.content&&!calls.length)return;
  const o={role:'assistant',content:m.content||''};if(m.reasoning)o.reasoning_content=m.reasoning;
@@ -972,7 +995,8 @@ async function generate(vers,round,final){round=round||0;const c=conv();
  // (the date is the conversation's first day: a prompt that changed at midnight would lose the server's prompt cache)
  if(!c.day)c.day=new Date().toISOString().slice(0,10);
  const msgs=[],sys=[cfg.sys.trim(),web?toolPrompt(c.day):'',py?codePrompt():''].filter(Boolean).join('\n\n');if(sys)msgs.push({role:'system',content:sys});
- for(const m of c.msgs)pushHist(msgs,m);
+ const imgs=await convImages(c);
+ c.msgs.forEach((m,k)=>pushHist(msgs,m,imgs.get(k)));
  c.msgs.push(a);
  const body={messages:msgs,stream:true,timings_per_token:true,chat_template_kwargs:{enable_thinking:cfg.effort!=='off'}};
  if(cfg.effort==='low'||cfg.effort==='medium')body.reasoning_effort=cfg.effort;   // (high: the template's default -- Qwen xhigh, GLM max)
@@ -1014,7 +1038,7 @@ async function sendMsg(){if(busy){busy.abort();return}const t=IN.value.trim(),fl
  const m={role:'user',content:t};
  if(fl.length){sending=true;PEND=[];renderAtts();m.files=[];   // (into the conversation's /mnt/data; a file of the same name is replaced)
   for(const f of fl){const name=f.name.replace(/[\\/:*?"<>|\u0000-\u001f]+/g,'_').replace(/^\.+/,'').slice(-120)||'file';
-   try{await fput(c.id,name,await f.arrayBuffer());m.files=m.files.filter(x=>x.name!==name).concat({name,size:f.size})}catch(e){toast('Could not store '+name)}}
+   try{await fput(c.id,name,await f.arrayBuffer());m.files=m.files.filter(x=>x.name!==name).concat({name,size:f.size,type:f.type||''});IMGU.delete(c.id+'/'+name+'/'+f.size)}catch(e){toast('Could not store '+name)}}
   sending=false}
  c.msgs.push(m);if(c.title==='New chat')c.title=(t||m.files.map(f=>f.name).join(', ')).replace(/\s+/g,' ').slice(0,60);c.t=Date.now();
  IN.value='';S.set('hyper.draft','');autosz(IN);if(touch)IN.blur();editing=-1;save();generate()}
@@ -1031,7 +1055,7 @@ async function refreshLive(){try{const s=await (await fetch('/stats',{cache:'no-
    `<span>${fmtK(s.ctx_used||0)}<span class="mx"> / ${fmtK(s.ctx_max)}</span></span>`}
  catch(e){online=false}setDot();updState()}
 function ctxInfo(){if(!live.ctx_max)return;toast(`Context: ${(live.ctx_used||0).toLocaleString()} / ${live.ctx_max.toLocaleString()} tokens (${(100*(live.ctx_used||0)/live.ctx_max).toFixed(1)} %)`,null,null,3200)}
-fetch('/v1/models').then(r=>r.json()).then(j=>{live.model=j.data[0].id;$('mdl').textContent=live.model;const h=$('hsub');if(h)h.textContent=live.model+' · running locally';updState()}).catch(()=>{});
+fetch('/v1/models').then(r=>r.json()).then(j=>{live.model=j.data[0].id;live.vision=!!(j.data[0].meta&&j.data[0].meta.vision);$('mdl').textContent=live.model;const h=$('hsub');if(h)h.textContent=live.model+' · running locally';updState()}).catch(()=>{});
 fetch('/props').then(r=>r.ok?r.json():{}).then(j=>{defaults=j.sampling||{};syncSet()}).catch(()=>syncSet());
 loadTools();
 /* ---------- global events ---------- */

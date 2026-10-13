@@ -224,6 +224,11 @@ Endpoints:
 | `/v1/models`, `/health`, `/stats`, `/props` | model list, health, statistics JSON, sampling defaults |
 | `/v1/mcp`, `/mcp/<name>` | the configured MCP servers and a proxy to them (streamable HTTP), for the chat page |
 
+Images (Qwen3.8-Flash-Next with `--mmproj`): the encoder's rows replace the image token's at an image's positions. Those positions
+carry interleaved M-RoPE coordinates (t, h, w), kept per cache cell on every GPU. A text cell's three coordinates are its index,
+so text output stays bit-identical. The prompt cache tells images apart by a hash of their content, and an encoded image is
+reused while it is cached. The chat page sends attached images to such a model, at most 1536 px on the long side.
+
 Python in the chat: the model gets a `run_python` tool that the page runs in the browser, not on the server.
 - **Runtime:** Pyodide (CPython 3.14 in WebAssembly, with numpy, pandas, scipy, matplotlib, scikit-learn, sympy and more). Pure-Python packages such as python-docx or openpyxl install from PyPI on import.
 - **Sandbox:** a Worker inside an iframe with `sandbox="allow-scripts"`. Its opaque origin has no access to the chat page, its storage or the server's API, and its CSP allows only the package CDNs. A cell is stopped after 120 s.
@@ -246,6 +251,7 @@ Options:
 | `--expert-stats file` | — | routing statistics: read at start for placement, updated after every request |
 | `--snapshots` | 48 | prompt-cache snapshots kept in pinned RAM |
 | `--reasoning-effort` | template default | GLM: `low`, `high`, `max` or `none` (requests may override) |
+| `--mmproj file` | — | vision encoder (mmproj GGUF, e.g. unsloth's `mmproj-F16.gguf` for Qwen3.8-Flash-Next): images in chat and Responses requests (`data:` or http(s) URLs, also in tool outputs). Encoded with mainline libmtmd on GPU 0, before the engine places its experts |
 | `--mcp name=url` | — | an MCP server (streamable HTTP) whose tools the chat page offers the model; repeatable (`tools/web-tools`: search and a real browser in Docker) |
 
 Selected environment variables:

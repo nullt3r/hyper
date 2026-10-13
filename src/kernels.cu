@@ -634,7 +634,8 @@ __global__ void k_sumsq(const float * __restrict__ x, int xs, int n, float * ss,
 // ---------------- gated attention ----------------
 // grid (n_head + n_kv, nt), blockDim = hd
 __global__ void k_attn_prep(float * qkv, int stride, const float * qnorm, const float * knorm, half * kcache, half * vcache,
-                            const int * pos_p, int max_pos, int n_head, int n_kv, int hd, int n_rot, float rope_base, float eps) {
+                            const int * pos_p, int max_pos, int n_head, int n_kv, int hd, int n_rot, float rope_base, float eps,
+                            const int * rp, int rsec) {
     const int b = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
     const int pos = *pos_p + t;
     float * row = qkv + (size_t) t * stride;
@@ -650,7 +651,7 @@ __global__ void k_attn_prep(float * qkv, int stride, const float * qnorm, const 
     const int half_rot = n_rot / 2;
     if (i < n_rot) {
         const int fi = i < half_rot ? i : i - half_rot;
-        const double theta = (double) pos * pow((double) rope_base, -2.0 * fi / n_rot);
+        const double theta = (double) mrope_pos(rp, rsec, pos, fi) * pow((double) rope_base, -2.0 * fi / n_rot);
         double sn, cs;
         sincos(theta, &sn, &cs);
         const float c = (float) cs, s = (float) sn;
@@ -1883,9 +1884,9 @@ void sumsq(const float * x, int xs, int n, int nt, float * ss, int nss, cudaStre
 }
 void attn_prep(float * qkv, int stride, const float * qnorm, const float * knorm, half * kcache, half * vcache,
                const int * pos, int max_pos, int n_head, int n_kv, int hd, int n_rot, float rope_base, float eps,
-               int nt, cudaStream_t s) {
+               int nt, cudaStream_t s, const int * rp, int rsec) {
     k_attn_prep<<<dim3(n_head + n_kv, nt), hd, 0, s>>>(qkv, stride, qnorm, knorm, kcache, vcache, pos, max_pos, n_head, n_kv,
-                                                       hd, n_rot, rope_base, eps);
+                                                       hd, n_rot, rope_base, eps, rp, rsec);
 }
 void attn_decode(const float * qkv, int stride, const half * kcache, const half * vcache, float * out, int out_stride,
                  const int * pos, int max_pos, int n_head, int n_kv, int head_off, int group, int kv_off, int hd,

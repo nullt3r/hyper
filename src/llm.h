@@ -21,6 +21,18 @@ struct GenStats {
     int prompt_reused = 0;       // prompt tokens served from the prompt cache
 };
 
+// Images in the next prompt (vision engines). The prompt holds the image token at an image's positions; their input rows
+// come from the vision encoder instead. Every prompt token has M-RoPE positions (t, h, w): a text token's three are its
+// position, an image token's are its grid cell's, and an image moves the text after it on by max(rows, columns), not by
+// its token count. keys: per prompt token, what the prompt cache compares (an image's positions carry its hash, so another
+// image in the same place is not taken for the cached one).
+struct PromptMedia {
+    std::vector<int> pos3;                             // [prompt tokens][3]
+    int next = 0;                                      // the position after the prompt (where generation goes on)
+    std::vector<int> keys;                             // [prompt tokens]
+    std::vector<std::pair<int, const float *>> rows;   // (prompt position, n_embd floats), the image positions ascending
+};
+
 class LLM {
 public:
     virtual ~LLM() = default;
@@ -34,6 +46,8 @@ public:
     virtual int n_draft() const = 0;
     virtual bool has_mtp() const = 0;
     virtual void reset_cache() = 0;   // forget the cached conversation(s); snapshot buffers stay allocated for reuse
+    // images for the next generate() only (nullptr: none); false: this engine is text-only
+    virtual bool set_media(const PromptMedia * m) { return m == nullptr; }
 };
 
 } // namespace hyper

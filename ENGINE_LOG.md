@@ -446,3 +446,34 @@ Flash-Next znovu, čistě (zahřáté, vypnuto–zapnuto–vypnuto): 156,0 / **1
 První běh po vypnutí produkčního serveru je zkreslený (jádro uvolňuje ~100 GB a vytlačuje page cache: prefill prvního
 požadavku 69 s místo 16 s) → při A/B vždy jeden zahřívací běh.
 
+
+## 2026-10-13 – obrázky pro Qwen3.8-Flash-Next (`--mmproj`)
+
+Vision encoder: unsloth `mmproj-F16.gguf` (904 MB, projektor `qwen3vl_merger`, 27 bloků, výstup 2560 = `n_embd`). Kóduje ho
+mainline libmtmd (statická `libmtmd.a`) na GPU 0. Načítá se před enginem, takže rozmístění expertů s jeho VRAM (~1,1 GiB)
+počítá: GPU 0 drží 114 místo 122 expertů na vrstvu.
+
+Model používá prokládané M-RoPE (IMROPE, sekce 11/11/10). Obrazový token má pozici (t, h, w) podle buňky mřížky a text
+za obrázkem pokračuje od n_past + max(nx, ny). Engine proto má na každé GPU tabulku pozic [buňky][3]:
+- Kernely `attn_prep`, `idx_prep`, `idx_prep_pool` a `idx_pool` z ní čtou složku podle páru frekvencí (`mrope_pos`).
+  Poolovaný klíč se točí podle pozice svého prvního členu (jako v mainline).
+- Pozice promptu se zapíšou jednou za požadavek, budoucí buňky dostanou „buňka + posun“. Dekódování tak nic nepřidává.
+- Text má všechny tři složky rovné indexu, výpočet je tedy stejný jako dřív.
+- Obrazové pozice dostávají řádky encoderu místo embeddingu tokenu, a to i MTP (řádek t nese token pos + t + 1).
+- PLE na nich hashuje `ple.image_token_id` (248056), stejně jako mainline.
+- Prompt cache porovnává klíče: obrazové pozice nesou záporný hash obrázku. Tabulka pozic se odkládá s konverzací.
+
+Ověření:
+
+| Test | Výsledek |
+|---|---|
+| replay 20 požadavků Codexu, greedy, tabulka vs. `HYPER4_NO_MROPE=1` | 20/20 shodných, 187,0 / 186,5 t/s, prefill 1294 / 1291 |
+| syntetický obrázek (text, tvary, barvy, čísla) | vše správně |
+| titulní strana NYT 1969 | titulek, podtitulek, noviny i datum správně |
+| navazující otázka se stejným obrázkem | obrázek z cache (cached 328), odpověď správná |
+| jiný obrázek na stejném místě | cache se rozejde přesně na první obrazové pozici |
+| Responses `input_image`, obrázek ve výstupu nástroje | správně |
+| greedy vs. mainline (4 obrazové testy) | rozchod po 67–350 znacích, text-only 24–330 (stejný šum) |
+
+Úskalí: `mtmd_input_text` má pole `text_len`. `llama_model_n_embd_inp()` u modelu jen se slovníkem vrací 0, proto se šířka
+řádku bere z `clip.vision.projection_dim`.

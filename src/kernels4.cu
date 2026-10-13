@@ -1011,18 +1011,19 @@ __global__ void __launch_bounds__(256) k_moe_gemm(MoeDev m, const half * __restr
 
 // ---------------- QSA indexer ----------------
 // rotate the first n_rot dims (NEOX pairs i, i + n_rot/2) of a 128-dim vector held in shared memory buf, thread i
-__device__ __forceinline__ float rope_dim(const float * buf, int i, int pos, int n_rot, float base) {
+__device__ __forceinline__ float rope_dim(const float * buf, int i, int cell, int n_rot, float base, const int * rp, int rsec) {
     const int half_rot = n_rot / 2;
     if (i >= n_rot) return buf[i];
     const int fi = i < half_rot ? i : i - half_rot;
-    const double theta = (double) pos * pow((double) base, -2.0 * fi / n_rot);
+    const double theta = (double) mrope_pos(rp, rsec, cell, fi) * pow((double) base, -2.0 * fi / n_rot);
     double sn, cs;
     sincos(theta, &sn, &cs);
     return i < half_rot ? buf[i] * (float) cs - buf[i + half_rot] * (float) sn : buf[i - half_rot] * (float) sn + buf[i] * (float) cs;
 }
 // grid (nt, n_head + 1), 128 threads: query heads normed + rotated into qn; the last "head" stores the raw key (fp16)
 __global__ void k_idx_prep(const float * __restrict__ qi, const float * __restrict__ kr, const float * __restrict__ qnorm,
-                           float * __restrict__ qn, half * __restrict__ kraw, const int * pos_p, int n_head, int n_rot, float base, float eps) {
+                           float * __restrict__ qn, half * __restrict__ kraw, const int * pos_p, int n_head, int n_rot, float base, float eps,
+                           const int * rp, int rsec) {
     const int t = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
     const int pos = *pos_p + t;
     if (h == n_head) { kraw[(size_t) pos * 128 + i] = __float2half(kr[(size_t) t * 128 + i]); return; }
@@ -1031,13 +1032,13 @@ __global__ void k_idx_prep(const float * __restrict__ qi, const float * __restri
     const float ss = block_sum4(x * x);
     buf[i] = x * rsqrtf(ss / 128 + eps) * qnorm[i];
     __syncthreads();
-    qn[((size_t) t * n_head + h) * 128 + i] = rope_dim(buf, i, pos, n_rot, base);
+    qn[((size_t) t * n_head + h) * 128 + i] = rope_dim(buf, i, pos, n_rot, base, rp, rsec);
 }
 // decode (one token): k_idx_prep, and the block that stores the raw key also pools a completed block of 4 cells exactly as
 // k_idx_pool (the three earlier cells from the cache, this one as the fp16 value it stores) -- one launch instead of two
 __global__ void k_idx_prep_pool(const float * __restrict__ qi, const float * __restrict__ kr, const float * __restrict__ qnorm,
                                 float * __restrict__ qn, half * __restrict__ kraw, half * __restrict__ pool, const float * __restrict__ knorm,
-                                const int * pos_p, int n_head, int n_rot, float base, float eps) {
+                                const int * pos_p, int n_head, int n_rot, float base, float eps, const int * rp, int rsec) {
     const int h = blockIdx.y, i = threadIdx.x;
     const int pos = *pos_p;
     __shared__ float buf[128];
@@ -1053,19 +1054,19 @@ __global__ void k_idx_prep_pool(const float * __restrict__ qi, const float * __r
         const float ss = block_sum4(x * x);
         buf[i] = x * rsqrtf(ss / 128 + eps) * knorm[i];
         __syncthreads();
-        pool[(size_t) b * 128 + i] = __float2half(rope_dim(buf, i, 4 * b, n_rot, base));
+        pool[(size_t) b * 128 + i] = __float2half(rope_dim(buf, i, 4 * b, n_rot, base, rp, rsec));
         return;
     }
     float x = qi[(size_t) h * 128 + i];
     const float ss = block_sum4(x * x);
     buf[i] = x * rsqrtf(ss / 128 + eps) * qnorm[i];
     __syncthreads();
-    qn[(size_t) h * 128 + i] = rope_dim(buf, i, pos, n_rot, base);
+    qn[(size_t) h * 128 + i] = rope_dim(buf, i, pos, n_rot, base, rp, rsec);
 }
 // grid (candidate blocks), 128 threads: blocks of 4 cells completed by tokens pos..pos+nt-1: mean raw key -> rms norm ->
 // rope at the block's first position -> pool[b]
 __global__ void k_idx_pool(const half * __restrict__ kraw, half * __restrict__ pool, const float * __restrict__ knorm, const int * pos_p,
-                           int nt, int n_rot, float base, float eps) {
+                           int nt, int n_rot, float base, float eps, const int * rp, int rsec) {
     const int pos = *pos_p;
     const int b = pos / 4 + blockIdx.x, last = 4 * b + 3, i = threadIdx.x;
     if (last < pos || last > pos + nt - 1) return;
@@ -1076,7 +1077,7 @@ __global__ void k_idx_pool(const half * __restrict__ kraw, half * __restrict__ p
     const float ss = block_sum4(x * x);
     buf[i] = x * rsqrtf(ss / 128 + eps) * knorm[i];
     __syncthreads();
-    pool[(size_t) b * 128 + i] = __float2half(rope_dim(buf, i, 4 * b, n_rot, base));
+    pool[(size_t) b * 128 + i] = __float2half(rope_dim(buf, i, 4 * b, n_rot, base, rp, rsec));
 }
 // block per token (1024 threads): visible complete pools np = (p+1)/4; np <= top: all cells 0..p. Otherwise the top
 // `top` pools by sum_h relu(q_h . pool) / sqrt(128) (radix select on the non-negative score bits, ties to the lower
@@ -1413,15 +1414,16 @@ void moe_publish(volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_
     k_moe_seq<<<1, 1, 0, s>>>(seq, counter, seq_tag);
 }
 void idx_prep(const float * qi, const float * kr, const float * qnorm, float * qn, half * kraw, const int * pos, int n_head, int n_rot,
-              float base, float eps, int nt, cudaStream_t s) {
-    k_idx_prep<<<dim3(nt, n_head + 1), 128, 0, s>>>(qi, kr, qnorm, qn, kraw, pos, n_head, n_rot, base, eps);
+              float base, float eps, int nt, cudaStream_t s, const int * rp, int rsec) {
+    k_idx_prep<<<dim3(nt, n_head + 1), 128, 0, s>>>(qi, kr, qnorm, qn, kraw, pos, n_head, n_rot, base, eps, rp, rsec);
 }
 void idx_prep_pool(const float * qi, const float * kr, const float * qnorm, float * qn, half * kraw, half * pool, const float * knorm,
-                   const int * pos, int n_head, int n_rot, float base, float eps, cudaStream_t s) {
-    k_idx_prep_pool<<<dim3(1, n_head + 1), 128, 0, s>>>(qi, kr, qnorm, qn, kraw, pool, knorm, pos, n_head, n_rot, base, eps);
+                   const int * pos, int n_head, int n_rot, float base, float eps, cudaStream_t s, const int * rp, int rsec) {
+    k_idx_prep_pool<<<dim3(1, n_head + 1), 128, 0, s>>>(qi, kr, qnorm, qn, kraw, pool, knorm, pos, n_head, n_rot, base, eps, rp, rsec);
 }
-void idx_pool(const half * kraw, half * pool, const float * knorm, const int * pos, int nt, int n_rot, float base, float eps, cudaStream_t s) {
-    k_idx_pool<<<nt / 4 + 2, 128, 0, s>>>(kraw, pool, knorm, pos, nt, n_rot, base, eps);
+void idx_pool(const half * kraw, half * pool, const float * knorm, const int * pos, int nt, int n_rot, float base, float eps, cudaStream_t s,
+              const int * rp, int rsec) {
+    k_idx_pool<<<nt / 4 + 2, 128, 0, s>>>(kraw, pool, knorm, pos, nt, n_rot, base, eps, rp, rsec);
 }
 void idx_select(const float * qn, const half * pool, const int * pos, int nt, int n_head, int top, float * scores, int score_stride,
                 int score_rows, int * list, int list_stride, int * list_n, cudaStream_t s) {

@@ -17,6 +17,8 @@
 
 #include "chat.h"
 #include "llama.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 
 #include "cpp-httplib/httplib.h"
 #include "nlohmann/json.hpp"
@@ -29,6 +31,8 @@
 #include <condition_variable>
 #include <fstream>
 #include <iterator>
+#include <list>
+#include <memory>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -38,6 +42,7 @@
 
 using ojson = nlohmann::ordered_json;
 static std::string g_reasoning_effort;   // --reasoning-effort: default for requests without one
+static bool g_vision = false;            // --mmproj loaded: image parts reach the model
 using namespace hyper;
 
 namespace {
@@ -74,6 +79,13 @@ struct Ctx {
     common_chat_templates_ptr tmpls;
     std::string alias;
     bool glm = false;   // glm5-next: its templates know reasoning effort low / high (/ max)
+    // --mmproj: the vision encoder (libmtmd); images of a prompt become its rows at the image token's positions
+    mtmd_context * mtmd = nullptr;
+    int image_tok = -1, n_embd_inp = 0;
+    std::mutex mtmd_mu;
+    // encoded images by content hash (a conversation sends its images again with every request), least recently used out
+    std::list<std::pair<std::string, std::shared_ptr<std::vector<float>>>> img_cache;
+    size_t img_cache_bytes = 0;
     std::mutex mu;
     std::atomic<long> next_id{1};
 };
@@ -138,6 +150,8 @@ std::string random_id(const char * prefix, long n) {
 
 struct Request {
     std::vector<int> prompt;
+    std::shared_ptr<PromptMedia> media;                        // images (vision): rows, positions, cache keys
+    std::vector<std::shared_ptr<std::vector<float>>> media_keep;   // (their rows)
     common_chat_parser_params pp;
     std::vector<std::string> stops;
     int max_tokens = 0;
@@ -240,6 +254,133 @@ common_chat_msg parse_out(const std::string & text, bool partial, const Request 
 
 bool is_image_part(const ojson & p);
 std::string part_text(const ojson & c);
+extern const char * kImageNote;
+
+// ---------------- images (vision, --mmproj) ----------------
+std::string image_url_of(const ojson & p) {   // chat {"image_url": {"url"}}, Responses {"image_url": "..."}
+    if (p.contains("image_url")) {
+        const ojson & u = p["image_url"];
+        if (u.is_string()) return u.get<std::string>();
+        if (u.is_object() && u.contains("url") && u["url"].is_string()) return u["url"].get<std::string>();
+    }
+    if (p.contains("url") && p["url"].is_string()) return p["url"].get<std::string>();
+    return "";
+}
+std::string b64_decode(const std::string & in) {
+    static int8_t T[256];
+    static bool init = false;
+    if (!init) {
+        memset(T, -1, sizeof T);
+        const char * A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; ++i) T[(uint8_t) A[i]] = (int8_t) i;
+        T[(uint8_t) '-'] = 62; T[(uint8_t) '_'] = 63;   // (url-safe alphabet too)
+        init = true;
+    }
+    std::string out;
+    out.reserve(in.size() * 3 / 4);
+    unsigned v = 0; int bits = 0;
+    for (unsigned char ch : in) {
+        if (T[ch] < 0) continue;   // (padding, whitespace)
+        v = v << 6 | (unsigned) T[ch]; bits += 6;
+        if (bits >= 8) { bits -= 8; out.push_back((char) (v >> bits & 0xff)); }
+    }
+    return out;
+}
+// an image's bytes: a data: URL, or downloaded (http / https)
+std::string load_image(const std::string & url) {
+    if (url.rfind("data:", 0) == 0) {
+        const size_t comma = url.find(',');
+        if (comma == std::string::npos) throw std::invalid_argument("image: malformed data URL");
+        if (url.substr(0, comma).find(";base64") == std::string::npos) throw std::invalid_argument("image: data URL is not base64");
+        return b64_decode(url.substr(comma + 1));
+    }
+    const size_t se = url.find("://");
+    if (se == std::string::npos || (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0))
+        throw std::invalid_argument("image: only data: and http(s) URLs are supported");
+    const size_t ps = url.find('/', se + 3);
+    httplib::Client cli(url.substr(0, ps));
+    cli.set_follow_location(true);
+    cli.set_connection_timeout(10);
+    cli.set_read_timeout(30);
+    auto res = cli.Get(ps == std::string::npos ? "/" : url.substr(ps));
+    if (!res || res->status != 200) throw std::invalid_argument("image: cannot download " + url.substr(0, 120));
+    return res->body;
+}
+// the prompt text with one media marker per image -> tokens, and for the engine the images' rows (encoded once per image
+// content), M-RoPE positions and cache keys
+void build_media(Ctx & c, const std::string & text, const std::vector<std::string> & urls, Request & r, const std::string & rid) {
+    std::vector<mtmd_bitmap *> bms;
+    struct Free { std::vector<mtmd_bitmap *> & v; ~Free() { for (auto * b : v) mtmd_bitmap_free(b); } } fr{bms};
+    for (size_t i = 0; i < urls.size(); ++i) {
+        const std::string data = load_image(urls[i]);
+        const mtmd_helper_bitmap_wrapper w = mtmd_helper_bitmap_init_from_buf(c.mtmd, (const unsigned char *) data.data(), data.size(), false,
+                                                                             mtmd_helper_init_opt_default());
+        if (!w.bitmap) throw std::invalid_argument("image " + std::to_string(i + 1) + ": not a readable image (" + std::to_string(data.size()) + " bytes)");
+        bms.push_back(w.bitmap);
+    }
+    std::lock_guard<std::mutex> lk(c.mtmd_mu);
+    mtmd_input_text in{};
+    in.text = text.c_str();
+    in.text_len = text.size();
+    in.add_special = true;
+    in.parse_special = true;
+    std::unique_ptr<mtmd_input_chunks, void (*)(mtmd_input_chunks *)> ch(mtmd_input_chunks_init(), mtmd_input_chunks_free);
+    const int rc = mtmd_tokenize(c.mtmd, ch.get(), &in, (const mtmd_bitmap **) bms.data(), bms.size());
+    if (rc != 0) throw std::invalid_argument("images: tokenizing the prompt failed (" + std::to_string(rc) + ")");
+    auto md = std::make_shared<PromptMedia>();
+    int n_past = 0, n_img = 0;
+    for (size_t i = 0; i < mtmd_input_chunks_size(ch.get()); ++i) {
+        const mtmd_input_chunk * k = mtmd_input_chunks_get(ch.get(), i);
+        const auto type = mtmd_input_chunk_get_type(k);
+        if (type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            size_t n = 0;
+            const llama_token * t = mtmd_input_chunk_get_tokens_text(k, &n);
+            for (size_t j = 0; j < n; ++j, ++n_past) {
+                r.prompt.push_back(t[j]);
+                md->keys.push_back(t[j]);
+                md->pos3.insert(md->pos3.end(), {n_past, n_past, n_past});
+            }
+            continue;
+        }
+        if (type != MTMD_INPUT_CHUNK_TYPE_IMAGE) throw std::invalid_argument("only images are supported");
+        const mtmd_image_tokens * it = mtmd_input_chunk_get_tokens_image(k);
+        const size_t nt = mtmd_image_tokens_get_n_tokens(it);
+        const std::string id = mtmd_input_chunk_get_id(k) ? mtmd_input_chunk_get_id(k) : std::to_string(i);
+        std::shared_ptr<std::vector<float>> e;
+        for (auto ci = c.img_cache.begin(); ci != c.img_cache.end(); ++ci)
+            if (ci->first == id) { e = ci->second; c.img_cache.splice(c.img_cache.begin(), c.img_cache, ci); break; }
+        double enc_s = 0;
+        if (!e) {
+            const auto t0 = clk::now();
+            if (mtmd_encode_chunk(c.mtmd, k) != 0) throw std::runtime_error("image " + std::to_string(n_img + 1) + ": encoding failed");
+            const float * out = mtmd_get_output_embd(c.mtmd);
+            e = std::make_shared<std::vector<float>>(out, out + nt * (size_t) c.n_embd_inp);
+            enc_s = secs(t0, clk::now());
+            c.img_cache.push_front({id, e});
+            c.img_cache_bytes += e->size() * sizeof(float);
+            while (c.img_cache_bytes > ((size_t) 2 << 30) && c.img_cache.size() > 1) {
+                c.img_cache_bytes -= c.img_cache.back().second->size() * sizeof(float);
+                c.img_cache.pop_back();
+            }
+        }
+        // (an image's positions all carry one key from its hash: another image in the same place is not a cache hit)
+        const int key = -1 - (int) (std::strtoul(id.substr(0, 7).c_str(), nullptr, 16) & 0x0fffffff);
+        for (size_t j = 0; j < nt; ++j) {
+            const mtmd_decoder_pos dp = mtmd_image_tokens_get_decoder_pos(it, n_past, j);
+            md->rows.push_back({(int) r.prompt.size(), e->data() + j * (size_t) c.n_embd_inp});
+            r.prompt.push_back(c.image_tok);
+            md->keys.push_back(key);
+            md->pos3.insert(md->pos3.end(), {(int) dp.t, (int) dp.y, (int) dp.x});
+        }
+        n_past += mtmd_image_tokens_get_n_pos(it);
+        r.media_keep.push_back(e);
+        ++n_img;
+        if (enc_s > 0) fprintf(stderr, "[%s] image %d: %zu tokens, encoded in %.2f s\n", rid.c_str(), n_img, nt, enc_s);
+        else fprintf(stderr, "[%s] image %d: %zu tokens (encoded before)\n", rid.c_str(), n_img, nt);
+    }
+    md->next = n_past;
+    r.media = md;
+}
 
 // tool-call arguments must be a JSON object: a call cut off mid-arguments ("{", a truncated command) becomes "{}" (not
 // completed: a truncated shell command must not run as something else); the client reports the error to the model
@@ -253,12 +394,30 @@ Request prepare(Ctx & c, const ojson & body) {
     Request r;
     common_chat_templates_inputs in;
     ojson msgs_in = body.at("messages");   // (broken tool-call arguments in the history: repaired, not rejected)
+    // image parts: with the vision encoder the content becomes text with a media marker per image (in prompt order);
+    // text-only, a note per image
+    std::vector<std::string> images;
+    const std::string marker = mtmd_default_marker();
     if (msgs_in.is_array())
-        for (auto & m : msgs_in)   // image parts (text-only engines): the content becomes text with a note per image
+        for (auto & m : msgs_in)
             if (m.is_object() && m.contains("content") && m["content"].is_array()) {
                 bool img = false;
                 for (auto & p : m["content"]) img |= is_image_part(p);
-                if (img) { m["content"] = part_text(m["content"]); fprintf(stderr, "request: image(s) replaced by a text note (text-only)\n"); }
+                if (!img) continue;
+                if (!c.mtmd) { m["content"] = part_text(m["content"]); fprintf(stderr, "request: image(s) replaced by a text note (text-only)\n"); continue; }
+                std::string t;
+                for (auto & p : m["content"]) {
+                    std::string x;
+                    if (is_image_part(p)) {
+                        const std::string u = image_url_of(p);
+                        if (u.empty()) { x = kImageNote; }
+                        else { t += marker; images.push_back(u); continue; }
+                    } else if (p.is_string()) x = p.get<std::string>();
+                    else if (p.is_object() && p.contains("text") && p["text"].is_string()) x = p["text"].get<std::string>();
+                    for (size_t q; (q = x.find(marker)) != std::string::npos;) x.replace(q, marker.size(), "<_media_>");   // (not a marker)
+                    t += x;
+                }
+                m["content"] = t;
             }
     if (msgs_in.is_array())
         for (auto & m : msgs_in)
@@ -301,7 +460,9 @@ Request prepare(Ctx & c, const ojson & body) {
         else if (!eff.empty() && !in.chat_template_kwargs.count("reasoning_effort")) in.chat_template_kwargs["reasoning_effort"] = "\"" + eff + "\"";
     }
     const common_chat_params cp = common_chat_templates_apply(c.tmpls.get(), in);
-    r.prompt = tokenize(c.vocab, cp.prompt);
+    if (getenv("HYPER_SHOW_PROMPT")) fprintf(stderr, "request prompt (%zu images):\n%s\n---\n", images.size(), cp.prompt.c_str());
+    if (images.empty()) r.prompt = tokenize(c.vocab, cp.prompt);
+    else build_media(c, cp.prompt, images, r, "request");
     r.pp = common_chat_parser_params(cp);
     r.pp.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     r.pp.parse_tool_calls = !in.tools.empty() && in.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
@@ -408,6 +569,7 @@ GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::strin
     });
     bool first = true;
     clk::time_point t1 = t0;
+    if (!c.eng->set_media(r.media.get())) throw std::invalid_argument("this model takes no images");
     c.eng->generate(r.prompt, r.max_tokens, c.eng->n_draft() > 0, &st, [&](int tok) {
         const auto now = clk::now();
         if (first) {
@@ -536,7 +698,7 @@ ojson usage(const Request & r, const GenOut & o) {
 // ---------------- OpenAI Responses API (/v1/responses) on top of the chat path ----------------
 // the engines are text-only: an image becomes this note (instead of vanishing, after which models describe what they
 // "saw")
-const char * kImageNote = "[image not shown: this model server is text-only and cannot see images]";
+const char * kImageNote = "[image not shown: this model server cannot see images]";
 bool is_image_part(const ojson & p) {
     if (!p.is_object()) return false;
     const std::string ty = p.value("type", "");
@@ -583,6 +745,18 @@ ojson responses_to_chat(const ojson & body, std::set<std::string> & custom_tools
             if (type == "message") {
                 std::string role = it.value("role", "user");
                 const std::string text = part_text(it.contains("content") ? it["content"] : ojson(""));
+                bool img = false;   // (images of a user / tool message: kept as parts, the chat path sees them)
+                if (g_vision && it.contains("content") && it["content"].is_array()) for (auto & p : it["content"]) img |= is_image_part(p);
+                if (img && role != "system" && role != "developer" && role != "assistant") {
+                    if (!msgs.empty() && msgs.back()["role"] == "assistant") msgs.back()["closed"] = true;
+                    ojson parts = ojson::array();
+                    for (auto & p : it["content"]) {
+                        if (is_image_part(p)) parts.push_back({{"type", "image_url"}, {"image_url", {{"url", image_url_of(p)}}}});
+                        else if (p.is_object() && p.contains("text") && p["text"].is_string()) parts.push_back({{"type", "text"}, {"text", p["text"]}});
+                    }
+                    msgs.push_back({{"role", role}, {"content", parts}});
+                    continue;
+                }
                 if (role == "system" || role == "developer") { sys += (sys.empty() ? "" : "\n\n") + text; continue; }
                 if (role == "assistant") {
                     ojson & m = assistant();
@@ -602,6 +776,19 @@ ojson responses_to_chat(const ojson & body, std::set<std::string> & custom_tools
                 add_call(it.value("call_id", ""), it.value("name", ""), ojson({{"input", it.value("input", "")}}).dump());
             } else if (type == "function_call_output" || type == "custom_tool_call_output") {
                 if (!msgs.empty() && msgs.back()["role"] == "assistant") msgs.back()["closed"] = true;
+                if (g_vision && it.contains("output") && it["output"].is_array()) {   // (a tool's output with images, e.g. a screenshot)
+                    bool img = false;
+                    for (auto & p : it["output"]) img |= is_image_part(p);
+                    if (img) {
+                        ojson parts = ojson::array();
+                        for (auto & p : it["output"]) {
+                            if (is_image_part(p)) parts.push_back({{"type", "image_url"}, {"image_url", {{"url", image_url_of(p)}}}});
+                            else if (p.is_object() && p.contains("text") && p["text"].is_string()) parts.push_back({{"type", "text"}, {"text", p["text"]}});
+                        }
+                        msgs.push_back({{"role", "tool"}, {"tool_call_id", it.value("call_id", "")}, {"content", parts}});
+                        continue;
+                    }
+                }
                 const std::string out = it.contains("output") ? (it["output"].is_string() ? it["output"].get<std::string>()
                                                                  : it["output"].is_object() && it["output"].contains("content")
                                                                        ? part_text(it["output"]["content"]) : part_text(it["output"]))
@@ -676,6 +863,7 @@ int main(int argc, char ** argv) {
     std::string stats_path;   // qwen4exp: routing statistics, read at start and updated after every request
     std::string mtp_path;     // qwen4exp: separate NextN (MTP) GGUF; glm5-next: a GGUF with blk.<n_layer> (the original split files)
     std::string template_file;   // chat template (jinja) instead of the GGUF's
+    std::string mmproj_path;     // vision encoder (mmproj GGUF): images in prompts
     std::vector<std::pair<std::string, std::string>> mcps;   // --mcp name=url: tool servers for the chat page
     bool ctx_given = false, temp_given = false, top_p_given = false, top_k_given = false;
     SamplingParams defaults;   // Qwen's recommendation for thinking mode
@@ -697,6 +885,7 @@ int main(int argc, char ** argv) {
         }
         else if (k == "--reasoning-effort") g_reasoning_effort = v;
         else if (k == "--chat-template-file") template_file = v;
+        else if (k == "--mmproj") mmproj_path = v;
         else { fprintf(stderr, "unknown option %s\n", k.c_str()); return 1; }
     }
     const std::string path = argv[1];
@@ -721,6 +910,31 @@ int main(int argc, char ** argv) {
     }
     c.tmpls = common_chat_templates_init(c.vm, tmpl_override);
 
+    if (mmproj_path.empty() && getenv("HYPER_MMPROJ")) mmproj_path = getenv("HYPER_MMPROJ");   // (tests)
+    if (!mmproj_path.empty()) {   // before the engine: its expert placement sees the encoder's VRAM as taken
+        mtmd_context_params mpar = mtmd_context_params_default();
+        mpar.use_gpu = !getenv("HYPER_MMPROJ_CPU");
+        mpar.n_threads = 8;
+        mpar.print_timings = false;
+        mpar.warmup = true;
+        c.mtmd = mtmd_init_from_file(mmproj_path.c_str(), c.vm, mpar);
+        if (!c.mtmd || !mtmd_support_vision(c.mtmd)) { fprintf(stderr, "cannot load the vision encoder %s\n", mmproj_path.c_str()); return 1; }
+        const std::vector<int> it = tokenize(c.vocab, "<|image_pad|>");
+        c.image_tok = it.size() == 1 ? it[0] : -1;
+        {   // the encoder's rows are the model's input rows (the vocabulary-only model knows no embedding size)
+            GGUF gp(mmproj_path), gm(path);
+            c.n_embd_inp = (int) gp.get_int("clip.vision.projection_dim", 0);
+            const int n_model = (int) gm.get_int(gm.arch() + ".embedding_length", 0);
+            if (c.n_embd_inp <= 0 || c.n_embd_inp != n_model) {
+                fprintf(stderr, "the vision encoder's output (%d) does not fit the model's input rows (%d)\n", c.n_embd_inp, n_model);
+                return 1;
+            }
+        }
+        if (c.image_tok < 0) { fprintf(stderr, "the vocabulary has no <|image_pad|> token\n"); return 1; }
+        g_vision = true;
+        fprintf(stderr, "hyper-server: vision encoder %s (%s, rows of %d, image token %d, M-RoPE %s)\n", mmproj_path.c_str(), mpar.use_gpu ? "GPU" : "CPU",
+                c.n_embd_inp, c.image_tok, mtmd_decode_use_mrope(c.mtmd) ? "yes" : "no");
+    }
     std::string arch;
     { GGUF g(path); arch = g.arch(); }
     c.glm = arch == "glm5-next";
@@ -774,6 +988,11 @@ int main(int argc, char ** argv) {
     c.live.ctx_max = ctx;
     LLM & eng = *engine;
     c.eng = &eng;
+    if (c.mtmd) {   // (an engine that takes no images: the encoder is of no use)
+        PromptMedia probe;
+        if (!eng.set_media(&probe)) { fprintf(stderr, "hyper-server: this model takes no images, --mmproj ignored\n"); mtmd_free(c.mtmd); c.mtmd = nullptr; g_vision = false; }
+        else eng.set_media(nullptr);
+    }
     {
         int n_snap = 0;   // message starts: ChatML, or GLM's role tokens (an engine keeps every token it is given)
         for (const char * m : {"<|im_start|>", "<|assistant|>", "<|user|>", "<|observation|>"}) {
@@ -812,7 +1031,7 @@ int main(int argc, char ** argv) {
     srv.Get("/health", [&](const httplib::Request &, httplib::Response & res) { cors(res); res.set_content(R"({"status":"ok"})", "application/json"); });
     auto models = [&](const httplib::Request &, httplib::Response & res) {
         cors(res);
-        ojson m = {{"id", c.alias}, {"object", "model"}, {"created", 0}, {"owned_by", "hyper"}, {"meta", {{"n_ctx_train", ctx}}}};
+        ojson m = {{"id", c.alias}, {"object", "model"}, {"created", 0}, {"owned_by", "hyper"}, {"meta", {{"n_ctx_train", ctx}, {"vision", c.mtmd != nullptr}}}};
         res.set_content(ojson({{"object", "list"}, {"data", ojson::array({m})}}).dump(), "application/json");
     };
     srv.Get("/v1/models", models);

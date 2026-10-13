@@ -125,13 +125,15 @@ void moe_publish(volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_
 
 // ---- QSA indexer (sparse attention over the top blocks of 4 cells) ----
 // qi [nt][n_head*128] -> qn (rms norm * qnorm, rope at pos + t); kr [nt][128] -> kraw[pos + t] (fp16)
+// (rp / rsec: M-RoPE positions per cell, see mrope_pos; a pooled block turns by its first cell's)
 void idx_prep(const float * qi, const float * kr, const float * qnorm, float * qn, half * kraw, const int * pos, int n_head, int n_rot,
-              float base, float eps, int nt, cudaStream_t s);
+              float base, float eps, int nt, cudaStream_t s, const int * rp = nullptr, int rsec = 0);
 // blocks completed by these tokens: pool[b] = rope(rmsnorm(mean of kraw[4b..4b+3]) * knorm, 4b)
 // one decode token: idx_prep + idx_pool in one launch (same results)
 void idx_prep_pool(const float * qi, const float * kr, const float * qnorm, float * qn, half * kraw, half * pool, const float * knorm,
-                   const int * pos, int n_head, int n_rot, float base, float eps, cudaStream_t s);
-void idx_pool(const half * kraw, half * pool, const float * knorm, const int * pos, int nt, int n_rot, float base, float eps, cudaStream_t s);
+                   const int * pos, int n_head, int n_rot, float base, float eps, cudaStream_t s, const int * rp = nullptr, int rsec = 0);
+void idx_pool(const half * kraw, half * pool, const float * knorm, const int * pos, int nt, int n_rot, float base, float eps, cudaStream_t s,
+              const int * rp = nullptr, int rsec = 0);
 // per token: the attended cells (ascending): everything while (p+1)/4 <= top, else the top pools' cells + the tail.
 // scores: scratch [score_rows][score_stride >= max_pos/4]; tokens are processed score_rows at a time
 void idx_select(const float * qn, const half * pool, const int * pos, int nt, int n_head, int top, float * scores, int score_stride,

@@ -14,6 +14,7 @@
 #include <random>
 #include <thread>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace hyper {
@@ -79,6 +80,9 @@ public:
     int max_pos() const override { return opt_.max_pos; }
     int n_draft() const override { return mtp_g_ ? opt_.n_draft : 0; }
     bool has_mtp() const override { return mtp_g_ != nullptr; }
+    // images: a model with M-RoPE sections (Qwen3-VL style) takes them
+    bool set_media(const PromptMedia * m) override { if (m && !has_rpos()) return false; media_ = m; return true; }
+    bool has_rpos() const;
     // routing statistics: the loaded ones plus what the CPU side has seen since (decode routing of every layer)
     void save_expert_stats(const std::string & path);
     void dump_trace(const std::string & dir);   // HYPER4_TRACE: per-layer residual of the last forward's last row
@@ -101,6 +105,10 @@ private:
     void build_graphs();
     void embed(const int * tokens, int nt, int pos, int chunk = 0);
     void embed_tok(const int * tokens, int nt, float * dst);
+    void image_rows(int pos, int nt, float * dst);   // image positions of [pos, pos + nt): the encoder's rows
+    int rpos_cells() const { return opt_.max_pos + 4 * MAX_NT + 8; }
+    static void rpos_fill(int * rp, int from, int to, int delta, cudaStream_t s);
+    void set_rpos(int s, int P, const PromptMedia * md);
     void run(int kind, int nt);   // 0 main, 1 MTP, 2 MTP chain, 3 restore (nt = rows kept)
     int mtp_result();
     void draft_at(int64_t pos) { mtp_pos_ = pos; }   // the next MTP pass drafts the token at pos
@@ -136,6 +144,8 @@ private:
     std::unique_ptr<CpuMoe> cpu_;
     std::vector<std::vector<uint64_t>> stats_;   // expert placement statistics [layer][expert]
     std::vector<int> seq_;          // tokens by position (PLE n-gram history)
+    const PromptMedia * media_ = nullptr;           // images of the next generate()
+    std::unordered_map<int, const float *> mrows_;  // this prompt's image rows by position
     float * h_embd_ = nullptr;      // pinned [MAX_NT][n_embd]
     float * h_ple_ = nullptr;       // pinned [MAX_NT][ple heads * ple dim]
     int * h_pos_ = nullptr;

@@ -99,10 +99,11 @@ $(BUILD)/arbulk: tools/arbulk.cu $(BUILD)/kernels.o
 
 # OpenAI-compatible server: chat templates / tool-call parsing from mainline libcommon, vocab from libllama
 COMMON_LIBS := $(LLAMA)/build/common/libllama-common.a $(LLAMA)/build/common/libllama-common-base.a \
-               $(LLAMA)/build/vendor/cpp-httplib/libcpp-httplib.a
+               $(LLAMA)/build/vendor/cpp-httplib/libcpp-httplib.a \
+               $(LLAMA)/build/tools/mtmd/libmtmd.a $(LLAMA)/build/vendor/hash/libvendor-hash.a
 OBJ_ALL := $(sort $(OBJ) $(OBJ4))
 $(BUILD)/hyper-server: $(OBJ_ALL) tools/hyper_server.cpp tools/chat_page.h
-	$(NVCC) $(NVFLAGS) -Isrc -I$(LLAMA)/include -I$(LLAMA)/ggml/include -I$(LLAMA)/common -I$(LLAMA)/vendor \
+	$(NVCC) $(NVFLAGS) -Isrc -I$(LLAMA)/include -I$(LLAMA)/ggml/include -I$(LLAMA)/common -I$(LLAMA)/vendor -I$(LLAMA)/tools/mtmd \
 	  tools/hyper_server.cpp $(OBJ_ALL) -o $@ \
 	  -Xlinker --start-group $(COMMON_LIBS) $(LLAMA_LIBS) -Xlinker --end-group $(LIBS) -lssl -lcrypto
 

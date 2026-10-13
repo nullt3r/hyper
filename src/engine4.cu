@@ -97,6 +97,7 @@ struct Engine4::Device {
     DW m_eh, m_head_down, m_head_up;
     float * mres = nullptr, * mh = nullptr, * ecat = nullptr;   // MTP residual rows, chained hidden (1 row), eh_proj input
     int * mpos = nullptr;
+    int * rpos = nullptr;   // [cells][3]: M-RoPE positions (t, h, w) per cache cell (cfg_.rope_sec), see set_rpos
     cudaGraphExec_t g_mtp[MAX_NT + 1] = {}, g_chain = nullptr, g_restore[MAX_NT] = {};
     float * head_norm = nullptr;
     DW head_down, head_up, output;
@@ -1197,6 +1198,10 @@ void Engine4::load_weights() {
         dev.h16 = dev.alloc<half>((size_t) R * K * c.n_ff_exp);
         dev.pos = dev.alloc<int>(1);
         dev.mpos = dev.alloc<int>(1);
+        if (c.rope_sec && !getenv("HYPER4_NO_MROPE")) {   // (the cells MTP drafts reach past max_pos included; the switch: plain rope, text only)
+            dev.rpos = dev.alloc<int>((size_t) rpos_cells() * 3);
+            rpos_fill(dev.rpos, 0, rpos_cells(), 0, dev.stream);
+        }
         if (mtp_g_) {
             dev.mres = dev.alloc<float>((size_t) R * hcn);
             dev.mh = dev.alloc<float>((size_t) hcn);
@@ -1500,10 +1505,11 @@ void Engine4::record_main(int gi, int nt, int kind) {
                 }
                 static const bool sep_pool = getenv("HYPER4_SEP_POOL") != nullptr;
                 if (nt == 1 && !sep_pool)
-                    idx_prep_pool(d.iq, d.ik, L.idx_qn, d.iqn, L.kraw, L.kpool, L.idx_kn, P, c.idx_n_head, c.n_rot, c.rope_base, eps, s);
+                    idx_prep_pool(d.iq, d.ik, L.idx_qn, d.iqn, L.kraw, L.kpool, L.idx_kn, P, c.idx_n_head, c.n_rot, c.rope_base, eps, s,
+                                  d.rpos, c.rope_sec);
                 else {
-                    idx_prep(d.iq, d.ik, L.idx_qn, d.iqn, L.kraw, P, c.idx_n_head, c.n_rot, c.rope_base, eps, nt, s);
-                    idx_pool(L.kraw, L.kpool, L.idx_kn, P, nt, c.n_rot, c.rope_base, eps, s);
+                    idx_prep(d.iq, d.ik, L.idx_qn, d.iqn, L.kraw, P, c.idx_n_head, c.n_rot, c.rope_base, eps, nt, s, d.rpos, c.rope_sec);
+                    idx_pool(L.kraw, L.kpool, L.idx_kn, P, nt, c.n_rot, c.rope_base, eps, s, d.rpos, c.rope_sec);
                 }
                 if (cache_only) return;
                 static const bool old_sel = getenv("HYPER4_OLDSEL") != nullptr;
@@ -1521,7 +1527,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
             if (par_idx && !idx_late) mm(L.wqkv, d.mixed, n, d.big0, bs, nt);
             if (par_idx) {   // attention prep runs meanwhile (q/k norms, rope, the cache rows): it needs only q/k/v
                 attn_prep(d.big0, bs, L.q_norm, L.k_norm, L.kcache, L.vcache, P, opt_.max_pos, L.n_head_l, L.n_kv_l, c.head_dim,
-                          c.n_rot, c.rope_base, eps, nt, s);
+                          c.n_rot, c.rope_base, eps, nt, s, d.rpos, c.rope_sec);
                 join();
             }
             cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
@@ -1541,7 +1547,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
             const bool dense_chunk = !qsa || (pos_host + nt) / 4 <= top;
             if (!par_idx)
                 attn_prep(d.big0, bs, L.q_norm, L.k_norm, L.kcache, L.vcache, P, opt_.max_pos, L.n_head_l, L.n_kv_l, c.head_dim,
-                          c.n_rot, c.rope_base, eps, nt, s);
+                          c.n_rot, c.rope_base, eps, nt, s, d.rpos, c.rope_sec);
             if (cache_only) continue;
             const int ostride = L.n_head_l * c.head_dim;
             if (bulk && dense_chunk)
@@ -1884,12 +1890,22 @@ void Engine4::embed_tok(const int * tokens, int nt, float * dst) {
     }
 }
 
-// token embeddings and the PLE n-gram hash rows, for positions pos..pos+nt-1
+// an image's positions (this request's prompt): the vision encoder's rows instead of the image token's embedding
+void Engine4::image_rows(int pos, int nt, float * dst) {
+    if (mrows_.empty()) return;
+    for (int t = 0; t < nt; ++t) {
+        const auto it = mrows_.find(pos + t);
+        if (it != mrows_.end()) memcpy(dst + (size_t) t * cfg_.n_embd, it->second, cfg_.n_embd * sizeof(float));
+    }
+}
+
+// token embeddings and the PLE n-gram hash rows, for positions pos..pos+nt-1 (an image's positions hash as its token)
 void Engine4::embed(const int * tokens, int nt, int pos, int chunk) {
     const Q4Config & c = cfg_;
     if ((int) seq_.size() < pos + nt) seq_.resize(pos + nt, -1);
     for (int t = 0; t < nt; ++t) seq_[pos + t] = tokens[t];
     embed_tok(tokens, nt, h_embd_ + (size_t) chunk * R4 * c.n_embd);
+    image_rows(pos, nt, h_embd_ + (size_t) chunk * R4 * c.n_embd);
     if (c.ple_layer < 0) return;
     const GTensor & pt = gguf_->need("per_layer_token_embd.weight");
     const auto * pt_tr = ggml_get_type_traits((ggml_type) pt.type);
@@ -1915,6 +1931,27 @@ void Engine4::embed(const int * tokens, int nt, int pos, int chunk) {
                 pt_tr->to_float(pt.data + row * pt.row_bytes(), out + h * dim, dim);
             }
         }
+    }
+}
+
+// M-RoPE positions of cells [s, P) (the prompt's: images' grid positions; text: the index) and of every cell after it (text
+// generation goes on from md->next), on every device before the prompt's forwards
+__global__ void k_rpos_fill(int * rp, int from, int to, int delta) {
+    const int c = from + blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < to) { rp[3 * (size_t) c] = c + delta; rp[3 * (size_t) c + 1] = c + delta; rp[3 * (size_t) c + 2] = c + delta; }
+}
+void Engine4::rpos_fill(int * rp, int from, int to, int delta, cudaStream_t s) {
+    if (to > from) k_rpos_fill<<<(to - from + 255) / 256, 256, 0, s>>>(rp, from, to, delta);
+}
+bool Engine4::has_rpos() const { return !devs_.empty() && devs_[0]->rpos; }
+void Engine4::set_rpos(int s, int P, const PromptMedia * md) {
+    for (auto & dp : devs_) {
+        CUDA_CHECK(cudaSetDevice(dp->id));
+        if (md && P > s)
+            CUDA_CHECK(cudaMemcpyAsync(dp->rpos + 3 * (size_t) s, md->pos3.data() + 3 * (size_t) s, 3 * sizeof(int) * (size_t) (P - s),
+                                       cudaMemcpyHostToDevice, dp->stream));
+        rpos_fill(dp->rpos, md ? P : s, rpos_cells(), md ? md->next - P : 0, dp->stream);
+        CUDA_CHECK(cudaStreamSynchronize(dp->stream));   // (md's vectors are pageable and the caller's)
     }
 }
 
@@ -2095,6 +2132,7 @@ int Engine4::mtp_result() {
 // the rows only enter the block's cache, -1)
 int Engine4::mtp_draft(const int * tokens, int nt, int pos, bool need_draft) {
     embed_tok(tokens, nt, h_membd_);
+    image_rows(pos + 1, nt, h_membd_);   // (row t holds the token at pos + t + 1)
     h_pos_[1] = pos;
     draft_at(pos + nt + 1);   // (the row at q holds token q + 1 and drafts token q + 2)
     mtp_cache_only_ = !need_draft;
@@ -2164,6 +2202,7 @@ std::vector<ConvPark<Engine4::Snap>::Dev> Engine4::park_devs() const {
         };
         for (auto & L : dp->layers) attn(L);
         attn(dp->mtp);
+        if (dp->rpos) pd.spans.push_back({dp->rpos, 3 * sizeof(int), 0, 1, 1});
         v.push_back(std::move(pd));
     }
     return v;
@@ -2225,6 +2264,8 @@ int Engine4::sample_row(int t, const SamplingParams & sp, int64_t pos) {
 std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, bool spec_req, GenStats * stats,
                                    const std::function<bool(int)> & on_token, const SamplingParams & sp) {
     const bool spec = spec_req && mtp_g_;
+    const PromptMedia * md = media_;   // (taken first: a request that fails leaves none for the next)
+    media_ = nullptr;
     if (prompt.empty()) throw std::runtime_error("generate: empty prompt");
     if ((int) prompt.size() + 8 > opt_.max_pos) throw std::runtime_error("generate: prompt longer than the context");
     using clk = std::chrono::steady_clock;
@@ -2237,9 +2278,16 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
     const int P = (int) prompt.size();
     // prompt cache: KV / indexer entries stay valid for the common prefix L; the recurrent state comes from the
     // latest snapshot at s <= L - 1
+    // images (set_media): their rows by position, the cache compares keys (an image's hash at its positions)
+    mrows_.clear();
+    if (md) {
+        if ((int) md->keys.size() != P || (int) md->pos3.size() != 3 * P) throw std::runtime_error("generate: media do not match the prompt");
+        for (const auto & r : md->rows) mrows_[r.first] = r.second;
+    }
+    const std::vector<int> & key = md ? md->keys : prompt;
     int s = 0;
     if (opt_.prompt_cache) {
-        const int L = park_.resolve(prompt, hist_, snaps_, snap_pool_, park_devs(), "hyper4");   // (see park.h)
+        const int L = park_.resolve(key, hist_, snaps_, snap_pool_, park_devs(), "hyper4");   // (see park.h)
         for (size_t i = 0; i < snaps_.size();)
             if (snaps_[i].pos > L) { snap_pool_.push_back(snaps_[i].h); snaps_.erase(snaps_.begin() + i); } else ++i;
         Snap * best = nullptr;
@@ -2250,7 +2298,8 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
     req_steps_ = 0;
     ensure_kv(P + 2 * MAX_NT);
     seq_.assign(prompt.begin(), prompt.begin() + s);   // PLE n-gram history
-    hist_.assign(prompt.begin(), prompt.begin() + s);
+    hist_.assign(key.begin(), key.begin() + s);
+    if (devs_[0]->rpos) set_rpos(s, P, md);
     std::vector<int> snap_at;
     if (opt_.prompt_cache) {   // last two message starts always, older ones >= 256 tokens apart, every 4096 tokens
         std::vector<int> msg;
@@ -2309,7 +2358,8 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
         if (prefill_cb_) prefill_cb_(end, P, s);
         c0 = end;
     }
-    hist_ = prompt;
+    hist_ = key;
+    mrows_.clear();   // (the caller's rows are not kept past the prefill)
     st.t_prefill = std::chrono::duration<double>(clk::now() - tp).count();
     st.prompt_reused = s;
     std::vector<int> out;
@@ -2400,7 +2450,7 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
     }
     if (opt_.prompt_cache && p > P && state_ok) take_snapshot(p);   // state after the last processed token
     {
-        std::vector<int> sq = prompt;
+        std::vector<int> sq = key;
         sq.insert(sq.end(), out.begin(), out.end());
         sq.resize(std::min<size_t>(sq.size(), (size_t) p));
         hist_ = sq;
