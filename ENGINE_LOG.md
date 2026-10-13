@@ -496,3 +496,44 @@ Kernel na plnění tabulky (`rpos_fill`) je teď sdílený v kernels.cu.
 
 Produkční skripty: `VISION=0 ~/run-hyper-fn.sh` (`~/run-hyper.sh`) spustí server bez encoderu, takže GPU 0 zase drží
 všechny experty.
+
+## 2026-10-14 – hloubka kontextu: profil reálných přírůstků a dva bitově přesné kernely
+
+Metoda místo dlouhých replayů na živém modelu:
+- **Hloubkový scénář** (`~/deep_fn.sh TAG [ENV=…]`): nejhlubší zachycená Codex session (01a12cab…, 9 požadavků). První požadavek
+  naplní kontext (154 868 tokenů, studený prefill 112,6 s při 1376 t/s), pak 8 navazujících požadavků (979–3698 nových tokenů v hloubce
+  155–170k, 300 greedy tokenů). Zmrazené statistiky expertů, výstupy jako hash na požadavek. Jeden běh ~4,5 min.
+- **Profil** stejného scénáře pod nsys (`~/prof_fn.sh`, `nsys launch` + `start/stop` jen kolem přírůstků, `--cuda-event-trace=false`).
+  Rozpad času podle kernelů *a podle launch gridu* (gridY/gridZ = počet řádků), takže je vidět zvlášť dávka prefillu, ověření
+  1–4 řádků a hustá attention MTP vrstvy (`bench2/kgrid.py`, `nsys_phase.py`, `kdist.py`).
+- **Mikrobenchmark** `tools/qsabench.cu`: QSA cesta Flash-Next (indexer + výběr + sparse attention, i hustá attention MTP vrstvy)
+  na syntetické cache v libovolné hloubce, reálné wrappery, čas na volání (i se studenou L2) a hashe skóre, výběru a výstupu.
+  Změna kernelu se ověří bit po bitu za pár sekund.
+
+Profil (GPU1, ~160k, staré kernely): dávka prefillu indexeru po 64 řádcích **1,7 ms** (`k_qidx_score` čte všech ~40k bloků
+klíčů znovu pro každý řádek; ~0,65 s na přírůstek 2,5k tokenů), sparse attention prefillu 6,5–10,7 ms na vrstvu, hustá attention
+MTP vrstvy ~0,55 ms na volání. GPU0 (bez attention) mezitím čeká ve spinu LL allreduce.
+
+| Kernel (qsabench, 160k) | starý | nový |
+|---|---|---|
+| indexer + výběr, 64 řádků | 1739 µs | **407 µs** |
+| indexer + výběr, 4 řádky | 127 µs | **85 µs** |
+| hustá attention MTP, 1 / 4 řádky | 639 / 1900 µs | **325 / 1041 µs** |
+| sparse attention, 4 / 64 řádků | 57,6 / 467 µs | **47,7 / 297 µs** |
+
+- `k_qidx_score_t`: 8 řádků na blok, vlákno načte svůj blok klíčů jednou do registrů a skóruje proti němu všechny řádky (q ze sdílené
+  paměti). Stejný výraz ve stejném pořadí → skóre bitově shodná. `HYPER_QIDX_OLD=1` = starý kernel.
+- `k_attn_split` (sdílený i s 27B): smyčka přes hlavy bez `break` u `ng` – větvení bránilo kompilátoru prokládat řetězce shuffle
+  a exp šesti hlav. Nepoužité hlavy mají q = 0 a nezapisují se. `HYPER_ATTN_OLD=1` = stará varianta.
+- Zkoušeno a nepomohlo: předčítání buněk o 3 dopředu (pomalejší), pořadí bloků „split nejpomaleji“ (beze změny), celá dávka 64 řádků
+  v jednom bloku indexeru (málo bloků, pomalejší).
+
+| Hloubkový scénář (Flash-Next, 262k, MTP 3) | staré kernely | nové |
+|---|---|---|
+| prefill přírůstků | 860 t/s (2584 ms / požadavek) | **1145 t/s (1940 ms)** |
+| dekódování v hloubce 155–170k | 134,6 t/s | **145,3 t/s** |
+| výstupy 8 požadavků | | **8/8 shodných hashů** |
+
+Z produkčního logu: ani jednou (0 z 786 navazujících požadavků) se nevyužila cache až do konce předchozí odpovědi – předchozí odpověď
+se přepočítává (Flash průměrně 211 tokenů). Snapshot na konci generování nejde použít (historie končí před posledním tokenem,
+při spekulaci se navíc nebere). Na řadě.

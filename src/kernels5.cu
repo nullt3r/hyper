@@ -799,6 +799,52 @@ __global__ void __launch_bounds__(256) k_qidx_score(const float * __restrict__ q
     scores[(size_t) tl * score_stride + b] = sc;
     atomicAdd(&hist[(size_t) tl * GHIST + (fkey(sc) >> 16)], 1u);
 }
+// the same scores (bit for bit: the same expression per (row, pool) in the same order), RT rows per block: a thread
+// loads its pool once into registers and scores every row of the tile against it, the rows' q from shared memory
+// (k_qidx_score reads every pool once per row: a 64-row prefill batch at 160k context read the 10 MB of pools 64 times)
+template <int NH, int RT>
+__global__ void __launch_bounds__(128) k_qidx_score_t(const float * __restrict__ qn, const half * __restrict__ pool, const int * pos_p,
+                                                      int t_off, int nrows, int top, float * __restrict__ scores, int score_stride,
+                                                      unsigned * __restrict__ hist) {
+    const int r0 = blockIdx.y * RT, nr = min(RT, nrows - r0);
+    const int p0 = *pos_p + t_off + r0;
+    const int np_last = (p0 + nr) / 4;   // pools of the tile's last row (the most)
+    if (np_last <= top) return;
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if ((int) (blockIdx.x * blockDim.x) >= np_last) return;
+    __shared__ float qs[RT * NH * 128];
+    for (int i = threadIdx.x; i < nr * NH * 128; i += blockDim.x) qs[i] = qn[(size_t) (t_off + r0) * NH * 128 + i];
+    __syncthreads();
+    if (b >= np_last) return;
+    uint4 v[16];
+    const uint4 * pk = (const uint4 *) (pool + (size_t) b * 128);
+#pragma unroll
+    for (int u = 0; u < 16; ++u) v[u] = pk[u];
+    for (int rr = 0; rr < nr; ++rr) {
+        const int np = (p0 + rr + 1) / 4;
+        if (np <= top || b >= np) continue;
+        const float * q = qs + rr * NH * 128;
+        float acc[NH];
+#pragma unroll
+        for (int h = 0; h < NH; ++h) acc[h] = 0.0f;
+#pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            const __half2 * h2 = (const __half2 *) &v[u];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 f = __half22float2(h2[j]);
+#pragma unroll
+                for (int h = 0; h < NH; ++h) acc[h] += f.x * q[h * 128 + 8 * u + 2 * j] + f.y * q[h * 128 + 8 * u + 2 * j + 1];
+            }
+        }
+        float sum = 0.0f;
+#pragma unroll
+        for (int h = 0; h < NH; ++h) sum += fmaxf(acc[h], 0.0f);
+        const float sc = sum * rsqrtf(128.0f);
+        scores[(size_t) (r0 + rr) * score_stride + b] = sc;
+        atomicAdd(&hist[(size_t) (r0 + rr) * GHIST + (fkey(sc) >> 16)], 1u);
+    }
+}
 
 // block per token (1024 threads), from the score histogram: the bin B holding the top-th largest key; pools above B are
 // selected outright, B's pools (bitmap) are resolved by two 8-bit radix passes; ties at the final key go to the lower pool
@@ -1217,7 +1263,12 @@ void idx_select_hist(const float * qn, const half * pool, const int * pos, int n
         cudaMemsetAsync(hist, 0, (size_t) r * GHIST * sizeof(unsigned), s);
         static const int qb = getenv("HYPER_QIDX_BLOCK") ? atoi(getenv("HYPER_QIDX_BLOCK")) : 128;   // (thread per pool: small blocks
         // spread the few hundred to few thousand pools over more SMs)
-        k_qidx_score<<<dim3((score_stride + qb - 1) / qb, r), qb, 0, s>>>(qn, pool, pos, t0, n_head, top, scores, score_stride, hist);
+        static const bool per_row = getenv("HYPER_QIDX_OLD") != nullptr;   // (the kernel reading the pools once per row)
+        constexpr int RT = 8;
+        if (n_head == 4 && !per_row)
+            k_qidx_score_t<4, RT><<<dim3((score_stride + 127) / 128, (r + RT - 1) / RT), 128, 0, s>>>(qn, pool, pos, t0, r, top, scores,
+                                                                                                   score_stride, hist);
+        else k_qidx_score<<<dim3((score_stride + qb - 1) / qb, r), qb, 0, s>>>(qn, pool, pos, t0, n_head, top, scores, score_stride, hist);
         k_gidx_select_h<<<r, 1024, 0, s>>>(scores, score_stride, hist, pos, t0, top, list, list_stride, list_n);
     }
 }

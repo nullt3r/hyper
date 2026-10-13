@@ -49,6 +49,10 @@ clean:
 $(BUILD)/arbench: tools/arbench.cu $(BUILD)/kernels.o
 	$(NVCC) $(NVFLAGS) tools/arbench.cu $(BUILD)/kernels.o -o $@ $(LIBS)
 
+# Flash-Next QSA decode path (indexer selection + sparse attention) at depth, synthetic caches
+$(BUILD)/qsabench: tools/qsabench.cu $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/kernels5.o $(BUILD)/gguf.o
+	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/qsabench.cu $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/kernels5.o $(BUILD)/gguf.o -o $@ $(LIBS)
+
 # MoE routing kernel
 $(BUILD)/routebench: $(OBJ4) tools/routebench.cu
 	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/routebench.cu $(OBJ4) -o $@ \

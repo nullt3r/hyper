@@ -722,7 +722,7 @@ __global__ void k_attn_decode(const float * __restrict__ qkv, int stride, const 
 // split-K decode attention (flash-decoding). Block = one local kv head with all of its local q heads (<= G),
 // one slice of the positions, one token; 4 warps stride over the slice, lane owns 8 dims. Unnormalized partial
 // results {acc[HD], m, l} per (token, q head, split) go to `part`; attn_combine merges them.
-template <int HD, int G>
+template <int HD, int G, bool BRK>
 __global__ void __launch_bounds__(128) k_attn_split(const float * __restrict__ qkv, int stride, const half * __restrict__ kcache,
                                                     const half * __restrict__ vcache, float * __restrict__ part, const int * pos_p,
                                                     int max_pos, int n_head_l, int head_off, int group, int kv_off, float scale,
@@ -774,8 +774,9 @@ __global__ void __launch_bounds__(128) k_attn_split(const float * __restrict__ q
             kf[2 * j] = a.x; kf[2 * j + 1] = a.y; vf[2 * j] = b.x; vf[2 * j + 1] = b.y;
         }
 #pragma unroll
-        for (int g = 0; g < G; ++g) {
-            if (g >= ng) break;
+        for (int g = 0; g < G; ++g) {   // all G heads: an unused one has q = 0 and is never written (BRK, the old kernel: a break at ng,
+                                        // which kept the compiler from interleaving the heads' shuffle and exp chains, 2x slower)
+            if (BRK && g >= ng) break;
             float s = 0.0f;
 #pragma unroll
             for (int j = 0; j < 8; ++j) s += q[g][j] * kf[j];
@@ -1927,8 +1928,11 @@ void attn_split(const float * qkv, int stride, const half * kcache, const half *
     if (hd != 256) throw std::runtime_error("attn_split: only head_dim 256 is instantiated");
     const int ns = attn_nsplit(n_kv, nt);
     const int n_chunk = (std::min(group, n_head) + 5) / 6;   // local q heads of one kv head <= min(group, n_head)
-    k_attn_split<256, 6><<<dim3(n_kv * n_chunk, ns, nt), 128, 0, s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head, head_off,
-                                                                     group, kv_off, scale, n_chunk, list, list_stride, list_n);
+    static const bool brk = getenv("HYPER_ATTN_OLD") != nullptr;
+    if (brk) k_attn_split<256, 6, true><<<dim3(n_kv * n_chunk, ns, nt), 128, 0, s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head,
+                                                                                   head_off, group, kv_off, scale, n_chunk, list, list_stride, list_n);
+    else k_attn_split<256, 6, false><<<dim3(n_kv * n_chunk, ns, nt), 128, 0, s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head,
+                                                                                head_off, group, kv_off, scale, n_chunk, list, list_stride, list_n);
     k_attn_combine<256><<<dim3(n_head, nt), 256, 0, s>>>(qkv, stride, part, ns, out, out_stride, n_head);
 }
 void gdn_conv(float * in, int stride, float * conv_state, float * conv_snap, const float * conv_w, int channels, int K,
