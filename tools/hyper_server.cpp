@@ -123,7 +123,8 @@ size_t utf8_complete(const std::string & s) {
     return i;
 }
 
-ojson to_ojson(const common_json & j) { return ojson::parse(j.dump()); }
+ojson to_ojson(const common_json & j) { return ojson::parse(j.dump_safe()); }   // (a text
+// cut inside a UTF-8 sequence at max_tokens must not throw)
 common_json to_cjson(const ojson & j) { return common_json::parse(j.dump()); }
 
 ojson diff_to_delta(const common_chat_msg_diff & d) {
@@ -390,6 +391,25 @@ std::string valid_args(const std::string & a, const char * where = nullptr) {
     return "{}";
 }
 
+// the final parse of a non-streamed answer: a text the parser rejects (e.g. cut inside a tool call at max_tokens) is parsed
+// as partial, and failing that returned as plain content -- the client gets the output instead of an error
+common_chat_msg parse_final(const std::string & text, const Request & r) {
+    try { return parse_out(text, false, r); }
+    catch (const std::exception & e) {
+        fprintf(stderr, "[%s] final parse failed (%s), answer returned as parsed so far\n", r.id.c_str(), e.what());
+    }
+    try {
+        common_chat_msg m = parse_out(text, true, r);
+        for (auto & tc : m.tool_calls) tc.arguments = valid_args(tc.arguments, "final parse");   // (a call cut off mid-arguments:
+        // {}, never a truncated command)
+        return m;
+    } catch (const std::exception &) {}
+    common_chat_msg m;
+    m.role = "assistant";
+    m.content = text;
+    return m;
+}
+
 Request prepare(Ctx & c, const ojson & body) {
     Request r;
     common_chat_templates_inputs in;
@@ -537,6 +557,7 @@ struct Streamer {
         { std::lock_guard<std::mutex> lk(mu); stop = true; cv.notify_one(); }
         if (th.joinable()) th.join();
     }
+    ~Streamer() { finish(); }   // (an engine exception unwinds through run(): a joinable thread here would std::terminate)
 };
 
 GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::string &)> & on_text) {
@@ -1133,7 +1154,7 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> lk(c.mu);
             GenOut o;
             try { o = run(c, *r, {}); } catch (const std::exception & e) { fail(500, e.what()); return; }
-            common_chat_msg msg = parse_out(o.text, false, *r);
+            common_chat_msg msg = parse_final(o.text, *r);
             long tc = 0;
             for (auto & t : msg.tool_calls) if (t.id.empty()) t.id = random_id("call_", tc++);
             ojson m = to_ojson(msg.to_json_oaicompat());
@@ -1269,7 +1290,7 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> lk(c.mu);
             GenOut o;
             try { o = run(c, *r, {}); } catch (const std::exception & e) { fail(500, e.what()); return; }
-            common_chat_msg msg = parse_out(o.text, false, *r);
+            common_chat_msg msg = parse_final(o.text, *r);
             long n = 0;
             for (auto & t : msg.tool_calls) if (t.id.empty()) t.id = random_id("call_", n++);
             res.set_content(finish_obj(final_output(msg, n), o).dump(-1, ' ', false, ojson::error_handler_t::replace), "application/json");

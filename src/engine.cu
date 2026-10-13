@@ -935,6 +935,8 @@ void Engine::take_snapshot(int pos) {
 // ---------------- sampling ----------------
 // candidates of row t from every device's top-K, then temperature / top-k / min-p / top-p
 int Engine::sample_row(int t, const SamplingParams & sp, int64_t pos) {
+    // logits row of candidate row t: a prefill chunk keeps the candidates of its last row only (at t = 0), but every row's logits
+    const int lr = last_nt_ > MAX_NT ? last_nt_ - 1 : t;
     std::vector<std::pair<float, int>> cand;
     cand.reserve(devs_.size() * TOPK);
     for (size_t g = 0; g < devs_.size(); ++g) {
@@ -947,7 +949,7 @@ int Engine::sample_row(int t, const SamplingParams & sp, int64_t pos) {
         for (size_t g = 0; g < devs_.size(); ++g) {
             Device & d = *devs_[g];
             CUDA_CHECK(cudaSetDevice(d.id));
-            max_sumexp(d.logits + (size_t) t * d.output.n, d.output.n, d.lstat, d.stream, (float) invT);
+            max_sumexp(d.logits + (size_t) lr * d.output.n, d.output.n, d.lstat, d.stream, (float) invT);
             CUDA_CHECK(cudaMemcpyAsync(&ms[2 * g], d.lstat, 2 * sizeof(float), cudaMemcpyDeviceToHost, d.stream));
         }
         M = -INFINITY;
@@ -959,7 +961,7 @@ int Engine::sample_row(int t, const SamplingParams & sp, int64_t pos) {
         Z = 0;
         for (size_t g = 0; g < devs_.size(); ++g) Z += ms[2 * g + 1] * std::exp(((double) ms[2 * g] - M) * invT);
     };
-    return sample_candidates(cand, TOPK, sp, samp_seed_, pos, stats, [&](std::vector<float> & lg) { get_logits(t, lg); });
+    return sample_candidates(cand, TOPK, sp, samp_seed_, pos, stats, [&](std::vector<float> & lg) { get_logits(lr, lg); });
 }
 
 std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
@@ -1080,7 +1082,7 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
             double pc = mtp_p_;
             if (pc < pmin) return 0;
             int k = 1;
-            for (; k < K; ++k) {
+            for (; k < K && base + k < opt_.max_pos; ++k) {   // (the MTP cache holds positions < max_pos)
                 drafts[k] = mtp_chain(drafts[k - 1], base + k);
                 pc *= mtp_p_;
                 if (pc < pmin) break;

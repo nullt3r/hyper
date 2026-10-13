@@ -2395,7 +2395,7 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
             double pc = mtp_p_;
             if (pc < pmin) return 0;
             int k = 1;
-            for (; k < kc; ++k) {
+            for (; k < kc && base + k < opt_.max_pos; ++k) {   // (the MTP cache holds positions < max_pos)
                 drafts[k] = mtp_chain(drafts[k - 1], base + k);
                 pc *= mtp_p_;
                 if (pc < pmin) break;

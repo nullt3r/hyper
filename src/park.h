@@ -215,8 +215,11 @@ private:
             if (hb.bytes < need) {
                 if (hb.p) check(cudaFreeHost(hb.p), "free");
                 hb.p = nullptr;
+                hb.bytes = 0;   // (until the allocation succeeds: a failed one must not leave a size without memory)
+                void * p = nullptr;
+                check(cudaHostAlloc(&p, need * 5 / 4, cudaHostAllocPortable), "host alloc");
+                hb.p = p;
                 hb.bytes = need * 5 / 4;
-                check(cudaHostAlloc(&hb.p, hb.bytes, cudaHostAllocPortable), "host alloc");
             }
             char * hp = (char *) hb.p;
             for (auto & sp : d.spans) {
