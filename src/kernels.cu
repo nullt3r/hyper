@@ -729,12 +729,17 @@ __global__ void __launch_bounds__(128) k_attn_split(const float * __restrict__ q
                                                     const half * __restrict__ vcache, float * __restrict__ part, const int * pos_p,
                                                     int max_pos, int n_head_l, int head_off, int group, int kv_off, float scale,
                                                     int n_chunk, const int * __restrict__ list, int list_stride,
-                                                    const int * __restrict__ list_n) {
+                                                    const int * __restrict__ list_n, int nt_x) {
     // list (optional, sparse attention): token t attends to the cells list[t * list_stride + i], i < list_n[t]
     static_assert(HD == 256, "lane owns 8 dims");
     constexpr int NW = 4;
-    // blockIdx.x = kv head * n_chunk + chunk of G q heads (GQA groups larger than G take several blocks)
-    const int hk = blockIdx.x / n_chunk, hchunk = blockIdx.x % n_chunk, split = blockIdx.y, t = blockIdx.z, nsplit = gridDim.y;
+    // blockIdx.x = kv head * n_chunk + chunk of G q heads (GQA groups larger than G take several blocks), blockIdx.z = token;
+    // nt_x > 0 (rows fastest): blockIdx.x = (kv head * n_chunk + chunk) * nt_x + token, so the blocks of every token for one
+    // slice of the cache run together and read it once from DRAM (the same work per block)
+    int hk, hchunk, t;
+    if (nt_x > 0) { t = blockIdx.x % nt_x; hk = (blockIdx.x / nt_x) / n_chunk; hchunk = (blockIdx.x / nt_x) % n_chunk; }
+    else { hk = blockIdx.x / n_chunk; hchunk = blockIdx.x % n_chunk; t = blockIdx.z; }
+    const int split = blockIdx.y, nsplit = gridDim.y;
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const int n_pos = list ? list_n[t] : *pos_p + t + 1;
     const int * lt = list ? list + (size_t) t * list_stride : nullptr;
@@ -1979,10 +1984,14 @@ void attn_split(const float * qkv, int stride, const half * kcache, const half *
     const int ns = attn_nsplit(n_kv, nt);
     const int n_chunk = (std::min(group, n_head) + 5) / 6;   // local q heads of one kv head <= min(group, n_head)
     static const bool brk = getenv("HYPER_ATTN_OLD") != nullptr;
-    if (brk) k_attn_split<256, 6, true><<<dim3(n_kv * n_chunk, ns, nt), 128, 0, s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head,
-                                                                                   head_off, group, kv_off, scale, n_chunk, list, list_stride, list_n);
-    else k_attn_split<256, 6, false><<<dim3(n_kv * n_chunk, ns, nt), 128, 0, s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head,
-                                                                                head_off, group, kv_off, scale, n_chunk, list, list_stride, list_n);
+    // dense decode-sized rows (no list): rows fastest in the grid (HYPER_ATTN_ROWS=0/1 to choose for every case)
+    static const int rows_env = getenv("HYPER_ATTN_ROWS") ? atoi(getenv("HYPER_ATTN_ROWS")) : -1;
+    const bool rows_fast = rows_env >= 0 ? rows_env != 0 : (!list && nt > 1 && nt <= MAX_NT);
+    const dim3 grid = rows_fast ? dim3(n_kv * n_chunk * nt, ns) : dim3(n_kv * n_chunk, ns, nt);
+    if (brk) k_attn_split<256, 6, true><<<grid, 128, 0, s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head, head_off, group, kv_off,
+                                                           scale, n_chunk, list, list_stride, list_n, rows_fast ? nt : 0);
+    else k_attn_split<256, 6, false><<<grid, 128, 0, s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head, head_off, group, kv_off,
+                                                        scale, n_chunk, list, list_stride, list_n, rows_fast ? nt : 0);
     k_attn_combine<256><<<dim3(n_head, nt), 256, 0, s>>>(qkv, stride, part, ns, out, out_stride, n_head);
 }
 void gdn_conv(float * in, int stride, float * conv_state, float * conv_snap, const float * conv_w, int channels, int K,
@@ -1997,14 +2006,14 @@ void gdn_conv(float * in, int stride, float * conv_state, float * conv_snap, con
     }
     k_gdn_conv<<<(channels + 255) / 256, 256, 0, s>>>(in, stride, conv_state, conv_snap, conv_w, channels, K, nt);
 }
-// per-device scratch for k_gdn_prep (grown on demand; prefill chunks only, never inside a captured graph)
-static float * gdn_pre_scratch(size_t floats) {
+// scratch for k_gdn_prep per stream (grown on demand; prefill chunks only, never inside a captured graph). Per stream, not per
+// device: the 27B's two prefill micro-batches run on two streams, and one's next layer would overwrite the scales the other's
+// step is still reading
+static float * gdn_pre_scratch(size_t floats, cudaStream_t s) {
     static std::mutex mu;
-    static std::map<int, std::pair<float *, size_t>> bufs;
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) return nullptr;
+    static std::map<cudaStream_t, std::pair<float *, size_t>> bufs;
     std::lock_guard<std::mutex> lk(mu);
-    auto & b = bufs[dev];
+    auto & b = bufs[s];
     if (b.second < floats) {
         if (b.first) cudaFree(b.first);
         b.first = nullptr; b.second = 0;
@@ -2019,7 +2028,7 @@ void gdn_step(const float * in, int stride, int ab_off, float * state, float * s
     if (dk != 128 || dv % 32) throw std::runtime_error("gdn_step: expects dk = 128");
     if (dk == 128 && dv % 8 == 0 && nt > 8 && !getenv("HYPER_GDN_OLD")) {   // many tokens: warp per column
         static const bool nopre = getenv("HYPER_GDN_NOPRE") != nullptr;   // (every warp computes the per-token scales itself)
-        float * pre = nopre ? nullptr : gdn_pre_scratch((size_t) nt * 2 * (n_k + n_v));
+        float * pre = nopre ? nullptr : gdn_pre_scratch((size_t) nt * 2 * (n_k + n_v), s);
         if (pre) {
             k_gdn_prep<<<nt, 256, 0, s>>>(in, stride, ab_off, dt_bias, ssm_a, n_k, n_v, dk, eps, pre);
             k_gdn_step_w<true><<<dim3(n_v, dv / 8), 256, 0, s>>>(in, stride, ab_off, state, state_snap, o, o_stride, dt_bias, ssm_a,
