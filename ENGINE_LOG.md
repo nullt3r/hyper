@@ -589,3 +589,15 @@ v `prepare` (řádek `prompt:` v logu): parse 8, převod Responses→chat 19, š
 | **inkrementálně** | **180–195 ms** | **2–8 ms** |
 
 Výstupy 9/9 shodné. Zbývá šablona (~150 ms, minja v libcommon).
+
+### Chyba v předvýpočtu GDN (opraveno) a poučení
+
+Scratch `k_gdn_prep` byl jeden na zařízení. 27B ale v prefillu počítá dvě mikrodávky na dvou streamech: mikrodávka A mohla
+v další vrstvě přepsat předpočítané škály, zatímco krok mikrodávky B v předchozí vrstvě je ještě četl. Na hlubokém promptu
+(155k, chunkování prompt cache jako v serveru) z toho byl poškozený rekurentní stav a výstup „!!!!“. Projevilo se to jen
+při určitém časování: replay 27B (mělký) prošel 20/20 a výstup rozbilo teprve jiné pořadí bloků attention nebo LM hlava
+přes všechny řádky. Oprava: scratch na stream.
+
+Poučení pro metodu: změny sdílené s 27B (kernels.cu) ověřovat i hloubkovým scénářem 27B (`~/deep_27.sh`), nejen mělkým replayem.
+Pro bisekci na úrovni enginu: `HYPER_DUMP_TOKENS` uloží prompt serveru jako referenční soubor (jen tokeny) a `hyper gen` ho
+s `HYPER_PCACHE=1` předpočítá se stejným chunkováním jako server (`HYPER_GEN_PRINT=1` vypíše tokeny).

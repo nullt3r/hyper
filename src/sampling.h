@@ -85,37 +85,54 @@ inline KeptSet sampling_set(std::vector<std::pair<float, int>> & cand, int ntop,
     }
     float M = -INFINITY;
     for (int i : idx) M = std::max(M, lg[i]);
-    std::vector<double> w(idx.size());
-    double Z = 0;
-    for (size_t j = 0; j < idx.size(); ++j) { w[j] = std::exp((lg[idx[j]] - M) * invT); Z += w[j]; }
     // bins of log weight (1/8 nat), heavier bins first: a bin's tokens all outweigh the next bin's, so only the boundary
-    // bin needs sorting (the last bin takes every weight below e^-64 of the best)
+    // bin needs sorting (the last bin takes every weight below e^-64 of the best). A stable counting sort by bin keeps the
+    // order of idx inside a bin (the same lists, sums and kept set as per-bin vectors; ~3x faster on a 248k row)
     constexpr int NB = 8 * 64;
-    std::vector<std::vector<int>> bins(NB + 1);   // positions in idx / w
-    std::vector<double> mass(NB + 1, 0.0);
-    for (size_t j = 0; j < idx.size(); ++j) {
-        if (sp.min_p > 0 && w[j] < sp.min_p) continue;   // (min_p relative to the best token, whose weight is 1)
+    thread_local std::vector<double> w;
+    thread_local std::vector<uint16_t> bin;
+    thread_local std::vector<int> pos;
+    const int m = (int) idx.size();
+    w.resize(m); bin.resize(m);
+    double Z = 0;
+    for (int j = 0; j < m; ++j) { w[j] = std::exp((lg[idx[j]] - M) * invT); Z += w[j]; }
+    double mass[NB + 1] = {0};
+    int cnt[NB + 1] = {0};
+    for (int j = 0; j < m; ++j) {
+        if (sp.min_p > 0 && w[j] < sp.min_p) { bin[j] = 0xffff; continue; }   // (min_p relative to the best token, weight 1)
         const int b = std::min<int>(NB, (int) ((M - lg[idx[j]]) * invT * 8.0));
-        bins[b].push_back((int) j);
+        bin[j] = (uint16_t) b;
         mass[b] += w[j] / Z;
+        ++cnt[b];
     }
-    std::vector<int> kept;
-    std::vector<double> pr;
     double cum = 0;
+    int bstar = NB + 1;   // the boundary bin (top_p crossed inside it), none: every bin kept
     for (int b = 0; b <= NB; ++b) {
-        if (bins[b].empty()) continue;
-        if (sp.top_p < 1.0f && cum + mass[b] >= sp.top_p) {   // boundary bin: in logit order up to the crossing token
-            std::sort(bins[b].begin(), bins[b].end(), [&](int x, int y) { return by_logit(idx[x], idx[y]); });
-            for (int j : bins[b]) {
-                kept.push_back(idx[j]); pr.push_back(w[j] / Z); cum += w[j] / Z;
-                if (cum >= sp.top_p) break;
-            }
-            break;
-        }
-        for (int j : bins[b]) { kept.push_back(idx[j]); pr.push_back(w[j] / Z); }
+        if (!cnt[b]) continue;
+        if (sp.top_p < 1.0f && cum + mass[b] >= sp.top_p) { bstar = b; break; }
         cum += mass[b];
     }
-    return pick(pr, (int) kept.size(), [&](int i) { return kept[i]; });
+    const int last = std::min(bstar, NB);
+    int off[NB + 2];
+    off[0] = 0;
+    for (int b = 0; b <= last; ++b) off[b + 1] = off[b] + cnt[b];
+    pos.resize(off[last + 1]);
+    {
+        int fill[NB + 1];
+        for (int b = 0; b <= last; ++b) fill[b] = off[b];
+        for (int j = 0; j < m; ++j) { const int b = bin[j]; if (b <= last) pos[fill[b]++] = j; }
+    }
+    const int nfull = bstar <= NB ? off[bstar] : off[last + 1];
+    for (int i = 0; i < nfull; ++i) { const int j = pos[i]; ks.tok.push_back(idx[j]); ks.pr.push_back(w[j] / Z); }
+    if (bstar <= NB) {   // boundary bin: in logit order up to the crossing token
+        std::sort(pos.begin() + off[bstar], pos.begin() + off[bstar + 1], [&](int x, int y) { return by_logit(idx[x], idx[y]); });
+        for (int i = off[bstar]; i < off[bstar + 1]; ++i) {
+            const int j = pos[i];
+            ks.tok.push_back(idx[j]); ks.pr.push_back(w[j] / Z); cum += w[j] / Z;
+            if (cum >= sp.top_p) break;
+        }
+    }
+    return ks;
 }
 
 // Gumbel noise fixed per (seed, position, token): a draw is argmax_i (log p_i + G_i), exact sampling from p for every
