@@ -799,3 +799,5 @@ End to end:
 - hloubkový scénář 27B (server, 155–170k, oba běhy čerstvé): dekódování **67,9 → 89,0 t/s (+31 %)**, prefill 945 / 954 t/s.
   Hashe 8 z 9 shodné, míra přijetí na požadavek shodná až na ten jeden (týž požadavek, který se lišil i u splitu: greedy na
   téměř shodě).
+- Flash-Next (attention na tensor cores jen v MTP vrstvě), hloubkový scénář, oba běhy čerstvé: dekódování 146,4 → 148,7 t/s,
+  prefill 1635 / 1629 t/s. Všech 9 hashů shodných, míra přijetí draftů na každý požadavek shodná.
