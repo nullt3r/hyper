@@ -91,8 +91,9 @@ struct Ctx {
     // prompt tokenization reused across requests (see tokenize_prompt): the previous prompt's text and tokens, and the special
     // tokens that start a message (llama.cpp tokenizes the text between special tokens piece by piece)
     std::mutex tok_mu;
-    std::string tok_text;
-    std::vector<int> tok_ids;
+    struct TokEntry { std::string text; std::vector<int> ids; uint64_t used = 0; };
+    std::vector<TokEntry> tok_cache;   // a few recent prompts (an agent's side requests -- a title, a summary -- keep the main one)
+    uint64_t tok_clock = 0;
     std::vector<std::pair<std::string, int>> tok_marks;
 };
 
@@ -142,19 +143,27 @@ std::vector<int> tokenize_prompt(Ctx & c, const std::string & text) {
     };
     std::vector<int> out;
     size_t from = 0;
-    if (!c.tok_ids.empty() && !c.tok_marks.empty()) {
-        size_t lcp = 0;
-        const size_t lim = std::min(text.size(), c.tok_text.size());
-        while (lcp < lim && text[lcp] == c.tok_text[lcp]) ++lcp;
-        const std::vector<size_t> om = text_marks(c.tok_text, c.tok_text.size());
+    // the cached prompt sharing the longest text prefix
+    int best = -1;
+    size_t lcp = 0;
+    for (int i = 0; i < (int) c.tok_cache.size(); ++i) {
+        const std::string & t = c.tok_cache[i].text;
+        size_t l = 0;
+        const size_t lim = std::min(text.size(), t.size());
+        while (l < lim && text[l] == t[l]) ++l;
+        if (best < 0 || l > lcp) { best = i; lcp = l; }
+    }
+    if (best >= 0 && !c.tok_marks.empty()) {
+        const Ctx::TokEntry & ce = c.tok_cache[best];
+        const std::vector<size_t> om = text_marks(ce.text, ce.text.size());
         std::vector<size_t> ti;
-        for (size_t i = 0; i < c.tok_ids.size(); ++i)
-            for (auto & [m, id] : c.tok_marks) if (c.tok_ids[i] == id) { ti.push_back(i); break; }
+        for (size_t i = 0; i < ce.ids.size(); ++i)
+            for (auto & [m, id] : c.tok_marks) if (ce.ids[i] == id) { ti.push_back(i); break; }
         if (om.size() == ti.size()) {   // (else the marks do not map one to one: the whole text)
             int k = -1;   // the last mark starting inside the common prefix
             for (size_t i = 0; i < om.size() && om[i] < lcp; ++i) k = (int) i;
             if (k > 0) {
-                out.assign(c.tok_ids.begin(), c.tok_ids.begin() + ti[k]);
+                out.assign(ce.ids.begin(), ce.ids.begin() + ti[k]);
                 from = om[k];
             }
         }
@@ -169,8 +178,15 @@ std::vector<int> tokenize_prompt(Ctx & c, const std::string & text) {
         if (full != out) fprintf(stderr, "tokenize_prompt: MISMATCH (reused %zu bytes; %zu vs %zu tokens)\n", from, out.size(), full.size());
         else fprintf(stderr, "tokenize_prompt: reused %zu of %zu bytes, same tokens\n", from, text.size());
     }
-    c.tok_text = text;
-    c.tok_ids = out;
+    // the entry this prompt continues is replaced, else the least recently used one (at most 4)
+    int slot = from > 0 ? best : -1;
+    if (slot < 0 && c.tok_cache.size() < 4) { c.tok_cache.emplace_back(); slot = (int) c.tok_cache.size() - 1; }
+    if (slot < 0)
+        slot = (int) (std::min_element(c.tok_cache.begin(), c.tok_cache.end(), [](const Ctx::TokEntry & a, const Ctx::TokEntry & b) {
+                          return a.used < b.used; }) - c.tok_cache.begin());
+    c.tok_cache[slot].text = text;
+    c.tok_cache[slot].ids = out;
+    c.tok_cache[slot].used = ++c.tok_clock;
     return out;
 }
 

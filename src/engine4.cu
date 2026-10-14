@@ -2031,11 +2031,12 @@ std::vector<int> Engine4::forward(const int * tokens, int nt, int pos) {
     ensure_kv(pos + nt + 2 * MAX_NT);   // (MTP drafts run up to MAX_NT positions further)
     const bool bulk = nt > MAX_NT;
     static const bool hprof = getenv("HYPER4_HOSTPROF") != nullptr;   // host time per decode forward (GPUs idle meanwhile)
-    static double h_embed = 0, h_run = 0, h_gap = 0; static long h_n = 0;
+    static double h_embed = 0, h_run = 0, h_gap = 0, h_tok = 0, h_fill = 0, h_reb = 0; static long h_n = 0;
     static auto h_last = std::chrono::steady_clock::now();
     const auto th0 = std::chrono::steady_clock::now();
     embed(tokens, nt, pos);
     h_pos_[0] = pos;
+    const auto thf = std::chrono::steady_clock::now();
     if (elastic_ && !bulk) {
         ++dec_steps_;
         if (!fill_list_.empty() && dec_steps_ >= fill_due_) fill_wait(false);   // (the batch's due step: waits if needed)
@@ -2043,6 +2044,7 @@ std::vector<int> Engine4::forward(const int * tokens, int nt, int pos) {
         // requests of an agent -- a title, a summary -- end before that and leave the main conversation's room alone)
         if (++req_steps_ == 32) shrink_kv(pos + nt + 2 * MAX_NT);
     }
+    const auto thr = std::chrono::steady_clock::now();
     if (adapt_ && !bulk) {   // placement follows the routing: after a prompt, then every adapt_every_ decode steps
         if (prompt_routed_) { rebalance(1 << 20); prompt_routed_ = false; steps_ = 0; }
         else if (++steps_ % adapt_every_ == 0) rebalance(adapt_budget_);
@@ -2055,11 +2057,15 @@ std::vector<int> Engine4::forward(const int * tokens, int nt, int pos) {
         const auto th2 = std::chrono::steady_clock::now();
         h_gap += std::chrono::duration<double>(th0 - h_last).count();
         h_embed += std::chrono::duration<double>(th1 - th0).count();
+        h_tok += std::chrono::duration<double>(thf - th0).count();
+        h_fill += std::chrono::duration<double>(thr - thf).count();
+        h_reb += std::chrono::duration<double>(th1 - thr).count();
         h_run += std::chrono::duration<double>(th2 - th1).count();
         h_last = th2;
         if (++h_n % 200 == 0) {
-            fprintf(stderr, "hyper4: per decode forward: embed %.1f us, run %.1f us, caller between forwards %.1f us\n",
-                    h_embed / h_n * 1e6, h_run / h_n * 1e6, h_gap / h_n * 1e6);
+            fprintf(stderr, "hyper4: per decode forward: before launch %.1f us (embed %.1f, elastic %.1f, rebalance %.1f), run %.1f us, "
+                    "caller between forwards %.1f us\n", h_embed / h_n * 1e6, h_tok / h_n * 1e6, h_fill / h_n * 1e6, h_reb / h_n * 1e6,
+                    h_run / h_n * 1e6, h_gap / h_n * 1e6);
         }
     }
     last_nt_ = nt;
