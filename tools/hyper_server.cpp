@@ -35,6 +35,8 @@
 #include <memory>
 #include <map>
 #include <mutex>
+#include <csignal>
+#include <pthread.h>
 #include <thread>
 #include <set>
 #include <string>
@@ -672,6 +674,15 @@ GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::strin
     }
     fprintf(stderr, "[%s] prompt: %d tokens, max %d new (request: parse %.0f, convert %.0f, template %.0f, tokenize %.0f ms)\n", r.id.c_str(), P,
             r.max_tokens, r.t_parse, r.t_convert, r.t_template, r.t_tokenize);
+    if (const char * dt = getenv("HYPER_DUMP_TOKENS")) {   // the prompt as a token-only reference file (v2, no logits) for the CLI tools
+        const std::string fn = std::string(dt) + "-" + r.id + ".bin";
+        if (FILE * f = fopen(fn.c_str(), "wb")) {
+            const int hdr[4] = {0x32464552, P, llama_vocab_n_tokens(c.vocab), P};
+            fwrite(hdr, 4, 4, f);
+            fwrite(r.prompt.data(), 4, r.prompt.size(), f);
+            fclose(f);
+        }
+    }
     auto t_log = t0;
     c.eng->set_prefill_progress([&](int done, int total, int reused) {
         const auto now = clk::now();
@@ -1004,6 +1015,16 @@ ojson message_item(const std::string & id, const std::string & text, bool done) 
 
 int main(int argc, char ** argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s model.gguf [--host H] [--port P] [--ctx N] [--draft K] [--alias name]\n", argv[0]); return 1; }
+    // SIGINT / SIGTERM: a thread waits for them (blocked in every thread, also when the shell started us as a background job with
+    // SIGINT ignored) and stops the HTTP server, so main returns and the engine is torn down in order (GPU memory, pinned
+    // buffers, the GGUF mapping) instead of only by the kernel at exit; a second signal exits at once
+    sigset_t stop_sigs;
+    sigemptyset(&stop_sigs);
+    sigaddset(&stop_sigs, SIGINT);
+    sigaddset(&stop_sigs, SIGTERM);
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+    pthread_sigmask(SIG_BLOCK, &stop_sigs, nullptr);
     std::string host = "0.0.0.0", alias;
     int port = 8080, ctx = 262144, draft = 3, snaps = 48, cpu_threads = 30;
     float gpu_frac = 1.0f;
@@ -1548,8 +1569,17 @@ int main(int argc, char ** argv) {
     srv.Post("/v1/responses", responses);
     srv.Post("/responses", responses);
 
+    std::thread([&srv, stop_sigs] {
+        int sig = 0;
+        sigwait(&stop_sigs, &sig);
+        fprintf(stderr, "hyper-server: signal %d, stopping (again: exit at once)\n", sig);
+        srv.stop();
+        sigwait(&stop_sigs, &sig);
+        _exit(128 + sig);
+    }).detach();
     fprintf(stderr, "hyper-server: listening on http://%s:%d (model \"%s\", context %d, %d drafts)\n", host.c_str(), port,
             c.alias.c_str(), ctx, draft);
     if (!srv.listen(host, port)) { fprintf(stderr, "cannot listen on %s:%d\n", host.c_str(), port); return 1; }
+    fprintf(stderr, "hyper-server: stopped\n");
     return 0;
 }

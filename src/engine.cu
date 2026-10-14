@@ -536,7 +536,7 @@ void Engine::record_attn(Device & d, DevLayer & L, Act & a, int nt, int & call, 
     const float scale = 1.0f / sqrtf((float) c.head_dim);
     if (a.bulk && !getenv("HYPER_NO_FA"))
         attn_prefill(a.big0, bs, L.kcache, L.vcache, a.o, ostride, a.pos, opt_.max_pos, L.n_head_l, L.head_off,
-                     c.n_head / c.n_head_kv, L.kv_off, c.head_dim, scale, nt, a.s);
+                     c.n_head / c.n_head_kv, L.kv_off, c.head_dim, scale, nt, a.s, a.pos_host);
     else
         attn_split(a.big0, bs, L.kcache, L.vcache, a.attn_part, a.o, ostride, a.pos, opt_.max_pos, L.n_head_l, L.n_kv_l,
                    L.head_off, c.n_head / c.n_head_kv, L.kv_off, c.head_dim, scale, nt, a.s);
@@ -599,6 +599,7 @@ void Engine::record_main(int gi, int nt) {
     incr_counter(d.counter, s);
     sumsq(d.x, n, n, nt, d.ss, nss, s);
     Act a = act(d, 0, 0, s, d.pos, bulk);
+    a.pos_host = h_pos_[0];
     a.dma = nt >= DMA_MIN;
     if (bulk && nt >= 2 * MIN_MICRO) {
         const int nta = (nt / 2 + 63) / 64 * 64, ntb = nt - nta;
@@ -606,6 +607,7 @@ void Engine::record_main(int gi, int nt) {
         CUDA_CHECK(cudaEventRecord(d.ev_fork, s));
         CUDA_CHECK(cudaStreamWaitEvent(d.stream2, d.ev_fork, 0));
         Act b = act(d, nta, 1, d.stream2, d.pos2, true);
+        b.pos_host = h_pos_[2];
         a.dma = b.dma = true;
         record_layers(d, a, nta, &b, ntb, false);
         CUDA_CHECK(cudaEventRecord(d.ev_join, d.stream2));
@@ -615,8 +617,20 @@ void Engine::record_main(int gi, int nt) {
     }
     if (opt_.mtp) rmsnorm(d.x, n, d.output_norm, d.hn, n, n, nt, c.rms_eps, s);   // hidden fed to the MTP head
     NormIn ni; ni.w = d.output_norm; ni.ss = d.ss; ni.nss = nss; ni.eps = c.rms_eps;
-    mm(a, d.output, d.x, n, d.logits, d.output.n, nt, ni);
-    argmax_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.res, nt, s);
+    // a prefill chunk through the GEMM: the last row's logits only (generation reads no other; each output's sum is the same
+    // for any token count, so these logits are the same values) -- 82.8k vocabulary rows per GPU for every row were ~3 % of
+    // prefill. HYPER_ALL_LOGITS or opt_.all_logits: every row
+    static const bool all_env = getenv("HYPER_ALL_LOGITS") != nullptr;
+    const bool gemm_path = a.bulk && (nt > 8 || a.dma);
+    if (gemm_path && nt > 1 && !opt_.all_logits && !all_env) {
+        const size_t lo = (size_t) (nt - 1) * d.output.n;
+        to_half(d.x + (size_t) (nt - 1) * n, n, ni.w, d.output.k, ni.eps, a.xh, 1, s);
+        gemm_f16(d.output, a.xh, 1, d.logits + lo, d.output.n, nullptr, s);
+        argmax_pairs(d.logits + lo, d.output.n, d.output.n, d.vocab_off, d.res + (size_t) (nt - 1) * 2, 1, s);
+    } else {
+        mm(a, d.output, d.x, n, d.logits, d.output.n, nt, ni);
+        argmax_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.res, nt, s);
+    }
     CUDA_CHECK(cudaMemcpyAsync(h_res_ + (size_t) gi * MAX_ROWS * 2, d.res, (size_t) nt * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
     // sampling candidates: every row of a decode-sized forward, the last row of a prefill chunk
     const int tk_rows = nt <= MAX_NT ? nt : 1;
@@ -644,15 +658,47 @@ void Engine::record_mtp(int gi, int nt, bool chain) {
     CUDA_CHECK(cudaMemsetAsync(d.x, 0, (size_t) nt * n * sizeof(float), s));
     int call = 0;
     allreduce(d, a, nt, call);
-    record_attn(d, L, a, nt, call, {});
-    record_ffn(d, L, a, nt, call);
+    // only the last row's draft is used, so the others only write their K/V; the last row's attention, output projection, FFN
+    // go on alone in row 0 (verification rows: the same values for it; a prefill chunk: attention over the cache for one row
+    // instead of all of them -- drafts only, the output is verified). A prefill chunk that is not the prompt's last needs no
+    // draft at all: K/V only. HYPER_MTP_ATT_ALL: every row through everything, as before
+    static const bool att_all = getenv("HYPER_MTP_ATT_ALL") != nullptr;
+    int last = nt - 1;   // (row of the result)
+    if (nt > MAX_NT && !att_all && !mtp_need_draft_) {
+        const int bs = d.big_stride;
+        NormIn ni; ni.w = L.attn_norm; ni.ss = a.ss; ni.nss = nss; ni.eps = c.rms_eps;
+        mm(a, L.wqkv, a.x, n, a.big0, bs, nt, ni);
+        attn_prep(a.big0, bs, L.q_norm, L.k_norm, L.kcache, L.vcache, a.pos, opt_.max_pos, L.n_head_l, L.n_kv_l, c.head_dim,
+                  c.n_rot, c.rope_base, c.rms_eps, nt, a.s, d.rpos, c.rope_sec);
+        return;   // (no head: the caller ignores this chunk's draft)
+    }
+    if (nt > 1 && !att_all) {
+        const float eps = c.rms_eps;
+        const int bs = d.big_stride;
+        NormIn ni; ni.w = L.attn_norm; ni.ss = a.ss; ni.nss = nss; ni.eps = eps;
+        mm(a, L.wqkv, a.x, n, a.big0, bs, nt, ni);
+        attn_prep(a.big0, bs, L.q_norm, L.k_norm, L.kcache, L.vcache, a.pos, opt_.max_pos, L.n_head_l, L.n_kv_l, c.head_dim,
+                  c.n_rot, c.rope_base, eps, nt, a.s, d.rpos, c.rope_sec);
+        const int ostride = L.n_head_l * c.head_dim;
+        attn_split(a.big0 + (size_t) (nt - 1) * bs, bs, L.kcache, L.vcache, a.attn_part, a.o, ostride, a.pos, opt_.max_pos, L.n_head_l,
+                   L.n_kv_l, L.head_off, c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), 1, a.s,
+                   nullptr, 0, nullptr, nt - 1);
+        CUDA_CHECK(cudaMemcpyAsync(d.x, d.x + (size_t) (nt - 1) * n, (size_t) n * sizeof(float), cudaMemcpyDeviceToDevice, s));
+        mm(a, L.wo, a.o, ostride, a.part, n, 1);
+        allreduce(d, a, 1, call);
+        record_ffn(d, L, a, 1, call);
+        last = 0;
+    } else {
+        record_attn(d, L, a, nt, call, {});
+        record_ffn(d, L, a, nt, call);
+    }
     const float * hw = L.head_norm ? L.head_norm : d.output_norm;
-    rmsnorm(d.x + (size_t) (nt - 1) * n, n, hw, d.mhn, n, n, 1, c.rms_eps, s);   // feeds chained drafts
+    rmsnorm(d.x + (size_t) last * n, n, hw, d.mhn, n, n, 1, c.rms_eps, s);   // feeds chained drafts
     // only the last row's draft is used: run the (Q8) head on that row alone, normed by its own statistics
-    sumsq(d.x + (size_t) (nt - 1) * n, n, n, 1, d.ss, nss, s);
+    sumsq(d.x + (size_t) last * n, n, n, 1, d.ss, nss, s);
     NormIn nl; nl.w = hw; nl.ss = d.ss; nl.nss = nss; nl.eps = c.rms_eps;
     Act a1 = act(d, 0, 0, s, d.mpos, false);
-    mm(a1, d.output_q8, d.x + (size_t) (nt - 1) * n, n, d.logits, d.output.n, 1, nl);
+    mm(a1, d.output_q8, d.x + (size_t) last * n, n, d.logits, d.output.n, 1, nl);
     argmax_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.mres, 1, s);
     max_sumexp(d.logits, d.output.n, d.mres + 2, s);   // (the best token's probability: the drafts' gate)
     topk_pairs(d.logits, d.output.n, d.output.n, d.vocab_off, d.topk, TOPK, 1, s);   // (sampled drafts' candidates)
@@ -709,10 +755,12 @@ void Engine::launch(int kind, int nt) {
                 try {
                     CUDA_CHECK(cudaSetDevice(devs_[gi]->id));
                     if (kind == 0) record_main(gi, nt); else record_mtp(gi, nt, false);
-                } catch (const std::exception & ex) { err[gi] = ex.what(); }
+                } catch (const std::exception & ex) { err[gi] = ex.what(); barrier_->abort(); }
             });
         for (auto & t : th) t.join();
-        for (auto & m : err) if (!m.empty()) throw std::runtime_error(m);
+        std::string first;   // (the failing device's message, not the others' "barrier" ones)
+        for (auto & m : err) if (!m.empty() && (first.empty() || first.rfind("barrier:", 0) == 0)) first = m;
+        if (!first.empty()) { barrier_->reset(); throw std::runtime_error(first); }
         static const bool timing = getenv("HYPER_TIMING") != nullptr;
         if (timing) {
             const double rec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_rec).count();
@@ -801,8 +849,9 @@ std::vector<int> Engine::forward(const int * tokens, int nt, int pos) {
     return out;
 }
 
-int Engine::mtp_draft(const int * tokens, int nt, int pos) {
+int Engine::mtp_draft(const int * tokens, int nt, int pos, bool need_draft) {
     if (nt < 1 || nt > MAX_ROWS) throw std::runtime_error("mtp_draft: bad token count");
+    mtp_need_draft_ = need_draft || nt <= MAX_NT;   // (decode-sized passes always draft; they run as captured graphs)
     embed(tokens, nt, h_membd_);
     image_rows(pos + 1, nt, h_membd_);   // (row t holds the token at pos + t + 1)
     h_pos_[1] = pos;
@@ -1037,7 +1086,7 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
         if (spec) {
             std::vector<int> mt(len);
             for (int j = 0; j < len; ++j) mt[j] = c0 + 1 + j < P ? prompt[c0 + 1 + j] : next;
-            const int d0 = mtp_draft(mt.data(), len, c0);
+            const int d0 = mtp_draft(mt.data(), len, c0, end == P);
             if (end == P) drafts[0] = d0;
         }
         if (si < snap_at.size() && snap_at[si] == end) take_snapshot(end);

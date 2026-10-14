@@ -8,6 +8,8 @@
 #include <sys/mman.h>
 
 #include <algorithm>
+#include <array>
+#include <deque>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -238,6 +240,10 @@ struct Engine5::Device {
     cublasHandle_t blas = nullptr;
     cudaStream_t cstream = nullptr;
     cudaEvent_t ev_up[2] = {}, ev_free[2] = {};
+    // expert upload parts not yet enqueued (layer, half, part): each goes out after the next allreduce's downloads, so the copy
+    // engine (FIFO) never holds an allreduce copy -- on the critical path -- behind a whole upload
+    std::deque<std::array<int, 3>> up_pend;
+    cudaEvent_t ev_arh = nullptr;
     uint8_t * stage[2] = {};
     size_t stage_bytes = 0;
     cudaEvent_t ev_ar[2] = {};
@@ -273,6 +279,7 @@ struct Engine5::Device {
         if (blas) cublasDestroy(blas);
         for (auto & ev : ev_up) if (ev) cudaEventDestroy(ev);
         for (auto & ev : ev_free) if (ev) cudaEventDestroy(ev);
+        if (ev_arh) cudaEventDestroy(ev_arh);
         if (cstream) cudaStreamDestroy(cstream);
         if (fstream) cudaStreamDestroy(fstream);
         for (void * p : allocs) cudaFree(p);
@@ -321,6 +328,7 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
         CUDA_CHECK(cudaStreamCreateWithFlags(&dev->fstream, cudaStreamNonBlocking));
         for (auto & ev : dev->ev_up) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         for (auto & ev : dev->ev_free) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&dev->ev_arh, cudaEventDisableTiming));
         if (cublasCreate(&dev->blas) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasCreate failed");
         cublasSetStream(dev->blas, dev->stream);
         cublasSetMathMode(dev->blas, CUBLAS_DEFAULT_MATH);
@@ -374,6 +382,7 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
     if (getenv("HYPER5_MTP_PMIN")) mtp_pmin_ = atof(getenv("HYPER5_MTP_PMIN"));
     mtp_full_ = getenv("HYPER5_MTP_FULL") != nullptr;
     if (getenv("HYPER5_STREAM_MIN")) stream_min_ = atoi(getenv("HYPER5_STREAM_MIN"));
+    if (getenv("HYPER5_UP_PARTS")) up_parts_ = std::max(0, atoi(getenv("HYPER5_UP_PARTS")));
     if (getenv("HYPER5_DECAY")) adapt_decay_ = atof(getenv("HYPER5_DECAY"));
     if (getenv("HYPER5_PROMPT_W")) prompt_weight_ = atof(getenv("HYPER5_PROMPT_W"));
     if (getenv("HYPER5_ADAPT_EVERY")) adapt_every_ = std::max(1, atoi(getenv("HYPER5_ADAPT_EVERY")));
@@ -1341,6 +1350,7 @@ void Engine5::record_main(int gi, int nt, int kind) {
     const bool cache_only = mtp && mtp_shift_ && !mtp_full_;
     const bool streaming = bulk && opt_.stream_experts && nt >= stream_min_ && !cache_only;
     if (streaming) {
+        d.up_pend.clear();
         int first = il0;
         while (first < il1 && !d.layers[first].owner_bulk) ++first;
         if (first < il1) { upload_stage(d, first, 0); upload_stage(d, first, 1); }
@@ -1376,6 +1386,13 @@ void Engine5::record_main(int gi, int nt, int kind) {
             CUDA_CHECK(cudaStreamWaitEvent(s, devs_[p]->ev_ar[par], 0));
             CUDA_CHECK(cudaMemcpyAsync(d.recv + (size_t) j * R5 * n, stage(p), N * sizeof(half), cudaMemcpyHostToDevice, s));
             ++j;
+        }
+        if (!d.up_pend.empty()) {   // the next expert upload part, behind these downloads
+            CUDA_CHECK(cudaEventRecord(d.ev_arh, s));
+            CUDA_CHECK(cudaStreamWaitEvent(d.cstream, d.ev_arh, 0));
+            const auto q = d.up_pend.front();
+            d.up_pend.pop_front();
+            upload_stage(d, q[0], q[1], q[2], up_parts_);
         }
         add_parts(x, d.p16, d.recv, (size_t) R5 * n, nd - 1, (int) N, s);
     };
@@ -1511,6 +1528,11 @@ void Engine5::record_main(int gi, int nt, int kind) {
                         ms.up = d.stage[sb] + (size_t) cnt * L.moex.gate_bytes;
                         ms.down = d.stage[sb] + (size_t) 2 * cnt * L.moex.gate_bytes;
                         ms.slot = L.st_slot[sb];
+                        while (!d.up_pend.empty() && (d.up_pend.front()[0] < il || (d.up_pend.front()[0] == il && d.up_pend.front()[1] <= sb))) {
+                            const auto q = d.up_pend.front();   // (parts no allreduce took yet)
+                            d.up_pend.pop_front();
+                            upload_stage(d, q[0], q[1], q[2], up_parts_);
+                        }
                         CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_up[sb], 0));
                         moe_order(ms, d.ids, nt * K, c.n_expert, d.order, d.order_n, s, d.egrp);
                         moe_gemm_gate_up(ms, d.mix16, n, K, d.order, d.order_n, d.egrp, c.n_expert, d.h16, s);
@@ -1519,7 +1541,10 @@ void Engine5::record_main(int gi, int nt, int kind) {
                         CUDA_CHECK(cudaEventRecord(d.ev_free[sb], s));
                         int nx = il + 1;
                         while (nx < il1 && !d.layers[nx].owner_bulk) ++nx;
-                        if (nx < il1) upload_stage(d, nx, sb);
+                        if (nx < il1) {
+                            if (up_parts_ > 0) for (int pp = 0; pp < up_parts_; ++pp) d.up_pend.push_back({nx, sb, pp});
+                            else upload_stage(d, nx, sb);
+                        }
                     }
             } else {
                 moe_gate_up(L.moex, d.xn, n, d.ids, K, d.hexp, nt, s);
@@ -1556,16 +1581,19 @@ void Engine5::record_main(int gi, int nt, int kind) {
                                cudaMemcpyDeviceToHost, s));
 }
 
-void Engine5::upload_stage(Device & d, int il, int sb) {
+// part p of np of half sb (split by expert index); the first part waits for the staging buffer, the last one signals ev_up
+void Engine5::upload_stage(Device & d, int il, int sb, int p, int np) {
     DevLayer & L = d.layers[il];
     const ExpertHost & H = ehost_[il];
     const std::vector<int> & lst = L.st_list[sb];
     const int cnt = (int) lst.size();
-    CUDA_CHECK(cudaStreamWaitEvent(d.cstream, d.ev_free[sb], 0));
+    if (np < 1) np = 1;
+    const int i0 = (int) ((int64_t) cnt * p / np), i1 = (int) ((int64_t) cnt * (p + 1) / np);
+    if (p == 0) CUDA_CHECK(cudaStreamWaitEvent(d.cstream, d.ev_free[sb], 0));
     const size_t gb = H.gb, db = H.db;
-    for (int i = 0; i < cnt;) {   // runs of consecutive experts in one copy each
+    for (int i = i0; i < i1;) {   // runs of consecutive experts in one copy each
         int j = i + 1;
-        while (j < cnt && lst[j] == lst[j - 1] + 1) ++j;
+        while (j < i1 && lst[j] == lst[j - 1] + 1) ++j;
         const size_t e = (size_t) lst[i], r = (size_t) (j - i);
         CUDA_CHECK(cudaMemcpyAsync(d.stage[sb] + (size_t) i * gb, H.gate + e * gb, r * gb, cudaMemcpyHostToDevice, d.cstream));
         CUDA_CHECK(cudaMemcpyAsync(d.stage[sb] + (size_t) (cnt + i) * gb, H.up + e * gb, r * gb, cudaMemcpyHostToDevice, d.cstream));
@@ -1573,7 +1601,7 @@ void Engine5::upload_stage(Device & d, int il, int sb) {
                                    d.cstream));
         i = j;
     }
-    CUDA_CHECK(cudaEventRecord(d.ev_up[sb], d.cstream));
+    if (p == np - 1) CUDA_CHECK(cudaEventRecord(d.ev_up[sb], d.cstream));
 }
 
 // roll the KDA state back to the snapshot after row keep-1 of the last verification (the MLA side needs nothing: rejected rows'
@@ -1661,10 +1689,12 @@ void Engine5::run(int nt, int kind) {
         for (int gi = 0; gi < (int) devs_.size(); ++gi)
             th.emplace_back([&, gi] {
                 try { CUDA_CHECK(cudaSetDevice(devs_[gi]->id)); record_main(gi, nt, kind); }
-                catch (const std::exception & ex) { err[gi] = ex.what(); }
+                catch (const std::exception & ex) { err[gi] = ex.what(); barrier_->abort(); }
             });
         for (auto & t : th) t.join();
-        for (auto & m : err) if (!m.empty()) throw std::runtime_error(m);
+        std::string first;   // (the failing device's message, not the others' "barrier" ones)
+        for (auto & m : err) if (!m.empty() && (first.empty() || first.rfind("barrier:", 0) == 0)) first = m;
+        if (!first.empty()) { barrier_->reset(); throw std::runtime_error(first); }
     } else {
         for (int gi = 0; gi < (int) devs_.size(); ++gi) {
             auto & dp = devs_[gi];

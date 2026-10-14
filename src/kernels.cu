@@ -729,7 +729,7 @@ __global__ void __launch_bounds__(128) k_attn_split(const float * __restrict__ q
                                                     const half * __restrict__ vcache, float * __restrict__ part, const int * pos_p,
                                                     int max_pos, int n_head_l, int head_off, int group, int kv_off, float scale,
                                                     int n_chunk, const int * __restrict__ list, int list_stride,
-                                                    const int * __restrict__ list_n, int nt_x) {
+                                                    const int * __restrict__ list_n, int nt_x, int pos_off) {
     // list (optional, sparse attention): token t attends to the cells list[t * list_stride + i], i < list_n[t]
     static_assert(HD == 256, "lane owns 8 dims");
     constexpr int NW = 4;
@@ -741,7 +741,7 @@ __global__ void __launch_bounds__(128) k_attn_split(const float * __restrict__ q
     else { hk = blockIdx.x / n_chunk; hchunk = blockIdx.x % n_chunk; t = blockIdx.z; }
     const int split = blockIdx.y, nsplit = gridDim.y;
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
-    const int n_pos = list ? list_n[t] : *pos_p + t + 1;
+    const int n_pos = list ? list_n[t] : *pos_p + pos_off + t + 1;
     const int * lt = list ? list + (size_t) t * list_stride : nullptr;
     const int chunk = (n_pos + nsplit - 1) / nsplit;
     const int p0 = split * chunk, p1 = min(n_pos, p0 + chunk);
@@ -851,13 +851,19 @@ __global__ void k_attn_combine(const float * __restrict__ qkv, int stride, const
 // Q (pre-scaled, fp16) stays in shared memory; K/V tiles of 32 positions stream through shared memory. S = Q K^T
 // and O += P V run on mma m16n8k16; the S accumulators become the P A-fragments directly.
 constexpr int FA_BQ = 64, FA_BK = 32, FA_LD = 256 + 8;
-template <int HD>
+// DB: K/V double-buffered (the next tile's cp.async in flight while this one is computed; the same values and arithmetic)
+template <int HD, bool DB>
 __global__ void __launch_bounds__(128) k_attn_fa(const float * __restrict__ qkv, int stride, const half * __restrict__ kcache,
                                                  const half * __restrict__ vcache, float * __restrict__ out, int out_stride,
-                                                 const int * pos_p, int max_pos, int head_off, int group, int kv_off, float scale, int nt) {
+                                                 const int * pos_p, int max_pos, int head_off, int group, int kv_off, float scale, int nt,
+                                                 float * __restrict__ part) {
+    // part (split over the keys, gridDim.z slices of whole tiles): unnormalized partials {o[HD], m, l} per (row, head, slice) for
+    // k_attn_combine, as the decode split attention writes them
     static_assert(HD == 256, "FA_LD assumes head_dim 256");
     extern __shared__ __align__(16) half fa_smem[];
-    half * qs = fa_smem, * ks = qs + FA_BQ * FA_LD, * vs = ks + FA_BK * FA_LD;
+    half * qs = fa_smem;
+    half * kbuf[2] = {qs + FA_BQ * FA_LD, qs + FA_BQ * FA_LD + 2 * FA_BK * FA_LD};   // [K | V] per buffer
+    half * ks = kbuf[0], * vs = ks + FA_BK * FA_LD;
     const int h = blockIdx.y, qt0 = blockIdx.x * FA_BQ;
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
     const int hk = (head_off + h) / group - kv_off;
@@ -869,6 +875,13 @@ __global__ void __launch_bounds__(128) k_attn_fa(const float * __restrict__ qkv,
         *(__half2 *) (qs + r * FA_LD + d) = __floats2half2_rn(v.x * scale, v.y * scale);
     }
     const int n_keys = pos0 + min(nt, qt0 + FA_BQ);            // keys [0, n_keys) are visible to some row of the block
+    int kbeg = 0, kend = n_keys;                                 // this block's keys (a slice of them when split)
+    if (part) {
+        const int nsp = gridDim.z, n_all = pos0 + nt;
+        const int chunk = ((n_all + nsp - 1) / nsp + FA_BK - 1) / FA_BK * FA_BK;
+        kbeg = blockIdx.z * chunk;
+        kend = min(n_keys, kbeg + chunk);
+    }
     const int wrow0 = qt0 + w * 16;                             // first token row of this warp
     const int wlast = pos0 + min(nt - 1, wrow0 + 15);           // last visible key of the warp
     const half * kb = kcache + (size_t) hk * max_pos * HD, * vb = vcache + (size_t) hk * max_pos * HD;
@@ -877,16 +890,28 @@ __global__ void __launch_bounds__(128) k_attn_fa(const float * __restrict__ qkv,
     for (int i = 0; i < HD / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
     float m[2] = {-1e30f, -1e30f}, l[2] = {0.0f, 0.0f};
     const int qp[2] = {pos0 + wrow0 + gid, pos0 + wrow0 + gid + 8};
-    for (int kt0 = 0; kt0 < n_keys; kt0 += FA_BK) {
-        __syncthreads();
+    auto load_kv = [&](half * kd, half * vd, int kt) {
         for (int i = threadIdx.x; i < FA_BK * HD / 8; i += blockDim.x) {
-            const int r = i / (HD / 8), d = (i % (HD / 8)) * 8, p = kt0 + r;
-            const bool ok = p < n_keys;
-            cp_async16(ks + r * FA_LD + d, kb + (size_t) (ok ? p : 0) * HD + d, ok);
-            cp_async16(vs + r * FA_LD + d, vb + (size_t) (ok ? p : 0) * HD + d, ok);
+            const int r = i / (HD / 8), d = (i % (HD / 8)) * 8, p = kt + r;
+            const bool ok = p < kend;
+            cp_async16(kd + r * FA_LD + d, kb + (size_t) (ok ? p : 0) * HD + d, ok);
+            cp_async16(vd + r * FA_LD + d, vb + (size_t) (ok ? p : 0) * HD + d, ok);
         }
         cp_async_commit();
-        asm volatile("cp.async.wait_group 0;");
+    };
+    if (DB && kbeg < kend) load_kv(kbuf[0], kbuf[0] + FA_BK * FA_LD, kbeg);
+    for (int kt0 = kbeg; kt0 < kend; kt0 += FA_BK) {
+        __syncthreads();   // (every warp is done with the buffer the next load overwrites)
+        if (DB) {
+            const int cur = ((kt0 - kbeg) / FA_BK) & 1;
+            ks = kbuf[cur]; vs = ks + FA_BK * FA_LD;
+            if (kt0 + FA_BK < kend) load_kv(kbuf[cur ^ 1], kbuf[cur ^ 1] + FA_BK * FA_LD, kt0 + FA_BK);
+            else cp_async_commit();   // (an empty group: wait_group 1 below then covers this tile)
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            load_kv(ks, vs, kt0);
+            asm volatile("cp.async.wait_group 0;");
+        }
         __syncthreads();
         if (kt0 > wlast || wrow0 >= nt) continue;
         float s[4][4];
@@ -911,7 +936,7 @@ __global__ void __launch_bounds__(128) k_attn_fa(const float * __restrict__ qkv,
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const int key = kt0 + ni * 8 + 2 * tig + (e & 1);
-                if (key > qp[e >> 1] || key >= n_keys) s[ni][e] = -INFINITY;
+                if (key > qp[e >> 1] || key >= kend) s[ni][e] = -INFINITY;
                 tmax[e >> 1] = fmaxf(tmax[e >> 1], s[ni][e]);
             }
         float corr[2];
@@ -951,6 +976,23 @@ __global__ void __launch_bounds__(128) k_attn_fa(const float * __restrict__ qkv,
     for (int r = 0; r < 2; ++r) {
         l[r] += __shfl_xor_sync(0xffffffff, l[r], 1);
         l[r] += __shfl_xor_sync(0xffffffff, l[r], 2);
+    }
+    if (part) {   // unnormalized partials of this slice (a slice with no visible key: l = 0, k_attn_combine skips it)
+        const int nsp = gridDim.z, nh = gridDim.y;
+#pragma unroll
+        for (int e2 = 0; e2 < 2; ++e2) {
+            const int t = wrow0 + gid + e2 * 8;
+            if (t >= nt) continue;
+            float * dst = part + (((size_t) t * nh + h) * nsp + blockIdx.z) * (HD + 2);
+#pragma unroll
+            for (int i = 0; i < HD / 8; ++i) {
+                const int d = i * 8 + 2 * tig;
+                dst[d] = o[i][e2 * 2];
+                dst[d + 1] = o[i][e2 * 2 + 1];
+            }
+            if (tig == 0) { dst[HD] = m[e2]; dst[HD + 1] = l[e2]; }
+        }
+        return;
     }
 #pragma unroll
     for (int e2 = 0; e2 < 2; ++e2) {
@@ -1959,19 +2001,56 @@ void attn_decode(const float * qkv, int stride, const half * kcache, const half 
     k_attn_decode<256><<<dim3(n_head, nt), 256, 0, s>>>(qkv, stride, kcache, vcache, out, out_stride, pos, max_pos,
                                                         head_off, group, kv_off, scale);
 }
+// partial buffer per stream for the split prefill attention (grown on demand; prefill only, never captured)
+static float * fa_part_scratch(size_t floats, cudaStream_t s) {
+    static std::mutex mu;
+    static std::map<cudaStream_t, std::pair<float *, size_t>> bufs;
+    std::lock_guard<std::mutex> lk(mu);
+    auto & b = bufs[s];
+    if (b.second < floats) {
+        if (b.first) cudaFree(b.first);
+        b.first = nullptr; b.second = 0;
+        if (cudaMalloc(&b.first, floats * sizeof(float)) != cudaSuccess) { b.first = nullptr; return nullptr; }
+        b.second = floats;
+    }
+    return b.first;
+}
 void attn_prefill(const float * qkv, int stride, const half * kcache, const half * vcache, float * out, int out_stride,
                   const int * pos, int max_pos, int n_head, int head_off, int group, int kv_off, int hd, float scale, int nt,
-                  cudaStream_t s) {
+                  cudaStream_t s, int pos_host) {
     if (hd != 256) throw std::runtime_error("attn_prefill: only head_dim 256 is instantiated");
-    const size_t smem = (size_t) (FA_BQ + 2 * FA_BK) * FA_LD * sizeof(half);
+    static const bool single = getenv("HYPER_FA_SINGLE") != nullptr;   // (one K/V buffer: each tile's load waited for)
+    const size_t smem = (size_t) (FA_BQ + (single ? 2 : 4) * FA_BK) * FA_LD * sizeof(half);   // double: 101376 B, the sm_86 maximum
     static bool attr_set[16] = {};
     int dev = 0; cudaGetDevice(&dev);
     if (!attr_set[dev]) {
-        cudaFuncSetAttribute(k_attn_fa<256>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(k_attn_fa<256, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) ((FA_BQ + 2 * FA_BK) * FA_LD * sizeof(half)));
+        cudaFuncSetAttribute(k_attn_fa<256, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) ((FA_BQ + 4 * FA_BK) * FA_LD * sizeof(half)));
         attr_set[dev] = true;
     }
-    k_attn_fa<256><<<dim3((nt + FA_BQ - 1) / FA_BQ, n_head), 128, smem, s>>>(qkv, stride, kcache, vcache, out, out_stride, pos, max_pos,
-                                                                           head_off, group, kv_off, scale, nt);
+    // deep context: the keys split over gridDim.z slices so that the few (row tile, head) blocks of a chunk fill the GPU; partials
+    // merged by k_attn_combine (another order of the softmax sums than one pass: not bit-identical to it). Only from 2 slices of
+    // >= 4096 keys on, with the depth known (pos_host). Opt-in until validated (HYPER_FA_SPLIT=1); HYPER_FA_SPLITS=n: n slices
+    static const bool nosplit = getenv("HYPER_FA_SPLIT") == nullptr && getenv("HYPER_FA_SPLITS") == nullptr;
+    static const int force = getenv("HYPER_FA_SPLITS") ? atoi(getenv("HYPER_FA_SPLITS")) : 0;
+    const int tiles = (nt + FA_BQ - 1) / FA_BQ, blocks = tiles * n_head;
+    int nsp = 1;
+    if (!nosplit && pos_host >= 0) {
+        static int sms = 0;
+        if (!sms) { cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev); if (sms <= 0) sms = 82; }
+        nsp = force > 0 ? force : (2 * sms + blocks - 1) / blocks;
+        nsp = std::min(nsp, std::min(32, (pos_host + nt) / 4096));
+    }
+    float * part = nsp > 1 ? fa_part_scratch((size_t) nt * n_head * nsp * (hd + 2), s) : nullptr;
+    if (!part) nsp = 1;
+    const dim3 grid(tiles, n_head, nsp);
+    if (single)
+        k_attn_fa<256, false><<<grid, 128, smem, s>>>(qkv, stride, kcache, vcache, part ? nullptr : out, out_stride, pos, max_pos, head_off,
+                                                      group, kv_off, scale, nt, part);
+    else
+        k_attn_fa<256, true><<<grid, 128, smem, s>>>(qkv, stride, kcache, vcache, part ? nullptr : out, out_stride, pos, max_pos, head_off,
+                                                     group, kv_off, scale, nt, part);
+    if (part) k_attn_combine<256><<<dim3(n_head, nt), 256, 0, s>>>(qkv, stride, part, nsp, out, out_stride, n_head);
 }
 // decode-sized forwards (speculative verification rows) split the cache like a single row: every row's partial sums, and
 // so its rounding, are those of a plain decode step (the split count changed the output of 3- and 4-row verifications)
@@ -1979,7 +2058,7 @@ int attn_nsplit(int n_kv, int nt) { return std::max(1, std::min(64, 256 / (n_kv 
 size_t attn_part_floats(int n_head, int n_kv, int nt, int hd) { return (size_t) nt * n_head * attn_nsplit(n_kv, nt) * (hd + 2); }
 void attn_split(const float * qkv, int stride, const half * kcache, const half * vcache, float * part, float * out, int out_stride,
                 const int * pos, int max_pos, int n_head, int n_kv, int head_off, int group, int kv_off, int hd,
-                float scale, int nt, cudaStream_t s, const int * list, int list_stride, const int * list_n) {
+                float scale, int nt, cudaStream_t s, const int * list, int list_stride, const int * list_n, int pos_off) {
     if (hd != 256) throw std::runtime_error("attn_split: only head_dim 256 is instantiated");
     const int ns = attn_nsplit(n_kv, nt);
     const int n_chunk = (std::min(group, n_head) + 5) / 6;   // local q heads of one kv head <= min(group, n_head)
@@ -1989,9 +2068,9 @@ void attn_split(const float * qkv, int stride, const half * kcache, const half *
     const bool rows_fast = rows_env >= 0 ? rows_env != 0 : (!list && nt > 1 && nt <= MAX_NT);
     const dim3 grid = rows_fast ? dim3(n_kv * n_chunk * nt, ns) : dim3(n_kv * n_chunk, ns, nt);
     if (brk) k_attn_split<256, 6, true><<<grid, 128, 0, s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head, head_off, group, kv_off,
-                                                           scale, n_chunk, list, list_stride, list_n, rows_fast ? nt : 0);
+                                                           scale, n_chunk, list, list_stride, list_n, rows_fast ? nt : 0, pos_off);
     else k_attn_split<256, 6, false><<<grid, 128, 0, s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head, head_off, group, kv_off,
-                                                        scale, n_chunk, list, list_stride, list_n, rows_fast ? nt : 0);
+                                                        scale, n_chunk, list, list_stride, list_n, rows_fast ? nt : 0, pos_off);
     k_attn_combine<256><<<dim3(n_head, nt), 256, 0, s>>>(qkv, stride, part, ns, out, out_stride, n_head);
 }
 void gdn_conv(float * in, int stride, float * conv_state, float * conv_snap, const float * conv_w, int channels, int K,

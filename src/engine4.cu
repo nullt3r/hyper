@@ -1302,6 +1302,10 @@ void Engine4::record_main(int gi, int nt, int kind) {
     // all but the last of the kept verification rows; the last one alone goes on through the FFN to the head
     const bool cache_only = kind == 1 && mtp_cache_only_ && !mtp_full_;
     const bool last_only = kind == 1 && !mtp_cache_only_ && !mtp_full_ && nt > 1;
+    // ... and, already from the attention output on, alone: the other rows only write their K/V (HYPER4_MTP_ATT_ALL: attention,
+    // output projection and allreduce for every row, the last one kept -- the same values for it)
+    static const bool att_all = getenv("HYPER4_MTP_ATT_ALL") != nullptr;
+    const bool last_att = last_only && !att_all;   // (also a prefill tail: its MTP pass attended over the whole cache for every row)
     // matmul: decode GEMV (split-K for few rows) or, for a prefill chunk, fp16 conversion + tiled tensor-core GEMM
     auto mm = [&](const DW & W, const float * x, int xs, float * y, int ys, int rows, const NormIn & ni = NormIn{}) {
         if (!W.seg.empty()) {   // segments: Q8 fragments or KQ (prefill: dequantized to fp16 in slices + cuBLAS)
@@ -1502,7 +1506,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
         };
         auto join = [&] { CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_join, 0)); };
         if (L.full && L.n_head_l == 0) {   // no kv head on this GPU: contributes nothing to the attention output
-            CUDA_CHECK(cudaMemsetAsync(d.part, 0, (size_t) nt * n * sizeof(float), s));
+            CUDA_CHECK(cudaMemsetAsync(d.part, 0, (size_t) (last_att ? 1 : nt) * n * sizeof(float), s));
         } else if (L.full) {
             const bool qsa = L.kraw != nullptr;
             const bool par_idx = par && qsa;
@@ -1566,7 +1570,11 @@ void Engine4::record_main(int gi, int nt, int kind) {
                           c.n_rot, c.rope_base, eps, nt, s, d.rpos, c.rope_sec);
             if (cache_only) continue;
             const int ostride = L.n_head_l * c.head_dim;
-            if (bulk && dense_chunk)
+            if (last_att)   // the last row alone (position P + nt - 1), into row 0
+                attn_split(d.big0 + (size_t) (nt - 1) * bs, bs, L.kcache, L.vcache, d.attn_part, d.o, ostride, P, opt_.max_pos, L.n_head_l,
+                           L.n_kv_l, L.head_off, c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), 1, s,
+                           nullptr, 0, nullptr, nt - 1);
+            else if (bulk && dense_chunk)
                 attn_prefill(d.big0, bs, L.kcache, L.vcache, d.o, ostride, P, opt_.max_pos, L.n_head_l, L.head_off,
                              c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), nt, s);
             else if (getenv("HYPER4_OLDATTN"))
@@ -1576,7 +1584,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
                 attn_split(d.big0, bs, L.kcache, L.vcache, d.attn_part, d.o, ostride, P, opt_.max_pos, L.n_head_l, L.n_kv_l,
                            L.head_off, c.n_head / c.n_head_kv, L.kv_off, c.head_dim, 1.0f / sqrtf((float) c.head_dim), nt, s,
                            qsa ? d.ilist : nullptr, QSA_LIST, qsa ? d.ilist_n : nullptr);
-            mm(L.wo, d.o, ostride, d.part, n, nt);
+            mm(L.wo, d.o, ostride, d.part, n, last_att ? 1 : nt);
         } else {
             const int dv = c.head_v_dim();
             const int z_off = L.conv_ch, ab_off = L.conv_ch + L.n_v_l * dv;
@@ -1596,11 +1604,17 @@ void Engine4::record_main(int gi, int nt, int kind) {
             mm(L.wout, d.o, ostride, d.part, n, nt);
         }
         if (cache_only) continue;
+        if (last_att && L.full) {   // the last row's residual streams and injection weights to row 0: it goes on alone, in decode mode
+            CUDA_CHECK(cudaMemcpyAsync(R, R + (size_t) (nt - 1) * hcn, (size_t) hcn * sizeof(float), cudaMemcpyDeviceToDevice, s));
+            CUDA_CHECK(cudaMemcpyAsync(d.inj, d.inj + (size_t) (nt - 1) * 4, 4 * sizeof(float), cudaMemcpyDeviceToDevice, s));
+            nt = 1;
+            bulk = false;
+        }
         dbg(L.full ? "attn_part" : "gdn_part", il, d.part, (size_t) nt * n);
         if (bulk) { allreduce(); hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s); }
         else allreduce_hc_ll16(R, d.inj, n, hc, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
         if (il < 2) tr(4 + 4 * il, R, hcn);
-        if (last_only) {   // the last row moves to row 0 and continues alone, in decode mode
+        if (last_only && nt > 1) {   // the last row moves to row 0 and continues alone, in decode mode
             CUDA_CHECK(cudaMemcpyAsync(R, R + (size_t) (nt - 1) * hcn, (size_t) hcn * sizeof(float), cudaMemcpyDeviceToDevice, s));
             nt = 1;
             bulk = false;
@@ -1994,10 +2008,12 @@ void Engine4::run(int kind, int nt) {
         for (int gi = 0; gi < (int) devs_.size(); ++gi)
             th.emplace_back([&, gi] {
                 try { CUDA_CHECK(cudaSetDevice(devs_[gi]->id)); record_main(gi, nt, kind); }
-                catch (const std::exception & ex) { err[gi] = ex.what(); }
+                catch (const std::exception & ex) { err[gi] = ex.what(); barrier_->abort(); }
             });
         for (auto & t : th) t.join();
-        for (auto & m : err) if (!m.empty()) throw std::runtime_error(m);
+        std::string first;   // (the failing device's message, not the others' "barrier" ones)
+        for (auto & m : err) if (!m.empty() && (first.empty() || first.rfind("barrier:", 0) == 0)) first = m;
+        if (!first.empty()) { barrier_->reset(); throw std::runtime_error(first); }
     } else {
         for (int gi = 0; gi < (int) devs_.size(); ++gi) {
             auto & dp = devs_[gi];

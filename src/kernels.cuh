@@ -114,15 +114,17 @@ void attn_decode(const float * qkv, int stride, const half * kcache, const half 
 // prefill: tensor-core causal flash attention (64 query tokens x one q head per block)
 void attn_prefill(const float * qkv, int stride, const half * kcache, const half * vcache, float * out, int out_stride,
                   const int * pos, int max_pos, int n_head, int head_off, int group, int kv_off, int hd, float scale, int nt,
-                  cudaStream_t s);
+                  cudaStream_t s, int pos_host = -1);
 // split-K variant: a block per (local kv head, position slice, token) serves all q heads of that kv head;
 // part: scratch of attn_part_floats(n_head, n_kv, nt, hd) floats
 int attn_nsplit(int n_kv, int nt);
 size_t attn_part_floats(int n_head, int n_kv, int nt, int hd);
 // list (optional): sparse attention, token t attends to cells list[t * list_stride + i] for i < list_n[t]
+// pos_off: the rows are those of positions *pos + pos_off + t (qkv already at that row; e.g. the last row of a block alone)
 void attn_split(const float * qkv, int stride, const half * kcache, const half * vcache, float * part, float * out, int out_stride,
                 const int * pos, int max_pos, int n_head, int n_kv, int head_off, int group, int kv_off, int hd,
-                float scale, int nt, cudaStream_t s, const int * list = nullptr, int list_stride = 0, const int * list_n = nullptr);
+                float scale, int nt, cudaStream_t s, const int * list = nullptr, int list_stride = 0, const int * list_n = nullptr,
+                int pos_off = 0);
 
 // ---- gated delta net, local heads ----
 // in rows: [q n_k*dk | k n_k*dk | v n_v*dv | z n_v*dv | alpha n_v | beta n_v]  (conv runs over the first `channels`)

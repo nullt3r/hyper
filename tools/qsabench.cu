@@ -14,6 +14,7 @@
 #include <memory>
 #include <cstdlib>
 #include <random>
+#include <string>
 #include <vector>
 
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { printf("CUDA %s line %d\n", cudaGetErrorString(e), __LINE__); exit(1); } } while (0)
@@ -31,15 +32,18 @@ template <class T> static std::vector<T> dl(const T * d, size_t n) {
 int main(int argc, char ** argv) {
     const int ctx = argc > 1 ? atoi(argv[1]) : 160000, nt = argc > 2 ? atoi(argv[2]) : 4, iters = argc > 3 ? atoi(argv[3]) : 200;
     const int max_pos = 262144, idx_heads = 4, top = 2048 / 4, list_stride = 2052, score_rows = 64, score_stride = max_pos / 4 + 4;
-    const int hd = 256, n_head_l = 12, n_kv_l = 1, group = 12, head_off = 0, kv_off = 0;
+    // QSA_SHAPE=27b: the 27B's GPU 1 (8 q heads 8..15 on kv heads 1, 2; group 6) instead of Flash-Next's (12 q heads on 1 kv head)
+    const bool b27 = getenv("QSA_SHAPE") && std::string(getenv("QSA_SHAPE")) == "27b";
+    const int hd = 256, n_head_l = b27 ? 8 : 12, n_kv_l = b27 ? 2 : 1, group = b27 ? 6 : 12, head_off = b27 ? 8 : 0, kv_off = b27 ? 1 : 0;
     const int qstride = n_head_l * 2 * hd + 2 * n_kv_l * hd;   // q|gate per head, then k, v (as in big0)
     std::mt19937 rng(7);
     std::normal_distribution<float> nd(0.0f, 1.0f);
     // caches: pooled indexer keys and K/V rows for every position up to ctx (+ the nt new ones)
     const size_t npool = (size_t) max_pos / 4 + 1;
-    std::vector<half> pool(npool * 128), kc((size_t) max_pos * hd), vc((size_t) max_pos * hd);
+    std::vector<half> pool(npool * 128), kc((size_t) n_kv_l * max_pos * hd), vc((size_t) n_kv_l * max_pos * hd);
     for (size_t i = 0; i < (size_t) (ctx + nt) / 4 * 128 + 128; ++i) pool[i] = __float2half(nd(rng));
-    for (size_t i = 0; i < (size_t) (ctx + nt) * hd; ++i) { kc[i] = __float2half(nd(rng)); vc[i] = __float2half(nd(rng)); }
+    for (int h = 0; h < n_kv_l; ++h)
+        for (size_t i = 0; i < (size_t) (ctx + nt) * hd; ++i) { kc[(size_t) h * max_pos * hd + i] = __float2half(nd(rng)); vc[(size_t) h * max_pos * hd + i] = __float2half(nd(rng)); }
     std::vector<float> qn((size_t) nt * idx_heads * 128), qkv((size_t) nt * qstride);
     // QSA_ZERO=f: a share f of the pools scores exactly 0 (every head's dot product negative, as relu leaves it), the
     // rest as before -- real scores pile up in few histogram bins
@@ -121,6 +125,23 @@ int main(int argc, char ** argv) {
     };
     printf("ctx %d nt %d (cells/row %d): warm L2 select %.1f us  attention %.1f us | cold select %.1f us  attention %.1f us\n", ctx, nt,
            ln[0], timeit(select, false), timeit(attend, false), timeit(select, true), timeit(attend, true));
+    // QSA_FA=1: the prefill flash attention (attn_prefill) for these nt rows at depth ctx (27B / dense layers), cold L2
+    if (getenv("QSA_FA")) {
+        int ph = -1;   // (the host position: the deep-context key split may engage)
+        auto fa = [&] { attn_prefill(d_qkv, qstride, d_k, d_v, d_out, n_head_l * hd, d_pos, max_pos, n_head_l, head_off, group, kv_off, hd, scale,
+                                     nt, s, ph); };
+        fa(); CK(cudaStreamSynchronize(s));
+        const auto of = dl(d_out, (size_t) nt * n_head_l * hd);
+        printf("prefill flash attention, %d rows at %d: cold %.1f us  hash %016llx\n", nt, ctx, timeit(fa, true), fnv(of.data(), of.size() * 4));
+        ph = ctx;   // the same rows with the split (when it engages): time, and the difference from the one-pass result
+        fa(); CK(cudaStreamSynchronize(s));
+        const auto os = dl(d_out, (size_t) nt * n_head_l * hd);
+        double md = 0, num = 0, den = 0;
+        for (size_t i = 0; i < of.size(); ++i) { const double d = (double) os[i] - of[i]; md = std::max(md, std::fabs(d)); num += d * d; den += (double) of[i] * of[i]; }
+        printf("  with the key split: cold %.1f us  hash %016llx  max |diff| %.3g  rel L2 %.3g\n", timeit(fa, true), fnv(os.data(), os.size() * 4), md,
+               std::sqrt(num / std::max(den, 1e-30)));
+        return 0;
+    }
     // the MTP layer's dense attention over every cached position (no indexer)
     auto dense = [&] { attn_split(d_qkv, qstride, d_k, d_v, d_part, d_out, n_head_l * hd, d_pos, max_pos, n_head_l, n_kv_l, head_off, group,
                                   kv_off, hd, scale, nt, s, nullptr, 0, nullptr); };

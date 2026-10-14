@@ -601,3 +601,67 @@ přes všechny řádky. Oprava: scratch na stream.
 Poučení pro metodu: změny sdílené s 27B (kernels.cu) ověřovat i hloubkovým scénářem 27B (`~/deep_27.sh`), nejen mělkým replayem.
 Pro bisekci na úrovni enginu: `HYPER_DUMP_TOKENS` uloží prompt serveru jako referenční soubor (jen tokeny) a `hyper gen` ho
 s `HYPER_PCACHE=1` předpočítá se stejným chunkováním jako server (`HYPER_GEN_PRINT=1` vypíše tokeny).
+
+### Hustá dekódovací attention: řádky nejrychleji v gridu (27B, MTP vrstva Flash)
+
+Při ověření 2–4 řádků hustá attention (27B ve všech vrstvách attention, Flash v MTP vrstvě) spouštěla bloky v pořadí
+(hlava, split, řádek). Řádky 2–4 tak běžely v další vlně a stejné úseky KV cache četly znovu z DRAM. Pořadí „řádky
+nejrychleji“ (`nt_x`) pustí bloky všech řádků jednoho úseku současně a cache se čte jednou. Práce bloku je stejná, výsledek
+bitově shodný (qsabench, tvar 27B, shodné hashe):
+
+| 27B, 4 řádky | dosud | řádky nejrychleji |
+|---|---|---|
+| 60k | 455 µs | 401 µs |
+| 120k | 988 µs | 774 µs |
+| 200k | 1794 µs | 1290 µs |
+
+`hyper gen` na hlubokém promptu 27B (155k, chunkování jako server): spekulativní dekódování 85,2 → 98,5 t/s, výstup shodný
+s obyčejným. Výchozí pro hustou attention s 2–4 řádky (`HYPER_ATTN_ROWS=0/1` vynutí jedno pořadí pro všechny případy).
+(Je v commitu 4b38e92 spolu s opravou scratche GDN.)
+
+### Vzorkování přes celý řádek
+
+Když top_k nestačí (vypnutý top_k a široký nucleus, např. výchozí nastavení GLM), host projde celý řádek logitů. Biny
+podle log váhy byly vektory vektorů. Teď je to stabilní counting sort podle binu (stejné pořadí uvnitř binu): 2,53 → 1,71 ms
+na řádek o 248k. `tools/samptest_eq` (144 kombinací parametrů proti předchozímu kódu): tokeny, bity pravděpodobností
+i Gumbelovy tahy shodné.
+
+### Incident 2026-10-14 01:11 UTC: soft lockup hostu (restart nutný)
+
+Kernel log předchozího bootu:
+1. 01:10:18 skončil poslední požadavek běhu `e27c_base` (27B). Skript poslal SIGINT, ale **proces spuštěný na pozadí (`&`)
+   v neinteraktivním skriptu má SIGINT ignorovaný**, takže se nic nestalo. Po 60 s (01:11:18) dostal SIGKILL uprostřed
+   klidového stavu a jádro ho uklízelo samo.
+2. Další běh čekal jen na volnou VRAM, ne na konec procesu, a začal hned načítat **stejný GGUF** (27B).
+3. 01:11:20 `BUG: Bad page state in process hyper-server ... aops:ext4_da_aops ino:564e87 (GGUF 27B) ... page dumped because:
+   non-NULL mapping`, ve starém procesu na cestě `do_exit → … → uvm_release [nvidia_uvm] → mmput → exit_mmap → release_pages`.
+   Uvolnila se stránka, která ještě byla v page cache (refcount klesl na 0 o jednu referenci dřív).
+4. 01:12:02 `watchdog: BUG: soft lockup - CPU#0 stuck` v novém procesu: `filemap_fault → filemap_get_entry → xas_load` na té stránce,
+   donekonečna. Za ním systemd a `cgroup_release` ve stavu D, SSH relace se otevíraly minuty. Pomohl jen restart.
+
+Uživatelský kód „Bad page state“ sám způsobit nemůže. Jde o chybu jádra nebo ovladače (6.8.0-137, nvidia-open 580.173.02, HMM
+zapnuté: `uvm_disable_hmm=N`), kterou spustil souběh dvou věcí: úklidu zabitého procesu (SIGKILL, 2 s před hlášením) a načítání
+stejného souboru druhým. Shodu v issue trackeru nvidia jsem nenašel. Opatření:
+- benchmarkové skripty (`~/bench2/guard.sh`): ukončení přes SIGTERM a čekání na úplný konec procesu (`wait`, `pgrep`), žádný SIGKILL;
+  před startem a po každém běhu kontrola `dmesg` na „Bad page state / soft lockup“, řetěz běhů se pak zastaví;
+- `hyper-server` zachytí SIGINT/SIGTERM vláknem se `sigwait` (blokované ve všech vláknech, funguje i pro úlohu na pozadí),
+  zastaví HTTP server a engine se uklidí v destruktorech (GPU paměť, pinned buffery, mapování GGUF); druhý signál = okamžitý konec.
+
+### MTP jen pro poslední řádek, LM hlava 27B, flash attention s double-bufferingem, upload GLM
+
+Hloubkový scénář (155–170k), každý pár ve stejné relaci; výstupy (hash na požadavek) ve všech párech shodné, u MTP změn
+i míra přijetí draftů na každý požadavek (drafty bitově stejné):
+
+| Změna | před | po |
+|---|---|---|
+| Flash: MTP vrstva při ověření i u ocasu promptu počítá attention, wo a allreduce jen pro poslední řádek (ostatní jen K/V) | 146,3 t/s dekódování, 1400 ms/požadavek | **148,3 t/s, 1393 ms** |
+| 27B: MTP při ověření jen poslední řádek; v prefillu chunk, který není poslední, jen K/V; LM hlava prefillu jen pro poslední řádek | 642 t/s prefill, 68,5 t/s | 649 / 69,2 (bez FA) |
+| 27B: prefill flash attention s double-bufferingem K/V (`HYPER_FA_SINGLE=1` = staré), dohromady s předchozím řádkem | **639 t/s, 68,2 t/s** | **745 t/s (+17 %), 69,0 t/s** |
+| GLM: upload expertů po polovinách až za stahováním allreduce (`HYPER5_UP_PARTS=0` = staré) | 502 t/s (4053 ms/požadavek) | **608 t/s (+21 %, 3346 ms)** |
+
+- qsabench (tvar 27B, 64 řádků): flash attention 2522 → 2067 µs na 20k, 17,1 → 14,0 ms na 155k, hash shodný.
+- V hloubce flash attention prefillu běží jen 32–64 bloků (řádkové dlaždice × 8 hlav) na 82 SM. Split přes klíče
+  (`HYPER_FA_SPLIT=1`, sloučení přes `k_attn_combine`) zkrátí 64 řádků na 155k z 13,9 na **2,07 ms**. Není bitově shodný
+  (P se ve fp16 zaokrouhluje vůči maximu svého úseku: rozdíl max 4,7e-6, relativně 3,6e-4), proto zatím opt-in, dokud
+  neprojde KL proti referenci.
+- Bariéra nahrávacích vláken se dá přerušit (výjimka v jednom vlákně uvolní ostatní místo věčného čekání).

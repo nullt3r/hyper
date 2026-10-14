@@ -10,6 +10,7 @@
 #include "vmm.h"
 
 #include <atomic>
+#include <stdexcept>
 #include <functional>
 #include <random>
 #include <thread>
@@ -42,13 +43,18 @@ public:
             count_.store(0, std::memory_order_relaxed);
             gen_.fetch_add(1, std::memory_order_acq_rel);
         } else {
-            while (gen_.load(std::memory_order_acquire) == gen) {}
+            while (gen_.load(std::memory_order_acquire) == gen)
+                if (aborted_.load(std::memory_order_acquire)) throw std::runtime_error("barrier: another device's recording failed");
         }
     }
+    // a recording thread that failed releases the others (they throw instead of waiting forever); reset once all have joined
+    void abort() { aborted_.store(true, std::memory_order_release); }
+    void reset() { count_.store(0, std::memory_order_relaxed); aborted_.store(false, std::memory_order_release); }
 private:
     int n_;
     std::atomic<int> count_{0};
     std::atomic<unsigned> gen_{0};
+    std::atomic<bool> aborted_{false};
 };
 
 class Engine4 : public LLM {

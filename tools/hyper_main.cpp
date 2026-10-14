@@ -64,6 +64,7 @@ static int cmd_check(const char * model, const char * ref_path, int nt) {
     EngineOptions opt;
     opt.max_pos = n + 16;
     opt.mtp = nt > 1 && nt <= 4;
+    opt.all_logits = true;   // (every row is compared)
     Engine eng(model, opt);
     if (eng.config().n_vocab != nv) { fprintf(stderr, "vocab mismatch\n"); return 1; }
     Cmp cmp;
@@ -100,6 +101,7 @@ static int cmd_gen(const char * model, const char * ref_path, int n_prompt, int 
     EngineOptions opt;
     opt.max_pos = (int) toks.size() + n_gen + 16;
     if (getenv("HYPER_DRAFT")) opt.n_draft = atoi(getenv("HYPER_DRAFT"));
+    if (getenv("HYPER_PCACHE")) opt.prompt_cache = true;   // (the server's prefill chunking: snapshot points)
     Engine eng(model, opt);
     GenStats a, b;
     const hyper::SamplingParams gsp = test_sampling();
@@ -135,6 +137,11 @@ static int cmd_gen(const char * model, const char * ref_path, int n_prompt, int 
            1e3 * b.t_mtp / b.steps, 1e3 * b.t_restore / b.steps);
     printf("GEN plain per token: %.2f ms\n", 1e3 * a.seconds / a.tokens);
     printf("GEN identical prefix %d / %d%s\n", same, n_gen, same == n_gen ? " (sequences match)" : "");
+    if (getenv("HYPER_GEN_PRINT")) {   // (the plain run's first tokens)
+        printf("GEN tokens:");
+        for (int i = 0; i < std::min(n_gen, 32); ++i) printf(" %d", plain[i]);
+        printf("\n");
+    }
     return 0;
 }
 

@@ -9,6 +9,7 @@
 #include "model.h"
 
 #include <atomic>
+#include <stdexcept>
 #include <functional>
 #include <memory>
 #include <random>
@@ -24,6 +25,7 @@ struct EngineOptions {
     int n_draft = 3;             // MTP drafts per step (chained); verification runs n_draft + 1 tokens (3: +6-15 % over 2)
     bool prompt_cache = false;   // reuse the common prefix with the previous sequence (recurrent-state snapshots)
     int max_snapshots = 48;      // pinned host snapshots (~50 MB per GPU each for the 27B model)
+    bool all_logits = false;     // a prefill chunk's LM head for every row (the check tools); else its last row only
 };
 
 
@@ -38,13 +40,18 @@ public:
             count_.store(0, std::memory_order_relaxed);
             gen_.fetch_add(1, std::memory_order_acq_rel);
         } else {
-            while (gen_.load(std::memory_order_acquire) == gen) {}
+            while (gen_.load(std::memory_order_acquire) == gen)
+                if (aborted_.load(std::memory_order_acquire)) throw std::runtime_error("barrier: another device's recording failed");
         }
     }
+    // a recording thread that failed releases the others (they throw instead of waiting forever); reset once all have joined
+    void abort() { aborted_.store(true, std::memory_order_release); }
+    void reset() { count_.store(0, std::memory_order_relaxed); aborted_.store(false, std::memory_order_release); }
 private:
     int n_;
     std::atomic<int> count_{0};
     std::atomic<unsigned> gen_{0};
+    std::atomic<bool> aborted_{false};
 };
 
 class Engine : public LLM {
@@ -59,6 +66,7 @@ public:
         int sid;      // bulk allreduce channel (micro-batch)
         bool bulk;    // prefill: tiled GEMM (and flash attention)
         bool dma;     // allreduce over the copy engines (large chunks); else the LL kernel
+        int pos_host = -1;   // position of row 0 when known on the host (prefill: deep-context attention split)
     };
     Engine(const std::string & model_path, const EngineOptions & opt);
     ~Engine();
@@ -116,7 +124,9 @@ private:
     ConvPark<Snap> park_;
     int sample_row(int t, const SamplingParams & sp, int64_t pos);   // pos: the sampled token's position   // kind: 0 main, 1 mtp, 2 restore
     void embed(const int * tokens, int nt, float * dst);
-    int mtp_draft(const int * tokens, int nt, int pos);   // MTP over (tokens[t], main hidden row t) at pos+t; argmax of last
+    int mtp_draft(const int * tokens, int nt, int pos, bool need_draft = true);   // MTP over (tokens[t], main hidden row t) at pos+t;
+    // argmax of last (need_draft = false, a prefill chunk that is not the prompt's last: its rows only write the block's K/V)
+    bool mtp_need_draft_ = true;
     int mtp_chain(int token, int pos);                   // MTP over (token, MTP's own last hidden) at pos
     int mtp_result();                                    // the draft; mtp_p_ = the MTP head's best probability
     void draft_at(int64_t pos) { mtp_pos_ = pos; }   // the next MTP pass drafts the token at pos

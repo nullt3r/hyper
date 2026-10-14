@@ -64,7 +64,7 @@ private:
     void load_weights();
     void load_layer(Device & dev, DevLayer & L, int il);
     void load_experts(int il, const std::vector<int> & quota);
-    void upload_stage(Device & d, int il, int sb);
+    void upload_stage(Device & d, int il, int sb, int p = 0, int np = 1);
     void rebuild_stream(int il);
     void rebalance(int max_swaps);
     // kind 0: main model; 1: MTP block over the main model's hidden rows (decode: rows 0..nt-1 of the last verification;
@@ -154,6 +154,7 @@ private:
     double t_rebalance_ = 0;      // ms spent in rebalance (decode stalls)
     int steps_ = 0, n_swaps_ = 0;
     double acc_rate_ = 0.5;       // speculation: running fraction of drafted tokens accepted
+    int up_parts_ = 1;            // prefill expert uploads: parts per half, each after an allreduce's downloads (HYPER5_UP_PARTS; 0: at once)
     int stream_min_ = 280;        // prefill chunks this long stream the CPU experts to the GPUs; shorter ones use the CPU
     int * h_ids_ = nullptr;       // pinned [n_layer][R][K]: prefill routing from GPU 0
     // HYPER5_PREDSTAT (decode, measurement): layer l+1's router applied to layer l's router input on GPU 0; how many of
