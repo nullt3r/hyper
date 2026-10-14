@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <memory>
 #include <cstdlib>
@@ -101,8 +102,11 @@ int main(int argc, char ** argv) {
     const int ctx = argc > 1 ? atoi(argv[1]) : 160000, nt = argc > 2 ? atoi(argv[2]) : 4, iters = argc > 3 ? atoi(argv[3]) : 200;
     const int max_pos = 262144, idx_heads = 4, top = 2048 / 4, list_stride = 2052, score_rows = 64, score_stride = max_pos / 4 + 4;
     // QSA_SHAPE=27b: the 27B's GPU 1 (8 q heads 8..15 on kv heads 1, 2; group 6) instead of Flash-Next's (12 q heads on 1 kv head)
-    const bool b27 = getenv("QSA_SHAPE") && std::string(getenv("QSA_SHAPE")) == "27b";
-    const int hd = 256, n_head_l = b27 ? 8 : 12, n_kv_l = b27 ? 2 : 1, group = b27 ? 6 : 12, head_off = b27 ? 8 : 0, kv_off = b27 ? 1 : 0;
+    // QSA_SHAPE=27b0: the 27B's GPU 0 (q heads 0..7: six on kv head 0, two on kv head 1)
+    const std::string shape = getenv("QSA_SHAPE") ? getenv("QSA_SHAPE") : "";
+    const bool b27 = shape == "27b" || shape == "27b0", g0 = shape == "27b0";
+    const int hd = 256, n_head_l = b27 ? 8 : 12, n_kv_l = b27 ? 2 : 1, group = b27 ? 6 : 12, head_off = b27 && !g0 ? 8 : 0,
+              kv_off = b27 && !g0 ? 1 : 0;
     const int qstride = n_head_l * 2 * hd + 2 * n_kv_l * hd;   // q|gate per head, then k, v (as in big0)
     std::mt19937 rng(7);
     std::normal_distribution<float> nd(0.0f, 1.0f);
@@ -236,6 +240,29 @@ int main(int argc, char ** argv) {
     dense(); CK(cudaStreamSynchronize(s));
     const auto od = dl(d_out, (size_t) nt * n_head_l * hd);
     printf("dense attention over %d cells: cold %.1f us  hash %016llx\n", ctx + 1, timeit(dense, true), fnv(od.data(), od.size() * 4));
+    if (getenv("QSA_REF")) {   // the dense rows against the exact (fp64) attention
+        double * d_ref; CK(cudaMalloc(&d_ref, od.size() * 8));
+        k_ref_attn<<<dim3(n_head_l, nt), 256, 0, s>>>(d_qkv, qstride, d_k, d_v, d_ref, n_head_l * hd, d_pos, max_pos, head_off, group, kv_off, scale);
+        CK(cudaStreamSynchronize(s));
+        const auto ref = dl(d_ref, od.size());
+        double mx = 0, n2 = 0, d2 = 0;
+        for (size_t i = 0; i < od.size(); ++i) { const double e = od[i] - ref[i]; mx = std::max(mx, std::fabs(e)); n2 += e * e; d2 += ref[i] * ref[i]; }
+        printf("  dense vs exact fp64: max |err| %.3g  rel L2 %.4g\n", mx, std::sqrt(n2 / d2));
+    }
+    if (getenv("QSA_ROWID") && nt > 1) {   // each row alone (one-row call at its own position): the same bits as in the nt-row call
+        int same = 0;
+        for (int t = 0; t < nt; ++t) {
+            const int pt = ctx + t;
+            CK(cudaMemcpy(d_pos, &pt, 4, cudaMemcpyHostToDevice));
+            attn_split(d_qkv + (size_t) t * qstride, qstride, d_k, d_v, d_part, d_out, n_head_l * hd, d_pos, max_pos, n_head_l, n_kv_l, head_off,
+                       group, kv_off, hd, scale, 1, s, nullptr, 0, nullptr);
+            CK(cudaStreamSynchronize(s));
+            const auto o1 = dl(d_out, (size_t) n_head_l * hd);
+            same += memcmp(o1.data(), od.data() + (size_t) t * n_head_l * hd, o1.size() * 4) == 0;
+        }
+        CK(cudaMemcpy(d_pos, &ctx, 4, cudaMemcpyHostToDevice));
+        printf("  rows alone vs together: %d / %d bit-identical\n", same, nt);
+    }
     printf("hash scores %016llx  list %016llx  out %016llx\n", hs, hl, ho);
     return 0;
 }

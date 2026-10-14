@@ -760,3 +760,42 @@ o jeden krok.
 
 Měřeno, nepokračuji: vykreslení chat šablony stojí v hloubce většinu režie mimo engine (155k: parse 7, převod 17,
 šablona 138, tokenizace 1–6 ms; 18k: 7 ms, 3k: 2 ms). Je to jinja engine llama.cpp nad ~600 KB textu, mírně nadlineárně.
+
+### Dekódovací attention na tensor cores (27B v hloubce)
+
+Profil dekódování 27B na 155–170k (nsys, `prof_27.sh`): krok ~42 ms (přijetí 1,65–2,1 draftu, tedy ověřování 4 řádků),
+z toho **hustá attention 4 řádků ~17 ms** (`k_attn_split`, 1,06 ms na vrstvu × 16). Jeden řádek (MTP) trvá 0,40 ms, což je
+šířka pásma DRAM pro 327 MB K/V na vrstvu a GPU. Čtyři řádky stojí 2,6× víc. Nejde o paměť: každá trojice (řádek, hlava,
+pozice) stojí na CUDA jádrech ~40 warp instrukcí (8 FMA, redukce přes 5 shuffle a 5 add, 2 exp, 16 operací v P·V).
+
+Zkoušeno a zahozeno (bitově shodné, ale pomalé):
+- všechny řádky v jednom bloku (warpy řádků čtou tytéž pozice, L1 je sdílí): GPU1 1041 → 820 µs, ale GPU0/2 (6+2 hlav na KV
+  hlavu) 1025 → 1222 µs, protože bloky po 4 hlavách čtou KV0 dvakrát;
+- totéž s dlaždicemi K/V ve sdílené paměti (jedno čtení na blok): pomalejší než přes L1, protože limitují instrukce.
+
+`k_attn_dec_tc` (výchozí, `HYPER_ATTN_TC=0` = fp32 kernel): MMA řádky jsou dvojice (token, q hlava) jedné KV hlavy (16, nebo 32 v 8warpovém bloku).
+q·scale a p se dělí na fp16 hi + lo, k a v jsou ve fp16 přesně, takže součiny jsou fp32-přesné. Tensor cores ale akumulují
+fp32 s ořezáním, proto mají řetězce krátké: skóre ve čtyřech akumulátorech po 64 dimenzích plus lo zvlášť, P·V každé
+dlaždice do vlastního akumulátoru, a teprve pak se sčítá ve fp32 (bez toho byla chyba proti fp64 8,8e-6, s tím 5,6e-7).
+Dlaždice 32 klíčů leží na absolutních pozicích a každý řádek má svůj úsek. Výsledek řádku tak nezávisí na ostatních řádcích
+bloku: řádek samotný = řádek ve 4řádkovém volání, bitově (qsabench `QSA_ROWID`), takže spekulativní dekódování dál přesně
+odpovídá obyčejnému. Dvojnásobek úseků proti fp32 kernelu; 16řádkový blok má 2 bloky na SM (Q fragmenty v registrech, jeden
+buffer), 32řádkový 1 blok s double bufferem.
+
+qsabench, 160k klíčů (fp32 kernel → tensor cores), chyba proti fp64 (rel L2):
+
+| tvar | 1 řádek | 4 řádky | chyba fp32 / tc |
+|---|---|---|---|
+| 27B GPU1 (4+4 hlav) | 405 → 433 µs | **1041 → 455 µs** | 5,0e-7 / 5,6e-7 |
+| 27B GPU0/2 (6+2) | 404 → 434 µs | **1031 → 535 µs** | 5,0e-7 / 5,6e-7 |
+| Flash-Next MTP (12 hlav) | **321 → 235 µs** | 1035 → 643 µs | – / 5,6e-7 |
+| 27B, 20k | 69 → 94 µs | 151 → 119 µs | 2,9e-7 / 5,3e-7 |
+
+End to end:
+- 27B proti fp32 referenci (12k, 1024 pozic): dekódování KL 0,000785 → **0,000784** (max 0,2074 → 0,2008), ověřovací řádky
+  po dvou stejně;
+- `hyper gen` na 155k: spekulativní **57,5 → 74,0 t/s**, hlavní forward 36,4 → 27,3 ms na krok, obyčejné 45,1 → 44,5 t/s;
+  obě sekvence shodné s obyčejným dekódováním (200/200);
+- hloubkový scénář 27B (server, 155–170k, oba běhy čerstvé): dekódování **67,9 → 89,0 t/s (+31 %)**, prefill 945 / 954 t/s.
+  Hashe 8 z 9 shodné, míra přijetí na požadavek shodná až na ten jeden (týž požadavek, který se lišil i u splitu: greedy na
+  téměř shodě).

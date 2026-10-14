@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -1010,6 +1011,216 @@ __global__ void __launch_bounds__(128) k_attn_fa(const float * __restrict__ qkv,
             dst[d] = o[i][e2 * 2] * inv * sigmoidf(gate[d]);
             dst[d + 1] = o[i][e2 * 2 + 1] * inv * sigmoidf(gate[d + 1]);
         }
+    }
+}
+
+// ---------------- tensor-core decode attention ----------------
+// Decode-sized rows (nt <= 4) of dense attention on the tensor cores. Block = one local kv head, one slice of the positions,
+// up to 16 (token, q head) pairs of that kv head as the MMA rows (pair r = t * ng + head; more pairs: more row groups,
+// blockIdx.z). q (scaled) and p are split into fp16 hi + lo parts and k, v are exact in fp16, so every product is fp32-accurate
+// and the sums run in fp32: the fp32 kernel's arithmetic in another order. Keys go in tiles of 32 at absolute positions
+// (multiples of 32), K/V double-buffered in shared memory; warp w scores keys 8w..8w+7 of a tile and accumulates output dims
+// 64w..64w+63. A row's result depends only on its own token's slice of the cache and the absolute tiles, not on the block's
+// other rows: one row and four rows give the same bits (speculative verification = plain decoding). Partials {acc[HD], m, l}
+// per (token, q head, split) for k_attn_combine, as k_attn_split writes them.
+constexpr int DT_K = 32, DT_LD = 256 + 8, DT_PL = DT_K + 8;
+// MT row tiles of 16 (MT = 2: 8 warps, warps 4g..4g+3 on rows 16g..16g+15 with the same per-warp keys and dims; one block per
+// SM, so its K/V tiles are double-buffered; MT = 1: two blocks per SM, one buffer each)
+template <int MT> __host__ __device__ constexpr int dt_nbuf() { return MT == 2 ? 2 : 1; }
+template <int MT> __host__ __device__ constexpr size_t dt_smem_bytes() { return (size_t) (dt_nbuf<MT>() * 2 * DT_K * DT_LD + 2 * 16 * MT * DT_PL) * sizeof(half); }
+template <int MT>
+__global__ void __launch_bounds__(128 * MT, MT == 1 ? 2 : 1) k_attn_dec_tc(const float * __restrict__ qkv, int stride,
+                                                                          const half * __restrict__ kcache, const half * __restrict__ vcache,
+                                                                          float * __restrict__ part, const int * pos_p, int max_pos,
+                                                                          int n_head_l, int head_off, int group, int kv_off, float scale,
+                                                                          int nt, int pos_off) {
+    constexpr int HD = 256, R = 16 * MT;
+    extern __shared__ __align__(16) half dt_smem[];
+    constexpr int NB = dt_nbuf<MT>();
+    half * kvb = dt_smem;                      // [NB][K | V][DT_K][DT_LD] (first: q hi | lo staging)
+    half * ph = kvb + NB * 2 * DT_K * DT_LD;   // [R][DT_PL] p hi
+    half * pl = ph + R * DT_PL;                // [R][DT_PL] p lo
+    __shared__ float red[2][4][R];             // per warp: a tile's row max / row sum of p over its 8 keys
+    const int hk = blockIdx.x, split = blockIdx.y, nsplit = gridDim.y, rg = blockIdx.z;
+    const int w = (threadIdx.x >> 5) & 3, g16 = (threadIdx.x >> 7) * 16, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+    const int hb = max(0, (kv_off + hk) * group - head_off), he = min(n_head_l, (kv_off + hk + 1) * group - head_off);
+    const int ng = he - hb, r0 = rg * R;
+    if (ng <= 0 || r0 >= nt * ng) return;
+    const int np = min(R, nt * ng - r0);   // pairs r0 .. r0 + np - 1
+    const int npos0 = *pos_p + pos_off + 1;
+    auto slice = [&](int t, int & p0, int & p1) {   // (token t's slice, as the one-row split takes it)
+        const int n_pos = npos0 + t, chunk = (n_pos + nsplit - 1) / nsplit;
+        p0 = split * chunk;
+        p1 = min(n_pos, p0 + chunk);
+    };
+    int b0 = INT_MAX, b1 = 0;
+    for (int t = r0 / ng; t <= (r0 + np - 1) / ng; ++t) {
+        int a, b;
+        slice(t, a, b);
+        if (a < b) { b0 = min(b0, a); b1 = max(b1, b); }
+    }
+    // q hi / lo through the (not yet used) tile buffers into registers: the A fragments of the 16 k steps
+    half * qh = kvb, * ql = kvb + DT_K * DT_LD;
+    for (int i = threadIdx.x; i < R * HD; i += blockDim.x) {
+        const int r = i / HD, d = i % HD;
+        float v = 0.0f;
+        if (r < np) {
+            const int t = (r0 + r) / ng, h = hb + (r0 + r) % ng;
+            v = qkv[(size_t) t * stride + (size_t) h * 2 * HD + d] * scale;
+        }
+        const half hi = __float2half_rn(v);
+        qh[r * DT_LD + d] = hi;
+        ql[r * DT_LD + d] = __float2half_rn(v - __half2float(hi));
+    }
+    __syncthreads();
+    unsigned qah[HD / 16][4], qal[HD / 16][4];
+#pragma unroll
+    for (int kk = 0; kk < HD / 16; ++kk) {
+        ldmatrix_x4(qah[kk], qh + (g16 + (lane & 15)) * DT_LD + kk * 16 + (lane >> 4) * 8);
+        ldmatrix_x4(qal[kk], ql + (g16 + (lane & 15)) * DT_LD + kk * 16 + (lane >> 4) * 8);
+    }
+    int rp0[2], rp1[2];   // my rows gid, gid + 8: their slices (empty past np)
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+        rp0[e] = rp1[e] = 0;
+        if (g16 + gid + 8 * e < np) slice((r0 + g16 + gid + 8 * e) / ng, rp0[e], rp1[e]);
+    }
+    float o[8][4];
+#pragma unroll
+    for (int n = 0; n < 8; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+    float m[2] = {-1e30f, -1e30f}, l[2] = {0.0f, 0.0f};
+    const half * kb = kcache + (size_t) hk * max_pos * HD, * vb = vcache + (size_t) hk * max_pos * HD;
+    const bool active = g16 < np;   // (a row tile with no pair: its warps only load and synchronize)
+    const int tb0 = b0 < b1 ? b0 / DT_K * DT_K : 0;
+    auto load = [&](int buf, int base) {
+        for (int i = threadIdx.x; i < 2 * DT_K * HD / 8; i += blockDim.x) {
+            const int kv = i / (DT_K * HD / 8), j = i % (DT_K * HD / 8), r = j / (HD / 8), d = (j % (HD / 8)) * 8, p = base + r;
+            const bool ok = p >= b0 && p < b1;
+            cp_async16(kvb + ((buf * 2 + kv) * DT_K + r) * DT_LD + d, (kv ? vb : kb) + (size_t) (ok ? p : 0) * HD + d, ok);
+        }
+        cp_async_commit();
+    };
+    __syncthreads();   // (the q staging is read)
+    if (NB == 2 && tb0 < b1) load(0, tb0);
+    int buf = 0;
+    for (int base = tb0; base < b1; base += DT_K, buf ^= (NB - 1)) {
+        if (NB == 2) {
+            if (base + DT_K < b1) load(buf ^ 1, base + DT_K);
+            else cp_async_commit();
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            if (base > tb0) __syncthreads();   // (the previous tile is done with the buffer)
+            load(0, base);
+            asm volatile("cp.async.wait_group 0;");
+        }
+        __syncthreads();
+        const half * ks = kvb + (size_t) (buf * 2) * DT_K * DT_LD, * vs = ks + DT_K * DT_LD;
+        // scores of rows gid / gid + 8 for keys 8w + 2 tig + {0, 1}: q hi in four accumulators of 64 dims and q lo in one, summed
+        // in fp32 (the tensor cores' fp32 accumulation truncates: short chains)
+        float shi[4][4], slo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int c = 0; c < 4; ++c) shi[c][0] = shi[c][1] = shi[c][2] = shi[c][3] = 0.0f;
+#pragma unroll
+        for (int kk = 0; kk < HD / 16; ++kk) {
+            if (!active) break;
+            unsigned b[2];
+            const unsigned ka = (unsigned) __cvta_generic_to_shared(ks + (w * 8 + (lane & 7)) * DT_LD + kk * 16 + ((lane >> 3) & 1) * 8);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(b[0]), "=r"(b[1]) : "r"(ka));
+            mma16816(shi[kk >> 2], qah[kk], b);
+            mma16816(slo, qal[kk], b);
+        }
+        float sc[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) sc[e] = ((shi[0][e] + shi[1][e]) + (shi[2][e] + shi[3][e])) + slo[e];
+        float tmax[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int key = base + w * 8 + 2 * tig + (e & 1), r = e >> 1;
+            if (key < rp0[r] || key >= rp1[r]) sc[e] = -INFINITY;
+            tmax[r] = fmaxf(tmax[r], sc[e]);
+        }
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            tmax[r] = fmaxf(tmax[r], __shfl_xor_sync(0xffffffff, tmax[r], 1));
+            tmax[r] = fmaxf(tmax[r], __shfl_xor_sync(0xffffffff, tmax[r], 2));
+            if (tig == 0) red[0][w][g16 + gid + 8 * r] = tmax[r];
+        }
+        __syncthreads();
+        float corr[2], psum[2] = {0.0f, 0.0f};
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const int row = g16 + gid + 8 * r;
+            const float tm = fmaxf(fmaxf(red[0][0][row], red[0][1][row]), fmaxf(red[0][2][row], red[0][3][row]));
+            const float mn = fmaxf(m[r], tm);
+            corr[r] = __expf(m[r] - mn);
+            m[r] = mn;
+        }
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int r = e >> 1;
+            const float p = __expf(sc[e] - m[r]);
+            psum[r] += p;
+            const half hi = __float2half_rn(p);
+            const int at = (g16 + gid + 8 * r) * DT_PL + w * 8 + 2 * tig + (e & 1);
+            ph[at] = hi;
+            pl[at] = __float2half_rn(p - __half2float(hi));
+        }
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            psum[r] += __shfl_xor_sync(0xffffffff, psum[r], 1);
+            psum[r] += __shfl_xor_sync(0xffffffff, psum[r], 2);
+            if (tig == 0) red[1][w][g16 + gid + 8 * r] = psum[r];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const int row = g16 + gid + 8 * r;
+            l[r] = l[r] * corr[r] + (((red[1][0][row] + red[1][1][row]) + red[1][2][row]) + red[1][3][row]);
+        }
+        // this tile's p v in its own accumulators, added to the running output in fp32 (short tensor-core chains, see above)
+        float ot[8][4];
+#pragma unroll
+        for (int n = 0; n < 8; ++n) ot[n][0] = ot[n][1] = ot[n][2] = ot[n][3] = 0.0f;
+#pragma unroll
+        for (int k2 = 0; k2 < DT_K / 16; ++k2) {
+            if (!active) break;
+            unsigned ahi[4], alo[4];
+            ldmatrix_x4(ahi, ph + (g16 + (lane & 15)) * DT_PL + k2 * 16 + (lane >> 4) * 8);
+            ldmatrix_x4(alo, pl + (g16 + (lane & 15)) * DT_PL + k2 * 16 + (lane >> 4) * 8);
+#pragma unroll
+            for (int dn = 0; dn < 4; ++dn) {
+                unsigned v4[4];
+                const unsigned va = (unsigned) __cvta_generic_to_shared(vs + (k2 * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * DT_LD + w * 64 +
+                                                                        dn * 16 + (lane >> 4) * 8);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                             : "=r"(v4[0]), "=r"(v4[1]), "=r"(v4[2]), "=r"(v4[3]) : "r"(va));
+                const unsigned b0[2] = {v4[0], v4[1]}, b1[2] = {v4[2], v4[3]};
+                mma16816(ot[2 * dn], ahi, b0);
+                mma16816(ot[2 * dn], alo, b0);
+                mma16816(ot[2 * dn + 1], ahi, b1);
+                mma16816(ot[2 * dn + 1], alo, b1);
+            }
+        }
+#pragma unroll
+        for (int n = 0; n < 8; ++n) {
+            o[n][0] = o[n][0] * corr[0] + ot[n][0]; o[n][1] = o[n][1] * corr[0] + ot[n][1];
+            o[n][2] = o[n][2] * corr[1] + ot[n][2]; o[n][3] = o[n][3] * corr[1] + ot[n][3];
+        }
+        if (NB == 2) __syncthreads();   // (the next iteration's load overwrites this buffer)
+    }
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const int row = g16 + gid + 8 * r;
+        if (row >= np) continue;
+        const int t = (r0 + row) / ng, h = hb + (r0 + row) % ng;
+        float * dst = part + (((size_t) t * n_head_l + h) * nsplit + split) * (HD + 2);
+#pragma unroll
+        for (int n = 0; n < 8; ++n) {
+            const int d = w * 64 + n * 8 + 2 * tig;
+            dst[d] = o[n][2 * r];
+            dst[d + 1] = o[n][2 * r + 1];
+        }
+        if (w == 0 && tig == 0) { dst[HD] = m[r]; dst[HD + 1] = l[r]; }
     }
 }
 
@@ -2096,7 +2307,13 @@ void attn_prefill(const float * qkv, int stride, const half * kcache, const half
 // decode-sized forwards (speculative verification rows) split the cache like a single row: every row's partial sums, and
 // so its rounding, are those of a plain decode step (the split count changed the output of 3- and 4-row verifications)
 int attn_nsplit(int n_kv, int nt) { return std::max(1, std::min(64, 256 / (n_kv * (nt <= MAX_NT ? 1 : nt)))); }
-size_t attn_part_floats(int n_head, int n_kv, int nt, int hd) { return (size_t) nt * n_head * attn_nsplit(n_kv, nt) * (hd + 2); }
+// the tensor-core decode attention (default; HYPER_ATTN_TC=0: the fp32 CUDA-core kernel): twice the slices
+static bool attn_tc() { static const bool tc = !getenv("HYPER_ATTN_TC") || atoi(getenv("HYPER_ATTN_TC")) != 0; return tc; }
+static int attn_tc_nsplit(int n_kv) { return 2 * attn_nsplit(n_kv, 1); }
+size_t attn_part_floats(int n_head, int n_kv, int nt, int hd) {
+    const int ns = std::max(attn_nsplit(n_kv, nt), attn_tc() && nt <= MAX_NT ? attn_tc_nsplit(n_kv) : 0);
+    return (size_t) nt * n_head * ns * (hd + 2);
+}
 void attn_split(const float * qkv, int stride, const half * kcache, const half * vcache, float * part, float * out, int out_stride,
                 const int * pos, int max_pos, int n_head, int n_kv, int head_off, int group, int kv_off, int hd,
                 float scale, int nt, cudaStream_t s, const int * list, int list_stride, const int * list_n, int pos_off) {
@@ -2108,6 +2325,31 @@ void attn_split(const float * qkv, int stride, const half * kcache, const half *
     static const int rows_env = getenv("HYPER_ATTN_ROWS") ? atoi(getenv("HYPER_ATTN_ROWS")) : -1;
     const bool rows_fast = rows_env >= 0 ? rows_env != 0 : (!list && nt > 1 && nt <= MAX_NT);
     const dim3 grid = rows_fast ? dim3(n_kv * n_chunk * nt, ns) : dim3(n_kv * n_chunk, ns, nt);
+    // dense decode-sized rows on the tensor cores (every dense call of 1..4 rows, so plain decoding and speculative verification
+    // share it; HYPER_ATTN_TC=0: k_attn_split)
+    if (attn_tc() && !list && nt <= std::min(4, MAX_NT)) {
+        const int ns = attn_tc_nsplit(n_kv);
+        static bool attr_set[16] = {};
+        int dev = 0; cudaGetDevice(&dev);
+        if (!attr_set[dev]) {
+            cudaFuncSetAttribute(k_attn_dec_tc<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) dt_smem_bytes<1>());
+            cudaFuncSetAttribute(k_attn_dec_tc<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) dt_smem_bytes<2>());
+            attr_set[dev] = true;
+        }
+        int ngm = 0;   // the most local q heads of one kv head
+        for (int hk = 0; hk < n_kv; ++hk)
+            ngm = std::max(ngm, std::min(n_head, (kv_off + hk + 1) * group - head_off) - std::max(0, (kv_off + hk) * group - head_off));
+        const int pairs = nt * ngm;
+        if (pairs > 16 && pairs <= 32)
+            k_attn_dec_tc<2><<<dim3(n_kv, ns, 1), 256, dt_smem_bytes<2>(), s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head, head_off,
+                                                                              group, kv_off, scale, nt, pos_off);
+        else
+            k_attn_dec_tc<1><<<dim3(n_kv, ns, (pairs + 15) / 16), 128, dt_smem_bytes<1>(), s>>>(qkv, stride, kcache, vcache, part, pos, max_pos,
+                                                                                               n_head, head_off, group, kv_off, scale, nt,
+                                                                                               pos_off);
+        k_attn_combine<256><<<dim3(n_head, nt), 256, 0, s>>>(qkv, stride, part, ns, out, out_stride, n_head);
+        return;
+    }
     if (brk) k_attn_split<256, 6, true><<<grid, 128, 0, s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head, head_off, group, kv_off,
                                                            scale, n_chunk, list, list_stride, list_n, rows_fast ? nt : 0, pos_off);
     else k_attn_split<256, 6, false><<<grid, 128, 0, s>>>(qkv, stride, kcache, vcache, part, pos, max_pos, n_head, head_off, group, kv_off,
