@@ -665,3 +665,30 @@ i míra přijetí draftů na každý požadavek (drafty bitově stejné):
   (P se ve fp16 zaokrouhluje vůči maximu svého úseku: rozdíl max 4,7e-6, relativně 3,6e-4), proto zatím opt-in, dokud
   neprojde KL proti referenci.
 - Bariéra nahrávacích vláken se dá přerušit (výjimka v jednom vlákně uvolní ostatní místo věčného čekání).
+
+### Split flash attention přes klíče: přesnost proti fp64, výchozí zapnutý
+
+KL proti llama.cpp (27B, hluboký prompt 155k, posledních 256 pozic; `hyper checkn`, chunky 512) se splitem mírně roste:
+0,004025 → 0,004162. llama.cpp ale není přesná reference. Jeho vlastní šum (ub512 proti ub256) je na 155k 0,00045, kdežto
+hyper je od něj v hloubce 9× dál (na 12k jen 0,00094 proti šumu 0,00069). Proto přímé měření proti přesné attention:
+`qsabench` s `QSA_REF=1` počítá stejné řádky v fp64 (q·scale nezaokrouhlené, K/V z fp16 cache), 64 řádků, tvar 27B:
+
+| případ | jeden průchod: rel L2 / max | split: rel L2 / max |
+|---|---|---|
+| 20k klíčů | 2,90e-4 / 1,34e-5 | **2,84e-4 / 1,22e-5** |
+| 155k klíčů | 3,80e-4 / 5,71e-6 | **2,87e-4 / 4,29e-6** |
+| 20k, ostřejší attention (`QSA_QMUL=3`) | 4,85e-4 / 8,2e-4 | **4,80e-4 / 7,8e-4** |
+| 155k, ostřejší | 5,40e-4 / 4,4e-4 | **5,15e-4 / 4,7e-4** |
+
+Split je blíž přesnému výsledku (kratší řetězce fp32 součtů v úsecích, sloučení ve fp32) a je 6,7–7,2× rychlejší (155k:
+13,9 → 2,07 ms). Je teď výchozí, `HYPER_FA_SPLIT=0` vrátí jeden průchod. Flash-Next ho nepoužívá (flash attention má jen
+pro mělké chunky pod sparse režimem), týká se 27B.
+
+Proč je hyper v hloubce dál od llama.cpp:
+- RoPE to není. hyper počítá úhel a sin/cos v double, llama.cpp ve fp32 s `-use_fast_math` (úhel 155k rad má ve fp32 krok
+  0,016). S aritmetikou llama.cpp v hyperu (dočasný přepínač) je KL na 155k 0,004090 místo 0,004025 a na 12k 0,000946 místo
+  0,000942, takže se nic nezlepšilo.
+
+Zkoušeno bez zisku: Q fragmenty ve flash attention načtené jednou do registrů a přeskočené přeškálování O při nezměněném
+maximu. Výsledek je bitově shodný, rychlost stejná (255 registrů bez spillu). Na SM to běží asi na 80 % tensor peaku
+(m16n8k16 s fp32 akumulací), rezerva je jen v paralelismu, a ten řeší split.

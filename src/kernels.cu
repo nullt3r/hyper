@@ -2029,9 +2029,10 @@ void attn_prefill(const float * qkv, int stride, const half * kcache, const half
         attr_set[dev] = true;
     }
     // deep context: the keys split over gridDim.z slices so that the few (row tile, head) blocks of a chunk fill the GPU; partials
-    // merged by k_attn_combine (another order of the softmax sums than one pass: not bit-identical to it). Only from 2 slices of
-    // >= 4096 keys on, with the depth known (pos_host). Opt-in until validated (HYPER_FA_SPLIT=1); HYPER_FA_SPLITS=n: n slices
-    static const bool nosplit = getenv("HYPER_FA_SPLIT") == nullptr && getenv("HYPER_FA_SPLITS") == nullptr;
+    // merged by k_attn_combine (another order of the softmax sums than one pass: not bit-identical to it, and closer to the exact
+    // fp64 attention: qsabench QSA_REF, 155k keys rel L2 3.8e-4 -> 2.9e-4). Only from 2 slices of >= 4096 keys on, with the depth
+    // known (pos_host). HYPER_FA_SPLIT=0: one pass; HYPER_FA_SPLITS=n: n slices
+    static const bool nosplit = getenv("HYPER_FA_SPLIT") && atoi(getenv("HYPER_FA_SPLIT")) == 0 && !getenv("HYPER_FA_SPLITS");
     static const int force = getenv("HYPER_FA_SPLITS") ? atoi(getenv("HYPER_FA_SPLITS")) : 0;
     const int tiles = (nt + FA_BQ - 1) / FA_BQ, blocks = tiles * n_head;
     int nsp = 1;

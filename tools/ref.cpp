@@ -131,6 +131,10 @@ int main(int argc, char ** argv) {
     cp.n_batch = n;
     cp.n_ubatch = n;
     if (getenv("REF_UBATCH")) cp.n_ubatch = atoi(getenv("REF_UBATCH"));   // other kernels / numerics (noise floor)
+    // a closer-to-exact reference: REF_KV=f32 an fp32 KV cache, REF_FA=0 attention without flash attention (fp32 scores and
+    // softmax over the whole row; with REF_UBATCH small enough for the score matrix)
+    if (getenv("REF_KV") && std::string(getenv("REF_KV")) == "f32") { cp.type_k = GGML_TYPE_F32; cp.type_v = GGML_TYPE_F32; }
+    if (getenv("REF_FA")) cp.flash_attn_type = atoi(getenv("REF_FA")) ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     if ((getenv("REF_DUMPRAW") || getenv("REF_DUMPLAST")) && !getenv("REF_DUMP")) { cp.cb_eval = dump_cb; cp.cb_eval_user_data = nullptr; }
     if (const char * d = getenv("REF_DUMP")) {
         std::string s = d;

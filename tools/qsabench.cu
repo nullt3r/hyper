@@ -25,6 +25,37 @@ static unsigned long long fnv(const void * p, size_t n, unsigned long long h = 1
     for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
     return h;
 }
+// the exact gated attention (fp64) of the rows the prefill flash attention computes: q * scale unrounded, K/V as cached;
+// grid (n_head, nt), 8 warps over the positions, lane owns 8 dims; the warps' online softmaxes combined at the end
+__global__ void k_ref_attn(const float * qkv, int stride, const half * kc, const half * vc, double * out, int out_stride, const int * pos_p,
+                           int max_pos, int head_off, int group, int kv_off, float scale) {
+    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int hk = (head_off + h) / group - kv_off, n_pos = *pos_p + t + 1;
+    const float * q = qkv + (size_t) t * stride + (size_t) h * 512;
+    double qr[8], acc[8], m = -1e300, l = 0;
+    for (int j = 0; j < 8; ++j) { qr[j] = (double) q[lane * 8 + j] * scale; acc[j] = 0; }
+    const half * kb = kc + (size_t) hk * max_pos * 256, * vb = vc + (size_t) hk * max_pos * 256;
+    for (int p = w; p < n_pos; p += 8) {
+        double sc = 0;
+        for (int j = 0; j < 8; ++j) sc += qr[j] * (double) __half2float(kb[(size_t) p * 256 + lane * 8 + j]);
+        for (int o = 16; o; o >>= 1) sc += __shfl_xor_sync(0xffffffff, sc, o);
+        const double mn = fmax(m, sc), corr = exp(m - mn), pw = exp(sc - mn);
+        l = l * corr + pw;
+        for (int j = 0; j < 8; ++j) acc[j] = acc[j] * corr + pw * (double) __half2float(vb[(size_t) p * 256 + lane * 8 + j]);
+        m = mn;
+    }
+    __shared__ double sm[8], sl[8], so[8][256];
+    if (lane == 0) { sm[w] = m; sl[w] = l; }
+    for (int j = 0; j < 8; ++j) so[w][lane * 8 + j] = acc[j];
+    __syncthreads();
+    const int d = threadIdx.x;
+    double M = -1e300, L = 0, O = 0;
+    for (int i = 0; i < 8; ++i) M = fmax(M, sm[i]);
+    for (int i = 0; i < 8; ++i) { const double f = exp(sm[i] - M); L += sl[i] * f; O += so[i][d] * f; }
+    const double g = (double) q[256 + d];
+    out[(size_t) t * out_stride + (size_t) h * 256 + d] = O / L / (1.0 + exp(-g));
+}
+
 template <class T> static std::vector<T> dl(const T * d, size_t n) {
     std::vector<T> v(n); CK(cudaMemcpy(v.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost)); return v;
 }
@@ -58,6 +89,12 @@ int main(int argc, char ** argv) {
         }
     }
     for (auto & x : qkv) x = nd(rng);
+    // QSA_QMUL=f: the q parts times f (score spread f: peakier attention over the positions)
+    if (getenv("QSA_QMUL"))
+        for (size_t i = 0; i < qkv.size(); ++i) {
+            const size_t c = i % qstride;
+            if (c < (size_t) n_head_l * 2 * hd && c % (2 * hd) < (size_t) hd) qkv[i] *= (float) atof(getenv("QSA_QMUL"));
+        }
     half * d_pool, * d_k, * d_v; float * d_qn, * d_qkv, * d_scores, * d_part, * d_out; unsigned * d_hist; int * d_list, * d_list_n, * d_pos;
     // QSA_VMM=1: the caches on the CUDA VMM API mapped granule by granule, as the engine's elastic caches
     std::vector<std::unique_ptr<VmmBuf>> vbufs;
@@ -140,6 +177,20 @@ int main(int argc, char ** argv) {
         for (size_t i = 0; i < of.size(); ++i) { const double d = (double) os[i] - of[i]; md = std::max(md, std::fabs(d)); num += d * d; den += (double) of[i] * of[i]; }
         printf("  with the key split: cold %.1f us  hash %016llx  max |diff| %.3g  rel L2 %.3g\n", timeit(fa, true), fnv(os.data(), os.size() * 4), md,
                std::sqrt(num / std::max(den, 1e-30)));
+        // QSA_REF=1: both against the exact (fp64) attention of the same inputs
+        if (getenv("QSA_REF")) {
+            double * d_ref; CK(cudaMalloc(&d_ref, of.size() * 8));
+            k_ref_attn<<<dim3(n_head_l, nt), 256, 0, s>>>(d_qkv, qstride, d_k, d_v, d_ref, n_head_l * hd, d_pos, max_pos, head_off, group, kv_off, scale);
+            CK(cudaStreamSynchronize(s));
+            const auto ref = dl(d_ref, of.size());
+            auto err = [&](const std::vector<float> & x, const char * name) {
+                double mx = 0, n2 = 0, d2 = 0;
+                for (size_t i = 0; i < x.size(); ++i) { const double e = x[i] - ref[i]; mx = std::max(mx, std::fabs(e)); n2 += e * e; d2 += ref[i] * ref[i]; }
+                printf("  %s vs exact fp64: max |err| %.3g  rel L2 %.4g\n", name, mx, std::sqrt(n2 / d2));
+            };
+            err(of, "one pass ");
+            err(os, "key split");
+        }
         return 0;
     }
     // the MTP layer's dense attention over every cached position (no indexer)

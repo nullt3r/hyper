@@ -6,6 +6,7 @@
 #include "engine.h"
 
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -60,7 +61,8 @@ struct Cmp {
 static int cmd_check(const char * model, const char * ref_path, int nt) {
     std::vector<int> toks; std::vector<float> ref; int nv = 0;
     if (!read_ref(ref_path, toks, ref, nv)) return 1;
-    const int n = (int) toks.size() / nt * nt;
+    // whole chunks of nt; a v2 reference (logits at the end only) also gets the remainder as a last, shorter chunk
+    const int n = g_ref_first > 0 ? (int) toks.size() : (int) toks.size() / nt * nt;
     EngineOptions opt;
     opt.max_pos = n + 16;
     opt.mtp = nt > 1 && nt <= 4;
@@ -70,10 +72,12 @@ static int cmd_check(const char * model, const char * ref_path, int nt) {
     Cmp cmp;
     std::vector<float> lg;
     for (int i = 0; i < n; i += nt) {
-        eng.forward(&toks[i], nt, i);
-        for (int t = 0; t < nt; ++t) {
+        const int len = std::min(nt, n - i);
+        eng.forward(&toks[i], len, i);
+        for (int t = 0; t < len; ++t) {
+            if (i + t < g_ref_first) continue;   // (v2 references: logits from g_ref_first on)
             eng.get_logits(t, lg);
-            cmp.add(&ref[(size_t) (i + t) * nv], lg, nv);
+            cmp.add(&ref[(size_t) (i + t - g_ref_first) * nv], lg, nv);
         }
     }
     char tag[32];
