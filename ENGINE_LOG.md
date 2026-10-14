@@ -680,15 +680,83 @@ hyper je od něj v hloubce 9× dál (na 12k jen 0,00094 proti šumu 0,00069). Pr
 | 20k, ostřejší attention (`QSA_QMUL=3`) | 4,85e-4 / 8,2e-4 | **4,80e-4 / 7,8e-4** |
 | 155k, ostřejší | 5,40e-4 / 4,4e-4 | **5,15e-4 / 4,7e-4** |
 
-Split je blíž přesnému výsledku (kratší řetězce fp32 součtů v úsecích, sloučení ve fp32) a je 6,7–7,2× rychlejší (155k:
-13,9 → 2,07 ms). Je teď výchozí, `HYPER_FA_SPLIT=0` vrátí jeden průchod. Flash-Next ho nepoužívá (flash attention má jen
-pro mělké chunky pod sparse režimem), týká se 27B.
+Na skutečných datech je rozdíl větší. `HYPER_FA_DUMP` vypíše vstupy volání `attn_prefill` (27B, GPU 1, 256 řádků na
+150k, první / prostřední / poslední attention vrstva) a `qsabench QSA_LOAD=` je přepočítá:
 
-Proč je hyper v hloubce dál od llama.cpp:
-- RoPE to není. hyper počítá úhel a sin/cos v double, llama.cpp ve fp32 s `-use_fast_math` (úhel 155k rad má ve fp32 krok
-  0,016). S aritmetikou llama.cpp v hyperu (dočasný přepínač) je KL na 155k 0,004090 místo 0,004025 a na 12k 0,000946 místo
-  0,000942, takže se nic nezlepšilo.
+| vrstva | jeden průchod: rel L2 / max | split: rel L2 / max |
+|---|---|---|
+| první | 4,73e-4 / 7,0e-4 | **1,56e-4 / 1,8e-4** |
+| prostřední | 2,46e-4 / 3,5e-3 | **2,06e-4 / 3,5e-3** |
+| poslední | 2,20e-4 / 1,5e-2 | **8,3e-5 / 4,9e-3** |
+
+Skutečná attention má sinky s velkým skóre. V jednom průchodu je běžící maximum od první dlaždice skóre sinku, takže P
+ostatních klíčů padá ve fp16 do subnormálů a ztrácí relativní přesnost. Úseky splitu bez sinku mají vlastní maximum a do
+fp32 se škálují až při sloučení. Split je tedy 2–3× přesnější a 6,7–7,2× rychlejší (155k, 64 řádků: 13,9 → 2,07 ms).
+Je teď výchozí, `HYPER_FA_SPLIT=0` vrátí jeden průchod. Flash-Next ho nepoužívá (flash attention má jen pro mělké chunky
+pod sparse režimem), týká se 27B.
+
+Hloubkový scénář 27B (155–170k, 8 přírůstků po 300 tokenech), oba běhy čerstvé: prefill **754 → 957 t/s (+27 %)**, 2946 →
+2322 ms na požadavek, dekódování 68,5 / 68,4 t/s. Hashe výstupů: 8 z 9 shodných, jeden požadavek se liší (greedy na
+téměř shodě).
+
+Proti fp32 referenci (llama.cpp `REF_KV=f32 REF_FA=0 REF_UBATCH=128`, 155k, posledních 256 pozic):
+
+| | KL průměr / max | top-1 |
+|---|---|---|
+| llama.cpp výchozí (FA, f16 KV, ub512) | 0,004239 / 0,547 | 98,44 % |
+| llama.cpp ub256 | 0,003306 / 0,288 | 97,66 % |
+| hyper, split | **0,000534** / 0,026 | 99,22 % |
+| hyper, jeden průchod | **0,000498** / 0,018 | 99,22 % |
+
+Hyper je v hloubce 8× blíž přesnému výsledku než llama.cpp. Rozdíl „hyper vs llama.cpp 0,004“ byla chyba llama.cpp.
+Rozdíl mezi splitem a jedním průchodem proti této referenci (0,000534 vs 0,000498) je šum: chybu tu určuje zaokrouhlení
+K/V do f16, které mají obě varianty stejné, a samotnou attention rozhoduje fp64 test výše.
+
+Než se ukázalo, že chyba je na straně llama.cpp, padlo podezření na RoPE: hyper počítá úhel a sin/cos v double, llama.cpp
+ve fp32 s `-use_fast_math` (úhel 155k rad má ve fp32 krok 0,016). S aritmetikou llama.cpp v hyperu (dočasný přepínač) byl
+ale KL proti llama.cpp na 155k 0,004090 místo 0,004025 a na 12k 0,000946 místo 0,000942. RoPE to tedy není.
 
 Zkoušeno bez zisku: Q fragmenty ve flash attention načtené jednou do registrů a přeskočené přeškálování O při nezměněném
 maximu. Výsledek je bitově shodný, rychlost stejná (255 registrů bez spillu). Na SM to běží asi na 80 % tensor peaku
 (m16n8k16 s fp32 akumulací), rezerva je jen v paralelismu, a ten řeší split.
+
+### Snapshot na konci odpovědi (převzetí předchozí odpovědi)
+
+Produkční log (911 požadavků Flash-Next, 819 navazujících dvojic): každý tah začínal prefill na startu poslední zprávy
+předchozího promptu (`cached = P - 5`). Předchozí odpověď se tak počítala znovu a tvořila **20,7 % všech znovu
+prefillovaných tokenů** (166k z 802k). Znovu vykreslený prompt se s vygenerovanými tokeny shoduje v celé odpovědi u ~78 %
+dvojic. Uvnitř odpovědi se rozchází u 61 dvojic (jiná tokenizace, vypuštěné uvažování), u 117 jde o jinou konverzaci.
+
+Proč se snapshot na konci odpovědi nikdy nepoužil: při spekulativním dekódování přijde stop (EOS, max_tokens, odpojení
+klienta) až po forwardu, který už obsahuje i drafty za koncem výstupu. Stav tedy nebyl použitelný (`state_ok = false`)
+a historie končila před posledním tokenem.
+
+Nově, ve všech třech enginech:
+- token na pozici p se odešle před svým forwardem, takže stop na něm nechá stav na p (a ušetří zbytečný forward);
+- stop uvnitř přijatých draftů vrátí stav na řádek před posledním tokenem výstupu (stejný restore jako při odmítnutém
+  draftu) a dopíše jejich řádky do MTP cache;
+- snapshot na pozici posledního tokenu, historie ho obsahuje (MTP řádek p − 1 byl spočítán s ním). Další požadavek, který
+  odpověď zopakuje, pokračuje od jejího konce.
+
+Ověření (`hyper4 cachekl`, Flash-Next, pevné rozmístění expertů `HYPER4_ADAPT=0`, odpovědi 40–44 tokenů, aby stop padl na
+různé řádky): převzetí po odpovědi vygenerované s drafty je **bitově shodné** s převzetím po odpovědi bez draftů. Agentní
+smyčka na serveru (6 tahů s tool cally): každý tah pokračuje přesně na P + délka odpovědi, dosud na P − 5.
+
+Numerika: K/V a stav odpovědi zůstanou takové, jak je spočítalo dekódování, místo nového prefillu. U Flash-Next a GLM běží
+CPU experti při dekódování s aktivacemi kvantovanými na Q8_K, kdežto prefill je streamuje na GPU (fp16). Proti „vše
+prefillované“ je proto KL dalších tokenů ~1,2e-2. Stejný řád ale dává i samotné jiné rozdělení na chunky (malý chunk
+počítá CPU experty na CPU): 0,9–2,2e-2. Podle pravidla o přesnosti je převzetí odpovědi u MoE modelů vypnuté a zapíná se
+`HYPER_ANSWER_REUSE=1`.
+
+U 27B (bez CPU expertů) jsou obě cesty stejně přesné. Proti fp32 referenci na 12k (posledních 1024 pozic) vychází
+prefill po 512 KL 0,000785, dekódování po jednom tokenu 0,000785 a ověřovací řádky po dvou 0,000785. Převzetí je tu proto
+zapnuté. Agentní smyčka na 27B: každý tah navazuje na konec odpovědi, i když byla uříznutá na max_tokens (600 tokenů,
+další požadavek prefilloval jen 30 tokenů).
+
+Bez převzetí (výchozí u Flash/GLM) je generování stejné jako dřív. Agentní smyčka Flash s pevným rozmístěním expertů
+(`HYPER4_ADAPT=0`), starý a nový build: všech 6 tahů bitově shodných. S adaptivním rozmístěním se výstupy od tahu 1 liší.
+Nový kód vynechá zbytečný forward za EOS, takže statistiky routování (a s nimi rozmístění expertů mezi CPU a GPU) se posunou
+o jeden krok.
+
+Měřeno, nepokračuji: vykreslení chat šablony stojí v hloubce většinu režie mimo engine (155k: parse 7, převod 17,
+šablona 138, tokenizace 1–6 ms; 18k: 7 ms, 3k: 2 ms). Je to jinja engine llama.cpp nad ~600 KB textu, mírně nadlineárně.

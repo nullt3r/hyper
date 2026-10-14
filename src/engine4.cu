@@ -2418,7 +2418,6 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
     // generated tokens get recurrent-state snapshots too (every 1024 positions and at the end): the next request repeats
     // this answer in its prompt and resumes close to where the re-rendered history first differs
     int snap_mark = p / 1024;
-    bool state_ok = true;
     auto gen_snapshot = [&] {
         if (!opt_.prompt_cache || p / 1024 == snap_mark) return;
         snap_mark = p / 1024;
@@ -2456,6 +2455,8 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
         int cur = next;           // token at position p, not yet in the main model
         std::vector<int> in(K + 1), mt(K + 1);
         while (!stop && p + K + 1 < opt_.max_pos) {
+            // the token at p is final before its forward: a stop on it leaves the state at p (nothing past the output)
+            if (!emit(cur)) break;
             in[0] = cur;
             for (int j = 0; j < nd; ++j) in[j + 1] = drafts[j];
             ta = clk::now();
@@ -2468,8 +2469,22 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
             if (sampling) { while (m < nd && (a[m] = sample_row(m, sp, p + m + 1)) == drafts[m]) ++m; if (m == nd) a[nd] = sample_row(nd, sp, p + nd + 1); }
             else while (m < nd && a[m] == drafts[m]) ++m;
             st.accepted += m;
-            if (emit(cur)) for (int j = 0; j < m; ++j) if (!emit(drafts[j])) break;
-            if (stop) { state_ok = false; break; }   // (the state holds rows past the end of the output)
+            int r = 0;   // drafts emitted
+            while (r < m && emit(drafts[r++])) {}
+            if (stop) {
+                // the output ends with drafts[r - 1] at p + r: keep rows 0..r-1 (the state up to its last token, as when a stop
+                // comes before a forward) and their MTP cache rows, so the end-of-answer snapshot can serve the next request
+                if (opt_.answer_reuse) {
+                    ta = clk::now();
+                    run(3, r);
+                    st.t_restore += since(ta);
+                    ta = clk::now();
+                    mtp_draft(drafts.data(), r, p, false);
+                    st.t_mtp += since(ta);
+                    p += r;
+                }
+                break;
+            }
             if (m < nd) {                           // keep rows 0..m of the verified block
                 ta = clk::now();
                 run(3, m + 1);
@@ -2489,13 +2504,13 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
             gen_snapshot();
         }
     }
-    if (opt_.prompt_cache && p > P && state_ok) take_snapshot(p);   // state after the last processed token
-    {
-        std::vector<int> sq = key;
-        sq.insert(sq.end(), out.begin(), out.end());
-        sq.resize(std::min<size_t>(sq.size(), (size_t) p));
-        hist_ = sq;
-    }
+    // the state up to the output's last token (a stop token not run; a cut-off answer's last token as the template's
+    // end-of-message token would follow it): the next request repeats the answer and resumes there; the history holds that
+    // last token too (the MTP cache row at p - 1 was made with it)
+    if (opt_.prompt_cache && p > P && opt_.answer_reuse) take_snapshot(p);
+    hist_ = key;
+    hist_.insert(hist_.end(), out.begin(), out.end());
+    if (!opt_.answer_reuse) hist_.resize(std::min<size_t>(hist_.size(), (size_t) p));   // (positions < p: the earlier snapshots' reach)
     st.tokens = (int) out.size();
     st.seconds = std::chrono::duration<double>(clk::now() - t0).count();
     if (stats) *stats = st;

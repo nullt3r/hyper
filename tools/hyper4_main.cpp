@@ -113,7 +113,8 @@ static int run_cmd(int argc, char ** argv) {
     std::vector<int> toks; std::vector<float> ref; int nv = 0;
     if (!read_ref(argv[3], toks, ref, nv)) return 1;
     Options opt;
-    opt.prompt_cache = cmd == "cachetest";
+    opt.prompt_cache = cmd == "cachetest" || cmd == "cachekl";
+    opt.answer_reuse = cmd == "cachekl";
     if (getenv("HYPER4_NOSTREAM")) opt.stream_experts = false;
     if (getenv("HYPER4_STREAM")) opt.stream_experts = true;
     if (getenv("HYPER4_MTP")) opt.mtp_path = getenv("HYPER4_MTP");
@@ -224,6 +225,58 @@ static int run_cmd(int argc, char ** argv) {
                 int same = 0;
                 while (same < n_gen && plain[same] == parked[same]) ++same;
                 printf("CACHE4 %-9s reused %d (without side request %d)  identical %d / %d\n", "parked", r1, r0, same, n_gen);
+            }
+        } else if (cmd == "cachekl") {
+            // end-of-answer snapshot (HYPER4_MTP set: the answer with MTP drafts; HYPER4_ADAPT=0: a fixed expert placement, so the
+            // runs compare): prompt A, its greedy answer, then A + answer + 40 more reference tokens resumes at the answer's last
+            // token; 32 reference tokens after that, one per forward, compared between: R0 resumed (answer drafted), R1 resumed
+            // (answer without drafts, one token per forward: the same tokens -> the rollback at the stop), R2 all prefilled from
+            // scratch (the answer's K/V and state from prefill instead of decode), R3 A and the rest prefilled as two pieces
+            // (chunking alone)
+            const int na = argc > 4 ? atoi(argv[4]) : 2000, nf = 32;
+            if ((int) toks.size() < na + 140 + nf) { fprintf(stderr, "reference too short\n"); return 1; }
+            const std::vector<int> A(toks.begin(), toks.begin() + na), suf(toks.begin() + na + 100, toks.begin() + na + 140),
+                cont(toks.begin() + na + 140, toks.begin() + na + 140 + nf);
+            auto tail = [&](int P, std::vector<std::vector<float>> & L) {
+                std::vector<float> lg;
+                for (int j = 0; j < nf; ++j) { eng.forward(&cont[j], 1, P + j); eng.get_logits(0, lg); L.push_back(lg); }
+            };
+            auto cmp = [&](const std::vector<std::vector<float>> & a, const std::vector<std::vector<float>> & b, char * buf, size_t n) {
+                Cmp c; bool bits = true;
+                for (int j = 0; j < nf; ++j) { c.add(a[j].data(), b[j], nv); bits &= a[j] == b[j]; }
+                if (bits) snprintf(buf, n, "bit-identical");
+                else snprintf(buf, n, "KL mean %.2e max %.2e top1 %d/%d", c.kl_sum / nf, c.kl_max, c.top1, nf);
+            };
+            for (int n_gen : {40, 41, 42, 43, 44}) {
+                GenStats st;
+                std::vector<std::vector<float>> R[4];
+                eng.reset_cache(); eng.reset();
+                const std::vector<int> out0 = eng.generate(A, n_gen, true, &st);
+                std::vector<int> B = A;
+                B.insert(B.end(), out0.begin(), out0.end());
+                B.insert(B.end(), suf.begin(), suf.end());
+                const int P = (int) B.size();
+                eng.generate(B, 1, true, &st);
+                const int reused0 = st.prompt_reused;
+                tail(P, R[0]);
+                eng.reset_cache(); eng.reset();
+                const std::vector<int> out1 = eng.generate(A, n_gen, false, &st);
+                int reused1 = -1;
+                if (out1 == out0) { eng.generate(B, 1, false, &st); reused1 = st.prompt_reused; tail(P, R[1]); }
+                eng.reset_cache(); eng.reset();
+                eng.generate(B, 1, false, &st);
+                tail(P, R[2]);
+                eng.reset_cache(); eng.reset();
+                eng.prefill(A.data(), na, 0);
+                eng.prefill(B.data() + na, P - na, na);
+                tail(P, R[3]);
+                char c01[96] = "answers differ", c02[96], c32[96];
+                if (reused1 >= 0) cmp(R[0], R[1], c01, sizeof c01);
+                cmp(R[0], R[2], c02, sizeof c02);
+                cmp(R[3], R[2], c32, sizeof c32);
+                printf("CACHEKL n_gen %d: answer %zu tok, resumed at %d / %d (expected %d) | drafted vs plain answer: %s | resumed vs all "
+                       "prefilled: %s | two pieces vs all prefilled: %s\n", n_gen, out0.size(), reused0, reused1, na + (int) out0.size() - 1,
+                       c01, c02, c32);
             }
         } else if (cmd == "trace") {   // HYPER4_TRACE=dir: tokens 0..n-1 one per forward, then every layer's last-row residual
             if constexpr (std::is_same_v<Engine, Engine4>) {

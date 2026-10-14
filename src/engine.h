@@ -25,6 +25,8 @@ struct EngineOptions {
     int n_draft = 3;             // MTP drafts per step (chained); verification runs n_draft + 1 tokens (3: +6-15 % over 2)
     bool prompt_cache = false;   // reuse the common prefix with the previous sequence (recurrent-state snapshots)
     int max_snapshots = 48;      // pinned host snapshots (~50 MB per GPU each for the 27B model)
+    bool answer_reuse = false;   // the end-of-answer snapshot serves a next request that repeats the answer (its K/V and state
+                                 // as decoding computed them, not re-prefilled)
     bool all_logits = false;     // a prefill chunk's LM head for every row (the check tools); else its last row only
 };
 

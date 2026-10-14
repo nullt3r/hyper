@@ -4,10 +4,13 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <mutex>
 #include <map>
+#include <string>
+#include <vector>
 
 namespace hyper {
 
@@ -2019,6 +2022,43 @@ void attn_prefill(const float * qkv, int stride, const half * kcache, const half
                   const int * pos, int max_pos, int n_head, int head_off, int group, int kv_off, int hd, float scale, int nt,
                   cudaStream_t s, int pos_host) {
     if (hd != 256) throw std::runtime_error("attn_prefill: only head_dim 256 is instantiated");
+    // HYPER_FA_DUMP=prefix: the inputs of the calls from depth HYPER_FA_DUMP_POS (150000) on, on device HYPER_FA_DUMP_DEV (1), the
+    // HYPER_FA_DUMP_CALLS-th ones ("0,7,15") as <prefix>-<k>.bin, for qsabench QSA_LOAD (real attention against fp64)
+    static const char * dp = getenv("HYPER_FA_DUMP");
+    if (dp) {
+        static int calls = 0;
+        int dev = 0; cudaGetDevice(&dev);
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(s, &cs);
+        const int dpos = getenv("HYPER_FA_DUMP_POS") ? atoi(getenv("HYPER_FA_DUMP_POS")) : 150000;
+        const int ddev = getenv("HYPER_FA_DUMP_DEV") ? atoi(getenv("HYPER_FA_DUMP_DEV")) : 1;
+        if (cs == cudaStreamCaptureStatusNone && dev == ddev && pos_host >= dpos) {
+            const int k = calls++;
+            const std::string want = std::string(",") + (getenv("HYPER_FA_DUMP_CALLS") ? getenv("HYPER_FA_DUMP_CALLS") : "0,7,15") + ",";
+            if (want.find("," + std::to_string(k) + ",") != std::string::npos) {
+                cudaStreamSynchronize(s);
+                const int n_kv = (head_off + n_head - 1) / group - kv_off + 1, n_pos = pos_host + nt;
+                std::vector<float> q((size_t) nt * stride);
+                std::vector<half> kv((size_t) n_kv * n_pos * hd);
+                const std::string fn = std::string(dp) + "-" + std::to_string(k) + ".bin";
+                FILE * f = fopen(fn.c_str(), "wb");
+                if (f) {
+                    const int hdr[9] = {nt, stride, pos_host, n_head, head_off, group, kv_off, n_kv, hd};
+                    fwrite(hdr, 4, 9, f);
+                    fwrite(&scale, 4, 1, f);
+                    cudaMemcpy(q.data(), qkv, q.size() * 4, cudaMemcpyDeviceToHost);
+                    fwrite(q.data(), 4, q.size(), f);
+                    for (const half * c : {kcache, vcache}) {
+                        for (int h = 0; h < n_kv; ++h)
+                            cudaMemcpy(kv.data() + (size_t) h * n_pos * hd, c + (size_t) h * max_pos * hd, (size_t) n_pos * hd * 2, cudaMemcpyDeviceToHost);
+                        fwrite(kv.data(), 2, kv.size(), f);
+                    }
+                    fclose(f);
+                    fprintf(stderr, "attn_prefill: dumped call %d (%d rows at %d) to %s\n", k, nt, pos_host, fn.c_str());
+                }
+            }
+        }
+    }
     static const bool single = getenv("HYPER_FA_SINGLE") != nullptr;   // (one K/V buffer: each tile's load waited for)
     const size_t smem = (size_t) (FA_BQ + (single ? 2 : 4) * FA_BK) * FA_LD * sizeof(half);   // double: 101376 B, the sm_86 maximum
     static bool attr_set[16] = {};

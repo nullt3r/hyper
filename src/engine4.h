@@ -31,6 +31,8 @@ struct Engine4Options {
     int cpu_threads = 30;
     bool prompt_cache = false;      // reuse the common prefix with the previous sequence (recurrent-state snapshots)
     int max_snapshots = 48;
+    bool answer_reuse = false;   // the end-of-answer snapshot serves a next request that repeats the answer (its K/V and state
+                                 // as decoding computed them, not re-prefilled)
 };
 
 // spin barrier for the per-device recording threads of a prefill chunk

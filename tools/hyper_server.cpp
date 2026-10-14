@@ -1105,6 +1105,10 @@ int main(int argc, char ** argv) {
     }
     std::string arch;
     { GGUF g(path); arch = g.arch(); }
+    // HYPER_ANSWER_REUSE=0/1: a request that repeats the previous answer resumes after it (its K/V and state as decoding computed
+    // them) instead of re-prefilling it from the message start. Default on for the 27B; off for the MoE models, whose decode
+    // runs the CPU-held experts on 8-bit activations (prefill streams them to the GPUs: the more precise K/V)
+    auto answer_reuse = [](bool def) { return getenv("HYPER_ANSWER_REUSE") ? atoi(getenv("HYPER_ANSWER_REUSE")) != 0 : def; };
     c.glm = arch == "glm5-next";
     std::unique_ptr<LLM> engine;
     if (arch == "qwen4exp") {
@@ -1115,6 +1119,7 @@ int main(int argc, char ** argv) {
         o4.cpu_threads = cpu_threads;
         o4.prompt_cache = true;
         o4.max_snapshots = snaps;
+        o4.answer_reuse = answer_reuse(false);
         o4.mtp_path = mtp_path;
         o4.n_draft = draft;
         auto e4 = std::make_unique<Engine4>(path, o4);
@@ -1136,6 +1141,7 @@ int main(int argc, char ** argv) {
         o5.cpu_threads = cpu_threads;
         o5.prompt_cache = true;
         o5.max_snapshots = snaps;
+        o5.answer_reuse = answer_reuse(false);
         o5.n_draft = draft;   // MTP drafts with --mtp, else prompt-lookup speculation
         o5.mtp_path = mtp_path;
         auto e5 = std::make_unique<Engine5>(path, o5);
@@ -1151,6 +1157,7 @@ int main(int argc, char ** argv) {
         opt.n_draft = draft;
         opt.prompt_cache = true;
         opt.max_snapshots = snaps;
+        opt.answer_reuse = answer_reuse(true);
         engine = std::make_unique<Engine>(path, opt);
     }
     c.live.ctx_max = ctx;

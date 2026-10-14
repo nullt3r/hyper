@@ -60,7 +60,44 @@ template <class T> static std::vector<T> dl(const T * d, size_t n) {
     std::vector<T> v(n); CK(cudaMemcpy(v.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost)); return v;
 }
 
+// QSA_LOAD=file (attn_prefill's HYPER_FA_DUMP): the prefill flash attention on real inputs, one pass and the key split against
+// the exact fp64 attention
+static int load_fa(const char * fn) {
+    FILE * f = fopen(fn, "rb");
+    if (!f) { printf("cannot open %s\n", fn); return 1; }
+    int h[9]; float scale;
+    if (fread(h, 4, 9, f) != 9 || fread(&scale, 4, 1, f) != 1) return 1;
+    const int nt = h[0], stride = h[1], pos = h[2], n_head = h[3], head_off = h[4], group = h[5], kv_off = h[6], n_kv = h[7], hd = h[8];
+    const int n_pos = pos + nt, max_pos = n_pos;
+    std::vector<float> q((size_t) nt * stride);
+    std::vector<half> kc((size_t) n_kv * n_pos * hd), vc(kc.size());
+    if (fread(q.data(), 4, q.size(), f) != q.size() || fread(kc.data(), 2, kc.size(), f) != kc.size() || fread(vc.data(), 2, vc.size(), f) != vc.size()) {
+        printf("short file\n"); return 1;
+    }
+    fclose(f);
+    float * d_q, * d_out; half * d_k, * d_v; int * d_pos; double * d_ref;
+    CK(cudaMalloc(&d_q, q.size() * 4)); CK(cudaMalloc(&d_k, kc.size() * 2)); CK(cudaMalloc(&d_v, vc.size() * 2));
+    CK(cudaMalloc(&d_out, (size_t) nt * n_head * hd * 4)); CK(cudaMalloc(&d_ref, (size_t) nt * n_head * hd * 8)); CK(cudaMalloc(&d_pos, 4));
+    CK(cudaMemcpy(d_q, q.data(), q.size() * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_k, kc.data(), kc.size() * 2, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_v, vc.data(), vc.size() * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_pos, &pos, 4, cudaMemcpyHostToDevice));
+    cudaStream_t s; CK(cudaStreamCreate(&s));
+    k_ref_attn<<<dim3(n_head, nt), 256, 0, s>>>(d_q, stride, d_k, d_v, d_ref, n_head * hd, d_pos, max_pos, head_off, group, kv_off, scale);
+    CK(cudaStreamSynchronize(s));
+    const auto ref = dl(d_ref, (size_t) nt * n_head * hd);
+    printf("%s: %d rows at %d, %d q heads on %d kv heads\n", fn, nt, pos, n_head, n_kv);
+    for (int ph : {-1, pos}) {
+        attn_prefill(d_q, stride, d_k, d_v, d_out, n_head * hd, d_pos, max_pos, n_head, head_off, group, kv_off, hd, scale, nt, s, ph);
+        CK(cudaStreamSynchronize(s));
+        const auto o = dl(d_out, ref.size());
+        double mx = 0, n2 = 0, d2 = 0;
+        for (size_t i = 0; i < o.size(); ++i) { const double e = o[i] - ref[i]; mx = std::max(mx, std::fabs(e)); n2 += e * e; d2 += ref[i] * ref[i]; }
+        printf("  %s vs exact fp64: max |err| %.3g  rel L2 %.4g\n", ph < 0 ? "one pass " : "key split", mx, std::sqrt(n2 / d2));
+    }
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (getenv("QSA_LOAD")) return load_fa(getenv("QSA_LOAD"));
     const int ctx = argc > 1 ? atoi(argv[1]) : 160000, nt = argc > 2 ? atoi(argv[2]) : 4, iters = argc > 3 ? atoi(argv[3]) : 200;
     const int max_pos = 262144, idx_heads = 4, top = 2048 / 4, list_stride = 2052, score_rows = 64, score_stride = max_pos / 4 + 4;
     // QSA_SHAPE=27b: the 27B's GPU 1 (8 q heads 8..15 on kv heads 1, 2; group 6) instead of Flash-Next's (12 q heads on 1 kv head)

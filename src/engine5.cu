@@ -1965,7 +1965,6 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
     // generated tokens get recurrent-state snapshots too (every 1024 positions and at the end): the next request repeats this
     // answer in its prompt and resumes close to where the re-rendered history first differs
     int snap_mark = p / 1024;
-    bool state_ok = true;
     auto gen_snapshot = [&] {
         if (!opt_.prompt_cache || p / 1024 == snap_mark) return;
         snap_mark = p / 1024;
@@ -1999,6 +1998,8 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
         int nd = extend(p);
         st.t_mtp += since(ta);
         while (!stop && p + K + 1 < opt_.max_pos) {
+            // the token at p is final before its forward: a stop on it leaves the state at p (nothing past the output)
+            if (!emit(cur)) break;
             in[0] = cur;
             for (int j = 0; j < nd; ++j) in[j + 1] = drafts[j];
             ta = clk::now();
@@ -2010,8 +2011,18 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
             if (sampling) { while (m < nd && (a[m] = sample_row(m, sp, p + m + 1)) == drafts[m]) ++m; if (m == nd) a[nd] = sample_row(nd, sp, p + nd + 1); }
             else while (m < nd && a[m] == drafts[m]) ++m;
             st.accepted += m;
-            if (emit(cur)) for (int j = 0; j < m; ++j) if (!emit(drafts[j])) break;
-            if (stop) { state_ok = false; break; }   // (the state holds rows past the end of the output)
+            int r = 0;   // drafts emitted
+            while (r < m && emit(drafts[r++])) {}
+            if (stop) {
+                // the output ends with drafts[r - 1] at p + r: keep rows 0..r-1 (the state up to its last token, as when a stop
+                // comes before a forward) and the MTP cache rows p+1..p+r, so the end-of-answer snapshot can serve the next request
+                if (opt_.answer_reuse) {
+                    ta = clk::now(); restore(r); st.t_restore += since(ta);
+                    ta = clk::now(); mtp_update(drafts.data(), r, p + 1); st.t_mtp += since(ta);
+                    p += r;
+                }
+                break;
+            }
             if (m < nd) { ta = clk::now(); restore(m + 1); st.t_restore += since(ta); }
             cur = a[m];
             for (int i = 0; i < m; ++i) mt[i] = drafts[i];
@@ -2048,6 +2059,7 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
         int cur = next;
         std::vector<int> in(K + 1);
         while (!stop && p + K + 1 < opt_.max_pos) {
+            if (!emit(cur)) break;   // (before its forward, as above)
             hist.push_back(cur);
             int nd = 0;
             if (hist.size() > NG) {
@@ -2075,21 +2087,25 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
             else while (m < nd && a[m] == in[1 + m]) ++m;
             st.accepted += m;
             if (nd > 0) acc_rate_ = 0.9 * acc_rate_ + 0.1 * ((double) m / nd);
-            if (emit(cur)) for (int j = 0; j < m; ++j) { hist.push_back(in[1 + j]); if (!emit(in[1 + j])) break; }
-            if (stop) { state_ok = false; break; }   // (the state holds rows past the end of the output)
+            int r = 0;   // drafts emitted
+            while (r < m) { hist.push_back(in[1 + r]); if (!emit(in[1 + r++])) break; }
+            if (stop) {   // (rows 0..r-1: the state up to the output's last token, as above)
+                if (opt_.answer_reuse) { ta = clk::now(); restore(r); st.t_restore += since(ta); p += r; }
+                break;
+            }
             if (m < nd) { ta = clk::now(); restore(m + 1); st.t_restore += since(ta); }
             cur = a[m];
             p += m + 1;
             gen_snapshot();
         }
     }
-    if (opt_.prompt_cache && p > P && state_ok) take_snapshot(p);   // state after the last processed token
-    {
-        std::vector<int> sq = prompt;
-        sq.insert(sq.end(), out.begin(), out.end());
-        sq.resize(std::min<size_t>(sq.size(), (size_t) p));
-        hist_ = sq;
-    }
+    // the state up to the output's last token (a stop token not run; a cut-off answer's last token as the template's
+    // end-of-message token would follow it): the next request repeats the answer and resumes there; the history holds that
+    // last token too (the MTP cache row at p was made with it)
+    if (opt_.prompt_cache && p > P && opt_.answer_reuse) take_snapshot(p);
+    hist_ = prompt;
+    hist_.insert(hist_.end(), out.begin(), out.end());
+    if (!opt_.answer_reuse) hist_.resize(std::min<size_t>(hist_.size(), (size_t) p));   // (positions < p: the earlier snapshots' reach)
     st.tokens = (int) out.size();
     st.seconds = std::chrono::duration<double>(clk::now() - t0).count();
     if (stats) *stats = st;
