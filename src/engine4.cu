@@ -1078,22 +1078,21 @@ void Engine4::load_experts(int il, const std::vector<int> & quota) {
         int nl = 0;
         for (int e = 0; e < E; ++e) if (owner[e] == dp->g) H.slot[dp->g][e] = nl++;
     }
-    // prefill streaming: the CPU-owned experts dealt to the GPUs by PCIe bandwidth (x16 : x8 : x16); the count per layer
-    // never changes (moves are exchanges), so the staging size is fixed; the lists are rebuilt when the placement changes
+    // prefill streaming: the CPU-owned experts dealt to the GPUs by PCIe bandwidth (x16 : x8 : x16); the lists are rebuilt
+    // when the placement changes. The count per layer only drops below its load-time value (elastic extra slots), but a
+    // rounded share is not monotone in it (209 -> 84 41 84, 208 -> 83 42 83): staging for ceil(nc w / tw) + 1, which bounds
+    // the share of any count up to nc
     if (opt_.stream_experts && nc > 0) {
         std::vector<double> wbw(nd, 2.0);
         if (nd > 1) wbw[1] = 1.0;   // GPU 1 sits on a x8 link on this box
-        double tw = 0, acc = 0;
+        double tw = 0;
         for (double w : wbw) tw += w;
-        int a = 0;
         for (auto & dp : devs_) {
             DevLayer & L = lay(*dp, il);
-            acc += wbw[dp->g];
-            const int b = dp->g == nd - 1 ? nc : (int) (nc * acc / tw + 0.5);
-            dp->stage_bytes = std::max(dp->stage_bytes, (size_t) (b - a) * (2 * gb + db));
+            const int share = std::min(nc, (int) std::ceil(nc * wbw[dp->g] / tw) + 1);
+            dp->stage_bytes = std::max(dp->stage_bytes, (size_t) share * (2 * gb + db));
             L.st_slot = dp->alloc<int>(E);
             L.owner_bulk = dp->alloc<int>(E);
-            a = b;
         }
         H.stream_dirty = true;
         rebuild_stream(il);
