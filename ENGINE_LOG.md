@@ -812,3 +812,6 @@ End to end:
   se stejným rozmístěním expertů (bf16 v alokaci velikosti fp32) 9/9 hashů identických. Bez toho uvolní ~125 MB
   na GPU → 122/93/90 místo 122/92/89 expertů na vrstvu, výstup se pak liší jen tím rozmístěním.
 - Rychlost v šumu (decode 134,9 → 135,0–135,9 t/s, prefill beze změny); odhad byl ~1 % (router ~0,3 ms z ~15 ms kroku).
+- GLM-5.3-Flash stejně (engine5, `HYPER5_ROUTER32=1` = fp32): router 42 MoE vrstev bf16-exaktní, kernel 6,05 M výstupů
+  bez rozdílu, deep A/B (155k + 8 přírůstků): základ / bf16 ve fp32 alokaci / bf16 9/9 hashů identických; rozmístění
+  beze změny (28 29 28 na vrstvu, ~100 MB nestačí na expert), rychlost v šumu (decode 21,8 / 21,7 / 21,6 t/s).

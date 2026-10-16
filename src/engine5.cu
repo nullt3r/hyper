@@ -191,6 +191,7 @@ struct Engine5::DevLayer {
     DW gu, down;
     int ff_l = 0;
     float * router = nullptr, * exp_bias = nullptr;
+    uint16_t * router16 = nullptr;   // the router as bf16, when every value is one exactly (GLM-5.3-Flash: all; half the bytes)
     MoeZC zc;   // decode: this GPU's slice [f0, f1) of the CPU-owned experts' hidden rows, read from mapped host memory
     MoeDev moex;
     VmmBuf * xg = nullptr, * xu = nullptr, * xd = nullptr;   // elastic: expert arrays with room for extra slots
@@ -222,6 +223,7 @@ struct Engine5::Device {
     int * pos_x = nullptr;           // their positions
     int * pos_last = nullptr;        // MTP update: the last row's position
     float * big0 = nullptr, * o = nullptr, * qabs = nullptr, * olat = nullptr, * attn_part = nullptr;
+    float * router32 = nullptr;   // prefill: a bf16 router widened
     float * rlog = nullptr, * wts = nullptr, * sg = nullptr, * shgu = nullptr, * shh = nullptr, * shpart = nullptr;
     float * plog = nullptr, * pwts = nullptr, * psg = nullptr;
     float * hzc = nullptr, * yzc = nullptr;   // zero-copy share of the CPU experts: hidden slice, partial outputs
@@ -817,7 +819,21 @@ void Engine5::load_layer(Device & dev, DevLayer & L, int il) {
         L.down = upload_dense(A, dev.id, {{T(p + dn), 0, n}}, {{f0 / 32, f1 / 32}});
     }
     if (L.moe) {
-        L.router = f32(p + "ffn_gate_inp.weight");
+        const std::vector<float> rw = to_f32(G.need(p + "ffn_gate_inp.weight"));
+        static const bool r32 = getenv("HYPER5_ROUTER32") != nullptr;   // (A/B: the fp32 router)
+        std::vector<uint16_t> b16(rw.size());
+        bool exact = !r32;
+        for (size_t i = 0; i < rw.size() && exact; ++i) {
+            uint32_t u;
+            memcpy(&u, &rw[i], 4);
+            exact = (u & 0xffffu) == 0;
+            b16[i] = (uint16_t) (u >> 16);
+        }
+        if (exact) L.router16 = dev.upload(b16.data(), b16.size());
+        else {
+            L.router = dev.upload(rw.data(), rw.size());
+            if (!r32 && dev.g == 0) fprintf(stderr, "hyper5: layer %d router stays fp32 (not exactly bf16)\n", il);
+        }
         L.exp_bias = f32(p + "exp_probs_b.bias");
     }
 }
@@ -1155,6 +1171,7 @@ void Engine5::load_weights() {
         dev.olat = dev.alloc<float>((size_t) R * nh_max * MLA_LAT);
         dev.attn_part = dev.alloc<float>(mla_part_floats(nh_max, MAX_NT));
         dev.rlog = dev.alloc<float>((size_t) R * c.n_expert);
+        dev.router32 = dev.alloc<float>((size_t) c.n_expert * c.n_embd);
         dev.ticket = dev.alloc<unsigned>(1);
         CUDA_CHECK(cudaMemset(dev.ticket, 0, sizeof(unsigned)));
         if (!zc_blocks_.empty()) {
@@ -1285,6 +1302,16 @@ void Engine5::record_main(int gi, int nt, int kind) {
         const float one = 1.0f, zero = 0.0f;
         if (cublasSgemm(d.blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, nr, k, &one, W, k, x, xs, &zero, y, ys) != CUBLAS_STATUS_SUCCESS)
             throw std::runtime_error("cublasSgemm failed");
+    };
+    // router logits: fp32, or bf16 (decode: the same products and sums; prefill: widened to fp32 for the same sgemm)
+    auto router_mm = [&](const DevLayer & RL, const float * x, float * y, int nr) {
+        const int E = cfg_.n_expert, k = cfg_.n_embd;
+        if (!RL.router16) f32mm(RL.router, E, k, x, k, y, E, nr);
+        else if (nr <= MAX_NT) gemv_bf16w(RL.router16, E, k, x, k, y, E, nr, s);
+        else {
+            bf16_to_f32(RL.router16, (size_t) E * k, d.router32, s);
+            f32mm(d.router32, E, k, x, k, y, E, nr);
+        }
     };
     // per-head projections (fp16 W [H][R][C]): warp GEMV, or a strided batched tensor-core GEMM for a prefill chunk
     auto hmm = [&](const half * W, int H, int R, int C, const float * x, int xs, float * y, int ys, int nr) {
@@ -1489,7 +1516,7 @@ void Engine5::record_main(int gi, int nt, int kind) {
         static const bool shared_first = getenv("HYPER5_SHARED_FIRST") != nullptr;
         if (!L.moe || shared_first) shared_ffn();
         if (L.moe) {
-            f32mm(L.router, c.n_expert, n, d.xn, n, d.rlog, c.n_expert, nt);
+            router_mm(L, d.xn, d.rlog, nt);
             static const bool sep_pub = getenv("HYPER5_SEP_PUBLISH") != nullptr;
             const bool fused_pub = !bulk && d.g == 0 && !sep_pub;   // (decode never streams)
             if (fused_pub)
@@ -1500,7 +1527,7 @@ void Engine5::record_main(int gi, int nt, int kind) {
             dbg("route_w", il, d.wts, (size_t) nt * K);
             if (pred_k_ && !bulk && d.g == 0 && il + 1 < c.n_layer && is_moe(il + 1)) {   // (HYPER5_PREDSTAT)
                 const DevLayer & N = d.layers[il + 1];
-                f32mm(N.router, c.n_expert, n, d.xn, n, d.plog, c.n_expert, 1);
+                router_mm(N, d.xn, d.plog, 1);
                 moe_route_sig(d.plog, c.n_expert, N.exp_bias, c.n_expert, pred_k_, c.w_scale, d.pids, d.pwts, d.psg, 1, s);
                 CUDA_CHECK(cudaMemcpyAsync(h_pred_ + (size_t) (il + 1) * MOE_MAX_USED, d.pids, pred_k_ * sizeof(int), cudaMemcpyDeviceToHost, s));
             }
