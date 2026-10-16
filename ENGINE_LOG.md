@@ -801,3 +801,14 @@ End to end:
   téměř shodě).
 - Flash-Next (attention na tensor cores jen v MTP vrstvě), hloubkový scénář, oba běhy čerstvé: dekódování 146,4 → 148,7 t/s,
   prefill 1635 / 1629 t/s. Všech 9 hashů shodných, míra přijetí draftů na každý požadavek shodná.
+
+## 2026-10-17 – Flash-Next: router v bf16
+
+- Router + gate sdíleného experta (`ffn_gate_inp`, `ffn_gate_inp_shexp`) jsou v GGUF F32, ale všechny hodnoty jsou
+  bf16-exaktní (48 vrstev i MTP). Ukládají se jako bf16 (kontrola při načtení po vrstvách, jinak fp32 a hláška),
+  dekódování: GEMV se stejnými součiny a pořadím součtu jako fp32, prefill: rozšíření do fp32 + stejný sgemm.
+  `HYPER4_ROUTER32=1` = původní cesta.
+- Kernel proti fp32 na skutečných vahách: 12,6 M výstupů, 0 bitových rozdílů. Deep A/B (155k + 8 přírůstků):
+  se stejným rozmístěním expertů (bf16 v alokaci velikosti fp32) 9/9 hashů identických. Bez toho uvolní ~125 MB
+  na GPU → 122/93/90 místo 122/92/89 expertů na vrstvu, výstup se pak liší jen tím rozmístěním.
+- Rychlost v šumu (decode 134,9 → 135,0–135,9 t/s, prefill beze změny); odhad byl ~1 % (router ~0,3 ms z ~15 ms kroku).

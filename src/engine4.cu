@@ -68,6 +68,7 @@ struct Engine4::DevLayer {
     int n_v_l = 0, n_k_l = 0, conv_ch = 0;
     // MoE
     float * router = nullptr;  // fp32 [n_expert + 1][n]: experts, then the shared-expert gate
+    uint16_t * router16 = nullptr;   // ... or as bf16, when every value is one exactly (Flash-Next: all; half the bytes)
     DW sh_gu, sh_down;
     int n_sh_l = 0;
     MoeDev moe;
@@ -107,6 +108,7 @@ struct Engine4::Device {
     float * x = nullptr, * res = nullptr, * xn = nullptr, * gate = nullptr, * lo = nullptr, * inj = nullptr, * mixed = nullptr;
     float * bo = nullptr, * part = nullptr, * big0 = nullptr, * o = nullptr, * attn_part = nullptr, * injp = nullptr;
     unsigned * inj_cnt = nullptr;   // hc norm: per token, the stream blocks' tickets
+    float * router32 = nullptr;   // prefill: a bf16 router widened
     float * rlog = nullptr, * wts = nullptr, * sg = nullptr, * shgu = nullptr, * shh = nullptr, * shpart = nullptr;
     float * hexp = nullptr, * yexp = nullptr, * ple_emb = nullptr, * ple_key = nullptr, * ple_val = nullptr, * ple_sc = nullptr;
     std::vector<float *> res_x, ple_x;   // the further chunks of a multi-chunk prefill pass: residual rows, PLE rows
@@ -962,7 +964,20 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
         std::vector<float> buf = to_f32(src_->need(p + "ffn_gate_inp.weight"));
         const std::vector<float> sgt = to_f32(src_->need(p + "ffn_gate_inp_shexp.weight"));
         buf.insert(buf.end(), sgt.begin(), sgt.end());
-        L.router = dev.upload(buf.data(), buf.size());
+        static const bool r32 = getenv("HYPER4_ROUTER32") != nullptr;   // (A/B: the fp32 router)
+        std::vector<uint16_t> b16(buf.size());
+        bool exact = !r32;
+        for (size_t i = 0; i < buf.size() && exact; ++i) {
+            uint32_t u;
+            memcpy(&u, &buf[i], 4);
+            exact = (u & 0xffffu) == 0;
+            b16[i] = (uint16_t) (u >> 16);
+        }
+        if (exact) L.router16 = dev.upload(b16.data(), b16.size());
+        else {
+            L.router = dev.upload(buf.data(), buf.size());
+            if (!r32 && dev.g == 0) fprintf(stderr, "hyper4: layer %d router stays fp32 (not exactly bf16)\n", il);
+        }
     }
     // shared expert: hidden split
     {
@@ -1167,6 +1182,7 @@ void Engine4::load_weights() {
             dev.attn_part = dev.alloc<float>(mx);
         }
         dev.rlog = dev.alloc<float>((size_t) R * (c.n_expert + 1));
+        dev.router32 = dev.alloc<float>((size_t) (c.n_expert + 1) * n);
         dev.ticket = dev.alloc<unsigned>(1);
         CUDA_CHECK(cudaMemset(dev.ticket, 0, sizeof(unsigned)));
         dev.ids = dev.alloc<int>((size_t) R * K);
@@ -1632,7 +1648,12 @@ void Engine4::record_main(int gi, int nt, int kind) {
             }
         };
         if (par) { fork(); on_s2(shexp); }   // (the shared expert || routing and the routed experts, until moe_reduce)
-        f32mm(L.router, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt);
+        if (!L.router16) f32mm(L.router, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt);
+        else if (nt <= MAX_NT) gemv_bf16w(L.router16, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt, s);
+        else {   // prefill: widened to fp32 for the same sgemm
+            bf16_to_f32(L.router16, (size_t) (c.n_expert + 1) * n, d.router32, s);
+            f32mm(d.router32, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt);
+        }
         dbg("router", il, d.rlog, (size_t) nt * (c.n_expert + 1));
         const bool stream = streaming && L.owner_bulk;
         static const bool sep_pub = getenv("HYPER4_SEP_PUBLISH") != nullptr;

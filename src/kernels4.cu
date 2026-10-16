@@ -177,6 +177,28 @@ __global__ void k_gemv_f32(const float * __restrict__ W, int rows, int k, const 
     if (lane == 0) y[(size_t) t * ys + r] = acc;
 }
 
+// warp per row, bf16 weights widened on load: the products and the summation order of k_gemv_f32
+__device__ __forceinline__ float bf16w(unsigned v) { return __uint_as_float(v << 16); }
+__global__ void k_gemv_bf16w(const uint16_t * __restrict__ W, int rows, int k, const float * __restrict__ x, int xs, float * __restrict__ y, int ys) {
+    const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), t = blockIdx.y, lane = threadIdx.x & 31;
+    if (r >= rows) return;
+    const uint16_t * wr = W + (size_t) r * k;
+    const float * xr = x + (size_t) t * xs;
+    float acc = 0.0f;
+    for (int i = lane * 4; i < k; i += 128) {
+        const uint2 w = *(const uint2 *) (wr + i);
+        const float4 a = make_float4(bf16w(w.x & 0xffffu), bf16w(w.x >> 16), bf16w(w.y & 0xffffu), bf16w(w.y >> 16));
+        const float4 b = *(const float4 *) (xr + i);
+        acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+    acc = warp_sum4(acc);
+    if (lane == 0) y[(size_t) t * ys + r] = acc;
+}
+__global__ void k_bf16_to_f32(const uint16_t * __restrict__ W, size_t n, float * __restrict__ out) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = bf16w(W[i]);
+}
+
 __global__ void k_gated_norm_sig(float * o, int o_stride, const float * __restrict__ z, int z_stride, const float * __restrict__ w,
                                  int dh, float eps) {
     const int h = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
@@ -1514,6 +1536,13 @@ void hc_init(float * res, const float * x, int n, int hc, int nt, cudaStream_t s
 void gemv_f32(const float * W, int rows, int k, const float * x, int xs, float * y, int ys, int nt, cudaStream_t s) {
     if (rows < 64 && (k & 3) == 0) k_gemv_f32_br<<<dim3(rows, nt), 256, 0, s>>>(W, k, x, xs, y, ys);
     else k_gemv_f32<<<dim3((rows + 7) / 8, nt), 256, 0, s>>>(W, rows, k, x, xs, y, ys);
+}
+void gemv_bf16w(const uint16_t * W, int rows, int k, const float * x, int xs, float * y, int ys, int nt, cudaStream_t s) {
+    if (k & 3) throw std::runtime_error("gemv_bf16w: k must be a multiple of 4");
+    k_gemv_bf16w<<<dim3((rows + 7) / 8, nt), 256, 0, s>>>(W, rows, k, x, xs, y, ys);
+}
+void bf16_to_f32(const uint16_t * W, size_t n, float * out, cudaStream_t s) {
+    k_bf16_to_f32<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(W, n, out);
 }
 void gated_norm_sigmoid(float * o, int o_stride, const float * z, int z_stride, const float * w, int n_heads, int dh, float eps,
                         int nt, cudaStream_t s) {

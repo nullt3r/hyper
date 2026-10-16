@@ -31,6 +31,10 @@ void hc_init(float * res, const float * x, int n, int hc, int nt, cudaStream_t s
 
 // y[t][r] = W[r] . x[t] for an fp32 row-major W[rows][k] (small: routers, injections, alpha/beta)
 void gemv_f32(const float * W, int rows, int k, const float * x, int xs, float * y, int ys, int nt, cudaStream_t s);
+// the same for bf16 weights (bit patterns, uint16) holding exactly the fp32 values: identical products and sums, half the
+// bytes; bf16_to_f32 widens them (prefill: the fp32 sgemm)
+void gemv_bf16w(const uint16_t * W, int rows, int k, const float * x, int xs, float * y, int ys, int nt, cudaStream_t s);
+void bf16_to_f32(const uint16_t * W, size_t n, float * out, cudaStream_t s);
 
 // gated delta net output with a sigmoid gate: o = rmsnorm_per_head(o) * w * sigmoid(z)
 void gated_norm_sigmoid(float * o, int o_stride, const float * z, int z_stride, const float * w, int n_heads, int dh, float eps,
