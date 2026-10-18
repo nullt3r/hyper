@@ -114,7 +114,7 @@ static int run_cmd(int argc, char ** argv) {
     std::vector<int> toks; std::vector<float> ref; int nv = 0;
     if (!read_ref(argv[3], toks, ref, nv)) return 1;
     Options opt;
-    opt.prompt_cache = cmd == "cachetest" || cmd == "cachekl";
+    opt.prompt_cache = cmd == "cachetest" || cmd == "cachekl" || cmd == "cachekl6";
     opt.answer_reuse = cmd == "cachekl";
     if (getenv("HYPER4_NOSTREAM")) opt.stream_experts = false;
     if (getenv("HYPER4_STREAM")) opt.stream_experts = true;
@@ -245,6 +245,64 @@ static int run_cmd(int argc, char ** argv) {
                 int same = 0;
                 while (same < n_gen && plain[same] == parked[same]) ++same;
                 printf("CACHE4 %-9s reused %d (without side request %d)  identical %d / %d\n", "parked", r1, r0, same, n_gen);
+            }
+        } else if (cmd == "cachekl6") {   // snapshot / parking resume vs all prefilled (KL over 32 reference tokens after the resume)
+            // wrap: prompt A (200), a 4500-token answer (sliding-window rings and hidden rows overwritten), A + 40 reference tokens
+            // (resumes from the prompt-end snapshot); side: conversation L (2000) + answer, a side request (100 + HYPER_SIDE generated
+            // tokens) parks it, then L + answer + 40 resumes; pieces: the same prompt prefilled in two pieces at the resume position
+            const int nf = 32, nside = getenv("HYPER_SIDE") ? atoi(getenv("HYPER_SIDE")) : 4500;
+            std::map<int, int> cnt;
+            for (int i = 0; i < 200; ++i) cnt[toks[i]]++;
+            int best = toks[0];
+            for (auto & [k, v] : cnt) if (v > cnt[best]) best = k;
+            eng.set_snapshot_token(best);
+            auto tail = [&](const std::vector<int> & cont, int P, std::vector<std::vector<float>> & L) {
+                std::vector<float> lg;
+                for (int j = 0; j < nf; ++j) { eng.forward(&cont[j], 1, P + j); eng.get_logits(0, lg); L.push_back(lg); }
+            };
+            auto cmp = [&](const std::vector<std::vector<float>> & a, const std::vector<std::vector<float>> & b) {
+                Cmp c; bool bits = true;
+                for (int j = 0; j < nf; ++j) { c.add(a[j].data(), b[j], nv); bits &= a[j] == b[j]; }
+                char buf[96];
+                if (bits) snprintf(buf, sizeof buf, "bit-identical");
+                else snprintf(buf, sizeof buf, "KL mean %.2e max %.2e top1 %d/%d", c.kl_sum / nf, c.kl_max, c.top1, nf);
+                return std::string(buf);
+            };
+            GenStats st;
+            auto check = [&](const char * name, const std::vector<int> & B, const std::vector<int> & cont, int reused) {
+                const int P = (int) B.size();
+                std::vector<std::vector<float>> R0, R1, R2;
+                tail(cont, P, R0);
+                eng.reset_cache(); eng.reset();
+                eng.generate(B, 1, false, &st);
+                tail(cont, P, R1);
+                eng.reset_cache(); eng.reset();
+                eng.prefill(B.data(), reused, 0);
+                eng.prefill(B.data() + reused, P - reused, reused);
+                tail(cont, P, R2);
+                printf("CACHEKL6 %-5s prompt %d resumed at %d | resumed vs all prefilled: %s | two pieces vs all prefilled: %s\n", name, P,
+                       reused, cmp(R0, R1).c_str(), cmp(R2, R1).c_str());
+                fflush(stdout);
+            };
+            {
+                const std::vector<int> A(toks.begin(), toks.begin() + 200);
+                eng.reset_cache(); eng.reset();
+                const std::vector<int> out = eng.generate(A, 4500, false, &st);
+                std::vector<int> D = A;
+                D.insert(D.end(), toks.begin() + 210, toks.begin() + 250);
+                eng.generate(D, 1, false, &st);
+                check("wrap", D, std::vector<int>(toks.begin() + 250, toks.begin() + 250 + nf), st.prompt_reused);
+            }
+            {
+                const std::vector<int> L(toks.begin(), toks.begin() + 2000), S(toks.begin() + 2000, toks.begin() + 2100);
+                eng.reset_cache(); eng.reset();
+                const std::vector<int> out = eng.generate(L, 64, false, &st);
+                eng.generate(S, nside, false, &st);
+                std::vector<int> B = L;
+                B.insert(B.end(), out.begin(), out.end());
+                B.insert(B.end(), toks.begin() + 2100, toks.begin() + 2140);
+                eng.generate(B, 1, false, &st);
+                check("side", B, std::vector<int>(toks.begin() + 2140, toks.begin() + 2140 + nf), st.prompt_reused);
             }
         } else if (cmd == "cachekl") {
             // end-of-answer snapshot (HYPER4_MTP set: the answer with MTP drafts; HYPER4_ADAPT=0: a fixed expert placement, so the
