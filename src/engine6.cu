@@ -370,6 +370,7 @@ Engine6::Engine6(const std::string & model_path, const Engine6Options & opt) : o
     elastic_log_ = getenv("HYPER6_ELASTIC_LOG") != nullptr;
     if (getenv("HYPER6_ELASTIC_MIN")) elastic_min_ = atof(getenv("HYPER6_ELASTIC_MIN"));
     if (getenv("HYPER6_KV_STEP")) kv_step_ = std::max(64, atoi(getenv("HYPER6_KV_STEP")));
+    park_.before_restore = [this](int n) { ensure_kv(n + 2 * MAX_NT); };
     ehost_.resize(nl_tot());
     for (auto & H : ehost_) { H.score.assign(cfg_.n_expert, 0.0); H.last_count.assign(1024, 0); H.pend.assign(cfg_.n_expert, 0); }
     load_weights();
@@ -377,6 +378,9 @@ Engine6::Engine6(const std::string & model_path, const Engine6Options & opt) : o
 
 Engine6::~Engine6() {
     if (fill_th_.joinable()) { fill_cancel_.store(true); fill_th_.join(); }
+    for (auto & sn : snaps_) snap_pool_.push_back(sn.h);
+    park_.release(snap_pool_);
+    for (auto & v : snap_pool_) for (float * p : v) cudaFreeHost(p);
     if (h_topk_) cudaFreeHost(h_topk_);
     if (h_mtopk_) cudaFreeHost(h_mtopk_);
     if (h_ids_) cudaFreeHost(h_ids_);
@@ -1513,6 +1517,90 @@ std::vector<int> Engine6::forward(const int * tokens, int nt, int pos) {
     return out;
 }
 
+// ---------------- prompt-cache snapshots (the window before a position) ----------------
+size_t Engine6::snap_bytes(int gi) const {
+    const MimoConfig & c = cfg_;
+    const Device & d = *devs_[gi];
+    const size_t W = (size_t) c.window;
+    size_t b = 0;
+    for (const auto * v : {&d.layers, &d.mtp})
+        for (const DevLayer & L : *v) if (L.swa) b += (size_t) L.nkv * W * (c.dk + c.dv) * sizeof(half);
+    if (d.hring) b += W * c.n_embd * sizeof(float);
+    return b;
+}
+
+void Engine6::snap_xfer(Snap & sn, bool to_host) {
+    const MimoConfig & c = cfg_;
+    const int W = c.window, a = std::max(0, sn.pos - W), b = sn.pos;
+    for (size_t gi = 0; gi < devs_.size(); ++gi) {
+        Device & d = *devs_[gi];
+        CUDA_CHECK(cudaSetDevice(d.id));
+        uint8_t * hp = (uint8_t *) sn.h[gi];
+        // rows q in [a, b) of a ring of R rows (row bytes rb) <-> host rows q - (pos - W)
+        auto ring = [&](uint8_t * dev, size_t rb, int R) {
+            for (int q = a; q < b;) {
+                const int r = q % R, n = std::min(b - q, R - r);
+                uint8_t * hrow = hp + (size_t) (q - (sn.pos - W)) * rb, * drow = dev + (size_t) r * rb;
+                if (to_host) CUDA_CHECK(cudaMemcpyAsync(hrow, drow, (size_t) n * rb, cudaMemcpyDeviceToHost, d.stream));
+                else CUDA_CHECK(cudaMemcpyAsync(drow, hrow, (size_t) n * rb, cudaMemcpyHostToDevice, d.stream));
+                q += n;
+            }
+            hp += (size_t) W * rb;
+        };
+        for (auto * v : {&d.layers, &d.mtp})
+            for (DevLayer & L : *v) {
+                if (!L.swa) continue;
+                for (int h = 0; h < L.nkv; ++h) {
+                    ring((uint8_t *) (L.kc + (size_t) h * L.kpitch), (size_t) c.dk * sizeof(half), L.ring);
+                    ring((uint8_t *) (L.vc + (size_t) h * L.vpitch), (size_t) c.dv * sizeof(half), L.ring);
+                }
+            }
+        if (d.hring) ring((uint8_t *) d.hring, (size_t) c.n_embd * sizeof(float), HR);
+    }
+    for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->stream)); }
+}
+
+// per-position GPU buffers of a conversation (parked to RAM): the global layers' K and V rows
+std::vector<ConvPark<Engine6::Snap>::Dev> Engine6::park_devs() const {
+    std::vector<ConvPark<Snap>::Dev> v;
+    for (auto & dp : devs_) {
+        ConvPark<Snap>::Dev pd;
+        pd.id = dp->id;
+        pd.stream = dp->stream;
+        for (auto & L : dp->layers)
+            if (!L.swa && L.nkv > 0) {
+                pd.spans.push_back({L.kc, (size_t) cfg_.dk * sizeof(half), L.kpitch * sizeof(half), L.nkv, 1});
+                pd.spans.push_back({L.vc, (size_t) cfg_.dv * sizeof(half), L.vpitch * sizeof(half), L.nkv, 1});
+            }
+        v.push_back(std::move(pd));
+    }
+    return v;
+}
+
+void Engine6::take_snapshot(int pos) {
+    for (auto & s : snaps_) if (s.pos == pos) return;
+    if ((int) snaps_.size() >= opt_.max_snapshots) {   // (the oldest position, sparing every 4096th)
+        auto victim = snaps_.end();
+        for (auto it = snaps_.begin(); it != snaps_.end(); ++it)
+            if (it->pos % 4096 && (victim == snaps_.end() || it->pos < victim->pos)) victim = it;
+        if (victim == snaps_.end())
+            victim = std::min_element(snaps_.begin(), snaps_.end(), [](const Snap & x, const Snap & y) { return x.pos < y.pos; });
+        snap_pool_.push_back(victim->h);
+        snaps_.erase(victim);
+    }
+    Snap sn;
+    sn.pos = pos;
+    if (!snap_pool_.empty()) { sn.h = snap_pool_.back(); snap_pool_.pop_back(); }
+    else
+        for (size_t gi = 0; gi < devs_.size(); ++gi) {
+            void * p = nullptr;
+            CUDA_CHECK(cudaHostAlloc(&p, std::max<size_t>(snap_bytes((int) gi), 1), cudaHostAllocPortable));
+            sn.h.push_back((float *) p);
+        }
+    snap_xfer(sn, true);
+    snaps_.push_back(sn);
+}
+
 std::vector<int> Engine6::generate(const std::vector<int> & prompt, int n_gen, bool spec_req, GenStats * stats,
                                    const std::function<bool(int)> & on_token, const SamplingParams & sp) {
     const PromptMedia * md = media_;   // (taken first: a request that fails leaves none for the next)
@@ -1533,13 +1621,32 @@ std::vector<int> Engine6::generate(const std::vector<int> & prompt, int n_gen, b
     samp_ = sp;
     const int P = (int) prompt.size();
     int s = 0;
-    if (opt_.prompt_cache && !hist_.empty()) {
-        // resume after the common prefix while the sliding-window rings still hold the window before it (no snapshots)
-        int L = 0;
-        const int m = std::min((int) hist_.size(), P - 1);
-        while (L < m && hist_[L] == key[L]) ++L;
+    if (opt_.prompt_cache) {
+        // resume after the common prefix L: directly while the sliding-window rings (and the hidden ring) still hold the window
+        // before it, else from the latest snapshot at or before it (an answer that was cut off or re-rendered: the rings moved on)
+        // another conversation: the current one parked (or a parked one swapped back: its rings are not the live ones)
+        const std::vector<int> before = hist_;
+        int L = std::min(park_.resolve(key, hist_, snaps_, snap_pool_, park_devs(), "hyper6"), P - 1);
+        const bool swapped = hist_ != before;
+        for (size_t i = 0; i < snaps_.size();)
+            if (snaps_[i].pos > L) { snap_pool_.push_back(snaps_[i].h); snaps_.erase(snaps_.begin() + i); } else ++i;
         const int newest = (int) hist_.size() - 1;
-        if (L > 0 && newest - L < ring_ - cfg_.window - 2 * MAX_NT) s = L;
+        if (L > 0 && !swapped && newest - L < std::min(ring_, (int) HR) - cfg_.window - 2 * MAX_NT) s = L;
+        else {
+            Snap * best = nullptr;
+            for (auto & sn : snaps_) if (sn.pos <= L && (!best || sn.pos > best->pos)) best = &sn;
+            if (best) { snap_xfer(*best, false); s = best->pos; }
+        }
+    }
+    std::vector<int> snap_at;   // prefill: snapshots at the last message start and every pass of mc_max_ chunks
+    if (opt_.prompt_cache) {
+        std::vector<int> msg;
+        for (int q = s + 1; q < P; ++q)
+            if (std::find(snap_tokens_.begin(), snap_tokens_.end(), prompt[q]) != snap_tokens_.end()) msg.push_back(q);
+        for (int q = s + R6 * mc_max_; q < P; q += R6 * mc_max_) snap_at.push_back(q);
+        if (!msg.empty() && msg.back() - s >= 64) snap_at.push_back(msg.back());
+        std::sort(snap_at.begin(), snap_at.end());
+        snap_at.erase(std::unique(snap_at.begin(), snap_at.end()), snap_at.end());
     }
     req_steps_ = 0;
     ensure_kv(P + 2 * MAX_NT);
@@ -1547,8 +1654,10 @@ std::vector<int> Engine6::generate(const std::vector<int> & prompt, int n_gen, b
     const int K = std::min(opt_.n_draft, MAX_NT - 1);
     auto tp = clk::now();
     int next = -1;
+    size_t si = 0;
     for (int c0 = s; c0 < P;) {
-        const int seg = P - c0, nch = (seg + R6 - 1) / R6;
+        while (si < snap_at.size() && snap_at[si] <= c0) ++si;
+        const int seg = (si < snap_at.size() ? snap_at[si] : P) - c0, nch = (seg + R6 - 1) / R6;
         const int L = (seg + nch - 1) / nch;
         int lens[8], nk = 0, tot = 0;
         while (nk < mc_max_ && tot < seg) { lens[nk] = std::min(L, seg - tot); tot += lens[nk++]; }
@@ -1558,6 +1667,7 @@ std::vector<int> Engine6::generate(const std::vector<int> & prompt, int n_gen, b
         const int end = c0 + tot, len = lens[nk - 1];
         next = multi ? forward_multi(&prompt[c0], lens, nk, c0) : forward(&prompt[c0], len, c0)[len - 1];
         if (sampling) next = sample_row(len <= MAX_NT ? len - 1 : 0, sp, end);
+        if (si < snap_at.size() && snap_at[si] == end) take_snapshot(end);
         if (prefill_cb_) prefill_cb_(end, P, s);
         c0 = end;
     }
@@ -1567,6 +1677,7 @@ std::vector<int> Engine6::generate(const std::vector<int> & prompt, int n_gen, b
         for (int h = 0; h < n_mtp_; ++h) mtp_pass(h, &prompt[q0], P - q0, q0, P - q0, false);
     }
     hist_ = key;
+    if (opt_.prompt_cache) take_snapshot(P);   // (an answer cut off or re-rendered resumes from the prompt's end)
     st.t_prefill = std::chrono::duration<double>(clk::now() - tp).count();
     st.prompt_reused = s;
     std::vector<int> out;
@@ -1581,6 +1692,12 @@ std::vector<int> Engine6::generate(const std::vector<int> & prompt, int n_gen, b
         return !stop;
     };
     auto since = [](clk::time_point a) { return std::chrono::duration<double>(clk::now() - a).count(); };
+    int snap_mark = p / 1024;   // generated positions get snapshots every 1024 too (a long answer cut off resumes near the cut)
+    auto gen_snapshot = [&] {
+        if (!opt_.prompt_cache || p / 1024 == snap_mark) return;
+        snap_mark = p / 1024;
+        take_snapshot(p);
+    };
     if (use_mtp) {
         // MTP drafts by the chained NextN heads (llama.cpp's chain_heads): head h runs over the rows at p .. p + h (the token at p
         // with the main hidden of p - 1, then the drafts with the outputs of heads 0 .. h - 1); its last row drafts the token at
@@ -1622,12 +1739,14 @@ std::vector<int> Engine6::generate(const std::vector<int> & prompt, int n_gen, b
             st.t_mtp += since(ta);
             cur = a[m];
             p += m + 1;
+            gen_snapshot();
         }
     } else if (K <= 0 || !spec_req) {
         while (emit(next) && p + 1 < opt_.max_pos) {
             next = forward(&next, 1, p++)[0];
             if (sampling) next = sample_row(0, sp, p);
             st.steps++;
+            gen_snapshot();
         }
     } else {
         // prompt-lookup speculation (as Engine5); a rejected draft's cache rows are rewritten when its position comes again
@@ -1671,6 +1790,7 @@ std::vector<int> Engine6::generate(const std::vector<int> & prompt, int n_gen, b
             if (stop) { if (opt_.answer_reuse) p += r; break; }
             cur = a[m];
             p += m + 1;
+            gen_snapshot();
         }
     }
     hist_ = key;

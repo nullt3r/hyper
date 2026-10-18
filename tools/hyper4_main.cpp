@@ -207,6 +207,25 @@ static int run_cmd(int argc, char ** argv) {
             C.insert(C.end(), outA.begin(), outA.end());
             C.insert(C.end(), toks.begin() + 200, toks.begin() + 240);
             run(C, "extended");
+            if (getenv("HYPER_CUTOFF")) {   // a long answer cut off (or re-rendered): the next prompt diverges at the old prompt's end
+                // (HYPER_CUTOFF generated tokens) or inside the answer (half of them kept): it must resume from a snapshot, not from 0
+                const int ng = atoi(getenv("HYPER_CUTOFF"));
+                for (int keep : {0, ng / 2}) {
+                    eng.reset_cache();
+                    std::vector<int> out = eng.generate(A, ng, false, &st);
+                    std::vector<int> D = A;
+                    D.insert(D.end(), out.begin(), out.begin() + std::min<int>(keep, (int) out.size()));
+                    D.insert(D.end(), toks.begin() + 210, toks.begin() + 250);
+                    const std::vector<int> cached = eng.generate(D, n_gen, false, &st);
+                    const int reused = st.prompt_reused;
+                    eng.reset_cache();
+                    const std::vector<int> fresh = eng.generate(D, n_gen, false, &st);
+                    int same = 0;
+                    while (same < n_gen && cached[same] == fresh[same]) ++same;
+                    printf("CACHE4 cutoff    answer %d kept %d: prompt %zu reused %d identical %d / %d\n", (int) out.size(), keep, D.size(), reused,
+                           same, n_gen);
+                }
+            }
             if (toks.size() >= 3200) {   // parked conversation: long A, unrelated side request S, then A extended; must match the
                 // same continuation without the side request bit for bit (both reuse the KV written while generating A)
                 std::vector<int> LA(toks.begin(), toks.begin() + 3000), S(toks.begin() + 3000, toks.begin() + 3100);

@@ -9,6 +9,7 @@
 #include "kernels5.cuh"
 #include "kernels6.cuh"
 #include "llm.h"
+#include "park.h"
 #include "vmm.h"
 #include "model6.h"
 
@@ -48,14 +49,14 @@ public:
     const MimoConfig & config() const { return cfg_; }
     std::vector<int> generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
                               const std::function<bool(int)> & on_token = {}, const SamplingParams & sp = {}) override;
-    void set_snapshot_token(int) override {}
+    void set_snapshot_token(int tok) override { snap_tokens_.push_back(tok); park_.msg_tokens.push_back(tok); }
     void set_prefill_progress(std::function<void(int, int, int)> fn) override { prefill_cb_ = std::move(fn); }
     int max_pos() const override { return opt_.max_pos; }
     int n_draft() const override { return std::min(opt_.n_draft, MAX_NT - 1); }
     bool has_mtp() const override { return mtp_g_ != nullptr; }
     void save_expert_stats(const std::string & path);
     void set_draft(int k, double pmin) { opt_.n_draft = std::max(0, k); mtp_pmin_ = pmin; }
-    void reset_cache() override { hist_.clear(); }
+    void reset_cache() override { hist_.clear(); for (auto & s : snaps_) snap_pool_.push_back(s.h); snaps_.clear(); park_.clear(snap_pool_); }
     // images: their rows replace the input rows at their positions (plain positions: mimo2 ropes text and image tokens alike);
     // the prompt cache compares keys (an image's hash at its positions)
     bool set_media(const PromptMedia * m) override { media_ = m; return true; }
@@ -86,6 +87,18 @@ private:
     int ring_ = 4096;              // sliding-window caches: rows per kv head (position % ring_)
     int ns_global_ = 64;           // decode: key splits of a global layer's attention (tensor-core kernel: 64 measured best)
     std::vector<int> hist_;        // tokens (or image keys) whose cache rows are in place (positions 0..)
+    // prompt-cache snapshots: the sliding-window layers' cache rows of the window before pos (main and NextN blocks) and the main
+    // hidden rows there (MTP inputs); the global layers' caches are by position and stay valid for the common prefix
+    struct Snap { int pos; std::vector<float *> h; };   // (h: per device, pinned; bytes)
+    std::vector<Snap> snaps_;
+    std::vector<std::vector<float *>> snap_pool_;
+    // other conversations (an agent's side requests): the current one's global-layer caches parked in RAM with its snapshots
+    ConvPark<Snap> park_;
+    std::vector<ConvPark<Snap>::Dev> park_devs() const;
+    std::vector<int> snap_tokens_;
+    size_t snap_bytes(int gi) const;
+    void snap_xfer(Snap & sn, bool to_host);
+    void take_snapshot(int pos);
     const PromptMedia * media_ = nullptr;          // images of the next generate()
     std::map<int, const float *> mrows_;           // this generate's image rows by position
     std::function<void(int, int, int)> prefill_cb_;
