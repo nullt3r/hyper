@@ -32,6 +32,13 @@ struct MimoAttn {
 };
 // ns: key splits per row block (fixed for a captured graph; empty splits are skipped by the combine)
 void mimo_attn(const MimoAttn & a, int ns, cudaStream_t s);
+
+// MTP inputs: the main model's last residual rows (before the output norm) kept by position, hring[(pos[0] + r) % HR] = R[r]
+// (the last HR rows of a call)
+void mimo_hstore(const float * R, int nt, const int * pos, float * hring, int HR, int n, cudaStream_t s);
+// hidden input rows of an MTP pass at positions q0 + t: t < nmain the main model's row of position q0 + t - 1 (zero before
+// position 0), then the chained rows chain[t - nmain]
+void mimo_hgather(float * dst, const float * hring, int HR, int n, int q0, int nrows, int nmain, const float * chain, cudaStream_t s);
 size_t mimo_attn_part_floats(int nkv, int nt, int group, int ns);
 
 } // namespace hyper

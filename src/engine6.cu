@@ -193,6 +193,13 @@ struct Engine6::Device {
     cudaStream_t stream = nullptr;
     cudaGraphExec_t g_main[MAX_NT + 1] = {};
     std::vector<DevLayer> layers;
+    // MTP: the NextN blocks (SWA attention + dense FFN), eh_proj on [enorm(embedding) | hnorm(hidden)], head norms; main hidden
+    // ring, pass rows (hidden in, residual), chained outputs, pass positions [first, last]
+    std::vector<DevLayer> mtp;
+    std::vector<DW> m_eh;
+    std::vector<float *> m_enorm, m_hnorm, m_onorm;
+    float * hring = nullptr, * mh = nullptr, * mres = nullptr, * mchain = nullptr;
+    int * mpos = nullptr;
     float * out_norm = nullptr;
     DW output;
     int vocab_off = 0;
@@ -275,6 +282,21 @@ Engine6::Engine6(const std::string & model_path, const Engine6Options & opt) : o
     cfg_ = MimoConfig::from_gguf(*gguf_);
     fprintf(stderr, "hyper6: %s\n", cfg_.describe().c_str());
     if (cfg_.n_expert_used > MOE_MAX_USED) throw std::runtime_error("hyper6: too many experts per token");
+    if (!opt_.mtp_path.empty() && opt_.n_draft > 0) {
+        mtp_g_ = std::make_unique<GGUF>(opt_.mtp_path);
+        const MimoConfig mc = MimoConfig::from_gguf(*mtp_g_);
+        const int L = cfg_.n_layer;
+        for (int h = 0; h < mc.n_nextn && h < MAX_NT - 1; ++h)
+            if (mtp_g_->tensor("blk." + std::to_string(L + h) + ".nextn.eh_proj.weight") && L + h < (int) mc.n_kv.size()) n_mtp_ = h + 1;
+        if (!n_mtp_) throw std::runtime_error("hyper6: " + opt_.mtp_path + " has no NextN block blk." + std::to_string(L));
+        cfg_.n_kv.resize(L + n_mtp_); cfg_.swa.resize(L + n_mtp_); cfg_.moe.resize(L + n_mtp_);
+        for (int h = 0; h < n_mtp_; ++h) {
+            cfg_.n_kv[L + h] = mc.n_kv[L + h]; cfg_.swa[L + h] = mc.swa[L + h]; cfg_.moe[L + h] = 0;
+            if (!mc.swa[L + h]) throw std::runtime_error("hyper6: global-attention NextN blocks not supported");
+        }
+        if (getenv("HYPER6_MTP_PMIN")) mtp_pmin_ = atof(getenv("HYPER6_MTP_PMIN"));
+        fprintf(stderr, "hyper6: MTP: %d NextN heads from %s\n", n_mtp_, opt_.mtp_path.c_str());
+    }
     int ndev = 0;
     CUDA_CHECK(cudaGetDeviceCount(&ndev));
     opt_.n_devices = std::min(opt_.n_devices, ndev);
@@ -310,6 +332,7 @@ Engine6::Engine6(const std::string & model_path, const Engine6Options & opt) : o
     CUDA_CHECK(cudaHostAlloc(&h_pos_, 16 * sizeof(int), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_res_, (size_t) nd * MAX_NT * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_topk_, (size_t) nd * MAX_NT * TOPK * 2 * sizeof(float), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_mtopk_, (size_t) nd * TOPK * 2 * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_ids_, (size_t) nl_tot() * mc_max_ * R6 * cfg_.n_expert_used * sizeof(int), cudaHostAllocPortable));
     const size_t ll = ll_slots(nd, MAX_NT, n);
     CUDA_CHECK(cudaHostAlloc(&ar_ll_, ll * sizeof(uint2), cudaHostAllocPortable | cudaHostAllocMapped));
@@ -355,6 +378,7 @@ Engine6::Engine6(const std::string & model_path, const Engine6Options & opt) : o
 Engine6::~Engine6() {
     if (fill_th_.joinable()) { fill_cancel_.store(true); fill_th_.join(); }
     if (h_topk_) cudaFreeHost(h_topk_);
+    if (h_mtopk_) cudaFreeHost(h_mtopk_);
     if (h_ids_) cudaFreeHost(h_ids_);
     cpu_.reset();
     for (auto & [p, sz] : host_bufs_) munmap(p, sz);
@@ -367,7 +391,7 @@ Engine6::~Engine6() {
 void Engine6::load_layer(Device & dev, DevLayer & L, int il) {
     const MimoConfig & c = cfg_;
     const int nd = opt_.n_devices, g = dev.g, n = c.n_embd;
-    const GGUF & G = *gguf_;
+    const GGUF & G = il >= c.n_layer ? *mtp_g_ : *gguf_;
     auto A = [&](size_t nb) { return (void *) dev.alloc<uint8_t>(nb); };
     auto T = [&](const std::string & name) { return &G.need(name); };
     auto f32 = [&](const std::string & name) {
@@ -939,11 +963,36 @@ void Engine6::load_weights() {
         dev.layers.resize(nl_tot());
         for (int il = 0; il < nl_tot(); ++il) load_layer(dev, dev.layers[il], il);
         { const std::vector<float> v = to_f32(gguf_->need("output_norm.weight")); dev.out_norm = dev.upload(v.data(), v.size()); }
+        if (n_mtp_) {
+            dev.mtp.resize(n_mtp_);
+            auto up32 = [&](const std::string & name) { const std::vector<float> v = to_f32(mtp_g_->need(name)); return dev.upload(v.data(), v.size()); };
+            for (int h = 0; h < n_mtp_; ++h) {
+                const int il = c.n_layer + h;
+                load_layer(dev, dev.mtp[h], il);
+                const std::string p = "blk." + std::to_string(il) + ".";
+                { const GTensor * t = &mtp_g_->need(p + "nextn.eh_proj.weight"); dev.m_eh.push_back(upload_dense(A, dev.id, {{t, 0, t->rows()}})); }
+                dev.m_enorm.push_back(up32(p + "nextn.enorm.weight"));
+                dev.m_hnorm.push_back(up32(p + "nextn.hnorm.weight"));
+                // head norm: shared_head_norm, else the block's layer_output_norm, else the model's output norm (as llama.cpp)
+                const char * hn = mtp_g_->tensor(p + "nextn.shared_head_norm.weight") ? "nextn.shared_head_norm.weight"
+                                : mtp_g_->tensor(p + "layer_output_norm.weight") ? "layer_output_norm.weight" : nullptr;
+                dev.m_onorm.push_back(hn ? up32(p + hn) : dev.out_norm);
+            }
+            dev.hring = dev.alloc<float>((size_t) HR * n);
+            dev.mh = dev.alloc<float>((size_t) MTPR * n);
+            dev.mres = dev.alloc<float>((size_t) MTPR * n);
+            dev.mchain = dev.alloc<float>((size_t) MAX_NT * n);
+            dev.mpos = dev.alloc<int>(2);
+        }
         auto [o0, o1] = split(c.n_vocab, nd, g);
         dev.vocab_off = (int) o0;
         { const GTensor & ot = gguf_->need("output.weight"); dev.output = upload_dense(A, dev.id, {{&ot, o0, o1}}, {}, true); }
         int bs = 0, nq_max = 0, ffl = 0, nkv_max = 0;
-        for (auto & L : dev.layers) {
+        std::vector<DevLayer *> all;
+        for (auto & L : dev.layers) all.push_back(&L);
+        for (auto & L : dev.mtp) all.push_back(&L);
+        for (DevLayer * pl : all) {
+            const DevLayer & L = *pl;
             bs = std::max(bs, L.nq * c.dk + L.nkv * (c.dk + c.dv));
             nq_max = std::max(nq_max, L.nq);
             nkv_max = std::max(nkv_max, L.nkv);
@@ -1243,6 +1292,8 @@ void Engine6::record_main(int gi, int nt) {
         allreduce(R);
         dbg("l_out", il, R, (size_t) nt * n);
     }
+    if (d.hring)   // (the main hidden rows, MTP inputs; every chunk of a multi-chunk pass)
+        for (int ci = 0; ci < nck; ++ci) mimo_hstore(ck[ci].R, ck[ci].nt, ck[ci].P, d.hring, HR, n, s);
     const int hr = bulk ? 1 : nt;
     rmsnorm(R + (size_t) (nt - hr) * n, n, d.out_norm, d.xn, n, n, hr, eps, s);
     mm(d.output, d.xn, n, d.logits, d.output.n(), hr);
@@ -1251,6 +1302,109 @@ void Engine6::record_main(int gi, int nt) {
     topk_pairs(d.logits, d.output.n(), d.output.n(), d.vocab_off, d.topk, TOPK, hr, s);
     CUDA_CHECK(cudaMemcpyAsync(h_topk_ + (size_t) gi * MAX_NT * TOPK * 2, d.topk, (size_t) hr * TOPK * 2 * sizeof(float),
                                cudaMemcpyDeviceToHost, s));
+}
+
+void Engine6::record_mtp(int gi, int head, int nrows, int nmain, bool full) {
+    const MimoConfig & c = cfg_;
+    Device & d = *devs_[gi];
+    cudaStream_t s = d.stream;
+    const int n = c.n_embd, bs = d.big_stride, nd = opt_.n_devices;
+    const float eps = c.rms_eps;
+    DevLayer & L = d.mtp[head];
+    auto mm = [&](const DW & W, const float * x, int xs, float * y, int ys, int rows, const NormIn & ni = NormIn{}) {
+        if (rows <= MAX_NT) {
+            if (W.f16) gemv_bf16(W.f, x, xs, y, ys, nullptr, rows, s, ni);
+            else gemv_q8(W.q8, x, xs, y, ys, nullptr, rows, s, ni);
+            return;
+        }
+        to_half(x, xs, nullptr, W.k(), 0.0f, d.xh, rows, s);
+        if (W.f16) gemm_f16(W.f, d.xh, rows, y, ys, nullptr, s);
+        else gemm_q8(W.q8, d.xh, rows, y, ys, nullptr, s);
+    };
+    CUDA_CHECK(cudaMemcpyAsync(d.mpos, h_pos_ + 12, 2 * sizeof(int), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(d.bo, h_embd_, (size_t) nrows * n * sizeof(float), cudaMemcpyHostToDevice, s));
+    incr_counter(d.counter, s);
+    mimo_hgather(d.mh, d.hring, HR, n, h_pos_[12], nrows, nmain, d.mchain, s);
+    float * ecat = d.yexp;   // [nrows][2n]
+    rmsnorm(d.bo, n, d.m_enorm[head], ecat, 2 * n, n, nrows, eps, s);
+    rmsnorm(d.mh, n, d.m_hnorm[head], ecat + n, 2 * n, n, nrows, eps, s);
+    mm(d.m_eh[head], ecat, 2 * n, d.mres, n, nrows);
+    float * R = d.mres;
+    rmsnorm(R, n, L.attn_norm, d.xn, n, n, nrows, eps, s);
+    mm(L.wqkv, d.xn, n, d.big0, bs, nrows);
+    mimo_qkv(d.big0, bs, L.nq, L.nkv, c.dk, c.dv, c.n_rot, c.rope_base_swa, d.mpos, nrows, L.kc, L.vc, L.kpitch, L.vpitch, L.ring, s);
+    if (!full) return;
+    if (nrows > 1) {   // the last row goes on alone
+        CUDA_CHECK(cudaMemcpyAsync(R, R + (size_t) (nrows - 1) * n, n * sizeof(float), cudaMemcpyDeviceToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(d.big0, d.big0 + (size_t) (nrows - 1) * bs, (size_t) L.nq * c.dk * sizeof(float), cudaMemcpyDeviceToDevice, s));
+    }
+    MimoAttn a;
+    a.q = d.big0; a.qs = bs;
+    a.kc = L.kc; a.vc = L.vc; a.kpitch = L.kpitch; a.vpitch = L.vpitch; a.ring = L.ring;
+    a.pos = d.mpos + 1; a.nt = 1; a.nq = L.nq; a.nkv = L.nkv; a.dk = c.dk; a.dv = c.dv;
+    a.window = c.window;
+    a.scale = 1.0f / sqrtf((float) c.dk);
+    a.vscale = c.v_scale;
+    a.sinks = L.sinks;
+    a.out = d.o; a.os = L.nq * c.dv;
+    a.part = d.attn_part;
+    mimo_attn(a, 4, s);
+    int call = 0;
+    mm(L.wo, d.o, L.nq * c.dv, d.part, n, 1);
+    allreduce_add_ll16(R, d.part, ar_ll_, d.g, nd, n, d.counter, call++, s, nullptr);
+    rmsnorm(R, n, L.ffn_norm, d.xn, n, n, 1, eps, s);
+    mm(L.gu, d.xn, n, d.shgu, 2 * L.ff_l, 1);
+    NormIn glu; glu.act = 2; glu.glu_off = L.ff_l;
+    mm(L.down, d.shgu, 2 * L.ff_l, d.part, n, 1, glu);
+    allreduce_add_ll16(R, d.part, ar_ll_, d.g, nd, n, d.counter, call++, s, nullptr);
+    CUDA_CHECK(cudaMemcpyAsync(d.mchain + (size_t) head * n, R, n * sizeof(float), cudaMemcpyDeviceToDevice, s));
+    rmsnorm(R, n, d.m_onorm[head], d.xn, n, n, 1, eps, s);
+    mm(d.output, d.xn, n, d.logits, d.output.n(), 1);
+    argmax_pairs(d.logits, d.output.n(), d.output.n(), d.vocab_off, d.wts, 1, s);
+    max_sumexp(d.logits, d.output.n(), d.wts + 2, s);   // (the draft's probability: the drafts' gate)
+    topk_pairs(d.logits, d.output.n(), d.output.n(), d.vocab_off, d.topk, TOPK, 1, s);
+    CUDA_CHECK(cudaMemcpyAsync(h_mtopk_ + (size_t) gi * TOPK * 2, d.topk, (size_t) TOPK * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(h_res_ + (size_t) gi * MAX_NT * 2, d.wts, 4 * sizeof(float), cudaMemcpyDeviceToHost, s));
+}
+
+void Engine6::mtp_pass(int head, const int * tokens, int nrows, int q0, int nmain, bool full) {
+    if (nrows < 1 || nrows > MTPR || head < 0 || head >= n_mtp_) throw std::runtime_error("mtp_pass: bad rows");
+    if (q0 + nrows > opt_.max_pos) throw std::runtime_error("mtp_pass: position exceeds max_pos");
+    embed(tokens, nrows, 0, q0);
+    h_pos_[12] = q0;
+    h_pos_[13] = q0 + nrows - 1;
+    mtp_pos_ = q0 + nrows;   // (the drafted token's position)
+    ++fwd_counter_;          // (the devices' counters advance with every pass)
+    for (int gi = 0; gi < (int) devs_.size(); ++gi) {
+        CUDA_CHECK(cudaSetDevice(devs_[gi]->id));
+        record_mtp(gi, head, nrows, nmain, full);
+    }
+    for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->stream)); }
+}
+
+int Engine6::mtp_result() {
+    float best = -INFINITY; int bi = -1;
+    for (size_t g = 0; g < devs_.size(); ++g) {
+        const float v = h_res_[(g * MAX_NT) * 2];
+        const int idx = ((const int *) h_res_)[(g * MAX_NT) * 2 + 1];
+        if (v > best) { best = v; bi = idx; }
+    }
+    float M = -INFINITY;
+    for (size_t g = 0; g < devs_.size(); ++g) M = std::max(M, h_res_[(g * MAX_NT) * 2 + 2]);
+    double z = 0;
+    for (size_t g = 0; g < devs_.size(); ++g) z += h_res_[(g * MAX_NT) * 2 + 3] * std::exp((double) h_res_[(g * MAX_NT) * 2 + 2] - M);
+    mtp_p_ = z > 0 ? 1.0 / z : 0.0;
+    if (samp_invT_ > 0) {
+        std::vector<std::pair<float, int>> cand;
+        for (size_t g = 0; g < devs_.size(); ++g)
+            for (int i = 0; i < TOPK; ++i) {
+                const float * q = h_mtopk_ + ((size_t) g * TOPK + i) * 2;
+                const int idx = ((const int *) q)[1];
+                if (idx >= 0) cand.push_back({q[0], idx});
+            }
+        if (!cand.empty()) return draft_pick(cand, samp_, samp_seed_, mtp_pos_);
+    }
+    return bi;
 }
 
 void Engine6::build_graphs() {
@@ -1320,7 +1474,7 @@ std::vector<int> Engine6::forward(const int * tokens, int nt, int pos) {
     if (pos + nt > opt_.max_pos) throw std::runtime_error("forward: position exceeds max_pos");
     ensure_kv(pos + nt + 2 * MAX_NT);
     const bool bulk = nt > MAX_NT;
-    embed(tokens, nt);
+    embed(tokens, nt, 0, pos);
     h_pos_[0] = pos;
     if (elastic_ && !bulk) {
         ++dec_steps_;
@@ -1359,18 +1513,29 @@ std::vector<int> Engine6::forward(const int * tokens, int nt, int pos) {
 
 std::vector<int> Engine6::generate(const std::vector<int> & prompt, int n_gen, bool spec_req, GenStats * stats,
                                    const std::function<bool(int)> & on_token, const SamplingParams & sp) {
+    const PromptMedia * md = media_;   // (taken first: a request that fails leaves none for the next)
+    media_ = nullptr;
     if (prompt.empty()) throw std::runtime_error("generate: empty prompt");
     if ((int) prompt.size() + 8 > opt_.max_pos) throw std::runtime_error("generate: prompt longer than the context");
     using clk = std::chrono::steady_clock;
     const bool sampling = sp.temp > 0.0f;
     samp_seed_ = sp.seed ? sp.seed : random_seed64();
+    mrows_.clear();
+    if (md) {
+        if ((int) md->keys.size() != (int) prompt.size()) throw std::runtime_error("generate: media do not match the prompt");
+        for (const auto & r : md->rows) mrows_[r.first] = r.second;
+    }
+    const std::vector<int> & key = md ? md->keys : prompt;
+    static const bool gumbel_draft = getenv("HYPER_GUMBEL_DRAFT") ? atoi(getenv("HYPER_GUMBEL_DRAFT")) != 0 : true;
+    samp_invT_ = sampling && gumbel_draft ? 1.0f / sp.temp : 0.0f;   // (MTP drafts coupled to the sampling noise)
+    samp_ = sp;
     const int P = (int) prompt.size();
     int s = 0;
     if (opt_.prompt_cache && !hist_.empty()) {
         // resume after the common prefix while the sliding-window rings still hold the window before it (no snapshots)
         int L = 0;
         const int m = std::min((int) hist_.size(), P - 1);
-        while (L < m && hist_[L] == prompt[L]) ++L;
+        while (L < m && hist_[L] == key[L]) ++L;
         const int newest = (int) hist_.size() - 1;
         if (L > 0 && newest - L < ring_ - cfg_.window - 2 * MAX_NT) s = L;
     }
@@ -1394,7 +1559,12 @@ std::vector<int> Engine6::generate(const std::vector<int> & prompt, int n_gen, b
         if (prefill_cb_) prefill_cb_(end, P, s);
         c0 = end;
     }
-    hist_ = prompt;
+    const bool use_mtp = mtp_g_ && K > 0 && spec_req;
+    if (use_mtp) {   // the NextN heads' caches over the window before the first draft position (main hidden rows of the prompt)
+        const int q0 = std::max(0, P - (cfg_.window - 1));
+        for (int h = 0; h < n_mtp_; ++h) mtp_pass(h, &prompt[q0], P - q0, q0, P - q0, false);
+    }
+    hist_ = key;
     st.t_prefill = std::chrono::duration<double>(clk::now() - tp).count();
     st.prompt_reused = s;
     std::vector<int> out;
@@ -1409,7 +1579,49 @@ std::vector<int> Engine6::generate(const std::vector<int> & prompt, int n_gen, b
         return !stop;
     };
     auto since = [](clk::time_point a) { return std::chrono::duration<double>(clk::now() - a).count(); };
-    if (K <= 0 || !spec_req) {
+    if (use_mtp) {
+        // MTP drafts by the chained NextN heads (llama.cpp's chain_heads): head h runs over the rows at p .. p + h (the token at p
+        // with the main hidden of p - 1, then the drafts with the outputs of heads 0 .. h - 1); its last row drafts the token at
+        // p + h + 1. Drafts while their run's probability stays >= mtp_pmin_; a draft is kept iff the token sampled (or argmax)
+        // at its row equals it: exact. After a step, the kept rows enter every head's cache with the main model's hidden rows.
+        std::vector<int> drafts(K), in(K + 1), toks(K + 1);
+        int cur = next;
+        while (!stop && p + K + 1 < opt_.max_pos) {
+            if (!emit(cur)) break;
+            auto ta = clk::now();
+            int nd = 0;
+            double pc = 1.0;
+            toks[0] = cur;
+            for (int h = 0; h < std::min(K, n_mtp_); ++h) {
+                mtp_pass(h, toks.data(), h + 1, p, 1, true);
+                const int dt = mtp_result();
+                pc *= mtp_p_;
+                if (pc < mtp_pmin_) break;
+                drafts[nd++] = dt;
+                toks[h + 1] = dt;
+            }
+            st.t_mtp += since(ta);
+            in[0] = cur;
+            for (int j = 0; j < nd; ++j) in[j + 1] = drafts[j];
+            ta = clk::now();
+            std::vector<int> a = forward(in.data(), nd + 1, p);
+            st.t_main += since(ta);
+            st.steps++;
+            st.drafted += nd;
+            int m = 0;
+            if (sampling) { while (m < nd && (a[m] = sample_row(m, sp, p + m + 1)) == drafts[m]) ++m; if (m == nd) a[nd] = sample_row(nd, sp, p + nd + 1); }
+            else while (m < nd && a[m] == drafts[m]) ++m;
+            st.accepted += m;
+            int r = 0;
+            while (r < m && emit(drafts[r++])) {}
+            if (stop) { if (opt_.answer_reuse) p += r; break; }
+            ta = clk::now();
+            for (int h = 0; h < n_mtp_; ++h) mtp_pass(h, in.data(), m + 1, p, m + 1, false);
+            st.t_mtp += since(ta);
+            cur = a[m];
+            p += m + 1;
+        }
+    } else if (K <= 0 || !spec_req) {
         while (emit(next) && p + 1 < opt_.max_pos) {
             next = forward(&next, 1, p++)[0];
             if (sampling) next = sample_row(0, sp, p);
@@ -1459,7 +1671,7 @@ std::vector<int> Engine6::generate(const std::vector<int> & prompt, int n_gen, b
             p += m + 1;
         }
     }
-    hist_ = prompt;
+    hist_ = key;
     hist_.insert(hist_.end(), out.begin(), out.end());
     hist_.resize(std::min<size_t>(hist_.size(), (size_t) p));   // (positions < p have their cache rows)
     st.tokens = (int) out.size();
@@ -1491,12 +1703,16 @@ void Engine6::upload_stage(Device & d, int il, int sb, int p, int np) {
     if (p == np - 1) CUDA_CHECK(cudaEventRecord(d.ev_up[sb], d.cstream));
 }
 
-void Engine6::embed(const int * tokens, int nt, int chunk) {
+void Engine6::embed(const int * tokens, int nt, int chunk, int pos) {
     const GTensor & te = gguf_->need("token_embd.weight");
     const auto * te_tr = ggml_get_type_traits((ggml_type) te.type);
     for (int t = 0; t < nt; ++t) {
-        const uint8_t * row = te.data + (size_t) tokens[t] * te.row_bytes();
         float * out = h_embd_ + ((size_t) chunk * R6 + t) * cfg_.n_embd;
+        if (pos >= 0 && !mrows_.empty()) {
+            const auto it = mrows_.find(pos + t);
+            if (it != mrows_.end()) { memcpy(out, it->second, cfg_.n_embd * sizeof(float)); continue; }
+        }
+        const uint8_t * row = te.data + (size_t) tokens[t] * te.row_bytes();
         if (te.type == GType::F32) memcpy(out, row, cfg_.n_embd * sizeof(float));
         else te_tr->to_float(row, out, cfg_.n_embd);
     }
@@ -1556,7 +1772,7 @@ int Engine6::forward_multi(const int * tokens, const int * lens, int nck, int po
     }
     int off = 0;
     for (int ci = 0; ci < nck; ++ci) {
-        embed(tokens + off, lens[ci], ci);
+        embed(tokens + off, lens[ci], ci, pos + off);
         mc_nt_[ci] = lens[ci];
         mc_pos_[ci] = pos + off;
         h_pos_[ci] = pos + off;

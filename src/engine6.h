@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -25,8 +26,8 @@ struct Engine6Options {
     int max_pos = 8192;
     float gpu_expert_frac = 1.0f;
     float vram_reserve_gib = 0.8f;
-    std::string mtp_path;           // (not used yet)
-    int n_draft = 3;                // prompt-lookup speculation drafts (0: off)
+    std::string mtp_path;           // GGUF with the NextN blocks blk.<n_layer>.. (the mtp-*.gguf sidecar): MTP drafts
+    int n_draft = 3;                // drafts per step: MTP (with mtp_path), else prompt lookup (0: off)
     bool stream_experts = true;
     int cpu_threads = 30;
     bool prompt_cache = false;      // resume a prompt that extends the cached conversation (no snapshots: sliding-window rings)
@@ -51,10 +52,13 @@ public:
     void set_prefill_progress(std::function<void(int, int, int)> fn) override { prefill_cb_ = std::move(fn); }
     int max_pos() const override { return opt_.max_pos; }
     int n_draft() const override { return std::min(opt_.n_draft, MAX_NT - 1); }
-    bool has_mtp() const override { return false; }
+    bool has_mtp() const override { return mtp_g_ != nullptr; }
     void save_expert_stats(const std::string & path);
-    void set_draft(int k, double) { opt_.n_draft = std::max(0, k); }
+    void set_draft(int k, double pmin) { opt_.n_draft = std::max(0, k); mtp_pmin_ = pmin; }
     void reset_cache() override { hist_.clear(); }
+    // images: their rows replace the input rows at their positions (plain positions: mimo2 ropes text and image tokens alike);
+    // the prompt cache compares keys (an image's hash at its positions)
+    bool set_media(const PromptMedia * m) override { media_ = m; return true; }
 
 private:
     struct DevLayer;
@@ -66,8 +70,14 @@ private:
     void rebuild_stream(int il);
     void rebalance(int max_swaps);
     void record_main(int gi, int nt);
+    // MTP: NextN head `head` over rows at positions q0.. (tokens embedded in chunk 0; hidden rows: the first nmain the main
+    // model's, the rest the chained outputs of heads 0..); all rows enter the head's cache, `full`: the last row goes on
+    // through attention, FFN and the head (draft in h_res_, its hidden in mchain[head])
+    void record_mtp(int gi, int head, int nrows, int nmain, bool full);
+    void mtp_pass(int head, const int * tokens, int nrows, int q0, int nmain, bool full);
+    int mtp_result();
     void build_graphs();
-    void embed(const int * tokens, int nt, int chunk = 0);
+    void embed(const int * tokens, int nt, int chunk = 0, int pos = -1);   // (pos >= 0: image rows from the prompt media)
     void run(int nt);
     int nl_tot() const { return cfg_.n_layer; }
     void * host_huge_alloc(size_t bytes);
@@ -75,14 +85,24 @@ private:
     bool is_moe(int il) const { return cfg_.moe[il] != 0; }
     int ring_ = 4096;              // sliding-window caches: rows per kv head (position % ring_)
     int ns_global_ = 32;           // decode: key splits of a global layer's attention
-    std::vector<int> hist_;        // tokens whose cache rows are in place (positions 0..)
+    std::vector<int> hist_;        // tokens (or image keys) whose cache rows are in place (positions 0..)
+    const PromptMedia * media_ = nullptr;          // images of the next generate()
+    std::map<int, const float *> mrows_;           // this generate's image rows by position
     std::function<void(int, int, int)> prefill_cb_;
     float * h_topk_ = nullptr;
     uint64_t samp_seed_ = 0;
     std::vector<std::pair<void *, size_t>> host_bufs_;
 
     Engine6Options opt_;
-    std::unique_ptr<GGUF> gguf_;
+    std::unique_ptr<GGUF> gguf_, mtp_g_;
+    int n_mtp_ = 0;                // NextN heads (chained: draft k by head k)
+    static constexpr int HR = 4096;     // main hidden rows kept by position (MTP inputs)
+    static constexpr int MTPR = 160;    // rows of an MTP pass (the window before a draft position + the chained rows)
+    double mtp_p_ = 1.0, mtp_pmin_ = 0.5;   // the last draft's probability; drafts while their run's probability >= pmin
+    float * h_mtopk_ = nullptr;
+    float samp_invT_ = 0.0f;
+    SamplingParams samp_;
+    int64_t mtp_pos_ = 0;
     MimoConfig cfg_;
     std::vector<std::unique_ptr<Device>> devs_;
     std::unique_ptr<CpuMoe> cpu_;

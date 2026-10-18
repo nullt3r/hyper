@@ -1165,7 +1165,8 @@ int main(int argc, char ** argv) {
         o6.prompt_cache = true;
         o6.max_snapshots = snaps;
         o6.answer_reuse = answer_reuse(false);
-        o6.n_draft = draft;   // prompt-lookup speculation
+        o6.n_draft = draft;   // MTP drafts with --mtp (the mtp-*.gguf sidecar), else prompt-lookup speculation
+        o6.mtp_path = mtp_path;
         auto e6 = std::make_unique<Engine6>(path, o6);
         if (!stats_path.empty()) {
             Engine6 * pe = e6.get();

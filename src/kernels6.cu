@@ -1,6 +1,7 @@
 #include "kernels6.cuh"
 
 #include <cfloat>
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -47,6 +48,7 @@ __device__ __forceinline__ float wsum(float v) {
 
 constexpr int AT_KT = 32;            // keys per tile (one per lane)
 constexpr int AT_QW = MIMO_QB / 8;   // queries per warp
+constexpr int AT_PG = 256;           // keys per page (the unit dealt to the key splits)
 
 template <int DK> constexpr size_t at_smem() { return (size_t) MIMO_QB * DK * 4 + (size_t) AT_KT * (DK + 2) * 2 + (size_t) AT_KT * 128 * 2; }
 
@@ -61,8 +63,9 @@ __global__ void __launch_bounds__(256) k_mimo_attn(MimoAttn a, int ns, int RB) {
     const int r0 = rb * RB, r1 = min(a.nt, r0 + RB), Qn = (r1 - r0) * group;
     const int p0 = a.pos[0];
     const int pf = p0 + r0, pl = p0 + r1 - 1;
-    const int kmin = a.window ? max(0, pf - a.window + 1) : 0, len = pl + 1 - kmin;
-    const int k0 = kmin + (int) ((long long) len * sp / ns), k1 = kmin + (int) ((long long) len * (sp + 1) / ns);
+    // keys in pages of AT_PG dealt to the splits round robin, tiles at absolute multiples of AT_KT: a query's partials (and so its
+    // result) do not depend on the other rows of the call -- a speculative verification row computes what a single decoded row does
+    const int kmin = a.window ? max(0, pf - a.window + 1) : 0, kbeg = kmin & ~(AT_KT - 1), kend = pl + 1;
     extern __shared__ __align__(16) float sm[];
     float * qsm = sm;
     half2 * Ks = (half2 *) (qsm + MIMO_QB * DK);       // [AT_KT][DK / 2 + 1]
@@ -84,7 +87,10 @@ __global__ void __launch_bounds__(256) k_mimo_attn(MimoAttn a, int ns, int RB) {
     }
     const half * kb = a.kc + (size_t) kvh * a.kpitch;
     const half * vb = a.vc + (size_t) kvh * a.vpitch;
-    for (int kt = k0; kt < k1; kt += AT_KT) {
+    for (int pg = kbeg / AT_PG; pg * AT_PG < kend; ++pg) {
+    if (pg % ns != sp) continue;
+    const int k1 = min((pg + 1) * AT_PG, kend);
+    for (int kt = max(pg * AT_PG, kbeg); kt < k1; kt += AT_KT) {
         __syncthreads();
         for (int i = tid; i < AT_KT * (DK / 2); i += 256) {
             const int j = i / (DK / 2), c = i - j * (DK / 2), key = kt + j;
@@ -145,6 +151,7 @@ __global__ void __launch_bounds__(256) k_mimo_attn(MimoAttn a, int ns, int RB) {
             }
         }
     }
+    }
 #pragma unroll
     for (int j = 0; j < AT_QW; ++j) {
         if (j >= nj) continue;
@@ -187,7 +194,29 @@ __global__ void k_mimo_comb(MimoAttn a, int ns, int RB, int nrb) {
     a.out[(size_t) t * a.os + (size_t) h * DV + d] = L > 0.0f ? acc / L * a.vscale : 0.0f;
 }
 
+__global__ void k_mimo_hstore(const float * __restrict__ R, int nt, const int * __restrict__ pos, float * __restrict__ hring, int HR, int n) {
+    const int r = max(0, nt - HR) + blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= nt || i >= n) return;
+    hring[(size_t) ((pos[0] + r) % HR) * n + i] = R[(size_t) r * n + i];
+}
+__global__ void k_mimo_hgather(float * __restrict__ dst, const float * __restrict__ hring, int HR, int n, int q0, int nmain,
+                               const float * __restrict__ chain) {
+    const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v;
+    if (t < nmain) { const int q = q0 + t - 1; v = q < 0 ? 0.0f : hring[(size_t) (q % HR) * n + i]; }
+    else v = chain[(size_t) (t - nmain) * n + i];
+    dst[(size_t) t * n + i] = v;
+}
+
 } // namespace
+
+void mimo_hstore(const float * R, int nt, const int * pos, float * hring, int HR, int n, cudaStream_t s) {
+    k_mimo_hstore<<<dim3((n + 255) / 256, std::min(nt, HR)), 256, 0, s>>>(R, nt, pos, hring, HR, n);
+}
+void mimo_hgather(float * dst, const float * hring, int HR, int n, int q0, int nrows, int nmain, const float * chain, cudaStream_t s) {
+    k_mimo_hgather<<<dim3((n + 255) / 256, nrows), 256, 0, s>>>(dst, hring, HR, n, q0, nmain, chain);
+}
 
 void mimo_qkv(float * big, int bs, int nq, int nkv, int dk, int dv, int n_rot, float base, const int * pos, int nt, half * kc,
               half * vc, size_t kpitch, size_t vpitch, int ring, cudaStream_t s) {
