@@ -1567,11 +1567,13 @@ std::vector<ConvPark<Engine6::Snap>::Dev> Engine6::park_devs() const {
         ConvPark<Snap>::Dev pd;
         pd.id = dp->id;
         pd.stream = dp->stream;
+        // (a span per kv head: a 2D copy over several heads would span the unmapped middle of an elastic cache -- invalid)
         for (auto & L : dp->layers)
-            if (!L.swa && L.nkv > 0) {
-                pd.spans.push_back({L.kc, (size_t) cfg_.dk * sizeof(half), L.kpitch * sizeof(half), L.nkv, 1});
-                pd.spans.push_back({L.vc, (size_t) cfg_.dv * sizeof(half), L.vpitch * sizeof(half), L.nkv, 1});
-            }
+            if (!L.swa)
+                for (int h = 0; h < L.nkv; ++h) {
+                    pd.spans.push_back({L.kc + (size_t) h * L.kpitch, (size_t) cfg_.dk * sizeof(half), 0, 1, 1});
+                    pd.spans.push_back({L.vc + (size_t) h * L.vpitch, (size_t) cfg_.dv * sizeof(half), 0, 1, 1});
+                }
         v.push_back(std::move(pd));
     }
     return v;
