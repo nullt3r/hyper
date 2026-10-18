@@ -32,6 +32,8 @@ struct MimoAttn {
 };
 // ns: key splits per row block (fixed for a captured graph; empty splits are skipped by the combine)
 void mimo_attn(const MimoAttn & a, int ns, cudaStream_t s);
+// prefill on the tensor cores (Q and P rounded to fp16, fp32 accumulation; full caches)
+void mimo_attn_fa(const MimoAttn & a, cudaStream_t s);
 
 // MTP inputs: the main model's last residual rows (before the output norm) kept by position, hring[(pos[0] + r) % HR] = R[r]
 // (the last HR rows of a call)

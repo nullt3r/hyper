@@ -1218,7 +1218,9 @@ void Engine6::record_main(int gi, int nt) {
                 while (ns < 32 && blocks * ns * 2 <= 256 && keys / (ns * 2) >= 1024) ns *= 2;
                 if (mimo_attn_part_floats(L.nkv, nt, group, ns) > d.attn_part_n) ns = 1;
             }
-            mimo_attn(a, ns, s);
+            static const bool fa_off = getenv("HYPER6_FA") && atoi(getenv("HYPER6_FA")) == 0;
+            if (bulk && !L.swa && !fa_off) mimo_attn_fa(a, s);   // (global layers: the keys of the whole context)
+            else mimo_attn(a, ns, s);
         }
         mm(L.wo, d.o, L.nq * c.dv, d.part, n, nt);
         dbg("attn_part", il, d.part, (size_t) nt * n);
