@@ -84,7 +84,7 @@ private:
     int sample_row(int t, const SamplingParams & sp, int64_t pos);
     bool is_moe(int il) const { return cfg_.moe[il] != 0; }
     int ring_ = 4096;              // sliding-window caches: rows per kv head (position % ring_)
-    int ns_global_ = 32;           // decode: key splits of a global layer's attention
+    int ns_global_ = 64;           // decode: key splits of a global layer's attention (tensor-core kernel: 64 measured best)
     std::vector<int> hist_;        // tokens (or image keys) whose cache rows are in place (positions 0..)
     const PromptMedia * media_ = nullptr;          // images of the next generate()
     std::map<int, const float *> mrows_;           // this generate's image rows by position

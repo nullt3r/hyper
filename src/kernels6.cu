@@ -1,6 +1,8 @@
 #include "kernels6.cuh"
 
 #include <cfloat>
+#include <climits>
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -366,6 +368,204 @@ __global__ void __launch_bounds__(128) k_mimo_fa(MimoAttn a) {
     }
 }
 
+// ---- tensor-core decode attention (as kernels.cu's k_attn_dec_tc, for k 192 / v 128, GQA, window, ring caches) ----
+// Block = one local kv head, one key slice, R = 16 MT (row, q head) pairs as the MMA rows (pair r = row * group + head).
+// q (scaled) and p are split into fp16 hi + lo and k, v are exact in fp16: every product fp32-accurate, sums in fp32. Keys in
+// tiles of 32 at absolute positions, K/V double-buffered (cp.async); warp w scores keys 8w..8w+7 of a tile and accumulates
+// output dims 32w..32w+31. A row's slice depends only on its own position (keys [kmin, p] in ns equal chunks): one row and four
+// rows give the same bits (speculative verification = plain decoding). Partials {m, l, -, -, o[128]} for k_mimo_comb.
+constexpr int DT6_K = 32, DT6_LDK = 192 + 8, DT6_LDV = 128 + 8, DT6_PL = DT6_K + 8;
+template <int MT> __host__ __device__ constexpr int dt6_nbuf() { return MT == 2 ? 2 : 1; }
+template <int MT> __host__ __device__ constexpr size_t dt6_smem() {
+    return ((size_t) dt6_nbuf<MT>() * DT6_K * (DT6_LDK + DT6_LDV) + 2 * 16 * MT * DT6_PL) * sizeof(half);
+}
+template <int MT>
+__global__ void __launch_bounds__(128 * MT, MT == 1 ? 2 : 1) k_mimo_dec_tc(MimoAttn a, int ns) {
+    constexpr int DK = 192, DV = 128, R = 16 * MT, NB = dt6_nbuf<MT>();
+    extern __shared__ __align__(16) half dt6_sm[];
+    half * kvb = dt6_sm;                                  // [NB][K: DT6_K x LDK | V: DT6_K x LDV]
+    half * ph = kvb + NB * DT6_K * (DT6_LDK + DT6_LDV);   // [R][DT6_PL]
+    half * pl = ph + R * DT6_PL;
+    __shared__ float red[2][4][R];
+    const int hk = blockIdx.x, split = blockIdx.y, rg = blockIdx.z;
+    const int w = (threadIdx.x >> 5) & 3, g16 = (threadIdx.x >> 7) * 16, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+    const int group = a.nq / a.nkv, pairs = a.nt * group, r0 = rg * R;
+    if (r0 >= pairs) return;
+    const int np = min(R, pairs - r0);
+    const int pos0 = a.pos[0];
+    auto slice = [&](int t, int & p0, int & p1) {
+        const int npos = pos0 + t + 1, kmin = a.window ? max(0, npos - a.window) : 0, chunk = (npos - kmin + ns - 1) / ns;
+        p0 = kmin + split * chunk;
+        p1 = min(npos, p0 + chunk);
+    };
+    int b0 = INT_MAX, b1 = 0;
+    for (int t = r0 / group; t <= (r0 + np - 1) / group; ++t) {
+        int x, y;
+        slice(t, x, y);
+        if (x < y) { b0 = min(b0, x); b1 = max(b1, y); }
+    }
+    half * qh = kvb, * ql = kvb + R * DT6_LDK;   // (staging in the not yet used tile buffers: 2 R LDK <= NB DT6_K (LDK + LDV))
+    for (int i = threadIdx.x; i < R * DK; i += blockDim.x) {
+        const int r = i / DK, d = i % DK;
+        float v = 0.0f;
+        if (r < np) {
+            const int t = (r0 + r) / group, h = hk * group + (r0 + r) % group;
+            v = a.q[(size_t) t * a.qs + (size_t) h * DK + d] * a.scale;
+        }
+        const half hi = __float2half_rn(v);
+        qh[r * DT6_LDK + d] = hi;
+        ql[r * DT6_LDK + d] = __float2half_rn(v - __half2float(hi));
+    }
+    __syncthreads();
+    unsigned qah[DK / 16][4], qal[DK / 16][4];
+#pragma unroll
+    for (int kk = 0; kk < DK / 16; ++kk) {
+        fa_ldm4(qah[kk], qh + (g16 + (lane & 15)) * DT6_LDK + kk * 16 + (lane >> 4) * 8);
+        fa_ldm4(qal[kk], ql + (g16 + (lane & 15)) * DT6_LDK + kk * 16 + (lane >> 4) * 8);
+    }
+    int rp0[2], rp1[2];
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+        rp0[e] = rp1[e] = 0;
+        if (g16 + gid + 8 * e < np) slice((r0 + g16 + gid + 8 * e) / group, rp0[e], rp1[e]);
+    }
+    float o[4][4];
+#pragma unroll
+    for (int n = 0; n < 4; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+    float m[2] = {-1e30f, -1e30f}, l[2] = {0.0f, 0.0f};
+    const half * kb = a.kc + (size_t) hk * a.kpitch, * vb = a.vc + (size_t) hk * a.vpitch;
+    const bool active = g16 < np;
+    const int tb0 = b0 < b1 ? b0 / DT6_K * DT6_K : 0;
+    auto load = [&](int buf, int base) {
+        half * kd = kvb + (size_t) buf * DT6_K * (DT6_LDK + DT6_LDV), * vd = kd + DT6_K * DT6_LDK;
+        for (int i = threadIdx.x; i < DT6_K * (DK + DV) / 8; i += blockDim.x) {
+            const bool isk = i < DT6_K * DK / 8;
+            const int j = isk ? i : i - DT6_K * DK / 8, per = (isk ? DK : DV) / 8, r = j / per, d = (j % per) * 8, p = base + r;
+            const bool ok = p >= b0 && p < b1;
+            const size_t row = ok ? (a.ring ? (size_t) (p % a.ring) : (size_t) p) : 0;
+            if (isk) fa_cp16(kd + r * DT6_LDK + d, kb + row * DK + d, ok);
+            else fa_cp16(vd + r * DT6_LDV + d, vb + row * DV + d, ok);
+        }
+        asm volatile("cp.async.commit_group;");
+    };
+    __syncthreads();   // (the q staging is read)
+    if (NB == 2 && tb0 < b1) load(0, tb0);
+    int buf = 0;
+    for (int base = tb0; base < b1; base += DT6_K, buf ^= (NB - 1)) {
+        if (NB == 2) {
+            if (base + DT6_K < b1) load(buf ^ 1, base + DT6_K);
+            else asm volatile("cp.async.commit_group;");
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            if (base > tb0) __syncthreads();
+            load(0, base);
+            asm volatile("cp.async.wait_group 0;");
+        }
+        __syncthreads();
+        const half * ks = kvb + (size_t) buf * DT6_K * (DT6_LDK + DT6_LDV), * vs = ks + DT6_K * DT6_LDK;
+        float shi[3][4], slo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int c = 0; c < 3; ++c) shi[c][0] = shi[c][1] = shi[c][2] = shi[c][3] = 0.0f;
+#pragma unroll
+        for (int kk = 0; kk < DK / 16; ++kk) {
+            if (!active) break;
+            unsigned b[2];
+            const unsigned ka = (unsigned) __cvta_generic_to_shared(ks + (w * 8 + (lane & 7)) * DT6_LDK + kk * 16 + ((lane >> 3) & 1) * 8);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(b[0]), "=r"(b[1]) : "r"(ka));
+            fa_mma(shi[kk >> 2], qah[kk], b);
+            fa_mma(slo, qal[kk], b);
+        }
+        float sc[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) sc[e] = ((shi[0][e] + shi[1][e]) + shi[2][e]) + slo[e];
+        float tmax[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int key = base + w * 8 + 2 * tig + (e & 1), r = e >> 1;
+            if (key < rp0[r] || key >= rp1[r]) sc[e] = -INFINITY;
+            tmax[r] = fmaxf(tmax[r], sc[e]);
+        }
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            tmax[r] = fmaxf(tmax[r], __shfl_xor_sync(0xffffffff, tmax[r], 1));
+            tmax[r] = fmaxf(tmax[r], __shfl_xor_sync(0xffffffff, tmax[r], 2));
+            if (tig == 0) red[0][w][g16 + gid + 8 * r] = tmax[r];
+        }
+        __syncthreads();
+        float corr[2], psum[2] = {0.0f, 0.0f};
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const int row = g16 + gid + 8 * r;
+            const float tm = fmaxf(fmaxf(red[0][0][row], red[0][1][row]), fmaxf(red[0][2][row], red[0][3][row]));
+            const float mn = fmaxf(m[r], tm);
+            corr[r] = __expf(m[r] - mn);
+            m[r] = mn;
+        }
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int r = e >> 1;
+            const float p = __expf(sc[e] - m[r]);
+            psum[r] += p;
+            const half hi = __float2half_rn(p);
+            const int at = (g16 + gid + 8 * r) * DT6_PL + w * 8 + 2 * tig + (e & 1);
+            ph[at] = hi;
+            pl[at] = __float2half_rn(p - __half2float(hi));
+        }
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            psum[r] += __shfl_xor_sync(0xffffffff, psum[r], 1);
+            psum[r] += __shfl_xor_sync(0xffffffff, psum[r], 2);
+            if (tig == 0) red[1][w][g16 + gid + 8 * r] = psum[r];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const int row = g16 + gid + 8 * r;
+            l[r] = l[r] * corr[r] + (((red[1][0][row] + red[1][1][row]) + red[1][2][row]) + red[1][3][row]);
+        }
+        float ot[4][4];
+#pragma unroll
+        for (int n = 0; n < 4; ++n) ot[n][0] = ot[n][1] = ot[n][2] = ot[n][3] = 0.0f;
+#pragma unroll
+        for (int k2 = 0; k2 < DT6_K / 16; ++k2) {
+            if (!active) break;
+            unsigned ahi[4], alo[4];
+            fa_ldm4(ahi, ph + (g16 + (lane & 15)) * DT6_PL + k2 * 16 + (lane >> 4) * 8);
+            fa_ldm4(alo, pl + (g16 + (lane & 15)) * DT6_PL + k2 * 16 + (lane >> 4) * 8);
+#pragma unroll
+            for (int dn = 0; dn < 2; ++dn) {
+                unsigned v4[4];
+                fa_ldm4t(v4, vs + (k2 * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * DT6_LDV + w * 32 + dn * 16 + (lane >> 4) * 8);
+                const unsigned c0[2] = {v4[0], v4[1]}, c1[2] = {v4[2], v4[3]};
+                fa_mma(ot[2 * dn], ahi, c0);
+                fa_mma(ot[2 * dn], alo, c0);
+                fa_mma(ot[2 * dn + 1], ahi, c1);
+                fa_mma(ot[2 * dn + 1], alo, c1);
+            }
+        }
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            o[n][0] = o[n][0] * corr[0] + ot[n][0]; o[n][1] = o[n][1] * corr[0] + ot[n][1];
+            o[n][2] = o[n][2] * corr[1] + ot[n][2]; o[n][3] = o[n][3] * corr[1] + ot[n][3];
+        }
+        if (NB == 2) __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const int row = g16 + gid + 8 * r;
+        if (row >= np) continue;
+        const int qi = r0 + row;
+        float * dst = a.part + (((size_t) hk * ns + split) * MIMO_QB + qi) * (DV + 4);
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            const int d = w * 32 + n * 8 + 2 * tig;
+            dst[4 + d] = o[n][2 * r];
+            dst[4 + d + 1] = o[n][2 * r + 1];
+        }
+        if (w == 0 && tig == 0) { dst[0] = m[r] == -1e30f ? -INFINITY : m[r]; dst[1] = l[r]; }
+    }
+}
+
 } // namespace
 
 void mimo_attn_fa(const MimoAttn & a, cudaStream_t s) {
@@ -411,6 +611,21 @@ void mimo_attn(const MimoAttn & a, int ns, cudaStream_t s) {
     if (dev < 16 && !attr[dev]) {
         cudaFuncSetAttribute(k_mimo_attn<192>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) at_smem<192>());
         attr[dev] = true;
+    }
+    static const bool tc_off = getenv("HYPER6_DEC_TC") && atoi(getenv("HYPER6_DEC_TC")) == 0;
+    if (!tc_off && nrb == 1 && a.nt * group <= MIMO_QB) {   // decode-sized rows: the tensor-core kernel, partials merged by the combine
+        static bool tattr[16] = {};
+        if (dev < 16 && !tattr[dev]) {
+            cudaFuncSetAttribute(k_mimo_dec_tc<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) dt6_smem<1>());
+            cudaFuncSetAttribute(k_mimo_dec_tc<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) dt6_smem<2>());
+            tattr[dev] = true;
+        }
+        if (!a.part) throw std::runtime_error("mimo_attn: the tensor-core kernel needs a partial buffer");
+        const int pairs = a.nt * group;
+        if (pairs > 16) k_mimo_dec_tc<2><<<dim3(a.nkv, ns, (pairs + 31) / 32), 256, dt6_smem<2>(), s>>>(a, ns);
+        else k_mimo_dec_tc<1><<<dim3(a.nkv, ns, 1), 128, dt6_smem<1>(), s>>>(a, ns);
+        k_mimo_comb<<<dim3(a.nq, a.nt), 128, 0, s>>>(a, ns, RB, 1);
+        return;
     }
     k_mimo_attn<192><<<dim3(a.nkv, ns, nrb), 256, at_smem<192>(), s>>>(a, ns, RB);
     if (ns > 1) k_mimo_comb<<<dim3(a.nq, a.nt), 128, 0, s>>>(a, ns, RB, nrb);
