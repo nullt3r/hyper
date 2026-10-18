@@ -11,7 +11,7 @@ BUILD := build
 # v1 (qwen35 dense) objects; qwen4exp objects additionally need ggml (CPU experts)
 OBJ   := $(BUILD)/gguf.o $(BUILD)/model.o $(BUILD)/kernels.o $(BUILD)/engine.o
 OBJ4  := $(BUILD)/gguf.o $(BUILD)/model4.o $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/cpu_moe.o $(BUILD)/engine4.o \
-         $(BUILD)/model5.o $(BUILD)/kernels5.o $(BUILD)/engine5.o
+         $(BUILD)/model5.o $(BUILD)/kernels5.o $(BUILD)/engine5.o $(BUILD)/model6.o $(BUILD)/kernels6.o $(BUILD)/engine6.o
 GGML_INC := -I$(LLAMA)/ggml/include -I$(LLAMA)/ggml/src
 
 all: $(BUILD)/hyper $(BUILD)/ref $(BUILD)/arbench

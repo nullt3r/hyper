@@ -13,6 +13,7 @@
 #include "engine.h"
 #include "engine4.h"
 #include "engine5.h"
+#include "engine6.h"
 #include "chat_page.h"
 
 #include "chat.h"
@@ -1151,6 +1152,27 @@ int main(int argc, char ** argv) {
         }
         draft = e5->n_draft();
         engine = std::move(e5);
+    } else if (arch == "mimo2") {
+        if (!ctx_given) ctx = 65536;
+        // MiMo's recommended sampling: temperature 1.0, top_p 0.95
+        if (!temp_given) c.defaults.temp = 1.0f;
+        if (!top_p_given) c.defaults.top_p = 0.95f;
+        if (!top_k_given) c.defaults.top_k = 0;
+        Engine6Options o6;
+        o6.max_pos = ctx;
+        o6.gpu_expert_frac = gpu_frac;
+        o6.cpu_threads = cpu_threads;
+        o6.prompt_cache = true;
+        o6.max_snapshots = snaps;
+        o6.answer_reuse = answer_reuse(false);
+        o6.n_draft = draft;   // prompt-lookup speculation
+        auto e6 = std::make_unique<Engine6>(path, o6);
+        if (!stats_path.empty()) {
+            Engine6 * pe = e6.get();
+            c.after_request = [pe, stats_path] { pe->save_expert_stats(stats_path); };
+        }
+        draft = e6->n_draft();
+        engine = std::move(e6);
     } else {
         EngineOptions opt;
         opt.max_pos = ctx;

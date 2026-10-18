@@ -3,6 +3,7 @@
 //   hyper4 bench <model> <ref.bin> [n_gen=128] [gpu_frac]   greedy decode speed after the reference prompt
 #include "engine4.h"
 #include "engine5.h"
+#include "engine6.h"
 
 #include <cuda_profiler_api.h>
 #include <csignal>
@@ -449,5 +450,6 @@ int main(int argc, char ** argv) {
     std::string arch;
     try { arch = GGUF(argv[2]).arch(); } catch (const std::exception & e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
     if (arch == "glm5-next") return run_cmd<Engine5, Engine5Options>(argc, argv);
+    if (arch == "mimo2") return run_cmd<Engine6, Engine6Options>(argc, argv);
     return run_cmd<Engine4, Engine4Options>(argc, argv);
 }

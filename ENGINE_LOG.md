@@ -815,3 +815,20 @@ End to end:
 - GLM-5.3-Flash stejně (engine5, `HYPER5_ROUTER32=1` = fp32): router 42 MoE vrstev bf16-exaktní, kernel 6,05 M výstupů
   bez rozdílu, deep A/B (155k + 8 přírůstků): základ / bf16 ve fp32 alokaci / bf16 9/9 hashů identických; rozmístění
   beze změny (28 29 28 na vrstvu, ~100 MB nestačí na expert), rychlost v šumu (decode 21,8 / 21,7 / 21,6 t/s).
+
+## 2026-10-18 – MiMo-V2.6-Flash (mimo2): engine6, první verze
+
+Model: 309 B / 15 B aktivních, 48 vrstev (39 SWA 128 s attention sinky, 9 globálních), GQA (q/k 192, v 128, RoPE 64),
+vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), experti MXFP4 (`ggml-org/MiMo-V2.6-Flash-MOPD-GGUF`).
+
+- MXFP4 v GGUF i v GPU MoE kernelech (deq8, prefill GEMM přes generickou cestu); `deqtest` bit-identický s ggml.
+- `kernels6`: q/k/v RoPE (double) + zápis do cache (globální vrstvy plné, SWA kruh 4096 řádků), GQA flash-decoding
+  (fp32 skóre a softmax, sinky, okno, split přes klíče + combine). Attention rozdělená po kv hlavách, u globálních vrstev
+  rotace dvojitého podílu mezi GPU.
+- Zbytek převzat z engine5 (CPU / GPU experti, adaptivní rozmístění, elastické sloty, streaming při prefillu).
+- Přesnost (ref z mainline llama.cpp, experti na CPU): 2779 tokenů KL 0,0167 top1 93,9 %, PPL 4,952 vs 4,945;
+  šumová podlaha llama.cpp proti sobě (ubatch 512) KL 0,0163 top1 94,6 %. Prefill 1024 + decode KL 0,0149.
+- Rychlost: decode 25 t/s (studené rozmístění) / 36 t/s po 8k prefillu; prefill 8k 1020–1120 t/s (opakovaný text).
+  llama.cpp (15 vrstev expertů na GPU): pp2048 120 t/s, tg 16,5 t/s.
+- Chybí: MTP (3 NextN vrstvy v sidecaru), vision, TC prefill attention, snapshoty / parkování (prompt cache jen navazuje
+  na poslední konverzaci, dokud SWA kruh drží okno).

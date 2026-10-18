@@ -27,6 +27,7 @@ const char * gtype_name(GType t) {
         case GType::Q6_K: return "Q6_K";
         case GType::IQ3_S: return "IQ3_S";
         case GType::IQ4_XS: return "IQ4_XS";
+        case GType::MXFP4: return "MXFP4";
         default:          return "?";
     }
 }
@@ -49,6 +50,7 @@ size_t gtype_block_bytes(GType t) {
         case GType::Q6_K: return 210;
         case GType::IQ3_S: return 110;
         case GType::IQ4_XS: return 136;
+        case GType::MXFP4: return 17;
         default: throw std::runtime_error(std::string("unsupported tensor type ") + std::to_string((uint32_t) t));
     }
 }
@@ -56,7 +58,7 @@ size_t gtype_block_bytes(GType t) {
 size_t gtype_block_elems(GType t) {
     switch (t) {
         case GType::F32: case GType::F16: case GType::BF16: return 1;
-        case GType::Q8_0: case GType::Q4_0: case GType::Q4_1: case GType::Q5_0: case GType::Q5_1: case GType::IQ4_NL: return 32;
+        case GType::Q8_0: case GType::Q4_0: case GType::Q4_1: case GType::Q5_0: case GType::Q5_1: case GType::IQ4_NL: case GType::MXFP4: return 32;
         case GType::Q2_K: case GType::Q3_K: case GType::Q4_K: case GType::Q5_K: case GType::Q6_K: case GType::IQ3_S: case GType::IQ4_XS:
             return 256;
         default: throw std::runtime_error(std::string("unsupported tensor type ") + std::to_string((uint32_t) t));

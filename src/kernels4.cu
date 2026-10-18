@@ -546,9 +546,24 @@ __device__ const int8_t g_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
 // lookup tables in shared memory (divergent lookups): every kernel that dequantizes calls load_tables<T>() and syncs
 __shared__ uint32_t s_iq3s_grid[512];
 __shared__ float s_iq4nl[16];
+// MXFP4: E2M1 values doubled (ggml's kvalues_mxfp4), the E8M0 scale halved
+__device__ const int8_t g_mxfp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+__shared__ float s_mxfp4[16];
 template <GType T> __device__ __forceinline__ void load_tables() {
     if (T == GType::IQ3_S) for (int i = threadIdx.x; i < 512; i += blockDim.x) s_iq3s_grid[i] = g_iq3s_grid[i];
     if (T == GType::IQ4_XS) for (int i = threadIdx.x; i < 16; i += blockDim.x) s_iq4nl[i] = g_iq4nl[i];
+    if (T == GType::MXFP4) for (int i = threadIdx.x; i < 16; i += blockDim.x) s_mxfp4[i] = g_mxfp4[i];
+}
+// ggml_e8m0_to_fp32_half: 2^(e - 128) (e < 2: the denormals)
+__device__ __forceinline__ float e8m0_half(unsigned e) { return __uint_as_float(e < 2 ? 0x00200000u << e : (e - 1) << 23); }
+// MXFP4 (17 B: e, qs[16]): value j < 16 = kv[qs[j] & 15] * d, value 16 + j = kv[qs[j] >> 4] * d (byte loads: blocks are unaligned)
+template <> __device__ __forceinline__ void deq8<GType::MXFP4>(const uint8_t * __restrict__ row, int c, float * v) {
+    const uint8_t * b = row + (size_t) (c >> 2) * 17;
+    const float d = e8m0_half(b[0]);
+    const int o = (c & 3) * 8, sh = o & 16 ? 4 : 0;
+    const uint8_t * q = b + 1 + (o & 15);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = s_mxfp4[(q[i] >> sh) & 0xf] * d;
 }
 template <> __device__ __forceinline__ void deq8<GType::IQ4_XS>(const uint8_t * __restrict__ row, int c, float * v) {
     const uint8_t * b = row + (size_t) (c >> 5) * 136;
@@ -1585,6 +1600,7 @@ bool moe_route_publish(const float * logits, int ls, int n_expert, int k, int * 
         case GType::Q6_K: { constexpr GType TT = GType::Q6_K; CALL; } break;       \
         case GType::IQ4_XS: { constexpr GType TT = GType::IQ4_XS; CALL; } break;   \
         case GType::IQ3_S: { constexpr GType TT = GType::IQ3_S; CALL; } break;     \
+        case GType::MXFP4: { constexpr GType TT = GType::MXFP4; CALL; } break;     \
         default: throw std::runtime_error(std::string("moe: unsupported expert type ") + gtype_name(T)); \
     }
 
