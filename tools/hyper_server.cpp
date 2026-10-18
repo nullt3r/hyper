@@ -1218,6 +1218,8 @@ int main(int argc, char ** argv) {
     }
 
     httplib::Server srv;
+    // (an agent's request carries every screenshot of its session as base64: 85 images were over httplib's 100 MB default)
+    srv.set_payload_max_length((size_t) 1 << 30);
     srv.set_read_timeout(3600);
     srv.set_write_timeout(3600);
     auto cors = [](httplib::Response & res) { res.set_header("Access-Control-Allow-Origin", "*"); };
