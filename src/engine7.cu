@@ -980,6 +980,109 @@ int Engine7::sample_row(int t, const SamplingParams & sp, int64_t pos) {
     return sample_candidates(cand, TOPK, sp, samp_seed_, pos, stats, [&](std::vector<float> & lg) { get_logits(t, lg); });
 }
 
+
+// tokens of prompt the state h (ring rows from position p0 on) serves: the common prefix, as far back as the ring rows reach
+// (the window before the resume position), at a whole compressor group (an odd position re-feeds the token before it)
+int Engine7::reuse_len(const std::vector<int> & h, int64_t p0, const std::vector<int> & prompt) const {
+    const int cur = (int) h.size(), P = (int) prompt.size();
+    int L = 0;
+    while (L < cur && L < P - 1 && h[L] == prompt[L]) ++L;
+    if (std::max<int64_t>(0, L - cfg_.win) < p0) return 0;   // (the window before the resume position: gone)
+    return L & ~1;
+}
+
+void Engine7::park() {
+    const Ds4Config & c = cfg_;
+    const int64_t pos = (int64_t) hist_.size();
+    if (pos == 0) return;
+    for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->stream)); }
+    static const int keep = getenv("HYPER7_PARK_ROWS") ? atoi(getenv("HYPER7_PARK_ROWS")) : 4096;
+    Parked pk;
+    pk.hist = hist_;
+    pk.p0 = std::max<int64_t>(0, pos - std::min(keep, ring_));
+    pk.ring.resize(c.n_layer); pk.ckv.resize(c.n_layer); pk.ik.resize(c.n_layer); pk.cstate.resize(c.n_layer);
+    const int HD = c.head_dim;
+    for (auto & dp : devs_) {
+        Device & d = *dp;
+        CUDA_CHECK(cudaSetDevice(d.id));
+        for (Layer & L : d.layers) {
+            auto & rg = pk.ring[L.il];
+            rg.resize((size_t) (pos - pk.p0) * HD);
+            for (int64_t q = pk.p0; q < pos;) {   // (at most two pieces: the ring wraps)
+                const int64_t r = q % ring_, n = std::min<int64_t>(pos - q, ring_ - r);
+                CUDA_CHECK(cudaMemcpy(rg.data() + (size_t) (q - pk.p0) * HD, L.ring + (size_t) r * HD, (size_t) n * HD * 2, cudaMemcpyDeviceToHost));
+                q += n;
+            }
+            pk.bytes += rg.size() * 2;
+            if (!L.kv_src) continue;
+            const size_t rows = (size_t) (pos / L.ratio);
+            pk.ckv[L.il].resize(rows * HD);
+            if (rows) CUDA_CHECK(cudaMemcpy(pk.ckv[L.il].data(), L.ckv, rows * HD * 2, cudaMemcpyDeviceToHost));
+            pk.bytes += rows * HD * 2;
+            if (L.ik) {
+                pk.ik[L.il].resize(rows * c.ix_hd);
+                if (rows) CUDA_CHECK(cudaMemcpy(pk.ik[L.il].data(), L.ik, rows * c.ix_hd * 2, cudaMemcpyDeviceToHost));
+                pk.bytes += rows * c.ix_hd * 2;
+            }
+            if (L.c_kv) {
+                auto & cs = pk.cstate[L.il];
+                cs.resize((size_t) 2 * L.ratio * HD);
+                CUDA_CHECK(cudaMemcpy(cs.data(), L.c_kv, (size_t) L.ratio * HD * 4, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(cs.data() + (size_t) L.ratio * HD, L.c_score, (size_t) L.ratio * HD * 4, cudaMemcpyDeviceToHost));
+            }
+        }
+    }
+    pk.used = ++park_clock_;
+    // the same conversation parked before: replaced
+    for (size_t i = 0; i < parked_.size(); ++i)
+        if (parked_[i].hist.size() <= pk.hist.size() && std::equal(parked_[i].hist.begin(), parked_[i].hist.end(), pk.hist.begin())) {
+            parked_.erase(parked_.begin() + i);
+            break;
+        }
+    fprintf(stderr, "hyper7: parked a conversation of %lld tokens (%.0f MiB)\n", (long long) pos, pk.bytes / 1048576.0);
+    parked_.push_back(std::move(pk));
+    static const double cap_gib = getenv("HYPER7_PARK_GIB") ? atof(getenv("HYPER7_PARK_GIB")) : 12.0;
+    for (;;) {   // least recently used out, past the memory cap
+        size_t tot = 0;
+        for (auto & q : parked_) tot += q.bytes;
+        if (tot <= (size_t) (cap_gib * 1073741824.0) || parked_.size() <= 1) break;
+        size_t lru = 0;
+        for (size_t i = 1; i < parked_.size(); ++i) if (parked_[i].used < parked_[lru].used) lru = i;
+        parked_.erase(parked_.begin() + lru);
+    }
+}
+
+void Engine7::unpark(size_t i) {
+    const Ds4Config & c = cfg_;
+    Parked pk = std::move(parked_[i]);
+    parked_.erase(parked_.begin() + i);
+    const int64_t pos = (int64_t) pk.hist.size();
+    const int HD = c.head_dim;
+    for (auto & dp : devs_) {
+        Device & d = *dp;
+        CUDA_CHECK(cudaSetDevice(d.id));
+        CUDA_CHECK(cudaStreamSynchronize(d.stream));
+        for (Layer & L : d.layers) {
+            const auto & rg = pk.ring[L.il];
+            for (int64_t q = pk.p0; q < pos;) {
+                const int64_t r = q % ring_, n = std::min<int64_t>(pos - q, ring_ - r);
+                CUDA_CHECK(cudaMemcpy(L.ring + (size_t) r * HD, rg.data() + (size_t) (q - pk.p0) * HD, (size_t) n * HD * 2, cudaMemcpyHostToDevice));
+                q += n;
+            }
+            if (!L.kv_src) continue;
+            if (!pk.ckv[L.il].empty()) CUDA_CHECK(cudaMemcpy(L.ckv, pk.ckv[L.il].data(), pk.ckv[L.il].size() * 2, cudaMemcpyHostToDevice));
+            if (L.ik && !pk.ik[L.il].empty()) CUDA_CHECK(cudaMemcpy(L.ik, pk.ik[L.il].data(), pk.ik[L.il].size() * 2, cudaMemcpyHostToDevice));
+            if (L.c_kv) {
+                const auto & cs = pk.cstate[L.il];
+                CUDA_CHECK(cudaMemcpy(L.c_kv, cs.data(), (size_t) L.ratio * HD * 4, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(L.c_score, cs.data() + (size_t) L.ratio * HD, (size_t) L.ratio * HD * 4, cudaMemcpyHostToDevice));
+            }
+        }
+    }
+    hist_ = std::move(pk.hist);
+    fprintf(stderr, "hyper7: restored a parked conversation of %lld tokens\n", (long long) pos);
+}
+
 std::vector<int> Engine7::generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
                                    const std::function<bool(int)> & on_token, const SamplingParams & sp) {
     using clk = std::chrono::steady_clock;
@@ -993,10 +1096,20 @@ std::vector<int> Engine7::generate(const std::vector<int> & prompt, int n_gen, b
     int s = 0;
     if (opt_.prompt_cache) {
         const int cur = (int) hist_.size();
-        int L = 0;
-        while (L < cur && L < P - 1 && hist_[L] == prompt[L]) ++L;
-        if (cur - L <= ring_ - cfg_.win - R_ - 8) s = L;
-        if (s & 1) --s;
+        s = reuse_len(hist_, std::max<int64_t>(0, cur - (ring_ - R_)), prompt);
+        // a parked conversation that serves this prompt better comes back (the current one is parked); a different
+        // conversation parks the current one before overwriting it
+        int best = -1, bs = s;
+        for (size_t i = 0; i < parked_.size(); ++i) {
+            const int r = reuse_len(parked_[i].hist, parked_[i].p0, prompt);
+            if (r > bs) { bs = r; best = (int) i; }
+        }
+        static const int park_min = getenv("HYPER7_PARK_MIN") ? atoi(getenv("HYPER7_PARK_MIN")) : 1024;
+        if (best >= 0 && bs >= s + 256) {
+            if (cur >= park_min && s < cur / 2) park();
+            unpark((size_t) best);
+            s = bs;
+        } else if (cur >= park_min && s < cur / 2) park();
     }
     if (s == 0) hist_.clear();
     GenStats st;

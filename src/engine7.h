@@ -46,7 +46,7 @@ public:
     int max_pos() const override { return opt_.max_pos; }
     int n_draft() const override { return std::max(0, std::min(opt_.n_draft, MAX_NT - 1)); }
     bool has_mtp() const override { return false; }
-    void reset_cache() override { hist_.clear(); }
+    void reset_cache() override { hist_.clear(); parked_.clear(); }
     void save_expert_stats(const std::string & path);
 
 private:
@@ -81,6 +81,22 @@ private:
     float * h_out_ = nullptr;                    // pinned: argmax pairs of the logit rows
     // enqueue a chunk (logits for its last nlog rows when nlog > 0); returns its set
     int enqueue(const int * tokens, int nt, int pos, int nlog);
+    // parked conversations: another conversation's request would overwrite the state, so it is kept in host memory (its
+    // tokens, the last PARK_ROWS window-ring rows of every layer, the KV sources' compressed rows / index keys and open
+    // compressor groups) and restored when its conversation comes back
+    struct Parked {
+        std::vector<int> hist;
+        std::vector<std::vector<uint16_t>> ring, ckv, ik;   // [layer]
+        std::vector<std::vector<float>> cstate;             // [layer]: open group kv | score
+        int64_t p0 = 0;                                     // the first position with a ring row
+        size_t bytes = 0;
+        uint64_t used = 0;
+    };
+    std::vector<Parked> parked_;
+    uint64_t park_clock_ = 0;
+    void park();
+    void unpark(size_t i);
+    int reuse_len(const std::vector<int> & h, int64_t p0, const std::vector<int> & prompt) const;
     void wait_set(int set);
     std::vector<std::vector<uint64_t>> stats_;
     std::vector<std::pair<void *, size_t>> host_bufs_;
