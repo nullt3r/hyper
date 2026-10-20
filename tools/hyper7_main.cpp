@@ -45,10 +45,10 @@ int main(int argc, char ** argv) {
         if (cmd == "run") {   // generate(): pipelined prefill, greedy decode
             const int n_gen = argc > 4 ? atoi(argv[4]) : 16;
             GenStats st;
-            const std::vector<int> out = eng.generate(ids, n_gen, false, &st);
+            const std::vector<int> out = eng.generate(ids, n_gen, getenv("HYPER7_SPEC") != nullptr, &st);
             printf("prefill %zu tokens: %.2f s (%.1f t/s)\ngen:", ids.size(), st.t_prefill, ids.size() / st.t_prefill);
             for (int t : out) printf(" %d", t);
-            printf("\ndecode %d tokens: %.2f s (%.2f t/s)\n", st.tokens, st.seconds, st.tokens / st.seconds);
+            printf("\ndecode %d tokens: %.2f s (%.2f t/s), %d steps, %d/%d drafts accepted\n", st.tokens, st.seconds, st.tokens / st.seconds, st.steps, st.accepted, st.drafted);
             if (getenv("HYPER7_SAVE_STATS")) eng.save_expert_stats(getenv("HYPER7_SAVE_STATS"));
         } else if (cmd == "dump") {
             if (argc < 5) throw std::runtime_error("dump: output path missing");

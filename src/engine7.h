@@ -24,6 +24,7 @@ struct Engine7Options {
     bool prompt_cache = true;
     float vram_reserve_gib = 1.0f;
     float gpu_expert_frac = 1.0f;   // share of the free VRAM given to experts
+    int n_draft = 3;                // prompt-lookup drafts per step (0: off)
 };
 
 class Engine7 : public LLM {
@@ -43,7 +44,7 @@ public:
     void set_snapshot_token(int) override {}
     void set_prefill_progress(std::function<void(int, int, int)> fn) override { prefill_cb_ = std::move(fn); }
     int max_pos() const override { return opt_.max_pos; }
-    int n_draft() const override { return 0; }
+    int n_draft() const override { return std::max(0, std::min(opt_.n_draft, MAX_NT - 1)); }
     bool has_mtp() const override { return false; }
     void reset_cache() override { hist_.clear(); }
     void save_expert_stats(const std::string & path);
@@ -85,6 +86,8 @@ private:
     std::vector<std::pair<void *, size_t>> host_bufs_;
     unsigned fwd_counter_ = 0;
     int last_nlog_ = 0;
+    bool has_r2_ = false;            // a compressor of ratio > 1 (its open group: drafts rejected inside it re-feed its first token)
+    double acc_rate_ = 0.5;          // prompt lookup: running fraction of the drafts accepted
     std::vector<int> hist_;
     uint64_t samp_seed_ = 0;
     std::function<void(int, int, int)> prefill_cb_;

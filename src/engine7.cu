@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 namespace hyper {
 
@@ -289,6 +290,7 @@ Engine7::Engine7(const std::string & model_path, const Engine7Options & opt) : o
     cpu_ = std::make_unique<CpuMoe>(opt_.cpu_threads, n, c.ff, c.n_used, cpu_rec_, cpu_out_, c.n_layer, cpu_bulk_, cpu_bulk_out_);
     cpu_->set_clamp(c.clamp_exp);
     const auto t0 = std::chrono::steady_clock::now();
+    for (int il = 0; il < c.n_layer; ++il) has_r2_ |= c.ratio[il] > 1;
     // per-device buffers
     const std::vector<float> fw = c.freqs(false), fc = c.freqs(true);
     const int HQ = c.n_head * c.head_dim, K = c.n_used;
@@ -971,7 +973,7 @@ int Engine7::sample_row(int t, const SamplingParams & sp, int64_t pos) {
     return sample_candidates(cand, TOPK, sp, samp_seed_, pos, stats, [&](std::vector<float> & lg) { get_logits(t, lg); });
 }
 
-std::vector<int> Engine7::generate(const std::vector<int> & prompt, int n_gen, bool, GenStats * stats,
+std::vector<int> Engine7::generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
                                    const std::function<bool(int)> & on_token, const SamplingParams & sp) {
     using clk = std::chrono::steady_clock;
     if (prompt.empty()) throw std::runtime_error("generate: empty prompt");
@@ -1015,10 +1017,66 @@ std::vector<int> Engine7::generate(const std::vector<int> & prompt, int n_gen, b
         if ((int) out.size() >= n_gen) stop = true;
         return !stop;
     };
-    while (emit(next) && p + 1 < opt_.max_pos) {
-        next = forward(&next, 1, p++, 1)[0];
-        if (sampling) next = sample_row(0, sp, p);
-        st.steps++;
+    const int K = spec ? n_draft() : 0;
+    if (K <= 0) {
+        while (emit(next) && p + 1 < opt_.max_pos) {
+            next = forward(&next, 1, p++, 1)[0];
+            if (sampling) next = sample_row(0, sp, p);
+            st.steps++;
+        }
+    } else {
+        // prompt-lookup speculation: drafts = the tokens that followed the latest earlier occurrence of the last NG tokens
+        // (history = prompt + output); a draft is kept iff the token sampled (or argmax) at its row equals it: exact.
+        // Rejected rows leave nothing behind (their window-ring rows, compressed rows and selections are rewritten when the
+        // positions come again) except a ratio-2 compressor's open group: when the next position is its second slot and a
+        // rejected row overwrote the first, the step re-feeds the group's first token
+        constexpr int NG = 3;
+        std::vector<int> hist(prompt.begin(), prompt.end());
+        std::unordered_map<uint64_t, int> last;   // n-gram -> position after its latest occurrence
+        auto key = [&](size_t end) { uint64_t h = 1469598103934665603ull; for (size_t i = end - NG; i < end; ++i) h = (h ^ (uint32_t) hist[i]) * 1099511628211ull; return h; };
+        size_t indexed = NG;
+        auto index_upto = [&](size_t n) { for (; indexed <= n; ++indexed) last[key(indexed)] = (int) indexed; };
+        int cur = next;
+        bool refeed = false;
+        std::vector<int> in(MAX_NT);
+        while (!stop && p + K + 1 < opt_.max_pos) {
+            if (!emit(cur)) break;
+            hist.push_back(cur);
+            const int kmax = K - (refeed ? 1 : 0);
+            std::vector<int> dr;
+            if (hist.size() > NG && kmax > 0) {
+                auto it = last.find(key(hist.size()));
+                index_upto(hist.size() - 1);
+                if (it != last.end()) {
+                    const int e0 = it->second, e1 = (int) hist.size();
+                    int ml = 0;
+                    while (ml < 32 && e0 - 1 - ml >= 0 && hist[e0 - 1 - ml] == hist[e1 - 1 - ml]) ++ml;
+                    const int need = acc_rate_ < 0.35 ? 8 : 5;
+                    const int kk = ml >= need + 6 ? kmax : ml >= need + 2 ? std::min(kmax, 2) : ml >= need ? 1 : 0;
+                    for (int j = e0; j < e1 && (int) dr.size() < kk; ++j) dr.push_back(hist[j]);
+                }
+            }
+            const int nd = (int) dr.size(), off = refeed ? 1 : 0, start = p - off;
+            int n_in = 0;
+            if (refeed) in[n_in++] = hist[hist.size() - 2];
+            in[n_in++] = cur;
+            for (int j = 0; j < nd; ++j) in[n_in++] = dr[j];
+            std::vector<int> a = forward(in.data(), n_in, start, n_in);
+            st.steps++;
+            st.drafted += nd;
+            int m = 0;
+            auto pick = [&](int j) { return sampling ? sample_row(off + j, sp, p + j + 1) : a[off + j]; };
+            int nxt = pick(0);
+            while (m < nd && nxt == dr[m]) { ++m; nxt = pick(m); }
+            st.accepted += m;
+            if (nd > 0) acc_rate_ = 0.9 * acc_rate_ + 0.1 * ((double) m / nd);
+            int r = 0;
+            while (r < m) { hist.push_back(dr[r]); if (!emit(dr[r++])) break; }
+            if (stop) { p += r + 1; break; }
+            p += m + 1;
+            refeed = has_r2_ && (p & 1) && m + 2 <= nd;
+            cur = nxt;
+        }
     }
     st.tokens = (int) out.size();
     st.seconds = std::chrono::duration<double>(clk::now() - t0).count();

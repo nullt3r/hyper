@@ -725,6 +725,83 @@ __global__ void k_moe_gate_up(MoeDev m, const float * __restrict__ x, int xs, co
     }
 }
 
+
+// ---- decode MoE gate/up for the IQ2 / IQ3 grid types: a lane takes whole 32-value groups (one header / scale decode per
+// group instead of one per 8 values); a warp per row of gate and of up ----
+__device__ __forceinline__ uint32_t ld32u(const uint8_t * p) {   // (2-byte aligned)
+    const uint16_t * q = (const uint16_t *) p;
+    return (uint32_t) q[0] | ((uint32_t) q[1] << 16);
+}
+__device__ __forceinline__ float sdot8(uint64_t g, uint8_t sg, const float * x) {   // grid row (8 bytes) with signs . x[0..8)
+    float a = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { const float v = (float) ((g >> (8 * j)) & 0xff) * x[j]; a += (sg >> j) & 1 ? -v : v; }
+    return a;
+}
+template <GType T> __device__ __forceinline__ float dot32(const uint8_t * __restrict__ row, int grp, const float * x);
+template <> __device__ __forceinline__ float dot32<GType::IQ2_XXS>(const uint8_t * __restrict__ row, int grp, const float * x) {
+    const uint8_t * b = row + (size_t) (grp >> 3) * 66;
+    const int ib = grp & 7;
+    const uint32_t a0 = ld32u(b + 2 + ib * 8), a1 = ld32u(b + 2 + ib * 8 + 4);
+    const float db = h2f(b) * (0.5f + (float) (a1 >> 28)) * 0.25f;
+    float acc = 0.0f;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) acc += sdot8(s_iq2xxs_grid[(a0 >> (8 * l)) & 0xff], s_ksigns[(a1 >> (7 * l)) & 127], x + 8 * l);
+    return db * acc;
+}
+template <> __device__ __forceinline__ float dot32<GType::IQ2_S>(const uint8_t * __restrict__ row, int grp, const float * x) {
+    const uint8_t * b = row + (size_t) (grp >> 3) * 82;
+    const int ib = grp & 7;
+    const float d = h2f(b);
+    const int sc = b[74 + ib], qh = b[66 + ib];
+    const uint32_t qs = ld32u(b + 2 + 4 * ib), sg = ld32u(b + 34 + 4 * ib);
+    float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const float v = sdot8(g_iq2s_grid[((qs >> (8 * l)) & 0xff) | ((qh << (8 - 2 * l)) & 0x300)], (uint8_t) (sg >> (8 * l)), x + 8 * l);
+        if (l < 2) a0 += v; else a1 += v;
+    }
+    return d * 0.25f * ((0.5f + (float) (sc & 0xf)) * a0 + (0.5f + (float) (sc >> 4)) * a1);
+}
+template <> __device__ __forceinline__ float dot32<GType::IQ3_XXS>(const uint8_t * __restrict__ row, int grp, const float * x) {
+    const uint8_t * b = row + (size_t) (grp >> 3) * 98;
+    const int ib = grp & 7;
+    const uint32_t a = ld32u(b + 66 + 4 * ib);
+    const float db = h2f(b) * (0.5f + (float) (a >> 28)) * 0.5f;
+    const uint8_t * q = b + 2 + 8 * ib;
+    float acc = 0.0f;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint8_t sg = s_ksigns[(a >> (7 * l)) & 127];
+        const uint32_t g1 = s_iq3xxs_grid[q[2 * l]], g2 = s_iq3xxs_grid[q[2 * l + 1]];
+        acc += sdot8((uint64_t) g1 | ((uint64_t) g2 << 32), sg, x + 8 * l);
+    }
+    return db * acc;
+}
+template <GType T>
+__global__ void __launch_bounds__(256) k_moe_gu_g32(MoeDev m, const float * __restrict__ x, int xs, const int * __restrict__ ids, int k,
+                                                    float * __restrict__ h, int kdim) {
+    const int p = blockIdx.x, t = p / k;
+    const int slot = m.slot[ids[p]];
+    if (slot < 0) return;
+    extern __shared__ float xsm[];
+    load_tables<T>();
+    for (int i = threadIdx.x; i < kdim; i += blockDim.x) xsm[i] = x[(size_t) t * xs + i];
+    __syncthreads();
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, r = blockIdx.y * 8 + w;
+    if (r >= m.ff) return;
+    const size_t rb = m.gate_bytes / m.ff;
+    const uint8_t * gr = m.gate + slot * m.gate_bytes + r * rb, * ur = m.up + slot * m.gate_bytes + r * rb;
+    float ag = 0.0f, au = 0.0f;
+    for (int g = lane; g < kdim / 32; g += 32) {
+        ag += dot32<T>(gr, g, xsm + g * 32);
+        au += dot32<T>(ur, g, xsm + g * 32);
+    }
+    ag = warp_sum4(ag);
+    au = warp_sum4(au);
+    if (lane == 0) h[(size_t) p * m.ff + r] = swiglu4(ag, au, m.clamp);
+}
+
 template <GType T>
 __global__ void k_moe_down(MoeDev m, const float * __restrict__ h, const int * __restrict__ ids, const float * __restrict__ wts, int k,
                            float * __restrict__ y, const int * __restrict__ order, const int * __restrict__ order_n) {
@@ -1664,6 +1741,14 @@ void moe_gate_up(const MoeDev & m, const float * x, int xs, const int * ids, int
         if (rw == 1) k_moe_gu_q4k<1><<<dim3(nt * k, (m.ff + 7) / 8), 256, 0, s>>>(m, x, xs, ids, k, h, kdim, order, order_n);
         else if (rw == 4) k_moe_gu_q4k<4><<<dim3(nt * k, (m.ff + 31) / 32), 256, 0, s>>>(m, x, xs, ids, k, h, kdim, order, order_n);
         else k_moe_gu_q4k<2><<<dim3(nt * k, (m.ff + 15) / 16), 256, 0, s>>>(m, x, xs, ids, k, h, kdim, order, order_n);
+        return;
+    }
+    static const bool g32 = getenv("HYPER_MOE_G32") ? atoi(getenv("HYPER_MOE_G32")) != 0 : true;
+    if (g32 && !order && kdim % 256 == 0 && (m.tg == GType::IQ2_XXS || m.tg == GType::IQ2_S || m.tg == GType::IQ3_XXS)) {
+        const dim3 gr(nt * k, (m.ff + 7) / 8);
+        if (m.tg == GType::IQ2_XXS) k_moe_gu_g32<GType::IQ2_XXS><<<gr, 256, kdim * sizeof(float), s>>>(m, x, xs, ids, k, h, kdim);
+        else if (m.tg == GType::IQ2_S) k_moe_gu_g32<GType::IQ2_S><<<gr, 256, kdim * sizeof(float), s>>>(m, x, xs, ids, k, h, kdim);
+        else k_moe_gu_g32<GType::IQ3_XXS><<<gr, 256, kdim * sizeof(float), s>>>(m, x, xs, ids, k, h, kdim);
         return;
     }
     // (IQ2 / IQ3 experts: 4 rows a warp -- the block's x copy and grid tables shared by 4x the rows; HYPER_MOE_IQ_ROWS=8: one)

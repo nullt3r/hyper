@@ -1166,12 +1166,13 @@ int main(int argc, char ** argv) {
         o7.gpu_expert_frac = gpu_frac;
         o7.cpu_threads = cpu_threads;
         o7.prompt_cache = true;
+        o7.n_draft = draft;   // prompt-lookup speculation
         auto e7 = std::make_unique<Engine7>(path, o7);
         if (!stats_path.empty()) {
             Engine7 * pe = e7.get();
             c.after_request = [pe, stats_path] { pe->save_expert_stats(stats_path); };
         }
-        draft = 0;
+        draft = e7->n_draft();
         engine = std::move(e7);
     } else if (arch == "mimo2") {
         if (!ctx_given) ctx = 65536;
