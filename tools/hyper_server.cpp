@@ -14,6 +14,7 @@
 #include "engine4.h"
 #include "engine5.h"
 #include "engine6.h"
+#include "engine7.h"
 #include "chat_page.h"
 
 #include "chat.h"
@@ -1033,6 +1034,7 @@ int main(int argc, char ** argv) {
     std::string mtp_path;     // qwen4exp: separate NextN (MTP) GGUF; glm5-next: a GGUF with blk.<n_layer> (the original split files)
     std::string template_file;   // chat template (jinja) instead of the GGUF's
     std::string mmproj_path;     // vision encoder (mmproj GGUF): images in prompts
+    std::string vocab_path;      // vocabulary / chat template from another GGUF (a model libllama does not know: deepseek41)
     std::vector<std::pair<std::string, std::string>> mcps;   // --mcp name=url: tool servers for the chat page
     bool ctx_given = false, temp_given = false, top_p_given = false, top_k_given = false;
     SamplingParams defaults;   // Qwen's recommendation for thinking mode
@@ -1055,6 +1057,7 @@ int main(int argc, char ** argv) {
         else if (k == "--reasoning-effort") g_reasoning_effort = v;
         else if (k == "--chat-template-file") template_file = v;
         else if (k == "--mmproj") mmproj_path = v;
+        else if (k == "--vocab") vocab_path = v;
         else { fprintf(stderr, "unknown option %s\n", k.c_str()); return 1; }
     }
     const std::string path = argv[1];
@@ -1067,7 +1070,7 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     auto mp = llama_model_default_params();
     mp.vocab_only = true;
-    c.vm = llama_model_load_from_file(path.c_str(), mp);
+    c.vm = llama_model_load_from_file((vocab_path.empty() ? path : vocab_path).c_str(), mp);
     if (!c.vm) { fprintf(stderr, "cannot load vocabulary\n"); return 1; }
     c.vocab = llama_model_get_vocab(c.vm);
     std::string tmpl_override;
@@ -1152,6 +1155,24 @@ int main(int argc, char ** argv) {
         }
         draft = e5->n_draft();
         engine = std::move(e5);
+    } else if (arch == "deepseek41") {
+        if (!ctx_given) ctx = 65536;
+        // DeepSeek's recommended sampling: temperature 1.0, top_p 1.0
+        if (!temp_given) c.defaults.temp = 1.0f;
+        if (!top_p_given) c.defaults.top_p = 1.0f;
+        if (!top_k_given) c.defaults.top_k = 0;
+        Engine7Options o7;
+        o7.max_pos = ctx;
+        o7.gpu_expert_frac = gpu_frac;
+        o7.cpu_threads = cpu_threads;
+        o7.prompt_cache = true;
+        auto e7 = std::make_unique<Engine7>(path, o7);
+        if (!stats_path.empty()) {
+            Engine7 * pe = e7.get();
+            c.after_request = [pe, stats_path] { pe->save_expert_stats(stats_path); };
+        }
+        draft = 0;
+        engine = std::move(e7);
     } else if (arch == "mimo2") {
         if (!ctx_given) ctx = 65536;
         // MiMo's recommended sampling: temperature 1.0, top_p 0.95

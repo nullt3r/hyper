@@ -463,7 +463,7 @@ Engine4::Engine4(const std::string & model_path, const Engine4Options & opt) : o
         fprintf(stderr, "hyper4: MTP head from %s\n", opt_.mtp_path.c_str());
     }
     fprintf(stderr, "hyper4: %s\n", cfg_.describe().c_str());
-    if (cfg_.n_embd > 4096 || cfg_.n_expert_used > MOE_MAX_USED) throw std::runtime_error("hyper4: model dimensions unsupported");
+    if (cfg_.n_embd > CPU_ROW || cfg_.n_expert_used > MOE_MAX_USED) throw std::runtime_error("hyper4: model dimensions unsupported");
     int ndev = 0;
     CUDA_CHECK(cudaGetDeviceCount(&ndev));
     opt_.n_devices = std::min(opt_.n_devices, ndev);

@@ -107,7 +107,7 @@ void q8k_test_quantize(const float * x, void * y, int64_t k) { quantize_q8_K_avx
 CpuMoe::CpuMoe(int n_threads, int n_embd, int ff, int k, CpuMoeRec * recs, CpuMoeOut * outs, int n_slots,
                CpuMoeBulk * bulk, CpuMoeBulkOut * bulk_out)
     : n_threads_(n_threads), n_embd_(n_embd), ff_(ff), k_(k), recs_(recs), outs_(outs), layers_(n_slots), bulk_(bulk), bulk_out_(bulk_out) {
-    if (n_embd > 4096 || k > MOE_MAX_USED) throw std::runtime_error("CpuMoe: dimensions too large");
+    if (n_embd > CPU_ROW || k > MOE_MAX_USED) throw std::runtime_error("CpuMoe: dimensions too large");
     counts.assign(n_slots, std::vector<uint64_t>(1024, 0));
     split_.assign(n_slots, ff);
     ggml_cpu_init();
@@ -368,7 +368,7 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
         std::vector<int> qt;
         for (int t = 0; t < nt; ++t) if (tok[t]) qt.push_back(t);
         const auto tj0 = std::chrono::steady_clock::now();   // (HYPER_CPUPROF: phase times of the decode job)
-        for (int t : qt) from_g(x + (size_t) t * 4096, qx_.data() + t * qx_row, n);
+        for (int t : qt) from_g(x + (size_t) t * CPU_ROW, qx_.data() + t * qx_row, n);
         // rows per gate/up and down task (cpumoebench, 30 threads: 16 / 32 -> 32 / 128 gives Flash-Next 3 experts x 4 rows 63 -> 68 GB/s,
         // GLM 5 x 1 68.6 -> 70.1 GB/s; longer contiguous reads per task, bit-identical output)
         static const int RG = getenv("HYPER_CPU_RG") ? atoi(getenv("HYPER_CPU_RG")) : 32, RD = getenv("HYPER_CPU_RD") ? atoi(getenv("HYPER_CPU_RD")) : 128;
@@ -379,21 +379,22 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
         auto & order = task_order_;
         order.clear();
         // task codes: bit 30 down, bit 29 down part of the last group (part in bits 26..28), group in bits 20..25,
-        // r0 / 4 in bits 10..19, r1 / 4 - 1 in bits 0..9 (4096 rows fit)
+        // r0 / 8 in bits 10..19, r1 / 8 - 1 in bits 0..9 (8192 rows fit; every task boundary is a multiple of 8)
         auto code = [](int g, int r0, int r1, bool dn, int part) {
-            return (dn ? 0x40000000 : 0) | (part >= 0 ? 0x20000000 | (part << 26) : 0) | (g << 20) | ((r0 >> 2) << 10) | (((r1 + 3) >> 2) - 1);
+            if (r0 & 7) throw std::runtime_error("CpuMoe: task rows not a multiple of 8");
+            return (dn ? 0x40000000 : 0) | (part >= 0 ? 0x20000000 | (part << 26) : 0) | (g << 20) | ((r0 >> 3) << 10) | (((r1 + 7) >> 3) - 1);
         };
         // balanced: a multiple of the team size of near-equal tasks (dynamic claiming then ends a phase with every thread
         // finishing at about the same time; 128 tasks for 30 threads left 4.3 rounds)
         static const bool bal = getenv("HYPER_CPU_BAL") != nullptr;   // (measured: equal or slightly slower; off)
         auto add = [&](std::vector<int> & v, int g, int a, int b, int R, bool dn, int part) {
-            if (bal && tail_mult == 0 && part < 0 && (b - a) % 4 == 0) {
-                const int units = (b - a) / 4, nth = n_threads_;
-                int nt_ = std::max(1, (int) std::lround((double) units * 4 / R / nth)) * nth;
+            if (bal && tail_mult == 0 && part < 0 && (b - a) % 8 == 0) {
+                const int units = (b - a) / 8, nth = n_threads_;
+                int nt_ = std::max(1, (int) std::lround((double) units * 8 / R / nth)) * nth;
                 nt_ = std::min(nt_, units);
                 for (int i = 0, u0 = 0; i < nt_; ++i) {
                     const int u1 = (int) ((long) units * (i + 1) / nt_);
-                    v.push_back(code(g, a + 4 * u0, a + 4 * u1, dn, part));
+                    v.push_back(code(g, a + 8 * u0, a + 8 * u1, dn, part));
                     u0 = u1;
                 }
                 return nt_;
@@ -401,7 +402,7 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
             const int tail = std::min(b - a, tail_mult * n_threads_ * R);
             int r = a, cnt = 0;
             for (; r + R <= b - tail; r += R) { v.push_back(code(g, r, r + R, dn, part)); ++cnt; }
-            for (; r < b; r += std::max(4, R / 4)) { v.push_back(code(g, r, std::min(b, r + std::max(4, R / 4)), dn, part)); ++cnt; }
+            for (; r < b; r += std::max(8, R / 4)) { v.push_back(code(g, r, std::min(b, r + std::max(8, R / 4)), dn, part)); ++cnt; }
             return cnt;
         };
         // the last group's down projection overlaps its own gate/up: gate/up in S parts of whole 256-row blocks; a finished
@@ -471,7 +472,7 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
         }
         auto chunk_sum = [&](int r0, int r1) {
             for (int t : qt) {
-                float * o = yout + (size_t) t * 4096;
+                float * o = yout + (size_t) t * CPU_ROW;
                 bool first = true;
                 for (int p = 0; p < P; ++p) {
                     if (pairs[p].t != t) continue;
@@ -489,7 +490,7 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
             const int c = order[i], g = (c >> 20) & 0x3f, part = c & 0x20000000 ? (c >> 26) & 7 : -1;
             const int p0 = grp[g], p1 = grp[g + 1];
             if (!(c & 0x40000000)) {
-                const int r0 = ((c >> 10) & 0x3ff) << 2, r1 = std::min(fa, ((c & 0x3ff) + 1) << 2);
+                const int r0 = ((c >> 10) & 0x3ff) << 3, r1 = std::min(fa, ((c & 0x3ff) + 1) << 3);
                 const uint8_t * gb = L.gate + L.index(pairs[p0].e) * L.gate_bytes, * ub = L.up + L.index(pairs[p0].e) * L.gate_bytes;
                 for (int r = r0; r < r1; ++r)
                     for (int p = p0; p < p1; ++p) {
@@ -514,7 +515,7 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
                     if (prof_ && g == G - 1) t_last_gu.store(std::chrono::steady_clock::now().time_since_epoch().count());
                 }
             } else if (part >= 0) {
-                const int r0 = ((c >> 10) & 0x3ff) << 2, r1 = std::min(n, ((c & 0x3ff) + 1) << 2), rt = r0 / RD;
+                const int r0 = ((c >> 10) & 0x3ff) << 3, r1 = std::min(n, ((c & 0x3ff) + 1) << 3), rt = r0 / RD;
                 while (!part_ready_[part].load(std::memory_order_acquire)) __builtin_ia32_pause();
                 while (dprog_[rt].load(std::memory_order_acquire) != part) __builtin_ia32_pause();
                 const uint8_t * db = L.down + L.index(pairs[p0].e) * L.down_bytes;
@@ -529,7 +530,7 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
                 dprog_[rt].store(part + 1, std::memory_order_release);
             } else {
                 while (!ready_[g].load(std::memory_order_acquire)) __builtin_ia32_pause();
-                const int r0 = ((c >> 10) & 0x3ff) << 2, r1 = std::min(n, ((c & 0x3ff) + 1) << 2);
+                const int r0 = ((c >> 10) & 0x3ff) << 3, r1 = std::min(n, ((c & 0x3ff) + 1) << 3);
                 const uint8_t * db = L.down + L.index(pairs[p0].e) * L.down_bytes;
                 for (int r = r0; r < r1; ++r)
                     for (int p = p0; p < p1; ++p) td->vec_dot(fa, &y_[(size_t) p * n + r], 0, db + r * d_row, 0, qh_.data() + p * qh_row, 0, 1);
@@ -551,7 +552,7 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
     auto tp = std::chrono::steady_clock::now();
     auto lap = [&](int ph) { if (!prof_) return; auto t = std::chrono::steady_clock::now(); prof_ph_[ph] += std::chrono::duration_cast<std::chrono::nanoseconds>(t - tp).count(); tp = t; };
     lap(0);
-    parallel((int) qt.size(), [&](int i) { const int t = qt[i]; from_g(x + (size_t) t * 4096, qx_.data() + t * qx_row, n); });
+    parallel((int) qt.size(), [&](int i) { const int t = qt[i]; from_g(x + (size_t) t * CPU_ROW, qx_.data() + t * qx_row, n); });
     lap(1);
     constexpr int RC = 16;
     const int gu_chunks = (fa + RC - 1) / RC;
@@ -586,7 +587,7 @@ void CpuMoe::run_layer(int slot, int nt, const int * ids, const float * wts, con
     for (int p = 0; p < P; ++p) by_tok[pairs[p].t].push_back(p);
     parallel((int) qt.size(), [&](int i) {
         const int t = qt[i];
-        float * o = yout + (size_t) t * 4096;
+        float * o = yout + (size_t) t * CPU_ROW;
         bool first = true;
         for (int p : by_tok[t]) {
             const float w = pairs[p].w, * y = y_.data() + (size_t) p * n;

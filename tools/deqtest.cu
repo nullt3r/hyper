@@ -13,7 +13,8 @@
 
 int main() {
     using hyper::GType;
-    const GType types[] = {GType::Q5_0, GType::Q5_1, GType::Q8_0, GType::Q4_K, GType::Q5_K, GType::Q6_K, GType::IQ4_XS, GType::Q3_K, GType::MXFP4};
+    const GType types[] = {GType::Q5_0, GType::Q5_1, GType::Q8_0, GType::Q4_K, GType::Q5_K, GType::Q6_K, GType::IQ4_XS, GType::Q3_K, GType::MXFP4,
+                           GType::IQ3_S, GType::IQ2_XXS, GType::IQ2_S, GType::IQ3_XXS};
     const int n = 2560;
     std::mt19937 rng(1);
     int bad = 0;
@@ -36,6 +37,7 @@ int main() {
         cudaMalloc(&drow, row.size()); cudaMalloc(&dout, n * sizeof(float));
         cudaMemcpy(drow, row.data(), row.size(), cudaMemcpyHostToDevice);
         hyper::deq_row_test(t, drow, n, dout);
+        if (cudaError_t e = cudaDeviceSynchronize()) { printf("CUDA error %s\n", cudaGetErrorString(e)); return 1; }
         cudaMemcpy(got.data(), dout, n * sizeof(float), cudaMemcpyDeviceToHost);
         cudaFree(drow); cudaFree(dout);
         double mx = 0, ma = 0;

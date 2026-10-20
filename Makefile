@@ -11,7 +11,8 @@ BUILD := build
 # v1 (qwen35 dense) objects; qwen4exp objects additionally need ggml (CPU experts)
 OBJ   := $(BUILD)/gguf.o $(BUILD)/model.o $(BUILD)/kernels.o $(BUILD)/engine.o
 OBJ4  := $(BUILD)/gguf.o $(BUILD)/model4.o $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/cpu_moe.o $(BUILD)/engine4.o \
-         $(BUILD)/model5.o $(BUILD)/kernels5.o $(BUILD)/engine5.o $(BUILD)/model6.o $(BUILD)/kernels6.o $(BUILD)/engine6.o
+         $(BUILD)/model5.o $(BUILD)/kernels5.o $(BUILD)/engine5.o $(BUILD)/model6.o $(BUILD)/kernels6.o $(BUILD)/engine6.o \
+         $(BUILD)/model7.o $(BUILD)/kernels7.o $(BUILD)/engine7.o
 GGML_INC := -I$(LLAMA)/ggml/include -I$(LLAMA)/ggml/src
 
 all: $(BUILD)/hyper $(BUILD)/ref $(BUILD)/arbench
@@ -23,6 +24,11 @@ $(BUILD)/%.o: src/%.cpp src/*.h
 $(BUILD)/%.o: src/%.cu src/*.h src/*.cuh
 	@mkdir -p $(BUILD)
 	$(NVCC) $(NVFLAGS) $(GGML_INC) -c $< -o $@
+
+# deepseek41 kernels: no fast math (rotary angles up to ~262k radians, the reference's F32 softmaxes and roundings)
+$(BUILD)/kernels7.o: src/kernels7.cu src/kernels7.cuh
+	@mkdir -p $(BUILD)
+	$(NVCC) $(filter-out --use_fast_math,$(NVFLAGS)) $(GGML_INC) -c $< -o $@
 
 $(BUILD)/hyper: $(OBJ) tools/hyper_main.cpp
 	$(NVCC) $(NVFLAGS) -Isrc tools/hyper_main.cpp $(OBJ) -o $@ $(LIBS)
@@ -122,6 +128,10 @@ $(BUILD)/hyper-server: $(OBJ_ALL) tools/hyper_server.cpp tools/chat_page.h
 	$(NVCC) $(NVFLAGS) -Isrc -I$(LLAMA)/include -I$(LLAMA)/ggml/include -I$(LLAMA)/common -I$(LLAMA)/vendor -I$(LLAMA)/tools/mtmd \
 	  tools/hyper_server.cpp $(OBJ_ALL) -o $@ \
 	  -Xlinker --start-group $(COMMON_LIBS) $(LLAMA_LIBS) -Xlinker --end-group $(LIBS) -lssl -lcrypto
+
+$(BUILD)/hyper7: $(OBJ4) tools/hyper7_main.cpp
+	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/hyper7_main.cpp $(OBJ4) -o $@ \
+	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)
 
 $(BUILD)/hyper4: $(OBJ4) tools/hyper4_main.cpp
 	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) -Xlinker --export-dynamic tools/hyper4_main.cpp $(OBJ4) -o $@ \

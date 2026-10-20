@@ -99,17 +99,19 @@ void moe_zc(const MoeZC & z, const float * x, int xs, const int * ids, const flo
             cudaStream_t s);
 void moe_zc_init();   // per device: shared memory limits
 
+// row stride of the CPU hand-off records' activations (>= every model's n_embd: DeepSeek-V4.1's 5120)
+constexpr int CPU_ROW = 5120;
 // CPU hand-off record in mapped host memory (one per layer)
 struct CpuMoeRec {
     volatile unsigned seq;
     int nt;
     int ids[MAX_NT][MOE_MAX_USED];
     float wts[MAX_NT][MOE_MAX_USED];
-    float x[MAX_NT][4096];
+    float x[MAX_NT][CPU_ROW];
 };
 struct CpuMoeOut {
     volatile unsigned seq;
-    float y[MAX_NT][4096];
+    float y[MAX_NT][CPU_ROW];
 };
 // prefill: one record reused by every layer (the CPU consumes them in order)
 struct CpuMoeBulk {
@@ -117,13 +119,13 @@ struct CpuMoeBulk {
     int nt;
     int ids[MOE_BULK_ROWS][MOE_MAX_USED];
     float wts[MOE_BULK_ROWS][MOE_MAX_USED];
-    float x[MOE_BULK_ROWS][4096];
+    float x[MOE_BULK_ROWS][CPU_ROW];
 };
 struct CpuMoeBulkOut {
     volatile unsigned seq;
-    float y[MOE_BULK_ROWS][4096];
+    float y[MOE_BULK_ROWS][CPU_ROW];
 };
-// write x, ids, wts (row strides 4096 / MOE_MAX_USED) and then the sequence tag (counter * 64 + tag)
+// write x, ids, wts (row strides CPU_ROW / MOE_MAX_USED) and then the sequence tag (counter * 64 + tag)
 void moe_publish(volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_dst, float * x_dst, const float * x, int xs, int n,
                  const int * ids, const float * wts, int k, int nt, const int * counter, unsigned seq_tag, cudaStream_t s);
 
