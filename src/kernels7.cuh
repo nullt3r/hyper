@@ -79,6 +79,18 @@ void swiglu7(const float * gu, int gus, float * h, int hs, int ff, float lim, in
 void init_pre7(float * pre, int nt, cudaStream_t s);
 // full-vocabulary sampling: *out = argmax_i (logits[i] / temp + G(seed, pos, i)) (sampling.h's gumbel_noise)
 void gumbel_argmax7(const float * logits, int n, float temp, uint64_t seed, long long pos, int * out, cudaStream_t s);
+// ---- DSpark drafter ----
+// out[t][e] (row stride ostride) = mean over the hc streams of h[t][s][e]
+void hc_mean7(const float * h, int dim, int hc, float * out, int ostride, int nt, cudaStream_t s);
+// the draft block's attention: queries at p0 .. p0 + T - 1 see the ring rows of max(0, p0 - win) .. p0 - 1 and all T block rows
+void draft_attn7(const float * q, const uint16_t * ring, int ring_rows, int win, const uint16_t * blk, int T, long long p0, const float * sink,
+                 int heads, int d, float scale, float * out, cudaStream_t s);
+// out[v] = logits[v] + mh[v] . emb[prev] (prev: the index of argmax pair *prev_pair, or y without it)
+void markov7(const float * logits, const uint16_t * mh, const uint16_t * emb, int vocab, int rank, const float * prev_pair, int y, float * out,
+             cudaStream_t s);
+// conf[i] = sigmoid([xh[i] | emb[prev_i]] . w): prev_0 = y, prev_i = pairs[i - 1]'s index
+void dconf7(const float * xh, int dim, const uint16_t * emb, int rank, const float * w, const float * pairs, int y, float * conf, int T,
+            cudaStream_t s);
 // x[i] = v (n values)
 void fill7(float * x, float v, int n, cudaStream_t s);
 

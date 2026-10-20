@@ -24,7 +24,9 @@ struct Engine7Options {
     bool prompt_cache = true;
     float vram_reserve_gib = 1.0f;
     float gpu_expert_frac = 1.0f;   // share of the free VRAM given to experts
-    int n_draft = 3;                // prompt-lookup drafts per step (0: off)
+    int n_draft = 3;                // drafts per step (DSpark when loaded, else prompt lookup; 0: off)
+    std::string dspark;             // DSpark drafter (dspark.bin + dspark.idx: tensor, type, offset, bytes, shape per line)
+    float dspark_conf = 0.5f;       // a draft is verified while its confidence is at least this
 };
 
 class Engine7 : public LLM {
@@ -52,6 +54,7 @@ public:
 private:
     struct Layer;
     struct Device;
+    struct DBlock;   // a DSpark drafter block (block b on device b)
     void load_layer(Device & d, Layer & L);
     void place_experts();
     void run_layer(Device & d, Layer & L, int nt, int64_t p0);
@@ -102,7 +105,19 @@ private:
     std::vector<std::pair<void *, size_t>> host_bufs_;
     unsigned fwd_counter_ = 0;
     int last_nlog_ = 0;
-    bool has_r2_ = false;            // a compressor of ratio > 1 (its open group: drafts rejected inside it re-feed its first token)
+    bool has_r2_ = false;
+    // DSpark
+    std::vector<std::unique_ptr<DBlock>> dblk_;
+    void * dsp_map_ = nullptr;
+    size_t dsp_size_ = 0;
+    int dsp_T_ = 5, dsp_noise_ = 0, dsp_rank_ = 256, dsp_tap0_ = 0;
+    float * h_dsp_ = nullptr;        // pinned: the draft block's rows between devices, main_x rows for the seeds
+    float * h_dout_ = nullptr;       // pinned: drafts (argmax pairs) and confidences
+    void load_dspark(const std::string & path);
+    void dspark_seed(int nt, int64_t pos);   // after a forward's layers: the drafter's ring rows of these positions
+    int dspark_draft(int y, int64_t p0, std::vector<int> & drafts, std::vector<float> & conf);
+    double dsp_acc_ = 2.0;           // running accepted drafts per round
+    float dsp_conf_ = 0.5f;            // a compressor of ratio > 1 (its open group: drafts rejected inside it re-feed its first token)
     double acc_rate_ = 0.5;          // prompt lookup: running fraction of the drafts accepted
     std::vector<int> hist_;
     uint64_t samp_seed_ = 0;

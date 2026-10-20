@@ -701,6 +701,116 @@ __global__ void __launch_bounds__(1024) k_gumbel_argmax7(const float * __restric
     }
 }
 
+
+// ---- DSpark drafter ----
+// taps[t][off + e] = mean_s h[t][s][e] (the streams' mean entering a target layer)
+__global__ void k_hc_mean7(const float * __restrict__ h, int dim, int hc, float * __restrict__ out, int ostride) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (e >= dim) return;
+    float a = 0.0f;
+    for (int s = 0; s < hc; ++s) a += h[((size_t) t * hc + s) * dim + e];
+    out[(size_t) t * ostride + e] = a / (float) hc;
+}
+// the draft block's attention: every query (positions p0 .. p0 + T - 1) sees the ring rows of positions
+// max(0, p0 - win) .. p0 - 1 and all T rows of the block (bf16 blk [T][d]); a block per (head, query)
+__global__ void __launch_bounds__(kThreads) k_draft_attn7(const float * __restrict__ q, const uint16_t * __restrict__ ring, int ring_rows,
+                                                         int win, const uint16_t * __restrict__ blk, int T, long long p0,
+                                                         const float * __restrict__ sink, int heads, int d, float scale,
+                                                         float * __restrict__ out) {
+    const int h = blockIdx.x, t = blockIdx.y;
+    const long long first = max(0LL, p0 - win);
+    const int n_win = (int) (p0 - first);
+    __shared__ float qs[512];
+    __shared__ float sc[kAttTile];
+    __shared__ const uint16_t * rows[kAttTile];
+    __shared__ float m_run_s, tile_scale_s, den_s;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) qs[i] = q[((size_t) t * heads + h) * d + i];
+    if (threadIdx.x == 0) { m_run_s = -1e30f; den_s = 0.0f; }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    float o0 = 0.0f, o1 = 0.0f;
+    const int total = n_win + T;
+    for (int t0 = 0; t0 < total; t0 += kAttTile) {
+        const int nt = min(kAttTile, total - t0);
+        if (threadIdx.x < nt) {
+            const int j = t0 + threadIdx.x;
+            rows[threadIdx.x] = j < n_win ? ring + (size_t) ((first + j) % ring_rows) * d : blk + (size_t) (j - n_win) * d;
+        }
+        __syncthreads();
+        for (int jj = wp; jj < nt; jj += kThreads / 32) {
+            const uint16_t * rr = rows[jj];
+            const uint4 a = *(const uint4 *) (rr + lane * 16);
+            const uint4 b = *(const uint4 *) (rr + lane * 16 + 8);
+            const uint16_t * pa = (const uint16_t *) &a;
+            const uint16_t * pb = (const uint16_t *) &b;
+            float s = 0.0f;
+#pragma unroll
+            for (int x = 0; x < 8; ++x) s += qs[lane * 16 + x] * bf16f(pa[x]);
+#pragma unroll
+            for (int x = 0; x < 8; ++x) s += qs[lane * 16 + 8 + x] * bf16f(pb[x]);
+            s = warp_sum(s);
+            if (lane == 0) sc[jj] = s * scale;
+        }
+        __syncthreads();
+        if (wp == 0) {
+            float m = -INFINITY;
+            for (int j = lane; j < nt; j += 32) m = fmaxf(m, sc[j]);
+            m = warp_max(m);
+            const float m_old = m_run_s, m_new = fmaxf(m_old, m);
+            float s = 0.0f;
+            for (int j = lane; j < nt; j += 32) { const float pr = expf(sc[j] - m_new); sc[j] = pr; s += pr; }
+            s = warp_sum(s);
+            __syncwarp();
+            if (lane == 0) { tile_scale_s = expf(m_old - m_new); den_s = den_s * tile_scale_s + s; m_run_s = m_new; }
+        }
+        __syncthreads();
+        const float cs = tile_scale_s;
+        o0 *= cs;
+        o1 *= cs;
+        const int c = threadIdx.x * 2;
+        for (int j = 0; j < nt; ++j) {
+            const uint32_t pr = *(const uint32_t *) (rows[j] + c);
+            o0 += sc[j] * bf16f((uint16_t) (pr & 0xffffu));
+            o1 += sc[j] * bf16f((uint16_t) (pr >> 16));
+        }
+        __syncthreads();
+    }
+    const float den = den_s + expf(sink[h] - m_run_s);
+    const int c = threadIdx.x * 2;
+    float * ov = out + ((size_t) t * heads + h) * d;
+    ov[c] = o0 / den;
+    ov[c + 1] = o1 / den;
+}
+// the markov head's bias for the token prev (*prev: an argmax pair's index bits, or y when prev_pair is null):
+// out[v] = logits[v] + mh[v] . embed[prev]  (mh, embed: bf16 [vocab][rank])
+__global__ void k_markov7(const float * __restrict__ logits, const uint16_t * __restrict__ mh, const uint16_t * __restrict__ emb, int vocab,
+                          int rank, const float * __restrict__ prev_pair, int y, float * __restrict__ out) {
+    __shared__ float e[256];
+    int prev = y;
+    if (prev_pair) { int pi; memcpy(&pi, prev_pair + 1, 4); prev = pi; }
+    for (int i = threadIdx.x; i < rank; i += blockDim.x) e[i] = bf16f(emb[(size_t) prev * rank + i]);
+    __syncthreads();
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int v = blockIdx.x * (blockDim.x >> 5) + w;
+    if (v >= vocab) return;
+    float a = 0.0f;
+    for (int k = lane; k < rank; k += 32) a += bf16f(mh[(size_t) v * rank + k]) * e[k];
+    a = warp_sum(a);
+    if (lane == 0) out[v] = logits[v] + a;
+}
+// confidences: conf[i] = sigmoid([xh[i] | embed[prev_i]] . w), prev_0 = y, prev_i = the draft before (pairs[i - 1])
+__global__ void k_dconf7(const float * __restrict__ xh, int dim, const uint16_t * __restrict__ emb, int rank, const float * __restrict__ w,
+                         const float * __restrict__ pairs, int y, float * __restrict__ conf) {
+    const int i = blockIdx.x;
+    int prev = y;
+    if (i > 0) { int pi; memcpy(&pi, pairs + 2 * (i - 1) + 1, 4); prev = pi; }
+    float a = 0.0f;
+    for (int k = threadIdx.x; k < dim; k += blockDim.x) a += xh[(size_t) i * dim + k] * w[k];
+    for (int k = threadIdx.x; k < rank; k += blockDim.x) a += bf16f(emb[(size_t) prev * rank + k]) * w[dim + k];
+    a = block_sum(a);
+    if (threadIdx.x == 0) conf[i] = 1.0f / (1.0f + expf(-a));
+}
+
 // ---- the router ----
 __global__ void __launch_bounds__(512) k_route7(const float * __restrict__ logits, int ls, const float * __restrict__ bias, int n, int k,
                                                 float route_scale, int * ids, float * w) {
@@ -880,6 +990,23 @@ void swiglu7(const float * gu, int gus, float * h, int hs, int ff, float lim, in
 void init_pre7(float * pre, int nt, cudaStream_t s) { k_init_pre7<<<(nt * 8 + 255) / 256, 256, 0, s>>>(pre, nt * 8); }
 void gumbel_argmax7(const float * logits, int n, float temp, uint64_t seed, long long pos, int * out, cudaStream_t s) {
     k_gumbel_argmax7<<<1, 1024, 0, s>>>(logits, n, 1.0 / (double) temp, seed, pos, out);
+}
+void hc_mean7(const float * h, int dim, int hc, float * out, int ostride, int nt, cudaStream_t s) {
+    k_hc_mean7<<<dim3((dim + 255) / 256, nt), 256, 0, s>>>(h, dim, hc, out, ostride);
+}
+void draft_attn7(const float * q, const uint16_t * ring, int ring_rows, int win, const uint16_t * blk, int T, long long p0, const float * sink,
+                 int heads, int d, float scale, float * out, cudaStream_t s) {
+    if (d != 512) throw std::runtime_error("draft_attn7: d must be 512");
+    k_draft_attn7<<<dim3(heads, T), kThreads, 0, s>>>(q, ring, ring_rows, win, blk, T, p0, sink, heads, d, scale, out);
+}
+void markov7(const float * logits, const uint16_t * mh, const uint16_t * emb, int vocab, int rank, const float * prev_pair, int y, float * out,
+             cudaStream_t s) {
+    if (rank > 256) throw std::runtime_error("markov7: rank");
+    k_markov7<<<(vocab + 7) / 8, 256, 0, s>>>(logits, mh, emb, vocab, rank, prev_pair, y, out);
+}
+void dconf7(const float * xh, int dim, const uint16_t * emb, int rank, const float * w, const float * pairs, int y, float * conf, int T,
+            cudaStream_t s) {
+    k_dconf7<<<T, 256, 0, s>>>(xh, dim, emb, rank, w, pairs, y, conf);
 }
 void fill7(float * x, float v, int n, cudaStream_t s) { k_fill7<<<(n + 255) / 256, 256, 0, s>>>(x, v, n); }
 void engram_gate7(float * h, const float * kv, const float * w, int hc, int dim, float eps, int nt, cudaStream_t s) {

@@ -6,6 +6,9 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <map>
 
 #include <algorithm>
 #include <chrono>
@@ -147,6 +150,23 @@ struct Engine7::Layer {
     int np() const { return part_i0.empty() ? 0 : (int) part_i0.size() - 1; }
 };
 
+struct Engine7::DBlock {
+    int b = 0, dev = 0;
+    DW win, wq_b, wo_b, sh_gu, sh_down, main_proj;
+    std::vector<DW> wo_a;
+    float * q_norm = nullptr, * kv_norm = nullptr, * attn_norm = nullptr, * ffn_norm = nullptr, * sink = nullptr;
+    float * hca_fn = nullptr, * hca_scale = nullptr, * hca_base = nullptr, * hcf_fn = nullptr, * hcf_scale = nullptr, * hcf_base = nullptr;
+    float * router = nullptr, * bias = nullptr;
+    MoeDev moex;
+    int * owner = nullptr;
+    int n_exp = 0, k_exp = 0;
+    uint16_t * ring = nullptr, * blk = nullptr;   // [ring][hd] seeds; the draft block's own rows [8][hd]
+    // the last block: the final norm, the markov head (bf16), the confidence head; main_proj / main_norm (the taps' device)
+    float * norm = nullptr, * conf_w = nullptr, * main_norm = nullptr;
+    uint16_t * mk_emb = nullptr, * mk_head = nullptr;
+    float * mrow = nullptr, * pairs = nullptr, * conf = nullptr;
+};
+
 struct Engine7::Device {
     int id = 0, g = 0;
     int l0 = 0, l1 = 0;   // layers [l0, l1)
@@ -159,6 +179,11 @@ struct Engine7::Device {
     size_t stage_bytes = 0;
     int * owner_all = nullptr;                          // [E] = this device (prefill: every expert computed here)
     float * h_in = nullptr;                             // pinned [R][hc * n + 8]: this device's input rows (no P2P: through the host)
+    // DSpark: the target taps (the device of layers 37..39), main_x rows, the seeds' own stream and fp16 scratch
+    float * taps = nullptr, * mainx = nullptr;
+    half * xh2 = nullptr;
+    cudaStream_t dstream = nullptr;
+    cudaEvent_t ev_seed = nullptr;
     std::vector<Layer> layers;
     std::vector<void *> allocs;
     size_t used = 0;
@@ -201,6 +226,8 @@ struct Engine7::Device {
         for (auto & ev : ev_up) if (ev) cudaEventDestroy(ev);
         for (auto & ev : ev_free) if (ev) cudaEventDestroy(ev);
         if (cstream) cudaStreamDestroy(cstream);
+        if (dstream) cudaStreamDestroy(dstream);
+        if (ev_seed) cudaEventDestroy(ev_seed);
         for (void * p : allocs) cudaFree(p);
         if (stream) cudaStreamDestroy(stream);
     }
@@ -250,6 +277,8 @@ Engine7::Engine7(const std::string & model_path, const Engine7Options & opt) : o
         CUDA_CHECK(cudaEventCreateWithFlags(&d->ev_taken, cudaEventDisableTiming));
         if (g > 0) CUDA_CHECK(cudaHostAlloc(&d->h_in, (size_t) R_ * (c.hc * c.n_embd + 8) * sizeof(float), cudaHostAllocPortable));
         CUDA_CHECK(cudaStreamCreateWithFlags(&d->cstream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&d->dstream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&d->ev_seed, cudaEventDisableTiming));
         for (auto & ev : d->ev_up) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         for (auto & ev : d->ev_free) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         if (cublasCreate(&d->blas) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasCreate failed");
@@ -358,12 +387,18 @@ Engine7::Engine7(const std::string & model_path, const Engine7Options & opt) : o
             d.out_norm = d.upload(to_f32(gguf_->need("output_norm.weight")).data(), n);
             const GTensor & to = gguf_->need("output.weight");
             d.output = upload_dense([&](size_t nb) { return (void *) d.alloc<uint8_t>(nb); }, d.id, {{&to, 0, to.rows()}});
-            d.logits = d.alloc<float>((size_t) MAX_NT * c.n_vocab);
+            d.logits = d.alloc<float>((size_t) 8 * c.n_vocab);   // (DSpark: a draft block's rows too)
             d.outp = d.alloc<float>((size_t) MAX_NT * TOPK * 2 + 64);
         }
         CUDA_CHECK(cudaStreamSynchronize(d.stream));
         fprintf(stderr, "hyper7: device %d: layers %d..%d, dense weights + caches + buffers %.2f GiB\n", d.id, d.l0, d.l1 - 1,
                 d.used / 1073741824.0);
+    }
+    {
+        std::string dp = opt_.dspark;
+        if (getenv("HYPER7_DSPARK")) dp = getenv("HYPER7_DSPARK");
+        dsp_conf_ = getenv("HYPER7_DSPARK_CONF") ? (float) atof(getenv("HYPER7_DSPARK_CONF")) : opt_.dspark_conf;
+        if (!dp.empty() && dp != "none") load_dspark(dp);
     }
     place_experts();
     CUDA_CHECK(cudaSetDevice(devs_.back()->id));
@@ -474,6 +509,292 @@ void Engine7::load_layer(Device & d, Layer & L) {
         L.eg_w = f32("engram_gate.weight");
     }
     L.owner = d.alloc<int>(c.n_expert);
+}
+
+
+// ---- DSpark drafter -------------------------------------------------------------------------------------------------
+// dspark.bin (Project Maya's drafter_pack.py from DeepSeek's checkpoint: the three mtp.* blocks; dense matrices Q8_0, routed
+// experts MXFP4 stacked per role, the rest BF16 / F32) with dspark.idx beside it (name, type, offset, bytes, shape [rows, cols]).
+// The drafter follows DeepSeek's inference/model.py (DSparkBlock, forward_spec) as Maya's tools/ds4/dspark_ref.py does: the
+// streams' mean entering target layers 37..39 -> main_proj -> main_norm -> every block's window ring (wkv, kv_norm, rope,
+// FP8); a round runs [y, noise x 4] at the positions after y's through the three blocks (window attention over the ring and
+// the whole block, 128-expert MoE with 3 picks), collapses the streams, and the trunk's head plus the markov bias of the token
+// before each position gives the drafts (greedy chain), a sigmoid confidence head their confidences.
+void Engine7::load_dspark(const std::string & path) {
+    const Ds4Config & c = cfg_;
+    std::string idx = path;
+    if (idx.size() > 4 && idx.compare(idx.size() - 4, 4, ".bin") == 0) idx = idx.substr(0, idx.size() - 4);
+    idx += ".idx";
+    FILE * fi = fopen(idx.c_str(), "r");
+    if (!fi) { fprintf(stderr, "hyper7: no DSpark index %s, drafter off\n", idx.c_str()); return; }
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) { fclose(fi); fprintf(stderr, "hyper7: cannot open %s, drafter off\n", path.c_str()); return; }
+    dsp_size_ = (size_t) lseek(fd, 0, SEEK_END);
+    dsp_map_ = mmap(nullptr, dsp_size_, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (dsp_map_ == MAP_FAILED) throw std::runtime_error("hyper7: mmap of the drafter failed");
+    std::map<std::string, GTensor> T;
+    char line[512];
+    while (fgets(line, sizeof line, fi)) {
+        char name[256], dt[32];
+        long long off, nb, r = 0, cc = 0;
+        const int n = sscanf(line, "%255s %31s %lld %lld %lld %lld", name, dt, &off, &nb, &r, &cc);
+        if (n < 5) continue;
+        GTensor t;
+        t.name = name;
+        const std::string ds = dt;
+        t.type = ds == "Q8_0" ? GType::Q8_0 : ds == "BF16" ? GType::BF16 : ds == "F32" ? GType::F32 : ds == "MXFP4" ? GType::MXFP4 : GType::I8;
+        if (t.type == GType::I8) throw std::runtime_error("hyper7: drafter tensor type " + ds);
+        t.ne = n >= 6 ? std::vector<int64_t>{cc, r} : std::vector<int64_t>{r};
+        t.data = (const uint8_t *) dsp_map_ + off;
+        t.nbytes = (size_t) nb;
+        T[name] = t;
+    }
+    fclose(fi);
+    auto need = [&](const std::string & k) -> const GTensor & {
+        auto it = T.find(k);
+        if (it == T.end()) throw std::runtime_error("hyper7: drafter tensor " + k + " missing");
+        return it->second;
+    };
+    dsp_noise_ = 128799;   // (DeepSeek's dspark_noise_token_id; the GGUF does not carry the drafter's config)
+    if (gguf_->has("deepseek41.dspark.noise_token_id")) dsp_noise_ = (int) gguf_->get_int("deepseek41.dspark.noise_token_id");
+    if (gguf_->has("deepseek41.dspark.block_size")) dsp_T_ = (int) gguf_->get_int("deepseek41.dspark.block_size");
+    std::vector<int64_t> tl = gguf_->has("deepseek41.dspark.target_layers") ? gguf_->get_int_arr("deepseek41.dspark.target_layers")
+                                                                             : std::vector<int64_t>{37, 38, 39};
+    dsp_tap0_ = (int) tl[0];
+    if (tl.size() != 3 || tl[1] != tl[0] + 1 || tl[2] != tl[0] + 2 || dev_of_[tl[0]] != dev_of_[tl[2]])
+        throw std::runtime_error("hyper7: DSpark taps must be three consecutive layers on one device");
+    if (dsp_T_ > 8) throw std::runtime_error("hyper7: DSpark block too long");
+    const int nb = 3, HD = c.head_dim, n = c.n_embd;
+    size_t tot = 0;
+    for (int b = 0; b < nb; ++b) {
+        auto B = std::make_unique<DBlock>();
+        B->b = b;
+        B->dev = std::min(b, (int) devs_.size() - 1);
+        Device & d = *devs_[B->dev];
+        const size_t used0 = d.used;
+        auto A = [&](size_t bytes) { return (void *) d.alloc<uint8_t>(bytes); };
+        const std::string P = "mtp." + std::to_string(b) + ".";
+        auto f32 = [&](const std::string & k) { const std::vector<float> v = to_f32(need(k)); return d.upload(v.data(), v.size()); };
+        {
+            const GTensor & qa = need(P + "attn.wq_a.weight"), & kv = need(P + "attn.wkv.weight");
+            B->win = upload_dense(A, d.id, {{&qa, 0, qa.rows()}, {&kv, 0, kv.rows()}});
+        }
+        { const GTensor & t = need(P + "attn.wq_b.weight"); B->wq_b = upload_dense(A, d.id, {{&t, 0, t.rows()}}); }
+        { const GTensor & t = need(P + "attn.wo_a.weight");
+          for (int g = 0; g < c.o_groups; ++g) B->wo_a.push_back(upload_dense(A, d.id, {{&t, (int64_t) g * c.o_lora, (int64_t) (g + 1) * c.o_lora}})); }
+        { const GTensor & t = need(P + "attn.wo_b.weight"); B->wo_b = upload_dense(A, d.id, {{&t, 0, t.rows()}}); }
+        { const GTensor & g1 = need(P + "ffn.shared_experts.w1.weight"), & g3 = need(P + "ffn.shared_experts.w3.weight"), & g2 = need(P + "ffn.shared_experts.w2.weight");
+          B->sh_gu = upload_dense(A, d.id, {{&g1, 0, g1.rows()}, {&g3, 0, g3.rows()}});
+          B->sh_down = upload_dense(A, d.id, {{&g2, 0, g2.rows()}}); }
+        B->q_norm = f32(P + "attn.q_norm.weight");
+        B->kv_norm = f32(P + "attn.kv_norm.weight");
+        B->sink = f32(P + "attn.attn_sink");
+        B->attn_norm = f32(P + "attn_norm.weight");
+        B->ffn_norm = f32(P + "ffn_norm.weight");
+        B->hca_fn = f32(P + "hc_attn_fn"); B->hca_scale = f32(P + "hc_attn_scale"); B->hca_base = f32(P + "hc_attn_base");
+        B->hcf_fn = f32(P + "hc_ffn_fn"); B->hcf_scale = f32(P + "hc_ffn_scale"); B->hcf_base = f32(P + "hc_ffn_base");
+        B->router = f32(P + "ffn.gate.weight");
+        B->bias = f32(P + "ffn.gate.bias");
+        B->n_exp = (int) need(P + "ffn.gate.weight").ne[1];
+        B->k_exp = 3;
+        {   // routed experts: every one in VRAM, gate / up / down stacked as the pack wrote them
+            const GTensor & e1 = need(P + "ffn.experts.0.w1.weight"), & e3 = need(P + "ffn.experts.0.w3.weight"), & e2 = need(P + "ffn.experts.0.w2.weight");
+            const size_t gb = e1.nbytes, db = e2.nbytes, E = (size_t) B->n_exp;
+            for (size_t e = 1; e < E; ++e)
+                if (need(P + "ffn.experts." + std::to_string(e) + ".w1.weight").data != e1.data + e * gb ||
+                    need(P + "ffn.experts." + std::to_string(e) + ".w3.weight").data != e3.data + e * gb ||
+                    need(P + "ffn.experts." + std::to_string(e) + ".w2.weight").data != e2.data + e * db)
+                    throw std::runtime_error("hyper7: drafter experts not stacked");
+            uint8_t * gg = d.alloc<uint8_t>(E * gb), * gu = d.alloc<uint8_t>(E * gb), * gd = d.alloc<uint8_t>(E * db);
+            CUDA_CHECK(cudaMemcpy(gg, e1.data, E * gb, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(gu, e3.data, E * gb, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(gd, e2.data, E * db, cudaMemcpyHostToDevice));
+            std::vector<int> slot(E), owner(E, d.g);
+            for (size_t e = 0; e < E; ++e) slot[e] = (int) e;
+            MoeDev & m = B->moex;
+            m.gate = gg; m.up = gu; m.down = gd;
+            m.tg = e1.type; m.td = e2.type;
+            m.gate_bytes = gb; m.down_bytes = db;
+            m.slot = d.upload(slot.data(), E);
+            m.ff = (int) e1.ne[1]; m.n = n;
+            m.clamp = c.clamp_exp;
+            B->owner = d.upload(owner.data(), E);
+        }
+        B->ring = d.alloc<uint16_t>((size_t) ring_ * HD);
+        B->blk = d.alloc<uint16_t>((size_t) 8 * HD);
+        if (b == nb - 1) {
+            B->norm = f32(P + "norm.weight");
+            B->conf_w = f32(P + "confidence_head.proj.weight");
+            const GTensor & me = need(P + "markov_head.embed.weight"), & mh = need(P + "markov_head.head.weight");
+            dsp_rank_ = (int) me.ne[0];
+            B->mk_emb = d.upload((const uint16_t *) me.data, me.nbytes / 2);
+            B->mk_head = d.upload((const uint16_t *) mh.data, mh.nbytes / 2);
+            B->mrow = d.alloc<float>(c.n_vocab);
+            B->pairs = d.alloc<float>(2 * 8);
+            B->conf = d.alloc<float>(8);
+        }
+        tot += d.used - used0;
+        dblk_.push_back(std::move(B));
+    }
+    {   // main_proj / main_norm, the taps and main_x on the taps' device; main_x on every drafter device; the seeds' scratch
+        Device & td = *devs_[dev_of_[dsp_tap0_]];
+        DBlock & B0 = *dblk_[0];
+        const GTensor & mp = need("mtp.0.main_proj.weight");
+        B0.main_proj = upload_dense([&](size_t bytes) { return (void *) td.alloc<uint8_t>(bytes); }, td.id, {{&mp, 0, mp.rows()}});
+        B0.main_norm = td.upload(to_f32(need("mtp.0.main_norm.weight")).data(), n);
+        td.taps = td.alloc<float>((size_t) R_ * 3 * n);
+        for (auto & dp : devs_) {
+            dp->mainx = dp->alloc<float>((size_t) R_ * n);
+            dp->xh2 = dp->alloc<half>((size_t) R_ * 3 * n);
+        }
+    }
+    CUDA_CHECK(cudaHostAlloc(&h_dsp_, (size_t) R_ * (c.hc * n + 8) * sizeof(float), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_dout_, 64 * sizeof(float), cudaHostAllocPortable));
+    munmap(dsp_map_, dsp_size_);   // (everything is in VRAM now)
+    dsp_map_ = nullptr;
+    fprintf(stderr, "hyper7: DSpark drafter from %s: 3 blocks (%d experts, top %d), block of %d, %.2f GiB in VRAM\n", path.c_str(),
+            dblk_[0]->n_exp, dblk_[0]->k_exp, dsp_T_, tot / 1073741824.0);
+}
+
+// the drafter's ring rows of positions pos .. pos + nt - 1 from this forward's taps (enqueued after the forward; the other
+// devices' blocks on their seed streams)
+void Engine7::dspark_seed(int nt, int64_t pos) {
+    const Ds4Config & c = cfg_;
+    const int n = c.n_embd, HD = c.head_dim;
+    Device & td = *devs_[dev_of_[dsp_tap0_]];
+    DBlock & B0 = *dblk_[0];
+    CUDA_CHECK(cudaSetDevice(td.id));
+    cudaStream_t s = td.stream;
+    // main_x = rmsnorm(main_proj taps) * main_norm
+    if (nt <= MAX_NT) gemv_q8(B0.main_proj.q8, td.taps, 3 * n, td.mainx, n, nullptr, nt, s);
+    else { to_half(td.taps, 3 * n, nullptr, 3 * n, 0.0f, td.xh2, nt, s); gemm_q8(B0.main_proj.q8, td.xh2, nt, td.mainx, n, nullptr, s); }
+    rmsnorm(td.mainx, n, B0.main_norm, td.mainx, n, n, nt, c.eps, s);
+    // the other devices take main_x through the host (their previous seeds' copies are done first)
+    bool remote = false;
+    for (auto & B : dblk_) remote |= devs_[B->dev].get() != &td;
+    if (remote) {
+        for (auto & B : dblk_) if (devs_[B->dev].get() != &td) CUDA_CHECK(cudaStreamWaitEvent(s, devs_[B->dev]->ev_seed, 0));
+        CUDA_CHECK(cudaMemcpyAsync(h_dsp_, td.mainx, (size_t) nt * n * sizeof(float), cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaEventRecord(td.ev_seed, s));
+    }
+    for (auto & Bp : dblk_) {
+        DBlock & B = *Bp;
+        Device & d = *devs_[B.dev];
+        CUDA_CHECK(cudaSetDevice(d.id));
+        cudaStream_t ss = &d == &td ? s : d.dstream;
+        if (&d != &td) {
+            CUDA_CHECK(cudaStreamWaitEvent(ss, td.ev_seed, 0));
+            CUDA_CHECK(cudaMemcpyAsync(d.mainx, h_dsp_, (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, ss));
+            CUDA_CHECK(cudaEventRecord(d.ev_seed, ss));
+        }
+        // kv = rmsnorm(main_x wkv) * kv_norm, rope, FP8 -> ring rows of the positions (wkv: rows q_lora .. of win)
+        float * kv = (float *) d.xh2;   // [nt][q_lora + HD] floats (xh2 holds R * 3n halves)
+        if (&d != &td) gemv_scratch_slot(1);
+        if (nt <= MAX_NT) gemv_q8(B.win.q8, d.mainx, n, kv, c.q_lora + HD, nullptr, nt, ss);
+        else {
+            half * xh = (half *) ((float *) d.xh2 + (size_t) R_ * (c.q_lora + HD));
+            to_half(d.mainx, n, nullptr, n, 0.0f, xh, nt, ss);
+            gemm_q8(B.win.q8, xh, nt, kv, c.q_lora + HD, nullptr, ss);
+        }
+        if (&d != &td) gemv_scratch_slot(0);
+        Fin7 f; f.w = B.kv_norm; f.eps = c.eps; f.rd = c.rd; f.freqs = d.freqs_win; f.pos = pos; f.quant = 1;
+        f.dst = B.ring; f.dst_stride = HD; f.ring = ring_;
+        fin7(kv + c.q_lora, nt, HD, c.q_lora + HD, f, ss);
+    }
+    CUDA_CHECK(cudaSetDevice(td.id));
+}
+
+
+// a draft round: y (the token at p0, not fed yet) and noise tokens at p0 .. p0 + T - 1 through the three blocks; drafts[i] is
+// the token at p0 + 1 + i, conf[i] its confidence
+int Engine7::dspark_draft(int y, int64_t p0, std::vector<int> & drafts, std::vector<float> & conf) {
+    const Ds4Config & c = cfg_;
+    const int n = c.n_embd, hcn = c.hc * n, HD = c.head_dim, HQ = c.n_head * HD, T = dsp_T_;
+    // the block's input rows (the token embedding as BF16, as the trunk's)
+    const GTensor & te = gguf_->need("token_embd.weight");
+    const auto * te_tr = ggml_get_type_traits((ggml_type) te.type);
+    for (int t = 0; t < T; ++t) {
+        float * out = h_dsp_ + (size_t) t * n;
+        te_tr->to_float(te.data + (size_t) (t == 0 ? y : dsp_noise_) * te.row_bytes(), out, n);
+        for (int e = 0; e < n; ++e) out[e] = bf_round(out[e]);
+    }
+    for (size_t bi = 0; bi < dblk_.size(); ++bi) {
+        DBlock & B = *dblk_[bi];
+        Device & d = *devs_[B.dev];
+        CUDA_CHECK(cudaSetDevice(d.id));
+        cudaStream_t s = d.stream;
+        if (bi == 0) {
+            CUDA_CHECK(cudaMemcpyAsync(d.x, h_dsp_, (size_t) T * n * sizeof(float), cudaMemcpyHostToDevice, s));
+            embed7(d.x, d.h, n, c.hc, T, s);
+            init_pre7(d.pre, T, s);
+        } else if (dblk_[bi - 1]->dev != B.dev) {
+            CUDA_CHECK(cudaMemcpyAsync(d.h, h_dsp_, (size_t) T * hcn * sizeof(float), cudaMemcpyHostToDevice, s));
+            CUDA_CHECK(cudaMemcpyAsync(d.pre, h_dsp_ + (size_t) T * hcn, (size_t) T * 8 * sizeof(float), cudaMemcpyHostToDevice, s));
+        }
+        auto mm = [&](const DW & W, const float * x, int xs, float * y_, int ys, const NormIn & ni = NormIn{}) {
+            gemv_q8(W.q8, x, xs, y_, ys, nullptr, T, s, ni);
+        };
+        const int wo = c.q_lora + HD;
+        // attention
+        hc7_mix(d.h, B.hca_fn, hcn, (2 + c.hc) * c.hc, c.eps, d.mix, T, s);
+        hc7_split(d.mix, B.hca_scale, B.hca_base, c.hc, c.sinkhorn, c.hc_eps, d.a_pre, d.a_post, d.a_comb, T, s);
+        hc7_pre_norm(d.h, d.pre, B.attn_norm, n, c.hc, c.eps, d.x, T, s);
+        mm(B.win, d.x, n, d.wout, wo);
+        {   Fin7 f; f.w = B.q_norm; f.eps = c.eps; fin7(d.wout, T, c.q_lora, wo, f, s); }
+        mm(B.wq_b, d.wout, wo, d.q, HQ);
+        {   Fin7 f; f.rd = c.rd; f.freqs = d.freqs_win; f.pos = p0; f.vpp = c.n_head; fin7(d.q, T * c.n_head, HD, HD, f, s); }
+        {   Fin7 f; f.w = B.kv_norm; f.eps = c.eps; f.rd = c.rd; f.freqs = d.freqs_win; f.pos = p0; f.quant = 1; f.dst = B.blk; f.dst_stride = HD;
+            fin7(d.wout + c.q_lora, T, HD, wo, f, s); }
+        draft_attn7(d.q, B.ring, ring_, c.win, B.blk, T, p0, B.sink, c.n_head, HD, 1.0f / std::sqrt((float) HD), d.o, s);
+        {   Fin7 f; f.rd = c.rd; f.freqs = d.freqs_win; f.pos = p0; f.vpp = c.n_head; f.inverse = true; f.quant = 1;
+            fin7(d.o, T * c.n_head, HD, HD, f, s); }
+        const int per = HQ / c.o_groups, ol = c.o_groups * c.o_lora;
+        for (int gi = 0; gi < c.o_groups; ++gi) gemv_q8(B.wo_a[gi].q8, d.o + (size_t) gi * per, HQ, d.oa + (size_t) gi * c.o_lora, ol, nullptr, T, s);
+        mm(B.wo_b, d.oa, ol, d.ao, n);
+        hc7_post(d.ao, d.h, d.a_post, d.a_comb, n, c.hc, d.h2, T, s);
+        std::swap(d.h, d.h2);
+        // MoE (every expert in VRAM)
+        hc7_mix(d.h, B.hcf_fn, hcn, (2 + c.hc) * c.hc, c.eps, d.mix, T, s);
+        hc7_split(d.mix, B.hcf_scale, B.hcf_base, c.hc, c.sinkhorn, c.hc_eps, d.f_pre, d.f_post, d.f_comb, T, s);
+        hc7_pre_norm(d.h, d.a_pre, B.ffn_norm, n, c.hc, c.eps, d.x, T, s);
+        gemv_f32(B.router, B.n_exp, n, d.x, n, d.rlog, B.n_exp, T, s);
+        route7(d.rlog, B.n_exp, B.bias, B.n_exp, B.k_exp, c.w_scale, d.ids, d.wts, T, s);
+        mm(B.sh_gu, d.x, n, d.shgu, 2 * c.ff);
+        {   NormIn glu; glu.act = 3; glu.glu_off = c.ff; glu.act_scale = c.clamp_sh; mm(B.sh_down, d.shgu, 2 * c.ff, d.shout, n, glu); }
+        moe_gate_up(B.moex, d.x, n, d.ids, B.k_exp, d.hexp, T, s);
+        moe_down(B.moex, d.hexp, d.ids, d.wts, B.k_exp, d.yexp, T, s);
+        moe_reduce(d.shout, d.ones, d.yexp, B.k_exp, d.ffo, n, T, d.ids, B.owner, d.g, CPU_OWNER, nullptr, nullptr, d.counter, 0, s);
+        hc7_post(d.ffo, d.h, d.f_post, d.f_comb, n, c.hc, d.h2, T, s);
+        std::swap(d.h, d.h2);
+        std::swap(d.pre, d.f_pre);
+        if (bi + 1 < dblk_.size() && dblk_[bi + 1]->dev != B.dev) {
+            CUDA_CHECK(cudaMemcpyAsync(h_dsp_, d.h, (size_t) T * hcn * sizeof(float), cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaMemcpyAsync(h_dsp_ + (size_t) T * hcn, d.pre, (size_t) T * 8 * sizeof(float), cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaStreamSynchronize(s));
+        }
+    }
+    // the drafts: collapse, the final norm, the trunk's head + the markov bias (greedy chain), the confidences
+    DBlock & B = *dblk_.back();
+    Device & d = *devs_[B.dev];
+    if (&d != devs_.back().get()) throw std::runtime_error("hyper7: the drafter's last block must sit with the head");
+    CUDA_CHECK(cudaSetDevice(d.id));
+    cudaStream_t s = d.stream;
+    hc7_pre_norm(d.h, d.pre, nullptr, n, c.hc, c.eps, d.ffo, T, s);   // xh (no norm)
+    hc7_pre_norm(d.h, d.pre, B.norm, n, c.hc, c.eps, d.x, T, s);      // rms(xh) * norm
+    gemv_q8(d.output.q8, d.x, n, d.logits, c.n_vocab, nullptr, T, s);
+    for (int i = 0; i < T; ++i) {
+        markov7(d.logits + (size_t) i * c.n_vocab, B.mk_head, B.mk_emb, c.n_vocab, dsp_rank_, i == 0 ? nullptr : B.pairs + 2 * (i - 1), y, B.mrow, s);
+        argmax_pairs(B.mrow, c.n_vocab, c.n_vocab, 0, B.pairs + 2 * i, 1, s);
+    }
+    dconf7(d.ffo, n, B.mk_emb, dsp_rank_, B.conf_w, B.pairs, y, B.conf, T, s);
+    CUDA_CHECK(cudaMemcpyAsync(h_dout_, B.pairs, (size_t) 2 * T * sizeof(float), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(h_dout_ + 16, B.conf, (size_t) T * sizeof(float), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    drafts.resize(T);
+    conf.resize(T);
+    for (int i = 0; i < T; ++i) { int id; memcpy(&id, &h_dout_[2 * i + 1], 4); drafts[i] = id; conf[i] = h_dout_[16 + i]; }
+    return T;
 }
 
 void Engine7::place_experts() {
@@ -589,7 +910,8 @@ Engine7::~Engine7() {
         cudaFreeHost(h_ids_[k]);
         if (ev_chunk_[k]) cudaEventDestroy(ev_chunk_[k]);
     }
-    for (void * p : {(void *) h_out_, (void *) cpu_rec_, (void *) cpu_out_, (void *) cpu_bulk_, (void *) cpu_bulk_out_})
+    if (dsp_map_) munmap(dsp_map_, dsp_size_);
+    for (void * p : {(void *) h_out_, (void *) h_dsp_, (void *) h_dout_, (void *) cpu_rec_, (void *) cpu_out_, (void *) cpu_bulk_, (void *) cpu_bulk_out_})
         if (p) cudaFreeHost(p);
 }
 
@@ -614,6 +936,8 @@ void Engine7::run_layer(Device & d, Layer & L, int nt, int64_t p0) {
     };
     const float * freqs = L.ratio ? d.freqs_comp : d.freqs_win;
     const int il = L.il;
+    if (!dblk_.empty() && il >= dsp_tap0_ && il < dsp_tap0_ + 3)   // DSpark taps: the streams' mean entering layers 37..39
+        hc_mean7(d.h, c.n_embd, c.hc, d.taps + (size_t) (il - dsp_tap0_) * c.n_embd, 3 * c.n_embd, nt, d.stream);
     // prefill: the CPU's experts go to the GPU in parts through the two staging buffers (the first two copies overlap the
     // attention; part j + 2's copy is issued once part j's experts are done)
     const bool stream_exp = bulk && stream_ && nt >= stream_min_ && L.np() > 0;
@@ -906,6 +1230,7 @@ int Engine7::enqueue(const int * tokens, int nt, int pos, int nlog) {
         CUDA_CHECK(cudaMemcpyAsync(h_out_, d.outp, (size_t) nlog * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
         last_nlog_ = nlog;
     }
+    if (!dblk_.empty()) dspark_seed(nt, pos);
     CUDA_CHECK(cudaEventRecord(ev_chunk_[set], d.stream));
     if (prof && bulk) {
         auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -936,7 +1261,11 @@ std::vector<int> Engine7::forward(const int * tokens, int nt, int pos, int nlog)
         std::this_thread::yield();
     }
     for (int k = 0; k < NSET; ++k) wait_set(k);
-    for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->stream)); }
+    for (auto & dp : devs_) {
+        CUDA_CHECK(cudaSetDevice(dp->id));
+        CUDA_CHECK(cudaStreamSynchronize(dp->stream));
+        CUDA_CHECK(cudaStreamSynchronize(dp->dstream));
+    }
     std::vector<int> out(nlog);
     for (int t = 0; t < nlog; ++t) { int idx; memcpy(&idx, &h_out_[2 * t + 1], 4); out[t] = idx; }
     return out;
@@ -1000,7 +1329,7 @@ void Engine7::park() {
     Parked pk;
     pk.hist = hist_;
     pk.p0 = std::max<int64_t>(0, pos - std::min(keep, ring_));
-    pk.ring.resize(c.n_layer); pk.ckv.resize(c.n_layer); pk.ik.resize(c.n_layer); pk.cstate.resize(c.n_layer);
+    pk.ring.resize(c.n_layer + dblk_.size()); pk.ckv.resize(c.n_layer); pk.ik.resize(c.n_layer); pk.cstate.resize(c.n_layer);
     const int HD = c.head_dim;
     for (auto & dp : devs_) {
         Device & d = *dp;
@@ -1031,6 +1360,19 @@ void Engine7::park() {
                 CUDA_CHECK(cudaMemcpy(cs.data() + (size_t) L.ratio * HD, L.c_score, (size_t) L.ratio * HD * 4, cudaMemcpyDeviceToHost));
             }
         }
+    }
+    for (size_t b = 0; b < dblk_.size(); ++b) {   // the drafter's rings
+        Device & d = *devs_[dblk_[b]->dev];
+        CUDA_CHECK(cudaSetDevice(d.id));
+        CUDA_CHECK(cudaStreamSynchronize(d.dstream));
+        auto & rg = pk.ring[c.n_layer + b];
+        rg.resize((size_t) (pos - pk.p0) * HD);
+        for (int64_t q = pk.p0; q < pos;) {
+            const int64_t r = q % ring_, n = std::min<int64_t>(pos - q, ring_ - r);
+            CUDA_CHECK(cudaMemcpy(rg.data() + (size_t) (q - pk.p0) * HD, dblk_[b]->ring + (size_t) r * HD, (size_t) n * HD * 2, cudaMemcpyDeviceToHost));
+            q += n;
+        }
+        pk.bytes += rg.size() * 2;
     }
     pk.used = ++park_clock_;
     // the same conversation parked before: replaced
@@ -1079,6 +1421,16 @@ void Engine7::unpark(size_t i) {
             }
         }
     }
+    for (size_t b = 0; b < dblk_.size(); ++b) {   // the drafter's rings
+        Device & d = *devs_[dblk_[b]->dev];
+        CUDA_CHECK(cudaSetDevice(d.id));
+        const auto & rg = pk.ring[c.n_layer + b];
+        for (int64_t q = pk.p0; q < pos && !rg.empty();) {
+            const int64_t r = q % ring_, n = std::min<int64_t>(pos - q, ring_ - r);
+            CUDA_CHECK(cudaMemcpy(dblk_[b]->ring + (size_t) r * HD, rg.data() + (size_t) (q - pk.p0) * HD, (size_t) n * HD * 2, cudaMemcpyHostToDevice));
+            q += n;
+        }
+    }
     hist_ = std::move(pk.hist);
     fprintf(stderr, "hyper7: restored a parked conversation of %lld tokens\n", (long long) pos);
 }
@@ -1124,6 +1476,7 @@ std::vector<int> Engine7::generate(const std::vector<int> & prompt, int n_gen, b
         if (prefill_cb_) prefill_cb_(c0, P, s);
     }
     if (sampling) next = sample_row(0, sp, P);
+    if (getenv("HYPER7_DSPARK_DEBUG")) fprintf(stderr, "hyper7: prefill done (%d tokens), next %d\n", P, next);
     st.t_prefill = std::chrono::duration<double>(clk::now() - tp).count();
     st.prompt_reused = s;
     std::vector<int> out;
@@ -1164,7 +1517,17 @@ std::vector<int> Engine7::generate(const std::vector<int> & prompt, int n_gen, b
             hist.push_back(cur);
             const int kmax = K - (refeed ? 1 : 0);
             std::vector<int> dr;
-            if (hist.size() > NG && kmax > 0) {
+            if (!dblk_.empty() && kmax > 0) {   // DSpark: the drafts while their confidence holds
+                std::vector<int> dd;
+                std::vector<float> cf;
+                auto ta = clk::now();
+                static const bool dbg = getenv("HYPER7_DSPARK_DEBUG") != nullptr;
+                if (dbg) fprintf(stderr, "hyper7: draft at %d (y %d)\n", p, cur);
+                dspark_draft(cur, p, dd, cf);
+                if (dbg) { fprintf(stderr, "hyper7: drafts"); for (size_t j = 0; j < dd.size(); ++j) fprintf(stderr, " %d (%.2f)", dd[j], cf[j]); fprintf(stderr, "\n"); }
+                st.t_mtp += std::chrono::duration<double>(clk::now() - ta).count();
+                for (int j = 0; j < (int) dd.size() && (int) dr.size() < kmax && cf[j] >= dsp_conf_; ++j) dr.push_back(dd[j]);
+            } else if (hist.size() > NG && kmax > 0) {
                 auto it = last.find(key(hist.size()));
                 index_upto(hist.size() - 1);
                 if (it != last.end()) {
