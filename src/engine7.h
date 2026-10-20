@@ -59,7 +59,7 @@ private:
     Engine7Options opt_;
     std::unique_ptr<GGUF> gguf_;
     Ds4Config cfg_;
-    int R_ = 1024;          // rows of a prefill chunk
+    int R_ = 2048;          // rows of a prefill chunk (the CPU experts stream through the GPUs once a chunk: 1024 -> 2048 prefill 242 -> 385 t/s)
     int ring_ = 16384;      // window ring rows per layer (the reach of a rollback: ring_ - win - chunk)
     std::vector<std::unique_ptr<Device>> devs_;
     std::vector<int> dev_of_;        // layer -> device
@@ -68,9 +68,19 @@ private:
     CpuMoeOut * cpu_out_ = nullptr;
     CpuMoeBulk * cpu_bulk_ = nullptr;
     CpuMoeBulkOut * cpu_bulk_out_ = nullptr;
-    float * h_embd_ = nullptr;       // pinned [R][n_embd]
-    std::vector<float *> h_eg_;      // pinned [R][cols * hd] per Engram layer
-    float * h_out_ = nullptr;        // pinned: argmax pairs / top-k candidates of the logit rows
+    // host rows of a chunk, NSET sets: prefill chunks run as a pipeline over the GPUs (the GPU of the first layers takes the
+    // next chunk while the later ones still work on this one); a set is reused once its chunk is done (ev_chunk_)
+    static constexpr int NSET = 3;
+    float * h_embd_[NSET] = {};                  // pinned [R][n_embd]
+    std::vector<float *> h_eg_[NSET];            // pinned [R][cols * hd] per Engram layer
+    int * h_ids_[NSET] = {};                     // pinned [n_layer][R][k]: streamed prefill routing (statistics)
+    int ids_nt_[NSET] = {};                      // (rows of a set's routing still to count)
+    cudaEvent_t ev_chunk_[NSET] = {};            // on the last device after a set's chunk
+    int cur_set_ = 0, next_set_ = 0;
+    float * h_out_ = nullptr;                    // pinned: argmax pairs of the logit rows
+    // enqueue a chunk (logits for its last nlog rows when nlog > 0); returns its set
+    int enqueue(const int * tokens, int nt, int pos, int nlog);
+    void wait_set(int set);
     std::vector<std::vector<uint64_t>> stats_;
     std::vector<std::pair<void *, size_t>> host_bufs_;
     unsigned fwd_counter_ = 0;

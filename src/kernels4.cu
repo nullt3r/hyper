@@ -683,7 +683,7 @@ template <GType T> __device__ __forceinline__ float dot_row(const uint8_t * __re
 
 constexpr int MOE_ROWS = 8;   // rows per block: MOE_ROWS / 8 per warp
 
-template <GType T>
+template <GType T, int MR = MOE_ROWS>
 __global__ void k_moe_gate_up(MoeDev m, const float * __restrict__ x, int xs, const int * __restrict__ ids, int k, float * __restrict__ h, int kdim,
                               const int * __restrict__ order, const int * __restrict__ order_n) {
     if (order && (int) blockIdx.x >= *order_n) return;
@@ -697,8 +697,8 @@ __global__ void k_moe_gate_up(MoeDev m, const float * __restrict__ x, int xs, co
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const size_t rb = m.gate_bytes / m.ff;
     // the warp's 4 rows of gate and up advance together: 8 independent load streams per lane
-    constexpr int RW = MOE_ROWS / 8;
-    const int r0 = blockIdx.y * MOE_ROWS + w * RW;
+    constexpr int RW = MR / 8;
+    const int r0 = blockIdx.y * MR + w * RW;
     const uint8_t * gr[RW], * ur[RW];
 #pragma unroll
     for (int rr = 0; rr < RW; ++rr) {
@@ -1664,6 +1664,12 @@ void moe_gate_up(const MoeDev & m, const float * x, int xs, const int * ids, int
         if (rw == 1) k_moe_gu_q4k<1><<<dim3(nt * k, (m.ff + 7) / 8), 256, 0, s>>>(m, x, xs, ids, k, h, kdim, order, order_n);
         else if (rw == 4) k_moe_gu_q4k<4><<<dim3(nt * k, (m.ff + 31) / 32), 256, 0, s>>>(m, x, xs, ids, k, h, kdim, order, order_n);
         else k_moe_gu_q4k<2><<<dim3(nt * k, (m.ff + 15) / 16), 256, 0, s>>>(m, x, xs, ids, k, h, kdim, order, order_n);
+        return;
+    }
+    // (IQ2 / IQ3 experts: 4 rows a warp -- the block's x copy and grid tables shared by 4x the rows; HYPER_MOE_IQ_ROWS=8: one)
+    static const int iq_rows = getenv("HYPER_MOE_IQ_ROWS") ? atoi(getenv("HYPER_MOE_IQ_ROWS")) : 8;   // (measured: 32 no faster)
+    if (iq_rows == 32 && (m.tg == GType::IQ2_XXS || m.tg == GType::IQ2_S || m.tg == GType::IQ3_XXS || m.tg == GType::IQ3_S) && m.ff % 32 == 0) {
+        MOE_TYPE_SWITCH(m.tg, (k_moe_gate_up<TT, 32><<<dim3(nt * k, m.ff / 32), 256, kdim * sizeof(float), s>>>(m, x, xs, ids, k, h, kdim, order, order_n)));
         return;
     }
     MOE_TYPE_SWITCH(m.tg, (k_moe_gate_up<TT><<<dim3(nt * k, (m.ff + MOE_ROWS - 1) / MOE_ROWS), 256, kdim * sizeof(float), s>>>(m, x, xs, ids, k, h, kdim, order, order_n)));

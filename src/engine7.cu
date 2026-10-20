@@ -151,12 +151,13 @@ struct Engine7::Device {
     int l0 = 0, l1 = 0;   // layers [l0, l1)
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
-    cudaEvent_t ev_done = nullptr;
+    cudaEvent_t ev_done = nullptr, ev_taken = nullptr;   // this chunk's rows done / the previous device's rows copied in
     cudaStream_t cstream = nullptr;                     // prefill: expert uploads
     cudaEvent_t ev_up[2] = {}, ev_free[2] = {};
     uint8_t * stage[2] = {};
     size_t stage_bytes = 0;
     int * owner_all = nullptr;                          // [E] = this device (prefill: every expert computed here)
+    float * h_in = nullptr;                             // pinned [R][hc * n + 8]: this device's input rows (no P2P: through the host)
     std::vector<Layer> layers;
     std::vector<void *> allocs;
     size_t used = 0;
@@ -194,6 +195,8 @@ struct Engine7::Device {
         cudaSetDevice(id);
         if (blas) cublasDestroy(blas);
         if (ev_done) cudaEventDestroy(ev_done);
+        if (ev_taken) cudaEventDestroy(ev_taken);
+        if (h_in) cudaFreeHost(h_in);
         for (auto & ev : ev_up) if (ev) cudaEventDestroy(ev);
         for (auto & ev : ev_free) if (ev) cudaEventDestroy(ev);
         if (cstream) cudaStreamDestroy(cstream);
@@ -243,6 +246,8 @@ Engine7::Engine7(const std::string & model_path, const Engine7Options & opt) : o
         CUDA_CHECK(cudaSetDevice(g));
         CUDA_CHECK(cudaStreamCreateWithFlags(&d->stream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&d->ev_done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&d->ev_taken, cudaEventDisableTiming));
+        if (g > 0) CUDA_CHECK(cudaHostAlloc(&d->h_in, (size_t) R_ * (c.hc * c.n_embd + 8) * sizeof(float), cudaHostAllocPortable));
         CUDA_CHECK(cudaStreamCreateWithFlags(&d->cstream, cudaStreamNonBlocking));
         for (auto & ev : d->ev_up) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         for (auto & ev : d->ev_free) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
@@ -252,11 +257,14 @@ Engine7::Engine7(const std::string & model_path, const Engine7Options & opt) : o
         gemv_init(g);
         devs_.push_back(std::move(d));
     }
-    CUDA_CHECK(cudaHostAlloc(&h_embd_, (size_t) R_ * n * sizeof(float), cudaHostAllocPortable));
-    for (size_t i = 0; i < c.eg_layers.size(); ++i) {
-        float * p = nullptr;
-        CUDA_CHECK(cudaHostAlloc(&p, (size_t) R_ * c.eg_cols() * c.eg_hd * sizeof(float), cudaHostAllocPortable));
-        h_eg_.push_back(p);
+    for (int k = 0; k < NSET; ++k) {
+        CUDA_CHECK(cudaHostAlloc(&h_embd_[k], (size_t) R_ * n * sizeof(float), cudaHostAllocPortable));
+        for (size_t i = 0; i < c.eg_layers.size(); ++i) {
+            float * p = nullptr;
+            CUDA_CHECK(cudaHostAlloc(&p, (size_t) R_ * c.eg_cols() * c.eg_hd * sizeof(float), cudaHostAllocPortable));
+            h_eg_[k].push_back(p);
+        }
+        CUDA_CHECK(cudaHostAlloc(&h_ids_[k], (size_t) c.n_layer * R_ * c.n_used * sizeof(int), cudaHostAllocPortable));
     }
     CUDA_CHECK(cudaHostAlloc(&h_out_, (size_t) MAX_NT * TOPK * 2 * sizeof(float) + 64, cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&cpu_rec_, (size_t) c.n_layer * sizeof(CpuMoeRec), cudaHostAllocPortable | cudaHostAllocMapped));
@@ -356,6 +364,8 @@ Engine7::Engine7(const std::string & model_path, const Engine7Options & opt) : o
                 d.used / 1073741824.0);
     }
     place_experts();
+    CUDA_CHECK(cudaSetDevice(devs_.back()->id));
+    for (auto & ev : ev_chunk_) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
     fprintf(stderr, "hyper7: loaded in %.1f s (chunk %d, ring %d, max_pos %d)\n",
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), R_, ring_, opt_.max_pos);
 }
@@ -571,8 +581,13 @@ Engine7::~Engine7() {
     cpu_.reset();
     for (auto & [p, sz] : host_bufs_) { cudaHostUnregister(p); munmap(p, sz); }
     devs_.clear();
-    for (float * p : h_eg_) cudaFreeHost(p);
-    for (void * p : {(void *) h_embd_, (void *) h_out_, (void *) cpu_rec_, (void *) cpu_out_, (void *) cpu_bulk_, (void *) cpu_bulk_out_})
+    for (int k = 0; k < NSET; ++k) {
+        for (float * p : h_eg_[k]) cudaFreeHost(p);
+        cudaFreeHost(h_embd_[k]);
+        cudaFreeHost(h_ids_[k]);
+        if (ev_chunk_[k]) cudaEventDestroy(ev_chunk_[k]);
+    }
+    for (void * p : {(void *) h_out_, (void *) cpu_rec_, (void *) cpu_out_, (void *) cpu_bulk_, (void *) cpu_bulk_out_})
         if (p) cudaFreeHost(p);
 }
 
@@ -613,7 +628,7 @@ void Engine7::run_layer(Device & d, Layer & L, int nt, int64_t p0) {
     // ---- Engram ----
     if (L.eg >= 0) {
         const int ecols = c.eg_cols() * c.eg_hd;
-        CUDA_CHECK(cudaMemcpyAsync(d.eg_x, h_eg_[L.eg], (size_t) nt * ecols * sizeof(float), cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(d.eg_x, h_eg_[cur_set_][L.eg], (size_t) nt * ecols * sizeof(float), cudaMemcpyHostToDevice, s));
         mm(L.eg_kv, d.eg_x, ecols, d.eg_kvo, (c.hc + 1) * n, nt);
         engram_gate7(d.h, d.eg_kvo, L.eg_w, c.hc, n, eps, nt, s);
     }
@@ -728,7 +743,8 @@ void Engine7::run_layer(Device & d, Layer & L, int nt, int64_t p0) {
             moe_down(L.moex, d.hexp, d.ids, d.wts, K, d.yexp, nt, s);
         }
     }
-    if (stream_exp) {
+    if (stream_exp) {   // (routing statistics: the CPU counts only the records it gets)
+        CUDA_CHECK(cudaMemcpyAsync(h_ids_[cur_set_] + (size_t) il * R_ * K, d.ids, (size_t) nt * K * sizeof(int), cudaMemcpyDeviceToHost, s));
         if (L.n_gpu == 0) to_half(d.x, n, nullptr, n, 0.0f, d.x16, nt, s);
         for (int j = 0; j < L.np(); ++j) {
             const int b = j & 1, cnt = L.part_i0[j + 1] - L.part_i0[j];
@@ -768,13 +784,35 @@ void Engine7::run_layer(Device & d, Layer & L, int nt, int64_t p0) {
     }
 }
 
-std::vector<int> Engine7::forward(const int * tokens, int nt, int pos, int nlog) {
+void Engine7::wait_set(int set) {
+    const Ds4Config & c = cfg_;
+    CUDA_CHECK(cudaSetDevice(devs_.back()->id));
+    CUDA_CHECK(cudaEventSynchronize(ev_chunk_[set]));
+    if (ids_nt_[set] > 0) {   // the streamed chunk's routing into the statistics
+        for (auto & dp : devs_)
+            for (Layer & L : dp->layers) {
+                if (L.np() == 0) continue;
+                auto & cnt = cpu_->counts[L.il];
+                const int * ids = h_ids_[set] + (size_t) L.il * R_ * c.n_used;
+                for (int i = 0; i < ids_nt_[set] * c.n_used; ++i) if (ids[i] >= 0 && ids[i] < (int) cnt.size()) cnt[ids[i]]++;
+            }
+        ids_nt_[set] = 0;
+    }
+}
+
+int Engine7::enqueue(const int * tokens, int nt, int pos, int nlog) {
     const Ds4Config & c = cfg_;
     if (nt < 1 || nt > R_) throw std::runtime_error("hyper7: bad token count");
     if (pos + nt > opt_.max_pos) throw std::runtime_error("hyper7: position exceeds max_pos");
-    nlog = std::max(1, std::min({nlog, nt, MAX_NT}));
     const int n = c.n_embd;
-    const bool bulk = nt > MAX_NT;
+    const bool bulk = nt > MAX_NT, streamed = bulk && stream_ && nt >= stream_min_;
+    const int set = next_set_;
+    next_set_ = (next_set_ + 1) % NSET;
+    static const bool prof = getenv("HYPER7_PROF") != nullptr;
+    const auto tq0 = std::chrono::steady_clock::now();
+    wait_set(set);   // (its previous chunk has read the host rows)
+    const auto tq1 = std::chrono::steady_clock::now();
+    cur_set_ = set;
     // token rows (Q8_0 dequantized, as BF16 like the reference) and the Engram rows (the n-grams need the tokens before pos)
     const GTensor & te = gguf_->need("token_embd.weight");
     const auto * te_tr = ggml_get_type_traits((ggml_type) te.type);
@@ -783,9 +821,11 @@ std::vector<int> Engine7::forward(const int * tokens, int nt, int pos, int nlog)
     if ((int) hist_.size() < pos) throw std::runtime_error("hyper7: history shorter than the position");
     toks.insert(toks.end(), hist_.begin() + (pos - back), hist_.begin() + pos);
     toks.insert(toks.end(), tokens, tokens + nt);
-#pragma omp parallel for schedule(static)
+    float * he = h_embd_[set];
+    // (a few rows: no OpenMP team -- its threads compete with the CPU experts' spinning workers, ~40 ms a decode step)
+#pragma omp parallel for schedule(static) if (nt >= 64)
     for (int t = 0; t < nt; ++t) {
-        float * out = h_embd_ + (size_t) t * n;
+        float * out = he + (size_t) t * n;
         te_tr->to_float(te.data + (size_t) tokens[t] * te.row_bytes(), out, n);
         for (int e = 0; e < n; ++e) out[e] = bf_round(out[e]);
     }
@@ -794,60 +834,97 @@ std::vector<int> Engine7::forward(const int * tokens, int nt, int pos, int nlog)
         const GTensor & tab = gguf_->need("blk." + std::to_string(c.eg_layers[i]) + ".engram_embd.weight");
         const auto * tr = ggml_get_type_traits((ggml_type) tab.type);
         const size_t rb = tab.row_bytes();
-#pragma omp parallel for schedule(dynamic, 4)
+        float * eg = h_eg_[set][i];
+        bool bad = false;
+        // every row of the chunk first, then readahead for all of them (the tables live on the disk: one fault at a time
+        // per thread was ~12k reads/s; the kernel queues these at once), then the reads and dequantization
+        std::vector<int64_t> rows((size_t) nt * cols);
+        for (int t = 0; t < nt; ++t) c.eg_rows((int) i, toks.data(), back + t, rows.data() + (size_t) t * cols);   // (before the start: pad)
+        if (nt > 1)
+            for (int64_t r : rows) {
+                if (r < 0 || r >= tab.ne[1]) continue;
+                const uintptr_t a0 = (uintptr_t) (tab.data + (size_t) r * rb) & ~(uintptr_t) 4095;
+                madvise((void *) a0, ((uintptr_t) (tab.data + (size_t) r * rb + rb) - a0 + 4095) & ~(uintptr_t) 4095, MADV_WILLNEED);
+            }
+#pragma omp parallel for schedule(dynamic, 4) if (nt >= 64)
         for (int t = 0; t < nt; ++t) {
-            int64_t rows[64];
-            c.eg_rows((int) i, toks.data(), back + t, rows);
-            // the absolute tokens: positions before 0 are pad (back < ngram - 1 only at the start)
-            if (pos + t < c.eg_ngram - 1 && back < c.eg_ngram - 1) { /* eg_rows treats indices < 0 as pad */ }
-            float * out = h_eg_[i] + (size_t) t * cols * hd;
+            float * out = eg + (size_t) t * cols * hd;
             for (int j = 0; j < cols; ++j) {
-                if (rows[j] < 0 || rows[j] >= tab.ne[1]) throw std::runtime_error("hyper7: Engram row out of range");
-                tr->to_float(tab.data + (size_t) rows[j] * rb, out + (size_t) j * hd, hd);
+                const int64_t r = rows[(size_t) t * cols + j];
+                if (r < 0 || r >= tab.ne[1]) { bad = true; continue; }
+                tr->to_float(tab.data + (size_t) r * rb, out + (size_t) j * hd, hd);
                 for (int e = 0; e < hd; ++e) out[(size_t) j * hd + e] = bf_round(out[(size_t) j * hd + e]);
             }
         }
+        if (bad) throw std::runtime_error("hyper7: Engram row out of range");
     }
+    const auto tq2 = std::chrono::steady_clock::now();
     ++fwd_counter_;
     {
         std::vector<int> slots;
-        for (auto & dp : devs_) for (Layer & L : dp->layers) if (!(bulk && stream_ && nt >= stream_min_ && L.np() > 0) && L.n_gpu < c.n_expert) slots.push_back(L.il);
+        for (auto & dp : devs_) for (Layer & L : dp->layers) if (!(streamed && L.np() > 0) && L.n_gpu < c.n_expert) slots.push_back(L.il);
         if (!slots.empty()) cpu_->expect(fwd_counter_, slots, bulk);
     }
     for (size_t gi = 0; gi < devs_.size(); ++gi) {
         Device & d = *devs_[gi];
         CUDA_CHECK(cudaSetDevice(d.id));
         cudaStream_t s = d.stream;
+        // the next device has taken this device's rows of the previous chunk (they are about to be overwritten)
+        if (gi + 1 < devs_.size()) CUDA_CHECK(cudaStreamWaitEvent(s, devs_[gi + 1]->ev_taken, 0));
         incr_counter(d.counter, s);
         if (gi == 0) {
-            CUDA_CHECK(cudaMemcpyAsync(d.x, h_embd_, (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
+            CUDA_CHECK(cudaMemcpyAsync(d.x, he, (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
             embed7(d.x, d.h, n, c.hc, nt, s);
-            std::vector<float> pre0((size_t) nt * 8, 0.0f);
-            for (int t = 0; t < nt; ++t) pre0[(size_t) t * 8] = 1.0f;
-            CUDA_CHECK(cudaMemcpyAsync(d.pre, pre0.data(), pre0.size() * sizeof(float), cudaMemcpyHostToDevice, s));
-            CUDA_CHECK(cudaStreamSynchronize(s));   // (pre0 is a host temporary)
+            init_pre7(d.pre, nt, s);
         } else {
-            Device & pd = *devs_[gi - 1];
-            CUDA_CHECK(cudaStreamWaitEvent(s, pd.ev_done, 0));
-            CUDA_CHECK(cudaMemcpyPeerAsync(d.h, d.id, pd.h, pd.id, (size_t) nt * c.hc * n * sizeof(float), s));
-            CUDA_CHECK(cudaMemcpyPeerAsync(d.pre, d.id, pd.pre, pd.id, (size_t) nt * 8 * sizeof(float), s));
+            // the previous device's rows through pinned host memory (cudaMemcpyPeerAsync without P2P blocks the host thread
+            // until the source is done: no pipeline)
+            CUDA_CHECK(cudaStreamWaitEvent(s, devs_[gi - 1]->ev_done, 0));   // (recorded after its copies into h_in)
+            CUDA_CHECK(cudaMemcpyAsync(d.h, d.h_in, (size_t) nt * c.hc * n * sizeof(float), cudaMemcpyHostToDevice, s));
+            CUDA_CHECK(cudaMemcpyAsync(d.pre, d.h_in + (size_t) R_ * c.hc * n, (size_t) nt * 8 * sizeof(float), cudaMemcpyHostToDevice, s));
         }
+        CUDA_CHECK(cudaEventRecord(d.ev_taken, s));
         for (Layer & L : d.layers) run_layer(d, L, nt, pos);
+        if (gi + 1 < devs_.size()) {
+            Device & nd = *devs_[gi + 1];
+            CUDA_CHECK(cudaMemcpyAsync(nd.h_in, d.h, (size_t) nt * c.hc * n * sizeof(float), cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaMemcpyAsync(nd.h_in + (size_t) R_ * c.hc * n, d.pre, (size_t) nt * 8 * sizeof(float), cudaMemcpyDeviceToHost, s));
+        }
         CUDA_CHECK(cudaEventRecord(d.ev_done, s));
     }
-    // the head: the last nlog rows
+    if (streamed) ids_nt_[set] = nt;
     Device & d = *devs_.back();
     CUDA_CHECK(cudaSetDevice(d.id));
-    cudaStream_t s = d.stream;
-    const int r0 = nt - nlog;
-    hc7_pre_norm(d.h + (size_t) r0 * c.hc * n, d.pre + (size_t) r0 * 8, d.out_norm, n, c.hc, c.eps, d.x, nlog, s);
-    gemv_q8(d.output.q8, d.x, n, d.logits, c.n_vocab, nullptr, nlog, s);
-    argmax_pairs(d.logits, c.n_vocab, c.n_vocab, 0, d.outp, nlog, s);
-    CUDA_CHECK(cudaMemcpyAsync(h_out_, d.outp, (size_t) nlog * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
+    if (nlog > 0) {   // the head: the last nlog rows
+        cudaStream_t s = d.stream;
+        const int r0 = nt - nlog;
+        hc7_pre_norm(d.h + (size_t) r0 * c.hc * n, d.pre + (size_t) r0 * 8, d.out_norm, n, c.hc, c.eps, d.x, nlog, s);
+        gemv_q8(d.output.q8, d.x, n, d.logits, c.n_vocab, nullptr, nlog, s);
+        argmax_pairs(d.logits, c.n_vocab, c.n_vocab, 0, d.outp, nlog, s);
+        CUDA_CHECK(cudaMemcpyAsync(h_out_, d.outp, (size_t) nlog * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
+        last_nlog_ = nlog;
+    }
+    CUDA_CHECK(cudaEventRecord(ev_chunk_[set], d.stream));
+    if (prof && bulk) {
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        fprintf(stderr, "hyper7: chunk %d at %d: wait %.1f ms, host rows %.1f ms, enqueue %.1f ms\n", nt, pos, ms(tq0, tq1), ms(tq1, tq2),
+                ms(tq2, std::chrono::steady_clock::now()));
+    }
+    // the state now holds these tokens
+    hist_.resize(pos);
+    hist_.insert(hist_.end(), tokens, tokens + nt);
+    return set;
+}
+
+std::vector<int> Engine7::forward(const int * tokens, int nt, int pos, int nlog) {
+    nlog = std::max(1, std::min({nlog, nt, MAX_NT}));
+    enqueue(tokens, nt, pos, nlog);
+    Device & d = *devs_.back();
+    CUDA_CHECK(cudaSetDevice(d.id));
     auto t_wait = std::chrono::steady_clock::now();
     bool reported = false;
     for (;;) {
-        const cudaError_t q = cudaStreamQuery(s);
+        const cudaError_t q = cudaStreamQuery(d.stream);
         if (q == cudaSuccess) break;
         if (q != cudaErrorNotReady) CUDA_CHECK(q);
         if (!reported && std::chrono::steady_clock::now() - t_wait > std::chrono::seconds(20)) {
@@ -856,11 +933,8 @@ std::vector<int> Engine7::forward(const int * tokens, int nt, int pos, int nlog)
         }
         std::this_thread::yield();
     }
+    for (int k = 0; k < NSET; ++k) wait_set(k);
     for (auto & dp : devs_) { CUDA_CHECK(cudaSetDevice(dp->id)); CUDA_CHECK(cudaStreamSynchronize(dp->stream)); }
-    last_nlog_ = nlog;
-    // the state now holds these tokens
-    hist_.resize(pos);
-    hist_.insert(hist_.end(), tokens, tokens + nt);
     std::vector<int> out(nlog);
     for (int t = 0; t < nlog; ++t) { int idx; memcpy(&idx, &h_out_[2 * t + 1], 4); out[t] = idx; }
     return out;
@@ -920,8 +994,10 @@ std::vector<int> Engine7::generate(const std::vector<int> & prompt, int n_gen, b
     auto tp = clk::now();
     int next = -1;
     for (int c0 = s; c0 < P;) {
-        const int len = std::min(R_, P - c0);
-        next = forward(&prompt[c0], len, c0, 1)[0];
+        // equal chunks of at most R_; all but the last enqueued without waiting (a pipeline over the GPUs) when streamed
+        const int left = P - c0, nch = (left + R_ - 1) / R_, len = std::min(left, (left + nch - 1) / nch);
+        if (c0 + len < P && len >= stream_min_ && stream_) enqueue(&prompt[c0], len, c0, 0);
+        else next = forward(&prompt[c0], len, c0, 1)[0];
         c0 += len;
         if (prefill_cb_) prefill_cb_(c0, P, s);
     }

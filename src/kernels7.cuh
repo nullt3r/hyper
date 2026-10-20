@@ -75,6 +75,8 @@ void sparse_attn7(const float * q, const uint16_t * ring, int ring_rows, int win
 void route7(const float * logits, int ls, const float * bias, int n, int k, float scale, int * ids, float * wts, int nt, cudaStream_t s);
 // h[t][i] = silu(min(g, L)) * clamp(u, -L, L) with g = gu[t][i], u = gu[t][ff + i]
 void swiglu7(const float * gu, int gus, float * h, int hs, int ff, float lim, int nt, cudaStream_t s);
+// pre[t] = (1, 0, 0, ..) (rows of 8): the first block's pre-mix
+void init_pre7(float * pre, int nt, cudaStream_t s);
 // x[i] = v (n values)
 void fill7(float * x, float v, int n, cudaStream_t s);
 

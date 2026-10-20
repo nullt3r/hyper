@@ -6,9 +6,11 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <mma.h>
 
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace hyper {
@@ -552,6 +554,120 @@ __global__ void __launch_bounds__(kThreads) k_sparse_attn7(const float * __restr
     ov[c + 1] = o1 / den;
 }
 
+
+// ---- prefill sparse attention on the tensor cores: a block = 16 heads of one query (grid heads / 16 x T). The query's rows
+// (window ring + selected compressed rows, <= 640) pass twice through shared memory in tiles of 32 as fp16 (exact: FP8 / FP4
+// values): S = Q K^T (fp16 q, fp32 sums), the softmax with the sink in fp32, then O = P V (fp16 probabilities, fp32 sums)
+constexpr int kTcH = 16, kTcRows = 32, kTcLd = 512 + 8, kTcMax = 640;
+constexpr size_t kTcSmem = (size_t) kTcH * kTcLd * 2 + (size_t) kTcRows * kTcLd * 2 + (size_t) kTcH * kTcMax * 4 + 8 * 256 * 4 + kTcH * kTcRows * 2;
+__global__ void __launch_bounds__(256) k_sparse_attn7_tc(const float * __restrict__ q, const uint16_t * __restrict__ ring, int ring_rows,
+                                                         int win, const uint16_t * __restrict__ ckv, const int * __restrict__ sel,
+                                                         int sel_stride, long long p0, int R, int kcap, const float * __restrict__ sink,
+                                                         int heads, float scale, float * __restrict__ out) {
+    using namespace nvcuda;
+    extern __shared__ __align__(16) unsigned char sm_raw[];
+    half * qs = (half *) sm_raw;                       // [16][kTcLd]
+    half * kt = qs + kTcH * kTcLd;                     // [32][kTcLd]
+    float * S = (float *) (kt + kTcRows * kTcLd);      // [16][kTcMax]
+    float * part = S + kTcH * kTcMax;                  // [8][16][16]: (k quarter, row fragment) partial scores
+    half * P = (half *) (part + 8 * 256);              // [16][kTcRows]
+    const int h0 = blockIdx.x * kTcH, t = blockIdx.y;
+    const long long p = p0 + t;
+    const long long first = max(0LL, p - win + 1);
+    const int n_win = (int) (p - first + 1);
+    const int n_sel = R > 0 ? (int) min((long long) kcap, (p + 1) / R) : 0;
+    const int total = n_win + n_sel;
+    const int * sl = sel + (size_t) t * sel_stride;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    for (int i = tid; i < kTcH * 512; i += 256) qs[(i >> 9) * kTcLd + (i & 511)] = __float2half(q[((size_t) t * heads + h0) * 512 + i]);
+    auto load_tile = [&](int j0, int nr) {   // rows j0 .. j0 + nr - 1 (bf16 -> fp16), zeros past nr
+        for (int i = tid; i < kTcRows * 64; i += 256) {
+            const int r = i >> 6, c = (i & 63) * 8;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (r < nr) {
+                const int j = j0 + r;
+                const uint16_t * row = j < n_win ? ring + (size_t) ((first + j) % ring_rows) * 512 : ckv + (size_t) sl[j - n_win] * 512;
+                v = *(const uint4 *) (row + c);
+            }
+            const uint16_t * b = (const uint16_t *) &v;
+            __align__(16) half hv[8];
+#pragma unroll
+            for (int x = 0; x < 8; ++x) hv[x] = __float2half(bf16f(b[x]));
+            *(uint4 *) (kt + r * kTcLd + c) = *(const uint4 *) hv;
+        }
+    };
+    // pass 1: S = Q K^T * scale
+    for (int j0 = 0; j0 < total; j0 += kTcRows) {
+        const int nr = min(kTcRows, total - j0);
+        __syncthreads();
+        load_tile(j0, nr);
+        __syncthreads();
+        const int fr = warp & 1, kq = warp >> 1;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.0f);
+#pragma unroll
+        for (int k = 0; k < 128; k += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+            wmma::load_matrix_sync(a, qs + kq * 128 + k, kTcLd);
+            wmma::load_matrix_sync(b, kt + fr * 16 * kTcLd + kq * 128 + k, kTcLd);
+            wmma::mma_sync(acc, a, b, acc);
+        }
+        wmma::store_matrix_sync(part + warp * 256, acc, 16, wmma::mem_row_major);
+        __syncthreads();
+        for (int i = tid; i < kTcH * kTcRows; i += 256) {
+            const int h = i / kTcRows, c = i % kTcRows, f = c >> 4, cc = c & 15;
+            if (c >= nr) continue;
+            float v = 0.0f;
+#pragma unroll
+            for (int q4 = 0; q4 < 4; ++q4) v += part[(q4 * 2 + f) * 256 + h * 16 + cc];
+            S[h * kTcMax + j0 + c] = v * scale;
+        }
+    }
+    __syncthreads();
+    // softmax with the sink: a warp per two heads; S becomes the probabilities
+    for (int h = warp; h < kTcH; h += 8) {
+        float * sr = S + h * kTcMax;
+        const float sk = sink[h0 + h];
+        float m = sk;
+        for (int j = lane; j < total; j += 32) m = fmaxf(m, sr[j]);
+        m = warp_max(m);
+        float den = 0.0f;
+        for (int j = lane; j < total; j += 32) { const float e = expf(sr[j] - m); sr[j] = e; den += e; }
+        den = warp_sum(den) + expf(sk - m);
+        const float inv = 1.0f / den;
+        for (int j = lane; j < total; j += 32) sr[j] *= inv;
+    }
+    // pass 2: O = P V; warp w: output columns w * 64 .. + 64
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> o[4];
+#pragma unroll
+    for (int f = 0; f < 4; ++f) wmma::fill_fragment(o[f], 0.0f);
+    for (int j0 = 0; j0 < total; j0 += kTcRows) {
+        const int nr = min(kTcRows, total - j0);
+        __syncthreads();
+        load_tile(j0, nr);
+        for (int i = tid; i < kTcH * kTcRows; i += 256) {
+            const int h = i / kTcRows, c = i % kTcRows;
+            P[i] = __float2half(c < nr ? S[h * kTcMax + j0 + c] : 0.0f);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < kTcRows; k += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+            wmma::load_matrix_sync(a, P + k, kTcRows);
+#pragma unroll
+            for (int f = 0; f < 4; ++f) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b;
+                wmma::load_matrix_sync(b, kt + k * kTcLd + warp * 64 + f * 16, kTcLd);
+                wmma::mma_sync(o[f], a, b, o[f]);
+            }
+        }
+    }
+    float * ob = out + ((size_t) t * heads + h0) * 512;
+#pragma unroll
+    for (int f = 0; f < 4; ++f) wmma::store_matrix_sync(ob + warp * 64 + f * 16, o[f], 512, wmma::mem_row_major);
+}
+
 // ---- the router ----
 __global__ void __launch_bounds__(512) k_route7(const float * __restrict__ logits, int ls, const float * __restrict__ bias, int n, int k,
                                                 float route_scale, int * ids, float * w) {
@@ -613,6 +729,11 @@ __global__ void k_swiglu7(const float * __restrict__ gu, int gus, float * __rest
         u = fminf(fmaxf(u, -lim), lim);
     }
     h[(size_t) t * hs + i] = g / (1.0f + expf(-g)) * u;
+}
+
+__global__ void k_init_pre7(float * pre, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) pre[i] = (i & 7) == 0 ? 1.0f : 0.0f;
 }
 
 __global__ void k_fill7(float * x, float v, int n) {
@@ -701,6 +822,19 @@ void cand_blocks7(const float * score, long long stride, int T, long long p0, in
 void sparse_attn7(const float * q, const uint16_t * ring, int ring_rows, int win, const uint16_t * ckv, const int * sel, int sel_stride,
                   long long p0, int R, int kcap, const float * sink, int heads, int d, float scale, float * out, int T, cudaStream_t s) {
     if (d != 512) throw std::runtime_error("sparse_attn7: d must be 512");
+    static const bool no_tc = getenv("HYPER7_ATTN_OLD") != nullptr;
+    if (T > 4 && !no_tc && heads % kTcH == 0 && win + kcap <= kTcMax) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        static unsigned done_mask = 0;
+        if (!(done_mask & (1u << dev))) {
+            cudaFuncSetAttribute(k_sparse_attn7_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcSmem);
+            done_mask |= 1u << dev;
+        }
+        k_sparse_attn7_tc<<<dim3(heads / kTcH, T), 256, kTcSmem, s>>>(q, ring, ring_rows, win, ckv, sel, sel_stride, p0, R, kcap, sink, heads,
+                                                                     scale, out);
+        return;
+    }
     k_sparse_attn7<<<dim3(heads, T), kThreads, 0, s>>>(q, ring, ring_rows, win, ckv, sel, sel_stride, p0, R, kcap, sink, heads, d, scale, out);
 }
 void route7(const float * logits, int ls, const float * bias, int n, int k, float scale, int * ids, float * wts, int nt, cudaStream_t s) {
@@ -710,6 +844,7 @@ void route7(const float * logits, int ls, const float * bias, int n, int k, floa
 void swiglu7(const float * gu, int gus, float * h, int hs, int ff, float lim, int nt, cudaStream_t s) {
     k_swiglu7<<<dim3((ff + 255) / 256, nt), 256, 0, s>>>(gu, gus, h, hs, ff, lim);
 }
+void init_pre7(float * pre, int nt, cudaStream_t s) { k_init_pre7<<<(nt * 8 + 255) / 256, 256, 0, s>>>(pre, nt * 8); }
 void fill7(float * x, float v, int n, cudaStream_t s) { k_fill7<<<(n + 255) / 256, 256, 0, s>>>(x, v, n); }
 void engram_gate7(float * h, const float * kv, const float * w, int hc, int dim, float eps, int nt, cudaStream_t s) {
     k_engram_gate7<<<dim3(hc, nt), 1024, 0, s>>>(h, kv, w, hc, dim, eps);
