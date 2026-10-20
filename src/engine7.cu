@@ -956,6 +956,13 @@ int Engine7::sample_row(int t, const SamplingParams & sp, int64_t pos) {
     Device & d = *devs_.back();
     CUDA_CHECK(cudaSetDevice(d.id));
     float * row = d.logits + (size_t) t * c.n_vocab;
+    if (sp.temp > 0.0f && sp.top_k <= 0 && sp.top_p >= 1.0f && sp.min_p <= 0.0f) {   // the whole vocabulary: on the GPU
+        int tok = 0;
+        gumbel_argmax7(row, c.n_vocab, sp.temp, samp_seed_, pos, (int *) d.outp, d.stream);
+        CUDA_CHECK(cudaMemcpyAsync(&tok, d.outp, sizeof(int), cudaMemcpyDeviceToHost, d.stream));
+        CUDA_CHECK(cudaStreamSynchronize(d.stream));
+        return tok;
+    }
     topk_pairs(row, c.n_vocab, c.n_vocab, 0, d.outp, TOPK, 1, d.stream);
     std::vector<float> tk(2 * TOPK);
     CUDA_CHECK(cudaMemcpyAsync(tk.data(), d.outp, tk.size() * sizeof(float), cudaMemcpyDeviceToHost, d.stream));

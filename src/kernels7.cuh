@@ -77,6 +77,8 @@ void route7(const float * logits, int ls, const float * bias, int n, int k, floa
 void swiglu7(const float * gu, int gus, float * h, int hs, int ff, float lim, int nt, cudaStream_t s);
 // pre[t] = (1, 0, 0, ..) (rows of 8): the first block's pre-mix
 void init_pre7(float * pre, int nt, cudaStream_t s);
+// full-vocabulary sampling: *out = argmax_i (logits[i] / temp + G(seed, pos, i)) (sampling.h's gumbel_noise)
+void gumbel_argmax7(const float * logits, int n, float temp, uint64_t seed, long long pos, int * out, cudaStream_t s);
 // x[i] = v (n values)
 void fill7(float * x, float v, int n, cudaStream_t s);
 

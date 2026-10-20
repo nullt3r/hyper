@@ -668,6 +668,39 @@ __global__ void __launch_bounds__(256) k_sparse_attn7_tc(const float * __restric
     for (int f = 0; f < 4; ++f) wmma::store_matrix_sync(ob + warp * 64 + f * 16, o[f], 512, wmma::mem_row_major);
 }
 
+
+// full-vocabulary sampling (no top-k / top-p / min-p): argmax_i (logit_i / T + G(seed, pos, i)) with sampling.h's Gumbel noise
+__device__ __forceinline__ uint64_t gmix64d(uint64_t x) {
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; x ^= x >> 33;
+    return x;
+}
+__global__ void __launch_bounds__(1024) k_gumbel_argmax7(const float * __restrict__ x, int n, double invT, uint64_t seed, long long pos,
+                                                         int * out) {
+    __shared__ double bv[32];
+    __shared__ int bi[32];
+    double best = -INFINITY;
+    int bix = 0x7fffffff;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const uint64_t k = gmix64d(seed ^ gmix64d(((uint64_t) (uint32_t) pos << 32) | (uint32_t) i));
+        const double u = ((double) (k >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+        const double v = (double) x[i] * invT - log(-log(u));
+        if (v > best || (v == best && i < bix)) { best = v; bix = i; }
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        const double ov = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+        if (ov > best || (ov == best && oi < bix)) { best = ov; bix = oi; }
+    }
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    if (lane == 0) { bv[w] = best; bi[w] = bix; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int j = 1; j < (int) (blockDim.x >> 5); ++j)
+            if (bv[j] > best || (bv[j] == best && bi[j] < bix)) { best = bv[j]; bix = bi[j]; }
+        *out = bix;
+    }
+}
+
 // ---- the router ----
 __global__ void __launch_bounds__(512) k_route7(const float * __restrict__ logits, int ls, const float * __restrict__ bias, int n, int k,
                                                 float route_scale, int * ids, float * w) {
@@ -845,6 +878,9 @@ void swiglu7(const float * gu, int gus, float * h, int hs, int ff, float lim, in
     k_swiglu7<<<dim3((ff + 255) / 256, nt), 256, 0, s>>>(gu, gus, h, hs, ff, lim);
 }
 void init_pre7(float * pre, int nt, cudaStream_t s) { k_init_pre7<<<(nt * 8 + 255) / 256, 256, 0, s>>>(pre, nt * 8); }
+void gumbel_argmax7(const float * logits, int n, float temp, uint64_t seed, long long pos, int * out, cudaStream_t s) {
+    k_gumbel_argmax7<<<1, 1024, 0, s>>>(logits, n, 1.0 / (double) temp, seed, pos, out);
+}
 void fill7(float * x, float v, int n, cudaStream_t s) { k_fill7<<<(n + 255) / 256, 256, 0, s>>>(x, v, n); }
 void engram_gate7(float * h, const float * kv, const float * w, int hc, int dim, float eps, int nt, cudaStream_t s) {
     k_engram_gate7<<<dim3(hc, nt), 1024, 0, s>>>(h, kv, w, hc, dim, eps);

@@ -136,3 +136,6 @@ $(BUILD)/hyper7: $(OBJ4) tools/hyper7_main.cpp
 $(BUILD)/hyper4: $(OBJ4) tools/hyper4_main.cpp
 	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) -Xlinker --export-dynamic tools/hyper4_main.cpp $(OBJ4) -o $@ \
 	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)
+
+$(BUILD)/g32bench: tools/g32bench.cu $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/gguf.o
+	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/g32bench.cu $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/gguf.o -o $@ $(LIBS)

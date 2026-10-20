@@ -264,6 +264,8 @@ struct Request {
 // llama.cpp's parsers want the arguments in schema order (and GLM's only string values); the models write them in any
 // order (often alphabetical) and numbers / booleans bare. Values of non-string arguments are read as JSON. Only complete
 // calls (closed blocks after the reasoning) are taken.
+static bool g_dsml_v41 = false;   // the template writes DeepSeek-V4.1 DSML tool calls ("<｜DSML｜ calls>")
+
 bool xml_tool_fallback(const std::string & text, const Request & r, common_chat_msg & out) {
     const size_t think_end = text.rfind("</think>");
     const size_t t0 = text.find("<tool_call>", think_end == std::string::npos ? 0 : think_end);
@@ -325,10 +327,62 @@ bool xml_tool_fallback(const std::string & text, const Request & r, common_chat_
     return !out.tool_calls.empty();
 }
 
+
+// DeepSeek-V4.1's DSML tool calls: "<｜DSML｜ calls>" blocks of "<｜DSML｜ invoke name=..>" / "<｜DSML｜ parameter name=.. string=..>"
+// (leading-space tag names, encoding/encoding.py), which libcommon's DeepSeek parser (V3.2 "function_calls", V4 "tool_calls",
+// selected by a dsml_token template variable) does not know. The text before the block goes through the template's parser
+// (reasoning, content); the calls are read here (partial: the complete invokes so far). false: no block in the text
+bool dsml_v41_parse(const std::string & text, bool partial, const Request & r, common_chat_msg & out) {
+    static const std::string D = "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c", open = "<" + D + " calls>";
+    const size_t think_end = text.rfind("</think>");
+    const size_t from = think_end == std::string::npos ? 0 : think_end;
+    size_t t0 = text.find(open, from);
+    if (t0 == std::string::npos) {
+        if (!partial) return false;
+        // (streaming: a tail that may still become the block's opening tag is held back, not shown as content)
+        const size_t lt = text.rfind('<');
+        if (lt == std::string::npos || lt < from || text.size() - lt >= open.size() || open.compare(0, text.size() - lt, text, lt) != 0) return false;
+        t0 = lt;
+    }
+    try {
+        out = common_chat_parse(text.substr(0, t0), partial, r.pp);
+    } catch (const std::exception &) {
+        out = common_chat_msg();
+        out.role = "assistant";
+        out.content = text.substr(0, t0);
+    }
+    out.tool_calls.clear();
+    const std::string inv = "<" + D + " invoke name=\"", inv_end = "</" + D + " invoke>", par = "<" + D + " parameter name=\"",
+                      par_end = "</" + D + " parameter>";
+    for (size_t p = text.find(inv, t0); p != std::string::npos; p = text.find(inv, p)) {
+        const size_t ne = text.find("\">", p + inv.size()), e = text.find(inv_end, p);
+        if (ne == std::string::npos || e == std::string::npos || ne > e) break;   // (an unfinished invoke: left out)
+        common_chat_tool_call tc;
+        tc.name = text.substr(p + inv.size(), ne - p - inv.size());
+        ojson args = ojson::object();
+        for (size_t k = text.find(par, ne); k != std::string::npos && k < e; k = text.find(par, k)) {
+            const size_t ke = text.find('"', k + par.size()), te = text.find("\">", ke == std::string::npos ? k : ke);
+            const size_t ve = te == std::string::npos ? te : text.find(par_end, te);
+            if (ke == std::string::npos || te == std::string::npos || ve == std::string::npos || ve > e) break;
+            const std::string key = text.substr(k + par.size(), ke - k - par.size());
+            const bool is_str = text.compare(ke, te - ke, "\" string=\"true") == 0;
+            const std::string raw = text.substr(te + 2, ve - te - 2);
+            if (is_str) args[key] = raw;
+            else { try { args[key] = ojson::parse(raw); } catch (const std::exception &) { args[key] = raw; } }
+            k = ve + par_end.size();
+        }
+        tc.arguments = args.dump();
+        out.tool_calls.push_back(tc);
+        p = e + inv_end.size();
+    }
+    return true;
+}
+
 // the template's parser; its result is replaced by the fallback when it rejects the text, or (final parse) when it found
 // fewer calls than the text has complete <tool_call> blocks after the reasoning
 common_chat_msg parse_out(const std::string & text, bool partial, const Request & r) {
     common_chat_msg m;
+    if (g_dsml_v41 && r.pp.parse_tool_calls && dsml_v41_parse(text, partial, r, m)) return m;
     try {
         m = common_chat_parse(text, partial, r.pp);
     } catch (const std::exception &) {
@@ -1081,6 +1135,11 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "hyper-server: chat template from %s (%zu chars)\n", template_file.c_str(), tmpl_override.size());
     }
     c.tmpls = common_chat_templates_init(c.vm, tmpl_override);
+    {   // DeepSeek-V4.1 DSML (leading-space tag names): parsed here, see dsml_v41_parse
+        const std::string src = common_chat_templates_source(c.tmpls.get());
+        g_dsml_v41 = src.find("\xef\xbd\x9c" "DSML" "\xef\xbd\x9c") != std::string::npos && src.find(" calls>") != std::string::npos;
+        if (g_dsml_v41) fprintf(stderr, "hyper-server: DeepSeek-V4.1 DSML tool calls\n");
+    }
 
     if (mmproj_path.empty() && getenv("HYPER_MMPROJ")) mmproj_path = getenv("HYPER_MMPROJ");   // (tests)
     if (!mmproj_path.empty()) {   // before the engine: its expert placement sees the encoder's VRAM as taken
