@@ -1174,7 +1174,7 @@ int main(int argc, char ** argv) {
     auto answer_reuse = [](bool def) { return getenv("HYPER_ANSWER_REUSE") ? atoi(getenv("HYPER_ANSWER_REUSE")) != 0 : def; };
     c.glm = arch == "glm5-next";
     std::unique_ptr<LLM> engine;
-    if (arch == "qwen4exp") {
+    if (arch == "qwen4exp" || arch == "qwen35moe") {
         if (!ctx_given) ctx = 131072;
         Engine4Options o4;
         o4.max_pos = ctx;

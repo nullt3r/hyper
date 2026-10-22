@@ -852,15 +852,19 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
     auto q8full = [&](const std::string & name) { const GTensor * t = T(name); return upload_dense(A, dev.id, {{t, 0, t->rows()}}); };
     const std::string p = "blk." + std::to_string(il) + ".";
     L.full = c.is_full_attn(il) || il == c.n_layer;   // the MTP block is an attention layer
-    // hyper-connection mixers
-    L.hca_norm = f32(p + "hc_attn_norm.weight");
-    L.hcf_norm = f32(p + "hc_ffn_norm.weight");
-    L.hca_inj = f32(p + "hc_attn_inject.weight");
-    L.hcf_inj = f32(p + "hc_ffn_inject.weight");
-    L.hca_down = q8full(p + "hc_attn_down.weight");
-    L.hca_up = upload_hc_up(A, dev.id, *T(p + "hc_attn_up.weight"), c.hc);
-    L.hcf_down = q8full(p + "hc_ffn_down.weight");
-    L.hcf_up = upload_hc_up(A, dev.id, *T(p + "hc_ffn_up.weight"), c.hc);
+    if (c.plain) {   // qwen35moe: plain pre-norm residual (the block norms in the mixers' place)
+        L.hca_norm = f32(p + "attn_norm.weight");
+        L.hcf_norm = f32(p + "post_attention_norm.weight");
+    } else {   // hyper-connection mixers
+        L.hca_norm = f32(p + "hc_attn_norm.weight");
+        L.hcf_norm = f32(p + "hc_ffn_norm.weight");
+        L.hca_inj = f32(p + "hc_attn_inject.weight");
+        L.hcf_inj = f32(p + "hc_ffn_inject.weight");
+        L.hca_down = q8full(p + "hc_attn_down.weight");
+        L.hca_up = upload_hc_up(A, dev.id, *T(p + "hc_attn_up.weight"), c.hc);
+        L.hcf_down = q8full(p + "hc_ffn_down.weight");
+        L.hcf_up = upload_hc_up(A, dev.id, *T(p + "hc_ffn_up.weight"), c.hc);
+    }
     if (L.full) {
         // whole kv groups per GPU (each KV head and its cache live on one GPU only); with fewer kv heads than GPUs,
         // some GPUs do no attention and keep that memory for experts
@@ -1133,6 +1137,11 @@ void Engine4::load_weights() {
             dev.m_enorm = up32(p + "nextn.enorm.weight");
             dev.m_hnorm = up32(p + "nextn.hnorm.weight");
             { const GTensor * t = &mtp_g_->need(p + "nextn.eh_proj.weight"); dev.m_eh = upload_dense(A, dev.id, {{t, 0, t->rows()}}); }
+            if (c.plain) {   // qwen35moe: the shared head norm (or the model's output norm)
+                const bool own = mtp_g_->tensor(p + "nextn.shared_head_norm.weight") != nullptr;
+                dev.m_head_norm = up32(own ? p + "nextn.shared_head_norm.weight" : "output_norm.weight");
+                src_ = gguf_.get();
+            } else {
             // exit mixer: the file's own nextn.hc_head_* or, in predictor-only files, its output_hc_*
             const bool own = mtp_g_->tensor(p + "nextn.hc_head_norm.weight") != nullptr;
             const std::string hn = own ? p + "nextn.hc_head_norm.weight" : "output_hc_norm.weight";
@@ -1142,10 +1151,14 @@ void Engine4::load_weights() {
             { const GTensor * t = &mtp_g_->need(hd); dev.m_head_down = upload_dense(A, dev.id, {{t, 0, t->rows()}}); }
             dev.m_head_up = upload_hc_up(A, dev.id, mtp_g_->need(hu), c.hc);
             src_ = gguf_.get();
+            }
         }
+        if (c.plain) { const std::vector<float> v = to_f32(gguf_->need("output_norm.weight")); dev.head_norm = dev.upload(v.data(), v.size()); }
+        else {
         { const std::vector<float> v = to_f32(gguf_->need("output_hc_norm.weight")); dev.head_norm = dev.upload(v.data(), v.size()); }
         { const GTensor * t = &gguf_->need("output_hc_down.weight"); dev.head_down = upload_dense(A, dev.id, {{t, 0, t->rows()}}); }
         dev.head_up = upload_hc_up(A, dev.id, gguf_->need("output_hc_up.weight"), c.hc);
+        }
         auto [o0, o1] = split(c.n_vocab, nd, g);
         dev.vocab_off = (int) o0;
         dev.output = upload_dense(A, dev.id, {{&gguf_->need("output.weight"), o0, o1}});
@@ -1198,7 +1211,9 @@ void Engine4::load_weights() {
         dev.ple_val = dev.alloc<float>((size_t) R * n);
         dev.ple_sc = dev.alloc<float>((size_t) R * c.hc * 4);
         dev.logits = dev.alloc<float>((size_t) (allrows_ ? R : MAX_NT) * dev.output.n());
-        dev.xh = dev.alloc<half>((size_t) R * std::max(hcn, c.n_ff_shexp));
+        // (fp16 rows of every bulk matmul input: the output projections read ssm_d_inner / n_head * head_dim wide rows, wider
+        // than the residual when hc = 1)
+        dev.xh = dev.alloc<half>((size_t) R * std::max({hcn, c.n_ff_shexp, c.ssm_d_inner, c.n_head * c.head_dim}));
         if (g_kq_max_elems) {   // prefill scratch for KQ dense weights (bigger segments go in slices)
             dev.ggs_elems = std::max<size_t>(std::min<size_t>(g_kq_max_elems, (size_t) 32 << 20), (size_t) 16 * 16384);
             dev.ggs = dev.alloc<half>(dev.ggs_elems);
@@ -1462,6 +1477,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
     auto hc_mix = [&](const float * norm, const DW & down, const DW & up, const float * inj, const float * res = nullptr, int rows = -1) {
         if (!res) res = R;
         if (rows < 0) rows = nt;
+        if (c.plain) { rmsnorm(res, n, norm, d.mixed, n, n, rows, eps, s); return; }   // (qwen35moe: the block's RMSNorm)
         const bool finj = inj && rows <= MAX_NT;   // decode: the injection dots ride along the norm kernel
         hc_norm(res, norm, d.xn, n, hc, eps, rows, s, finj ? inj : nullptr, d.injp, d.inj, d.inj_cnt);
         mm(down, d.xn, hcn, d.lo, lr, rows);
@@ -1477,7 +1493,12 @@ void Engine4::record_main(int gi, int nt, int kind) {
         hc_mixed(d.xn, d.gate, d.mixed, n, hc, rows, s, up.hcperm);
     };
     if (kind) {   // [rms(e) * enorm | rms(h_s) * hnorm_s] -> eh_proj, one row per hc stream
-        mtp_prep(d.x, d.m_enorm, kind == 1 ? (mtp_src_ > 0 ? d.res_x[mtp_src_ - 1] : d.res) : d.mh, kind == 1 ? hcn : 0, d.m_hnorm, eps, n, hc, mtp_whole_norm_, d.ecat, nt, s);
+        const float * mH = kind == 1 ? (mtp_src_ > 0 ? d.res_x[mtp_src_ - 1] : d.res) : d.mh;
+        if (c.plain && kind == 1) {   // qwen35moe: the MTP block takes the output-normed hidden (the chained one: shared_head_norm's)
+            rmsnorm(mH, n, d.head_norm, d.mres, n, n, nt, eps, s);
+            mH = d.mres;
+        }
+        mtp_prep(d.x, d.m_enorm, mH, kind == 1 ? hcn : 0, d.m_hnorm, eps, n, hc, mtp_whole_norm_, d.ecat, nt, s);
         const int blk = std::max(1, R4 * std::max(hcn, c.n_ff_shexp) / (2 * n));   // rows the fp16 scratch holds
         for (int r0 = 0; r0 < nt * hc; r0 += blk) {
             const int rr = std::min(blk, nt * hc - r0);
@@ -1615,7 +1636,8 @@ void Engine4::record_main(int gi, int nt, int kind) {
             gdn_conv(d.big0, bs, L.conv_state, snap ? L.conv_snap : nullptr, L.conv_w, L.conv_ch, c.ssm_conv, nt, s, bulk ? d.conv_raw : nullptr);
             const int ostride = L.n_v_l * dv;
             gdn_step(d.big0, bs, ab_off, L.state, snap ? L.state_snap : nullptr, d.o, ostride, L.dt_bias, L.ssm_a, L.n_k_l, L.n_v_l, c.ssm_d_state, dv, eps, nt, s);
-            gated_norm_sigmoid(d.o, ostride, d.big0 + z_off, bs, L.ssm_norm, L.n_v_l, dv, eps, nt, s);
+            if (c.plain) gated_norm(d.o, ostride, d.big0 + z_off, bs, L.ssm_norm, L.n_v_l, dv, eps, nt, s);   // (qwen35moe: silu gate)
+            else gated_norm_sigmoid(d.o, ostride, d.big0 + z_off, bs, L.ssm_norm, L.n_v_l, dv, eps, nt, s);
             mm(L.wout, d.o, ostride, d.part, n, nt);
         }
         if (cache_only) continue;
@@ -1626,7 +1648,10 @@ void Engine4::record_main(int gi, int nt, int kind) {
             bulk = false;
         }
         dbg(L.full ? "attn_part" : "gdn_part", il, d.part, (size_t) nt * n);
-        if (bulk) { allreduce(); hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s); }
+        if (c.plain) {   // plain residual: R += sum over the GPUs of the parts
+            if (bulk) { allreduce(); vec_add(R, d.bo, (size_t) nt * n, s); }
+            else allreduce_add_ll16(R, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s, nullptr);
+        } else if (bulk) { allreduce(); hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s); }
         else allreduce_hc_ll16(R, d.inj, n, hc, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
         if (il < 2) tr(4 + 4 * il, R, hcn);
         if (last_only && nt > 1) {   // the last row moves to row 0 and continues alone, in decode mode
@@ -1720,7 +1745,10 @@ void Engine4::record_main(int gi, int nt, int kind) {
         moe_reduce(d.shpart, d.sg, d.yexp, K, d.part, n, nt, d.ids, stream ? L.owner_bulk : L.owner, d.g, CPU_OWNER, cflag,
                    bulk ? &cpu_bulk_out_->y[0][0] : &cpu_out_[il].y[0][0], d.counter, (unsigned) il, s);
         dbg("moe_part", il, d.part, (size_t) nt * n);
-        if (bulk) { allreduce(); hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s); }
+        if (c.plain) {   // plain residual: R += sum over the GPUs of the parts
+            if (bulk) { allreduce(); vec_add(R, d.bo, (size_t) nt * n, s); }
+            else allreduce_add_ll16(R, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s, nullptr);
+        } else if (bulk) { allreduce(); hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s); }
         else allreduce_hc_ll16(R, d.inj, n, hc, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
         dbg("l_last", il, R, (size_t) nt * hcn);
         if (d.trace && !kind && last_ck)
@@ -1729,8 +1757,9 @@ void Engine4::record_main(int gi, int nt, int kind) {
     }
     if (kind) {   // drafts: the last row only; its residual feeds the next chained step
         if (cache_only) return;
-        CUDA_CHECK(cudaMemcpyAsync(d.mh, d.mres + (size_t) (nt - 1) * hcn, (size_t) hcn * sizeof(float), cudaMemcpyDeviceToDevice, s));
+        if (!c.plain) CUDA_CHECK(cudaMemcpyAsync(d.mh, d.mres + (size_t) (nt - 1) * hcn, (size_t) hcn * sizeof(float), cudaMemcpyDeviceToDevice, s));
         hc_mix(d.m_head_norm, d.m_head_down, d.m_head_up, nullptr, d.mres + (size_t) (nt - 1) * hcn, 1);
+        if (c.plain) CUDA_CHECK(cudaMemcpyAsync(d.mh, d.mixed, (size_t) n * sizeof(float), cudaMemcpyDeviceToDevice, s));   // (the chained input)
         mm(d.output, d.mixed, n, d.logits, d.output.n(), 1);
         argmax_pairs(d.logits, d.output.n(), d.output.n(), d.vocab_off, d.wts, 1, s);
         max_sumexp(d.logits, d.output.n(), d.wts + 2, s);   // (the best token's probability: the drafts' gate)

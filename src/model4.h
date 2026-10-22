@@ -32,6 +32,9 @@ struct Q4Config {
     int ple_layer = -1, ple_ngram = 0, ple_heads_per_ngram = 0, ple_conv = 0, ple_dim = 0, ple_eos = 0, ple_image = 0;
     std::vector<uint64_t> ple_mult, ple_offsets, ple_vocab;
     int n_vocab = 0;
+    // qwen35moe (Qwen3.5 MoE, Ornith): no hyper-connections (a plain pre-norm residual: hc = 1), no PLE / indexer, the GDN
+    // output gated by silu instead of sigmoid, the MTP block fed the output-normed hidden
+    bool plain = false;
 
     int head_v_dim() const { return ssm_d_inner / ssm_dt_rank; }
     int conv_dim() const { return ssm_d_inner + 2 * ssm_n_group * ssm_d_state; }

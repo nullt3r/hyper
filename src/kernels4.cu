@@ -1844,6 +1844,11 @@ template <GType T> __global__ void k_deq_row(const uint8_t * row, int n, float *
 void deq_row_test(GType t, const uint8_t * row, int n, float * out) {
     MOE_TYPE_SWITCH(t, (k_deq_row<TT><<<(n / 8 + 255) / 256, 256>>>(row, n, out)));
 }
+namespace { __global__ void k_vec_add(float * x, const float * __restrict__ y, size_t n) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += y[i];
+} }
+void vec_add(float * x, const float * y, size_t n, cudaStream_t s) { k_vec_add<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(x, y, n); }
 void moe_zc_init() {
     for (auto f : {(const void *) k_moe_zc_gate_up<GType::IQ3_S>, (const void *) k_moe_zc_gate_up<GType::IQ4_XS>,
                    (const void *) k_moe_zc_gate_up<GType::Q4_K>, (const void *) k_moe_zc_gate_up<GType::Q5_K>,

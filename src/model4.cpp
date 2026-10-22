@@ -5,9 +5,10 @@
 namespace hyper {
 
 Q4Config Q4Config::from_gguf(const GGUF & g) {
-    if (g.arch() != "qwen4exp") throw std::runtime_error("expected qwen4exp model, got " + g.arch());
-    const std::string a = "qwen4exp.";
+    if (g.arch() != "qwen4exp" && g.arch() != "qwen35moe") throw std::runtime_error("expected qwen4exp / qwen35moe model, got " + g.arch());
+    const std::string a = g.arch() + ".";
     Q4Config c;
+    c.plain = g.arch() == "qwen35moe";
     c.n_layer = (int) g.get_int(a + "block_count") - (int) g.get_int(a + "nextn_predict_layers", 0);
     c.n_embd = (int) g.get_int(a + "embedding_length");
     c.n_head = (int) g.get_int(a + "attention.head_count");
@@ -31,15 +32,16 @@ Q4Config Q4Config::from_gguf(const GGUF & g) {
     c.n_expert_used = (int) g.get_int(a + "expert_used_count");
     c.n_ff_exp = (int) g.get_int(a + "expert_feed_forward_length");
     c.n_ff_shexp = (int) g.get_int(a + "expert_shared_feed_forward_length");
-    c.hc = (int) g.get_int(a + "hyper_connection.count");
-    c.hc_lr = (int) g.get_int(a + "hyper_connection.low_rank");
-    c.idx_n_head = (int) g.get_int(a + "attention.indexer.head_count");
-    c.idx_dim = (int) g.get_int(a + "attention.indexer.key_length");
-    c.idx_top_k = (int) g.get_int(a + "attention.indexer.top_k");
-    for (int64_t r : g.get_int_arr(a + "attention.compress_ratios")) {
-        c.compress.push_back((int) r);
-        if (r) c.kpool = (int) r;
-    }
+    c.hc = c.plain ? 1 : (int) g.get_int(a + "hyper_connection.count");
+    c.hc_lr = c.plain ? 0 : (int) g.get_int(a + "hyper_connection.low_rank");
+    c.idx_n_head = (int) g.get_int(a + "attention.indexer.head_count", 0);
+    c.idx_dim = (int) g.get_int(a + "attention.indexer.key_length", 0);
+    c.idx_top_k = (int) g.get_int(a + "attention.indexer.top_k", 0);
+    if (g.has(a + "attention.compress_ratios"))
+        for (int64_t r : g.get_int_arr(a + "attention.compress_ratios")) {
+            c.compress.push_back((int) r);
+            if (r) c.kpool = (int) r;
+        }
     c.compress.resize(c.n_layer + 1, 0);
     if (g.has(a + "ple.layers")) {
         const auto layers = g.get_int_arr(a + "ple.layers");
@@ -62,9 +64,9 @@ Q4Config Q4Config::from_gguf(const GGUF & g) {
 std::string Q4Config::describe() const {
     char buf[640];
     snprintf(buf, sizeof buf,
-             "qwen4exp: %d layers (%d attn, kpool %d top %d), embd %d x hc %d (lr %d), heads %d/%d x %d (rot %d), "
+             "%s: %d layers (%d attn, kpool %d top %d), embd %d x hc %d (lr %d), heads %d/%d x %d (rot %d), "
              "gdn k%d v%d, moe %d/%d x %d + shared %d, ple layer %d (%d heads x %d), vocab %d",
-             n_layer, n_layer / full_attn_interval, kpool, idx_top_k, n_embd, hc, hc_lr, n_head, n_head_kv, head_dim, n_rot,
+             plain ? "qwen35moe" : "qwen4exp", n_layer, n_layer / full_attn_interval, kpool, idx_top_k, n_embd, hc, hc_lr, n_head, n_head_kv, head_dim, n_rot,
              ssm_n_group, ssm_dt_rank, n_expert_used, n_expert, n_ff_exp, n_ff_shexp, ple_layer, ple_n_heads(), ple_dim, n_vocab);
     return buf;
 }

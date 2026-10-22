@@ -26,6 +26,8 @@ void silu_scale(float * x, int n, float scale, int nt, int stride, cudaStream_t 
 void hc_mixed(const float * xn, const float * gate, float * mixed, int n, int hc, int nt, cudaStream_t s, bool perm = false);
 // res[t][s*n+e] += bo[t][e] * 2 * sigmoid(inject[t][s] / hc)
 void hc_combine(float * res, const float * bo, const float * inject, int inject_stride, int n, int hc, int nt, cudaStream_t s);
+// x[i] += y[i]
+void vec_add(float * x, const float * y, size_t n, cudaStream_t s);
 // res[t][s*n+e] = x[t][e] (hc copies)
 void hc_init(float * res, const float * x, int n, int hc, int nt, cudaStream_t s);
 
