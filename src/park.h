@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -55,6 +56,7 @@ public:
     ~ConvPark() {
         for (auto & s : slots_) free_bufs(s.host);
         free_bufs(tmp_);
+        for (void * c : pool_) cudaFreeHost(c);
     }
 
     // Before the snapshot match of a new prompt: parks the current conversation or swaps a parked one back.
@@ -88,10 +90,12 @@ public:
         if (best >= 0 && Up > U + min_gain) {   // a parked conversation comes back; the current one takes its slot
             Slot & s = slots_[best];
             const bool keep = cur >= min_park;
+            const auto t0 = std::chrono::steady_clock::now();
             if (keep) copy(tmp_, cur, true, devs);
             if (before_restore) before_restore((int) s.hist.size());
             copy(s.host, (int) s.hist.size(), false, devs);
-            fprintf(stderr, "%s: resumed a parked conversation of %zu tokens (%zu parked)\n", tag, s.hist.size(), slots_.size());
+            fprintf(stderr, "%s: resumed a parked conversation of %zu tokens in %.0f ms (%zu parked)\n", tag, s.hist.size(),
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), slots_.size());
             std::swap(hist, s.hist);
             std::swap(snaps, s.snaps);
             std::swap(s.host, tmp_);   // (the slot keeps the parked caches; the restored ones' buffers become the staging set)
@@ -104,6 +108,8 @@ public:
                 std::swap(tmp_, s.host);
                 slots_.erase(slots_.begin() + best);
             }
+            free_bufs(tmp_);   // (the staging set's chunks back to the pool: the next park reuses them)
+            trim();
             return Lp;
         }
         int last_msg = -1;   // (where the current conversation's last message starts; GLM's answer may end in <|user|>)
@@ -126,7 +132,9 @@ public:
             Slot & s = slots_[k];
             for (auto & sn : s.snaps) pool.push_back(sn.h);
             s.snaps.clear();
+            const auto t0 = std::chrono::steady_clock::now();
             copy(s.host, cur, true, devs);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             s.hist = hist;
             s.snaps.swap(snaps);
             if (ki >= 0) snaps.push_back(kept);
@@ -135,7 +143,7 @@ public:
             // the pinned memory budget: least recently used conversations out (never the one just parked)
             for (;;) {
                 size_t tot = 0;
-                for (auto & x : slots_) for (auto & b : x.host) tot += b.bytes;
+                for (auto & x : slots_) for (auto & b : x.host) tot += bytes(b);
                 if (tot <= max_bytes || slots_.size() <= 1) break;
                 int lru = -1;
                 for (int i = 0; i < (int) slots_.size(); ++i)
@@ -145,8 +153,10 @@ public:
                 slots_.erase(slots_.begin() + lru);
                 if (lru < k) --k;
             }
-            fprintf(stderr, "%s: parked a conversation of %zu tokens (%zu snapshots kept, %zu parked)\n", tag, slots_[k].hist.size(),
-                    slots_[k].snaps.size(), slots_.size());
+            trim();
+            fprintf(stderr, "%s: parked a conversation of %zu tokens in %.0f ms (%zu snapshots kept, %zu parked; %.1f GiB pinned, %.1f GiB "
+                            "of it free)\n", tag, slots_[k].hist.size(), ms, slots_[k].snaps.size(), slots_.size(),
+                    (double) pinned_ * CHUNK / 1073741824.0, (double) pool_.size() * CHUNK / 1073741824.0);
         }
         return L;
     }
@@ -157,6 +167,7 @@ public:
             free_bufs(s.host);
         }
         slots_.clear();
+        trim();
     }
     void release(std::vector<std::vector<float *>> & pool) {   // (destructor of the engine: snapshots back)
         for (auto & s : slots_) {
@@ -166,7 +177,32 @@ public:
     }
 
 private:
-    struct HostBuf { void * p = nullptr; size_t bytes = 0; };
+    // pinned host memory in fixed chunks from a pool: pinning costs ~0.65 s / GB on the host (freeing ~0.26 s / GB), and a
+    // parked conversation that grew needed a new whole buffer each time (6-10 s before a side request's prefill with a
+    // 200k+ conversation); chunks are only added for the growth and come back to the pool, which keeps up to the budget
+    const size_t CHUNK = (size_t) (getenv("HYPER_PARK_CHUNK_KB") ? atoi(getenv("HYPER_PARK_CHUNK_KB")) : 65536) << 10;   // (tests: small chunks)
+    struct HostBuf { std::vector<void *> chunks; };
+    size_t bytes(const HostBuf & b) const { return b.chunks.size() * CHUNK; }
+    std::vector<void *> pool_;   // free chunks
+    size_t pinned_ = 0;          // chunks allocated in all
+    void * take() {
+        if (!pool_.empty()) { void * c = pool_.back(); pool_.pop_back(); return c; }
+        void * c = nullptr;
+        check(cudaHostAlloc(&c, CHUNK, cudaHostAllocPortable), "host alloc");
+        ++pinned_;
+        return c;
+    }
+    void free_bufs(std::vector<HostBuf> & set) {
+        for (auto & b : set) { for (void * c : b.chunks) pool_.push_back(c); b.chunks.clear(); }
+        set.clear();
+    }
+    void trim() {   // free chunks beyond the budget go back to the system
+        size_t used = 0;
+        for (auto & x : slots_) for (auto & b : x.host) used += b.chunks.size();
+        for (auto & b : tmp_) used += b.chunks.size();
+        const size_t cap = max_bytes / CHUNK;
+        while (!pool_.empty() && used + pool_.size() > cap) { cudaFreeHost(pool_.back()); pool_.pop_back(); --pinned_; }
+    }
     struct Slot { std::vector<int> hist; std::vector<Snap> snaps; std::vector<HostBuf> host; uint64_t used = 0; };
     std::vector<Slot> slots_;
     std::vector<HostBuf> tmp_;   // per device: staging for a swap
@@ -193,17 +229,13 @@ private:
         }
         snaps.swap(keep);
     }
-    static void free_bufs(std::vector<HostBuf> & set) {
-        for (auto & b : set) if (b.p) cudaFreeHost(b.p);
-        set.clear();
-    }
-
     static void check(cudaError_t e, const char * what) {
         if (e != cudaSuccess) throw std::runtime_error(std::string("ConvPark: ") + what + ": " + cudaGetErrorString(e));
     }
 
-    // positions [0, n) of every span, per device, to / from a pinned host set (grown on demand)
-    static void copy(std::vector<HostBuf> & set, int n, bool to_host, const std::vector<Dev> & devs) {
+    // positions [0, n) of every span, per device, to / from a pinned host set (grown on demand by pool chunks); a head's
+    // rows are contiguous on the device, cut where they cross a chunk boundary
+    void copy(std::vector<HostBuf> & set, int n, bool to_host, const std::vector<Dev> & devs) {
         if (n <= 0) return;
         set.resize(devs.size());
         for (size_t gi = 0; gi < devs.size(); ++gi) {
@@ -212,21 +244,21 @@ private:
             size_t need = 0;
             for (auto & sp : d.spans) need += sp.rows(n) * sp.row_bytes * sp.heads;
             HostBuf & hb = set[gi];
-            if (hb.bytes < need) {
-                if (hb.p) check(cudaFreeHost(hb.p), "free");
-                hb.p = nullptr;
-                hb.bytes = 0;   // (until the allocation succeeds: a failed one must not leave a size without memory)
-                void * p = nullptr;
-                check(cudaHostAlloc(&p, need * 5 / 4, cudaHostAllocPortable), "host alloc");
-                hb.p = p;
-                hb.bytes = need * 5 / 4;
-            }
-            char * hp = (char *) hb.p;
+            while (bytes(hb) < need) hb.chunks.push_back(take());
+            size_t off = 0;   // (offset in the chunked host set)
             for (auto & sp : d.spans) {
-                const size_t w = sp.rows(n) * sp.row_bytes;
-                if (to_host) check(cudaMemcpy2DAsync(hp, w, sp.dev, sp.pitch ? sp.pitch : w, w, sp.heads, cudaMemcpyDeviceToHost, d.stream), "copy");
-                else check(cudaMemcpy2DAsync(sp.dev, sp.pitch ? sp.pitch : w, hp, w, w, sp.heads, cudaMemcpyHostToDevice, d.stream), "copy");
-                hp += w * sp.heads;
+                const size_t w = sp.rows(n) * sp.row_bytes, pitch = sp.pitch ? sp.pitch : w;
+                for (int h = 0; h < sp.heads; ++h) {
+                    char * dp = (char *) sp.dev + (size_t) h * pitch;
+                    for (size_t done = 0; done < w;) {
+                        const size_t ci = off / CHUNK, co = off % CHUNK, len = std::min(w - done, CHUNK - co);
+                        char * hp = (char *) hb.chunks[ci] + co;
+                        if (to_host) check(cudaMemcpyAsync(hp, dp + done, len, cudaMemcpyDeviceToHost, d.stream), "copy");
+                        else check(cudaMemcpyAsync(dp + done, hp, len, cudaMemcpyHostToDevice, d.stream), "copy");
+                        done += len;
+                        off += len;
+                    }
+                }
             }
         }
         for (auto & d : devs) { check(cudaSetDevice(d.id), "set device"); check(cudaStreamSynchronize(d.stream), "sync"); }
