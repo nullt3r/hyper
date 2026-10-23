@@ -1299,6 +1299,21 @@ void Engine4::load_weights() {
                 fprintf(stderr, "hyper4: device %d streams prefill experts through 2 x %.0f MiB\n", dp->id, dp->stage_bytes / 1048576.0);
             }
     }
+    // the PLE n-gram table in RAM (2 MB pages): its rows are read at random, 16 per token, and read through the mmapped file a
+    // cold page cache made every row a disk read (prefill ~550 t/s until the file was cached, and again whenever other files
+    // pushed it out); HYPER4_PLE_MMAP=1 keeps reading the file
+    if (c.ple_layer >= 0 && !getenv("HYPER4_PLE_MMAP")) {
+        const GTensor & pt = gguf_->need("per_layer_token_embd.weight");
+        const size_t bytes = pt.nbytes, step = 64u << 20;
+        auto tp = std::chrono::steady_clock::now();
+        uint8_t * buf = (uint8_t *) host_huge_alloc(bytes);
+#pragma omp parallel for schedule(dynamic)
+        for (size_t o = 0; o < bytes; o += step) memcpy(buf + o, pt.data + o, std::min(step, bytes - o));
+        collapse_huge(buf, bytes);
+        ple_tab_ = buf;
+        fprintf(stderr, "hyper4: PLE table (%.2f GiB) in RAM in %.1f s\n", bytes / 1073741824.0,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count());
+    }
     for (auto & dp : devs_) fprintf(stderr, "hyper4: device %d holds %.2f GiB\n", dp->id, dp->used / 1073741824.0);
     double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     fprintf(stderr, "hyper4: weights loaded in %.1f s (%d GPUs)\n", s, nd);
@@ -2017,7 +2032,7 @@ void Engine4::embed(const int * tokens, int nt, int pos, int chunk) {
             for (int gq = 0; gq < c.ple_heads_per_ngram; ++gq) {
                 const int h = (ngr - 2) * c.ple_heads_per_ngram + gq;
                 const uint64_t row = mixed % c.ple_vocab[h] + c.ple_offsets[h];
-                pt_tr->to_float(pt.data + row * pt.row_bytes(), out + h * dim, dim);
+                pt_tr->to_float((ple_tab_ ? ple_tab_ : pt.data) + row * pt.row_bytes(), out + h * dim, dim);
             }
         }
     }

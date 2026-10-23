@@ -191,6 +191,7 @@ private:
         bool tables_dirty = false, stream_dirty = false;
     };
     std::vector<ExpertHost> ehost_;   // [n_layer + 1]: the MTP block last
+    const uint8_t * ple_tab_ = nullptr;   // the PLE n-gram table copied to RAM (nullptr: read through the mmapped file)
     bool adapt_ = true, prompt_routed_ = false;
     double adapt_decay_ = 0.92, prompt_weight_ = 0.25;   // (Engine5's measured settings)
     int adapt_every_ = 16, adapt_budget_ = 64;
