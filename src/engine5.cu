@@ -170,7 +170,7 @@ struct Engine5::DevLayer {
     bool mla = false, moe = false;
     // mHC (replicated): fn [24][4n], scale [3], base [24]; block norms
     DW hca_fn, hcf_fn;
-    uint8_t * hca_raw = nullptr, * hcf_raw = nullptr;   // the same rows as raw GGUF Q8_0 (fused mHC mix)
+    uint8_t * hca_raw = nullptr, * hcf_raw = nullptr;   // the same rows as raw GGUF Q8_0 (fused mHC mix; nullptr: not Q8_0)
     float * hca_scale = nullptr, * hca_base = nullptr, * hcf_scale = nullptr, * hcf_base = nullptr;
     float * attn_norm = nullptr, * ffn_norm = nullptr;
     int nh = 0, h0 = 0;          // local heads (KDA or MLA)
@@ -705,8 +705,7 @@ void Engine5::load_layer(Device & dev, DevLayer & L, int il) {
         L.hcf_fn = full(p + "hc_ffn_fn.weight");
         for (auto [nm, dst] : {std::pair<const char *, uint8_t **>{"hc_attn_fn.weight", &L.hca_raw}, {"hc_ffn_fn.weight", &L.hcf_raw}}) {
             const GTensor & t = G.need(p + nm);
-            if (t.type != GType::Q8_0) throw std::runtime_error("hc_fn: expected Q8_0");
-            *dst = dev.upload(t.data, t.nbytes);
+            if (t.type == GType::Q8_0) *dst = dev.upload(t.data, t.nbytes);   // (other types, e.g. Maya's F32: the unfused mix)
         }
         L.hca_scale = f32(p + "hc_attn_scale.weight");
         L.hca_base = f32(p + "hc_attn_base.weight");
@@ -1433,7 +1432,7 @@ void Engine5::record_main(int gi, int nt, int kind) {
     // mHC pre-mix: res -> d.xn (block input after its RMS norm) and the post / comb weights
     static const bool old_mhc = getenv("HYPER5_OLDMHC") != nullptr;
     auto hc_pre = [&](const DW & fn, const uint8_t * raw, const float * scale, const float * base, const float * norm_w) {
-        if (!old_mhc && !bulk) { mhc_pre_fused(R, raw, d.mixpart, scale, base, norm_w, eps, c.hc_eps, c.sinkhorn, n, d.hcw, d.xn, nt, s); return; }
+        if (raw && !old_mhc && !bulk) { mhc_pre_fused(R, raw, d.mixpart, scale, base, norm_w, eps, c.hc_eps, c.sinkhorn, n, d.hcw, d.xn, nt, s); return; }
         mm(fn, R, hcn, d.mix, 32, nt);
         mhc_pre(R, d.mix, 32, scale, base, norm_w, eps, c.hc_eps, c.sinkhorn, n, d.hcw, d.xn, nt, s);
     };
