@@ -2,6 +2,7 @@
 #include "../src/gguf.h"
 #include "../src/kernels4.cuh"
 #include <cuda_runtime.h>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -153,7 +154,28 @@ int main(int argc, char ** argv) {
         double c2 = 0; for (float v : h2) c2 += v;
         printf("variant %d: %.1f us/call, %.1f GB/s, checksum %.6g (%s)\n", var, d2 * 1e6, 6.0 * 2 * gb / d2 / 1e9, c2, cudaGetErrorString(cudaGetLastError()));
     }
-    printf("G32BENCH %s %s: %.1f us/call, %.1f GB/s (6 experts gate+up %.1f MB), checksum %.6g\n", p.c_str(), gtype_name(tg.type), dt * 1e6,
+    printf("G32BENCH %s %s: %.1f us/call, %.1f GB/s (6 experts gate+up %.1f MB), checksum %.9g\n", p.c_str(), gtype_name(tg.type), dt * 1e6,
            6.0 * 2 * gb / dt / 1e9, 6.0 * 2 * gb / 1e6, cs);
+    {   // the down projection of the same 6 pairs (production dispatch: moe_down), time and checksum
+        const GTensor & td = g.need(p + "ffn_down_exps.weight");
+        const size_t db = td.nbytes / E;
+        uint8_t * dd; cudaMalloc(&dd, NE * db);
+        cudaMemcpy(dd, td.data, NE * db, cudaMemcpyHostToDevice);
+        MoeDev md = m; md.down = dd; md.td = td.type; md.down_bytes = db;
+        std::vector<float> wv(K * iters, 0.5f);
+        float * dw, * dy; cudaMalloc(&dw, wv.size() * 4); cudaMalloc(&dy, (size_t) K * n * 4);
+        cudaMemcpy(dw, wv.data(), wv.size() * 4, cudaMemcpyHostToDevice);
+        moe_gate_up(m, dx, n, dids, K, dh, 1, s);   // (h of the first id set)
+        for (int it = 0; it < 10; ++it) moe_down(md, dh, dids, dw, K, dy, 1, s);
+        cudaStreamSynchronize(s);
+        auto t2 = std::chrono::steady_clock::now();
+        for (int it = 0; it < iters; ++it) moe_down(md, dh, dids, dw, K, dy, 1, s);
+        cudaStreamSynchronize(s);
+        const double d3 = std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count() / iters;
+        std::vector<float> yv((size_t) K * n); cudaMemcpy(yv.data(), dy, yv.size() * 4, cudaMemcpyDeviceToHost);
+        double c3 = 0, a3 = 0; for (float v : yv) { c3 += v; a3 += fabs(v); }
+        printf("G32BENCH down %s: %.1f us/call, %.1f GB/s, checksum %.9g (abs %.9g) (%s)\n", gtype_name(td.type), d3 * 1e6, 6.0 * db / d3 / 1e9, c3, a3,
+               cudaGetErrorString(cudaGetLastError()));
+    }
     return 0;
 }

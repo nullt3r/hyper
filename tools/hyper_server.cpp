@@ -10,6 +10,7 @@
 //                     glm5-next: [--gpu-frac 1.0] [--cpu-threads 30] [--expert-stats file]   (context default 65536)
 //                     [--reasoning-effort low|high|max|none]   (template default when absent; requests may override)
 //                     [--chat-template-file t.jinja]   (instead of the GGUF's template)
+//                     [--chat-template-kwargs '{"reasoning_effort":75}']   (defaults; a request's chat_template_kwargs override)
 #include "engine.h"
 #include "engine4.h"
 #include "engine5.h"
@@ -38,6 +39,9 @@
 #include <map>
 #include <mutex>
 #include <csignal>
+#include <execinfo.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <thread>
 #include <set>
@@ -46,6 +50,7 @@
 
 using ojson = nlohmann::ordered_json;
 static std::string g_reasoning_effort;   // --reasoning-effort: default for requests without one
+static ojson g_tmpl_kwargs = ojson::object();   // --chat-template-kwargs: defaults under each request's chat_template_kwargs
 static bool g_vision = false;            // --mmproj loaded: image parts reach the model
 using namespace hyper;
 
@@ -83,6 +88,7 @@ struct Ctx {
     common_chat_templates_ptr tmpls;
     std::string alias;
     bool glm = false;   // glm5-next: its templates know reasoning effort low / high (/ max)
+    bool ds41 = false;  // deepseek41: reasoning effort an integer 1..100 or low / medium / high / max
     // --mmproj: the vision encoder (libmtmd); images of a prompt become its rows at the image token's positions
     mtmd_context * mtmd = nullptr;
     int image_tok = -1, n_embd_inp = 0;
@@ -616,18 +622,29 @@ Request prepare(Ctx & c, const ojson & body) {
     in.parallel_tool_calls = body.value("parallel_tool_calls", true);
     in.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     in.enable_thinking = true;
-    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
-        for (auto & [k, v] : body["chat_template_kwargs"].items()) in.chat_template_kwargs[k] = v.dump();
-        if (body["chat_template_kwargs"].contains("enable_thinking"))
-            in.enable_thinking = body["chat_template_kwargs"]["enable_thinking"].get<bool>();
+    {
+        ojson kw = g_tmpl_kwargs;
+        if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
+            for (auto & [k, v] : body["chat_template_kwargs"].items()) kw[k] = v;
+        for (auto & [k, v] : kw.items()) in.chat_template_kwargs[k] = v.dump();
+        if (kw.contains("enable_thinking") && kw["enable_thinking"].is_boolean()) in.enable_thinking = kw["enable_thinking"].get<bool>();
     }
     {   // reasoning effort: the request's OpenAI field, else --reasoning-effort (GLM templates know low / high, anything else = max;
         // Qwen's know xhigh / medium / low, unsloth's also high)
-        std::string eff = body.contains("reasoning_effort") && body["reasoning_effort"].is_string() ? body["reasoning_effort"].get<std::string>()
-                                                                                                   : g_reasoning_effort;
+        // (DeepSeek-V4.1: also an integer 1..100, as a number or a numeric string; OpenAI's xhigh -> max, minimal -> low)
+        const bool req = body.contains("reasoning_effort") && (body["reasoning_effort"].is_string() || body["reasoning_effort"].is_number_integer());
+        std::string eff = !req ? g_reasoning_effort : body["reasoning_effort"].is_string() ? body["reasoning_effort"].get<std::string>()
+                                                                                            : std::to_string(body["reasoning_effort"].get<int>());
         if (c.glm && eff == "medium") eff = "high";
+        const bool num = !eff.empty() && eff.size() <= 3 && eff.find_first_not_of("0123456789") == std::string::npos;
+        if (c.ds41 && eff == "xhigh") eff = "max";
+        if (c.ds41 && eff == "minimal") eff = "low";
+        // (a request's own field beats --chat-template-kwargs; the request's chat_template_kwargs beat both)
+        const bool own = body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object() &&
+                         body["chat_template_kwargs"].contains("reasoning_effort");
         if (eff == "none") in.enable_thinking = false;
-        else if (!eff.empty() && !in.chat_template_kwargs.count("reasoning_effort")) in.chat_template_kwargs["reasoning_effort"] = "\"" + eff + "\"";
+        else if (!eff.empty() && (!in.chat_template_kwargs.count("reasoning_effort") || (req && !own)))
+            in.chat_template_kwargs["reasoning_effort"] = c.ds41 && num ? eff : "\"" + eff + "\"";
     }
     const auto tt0 = clk::now();
     const common_chat_params cp = common_chat_templates_apply(c.tmpls.get(), in);
@@ -809,9 +826,9 @@ GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::strin
             r.id.c_str(), 1e3 * o.t_prompt, n_new, 1e3 * o.t_prompt / std::max(1, n_new), n_new / std::max(1e-9, o.t_prompt), o.reused);
     fprintf(stderr, "[%s]        eval time = %10.2f ms / %6d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
             r.id.c_str(), 1e3 * o.t_gen, o.n_gen, 1e3 * o.t_gen / std::max(1, o.n_gen), o.n_gen / std::max(1e-9, o.t_gen));
-    fprintf(stderr, "[%s]       total time = %10.2f ms / %6d tokens, finish: %s, draft acceptance %.2f / %d per step (%.2f drafted)\n",
+    fprintf(stderr, "[%s]       total time = %10.2f ms / %6d tokens, finish: %s, draft acceptance %.2f / %d per step (%.2f drafted, %d steps gated)\n",
             r.id.c_str(), 1e3 * secs(t0, t2), n_new + o.n_gen, o.finish.c_str(), o.steps ? (double) o.accepted / o.steps : 0.0,
-            c.eng->n_draft(), o.steps ? (double) st.drafted / o.steps : 0.0);
+            c.eng->n_draft(), o.steps ? (double) st.drafted / o.steps : 0.0, st.gated);
     if (on_text) fprintf(stderr, "[%s]  stream parse+send: %.0f ms on the stream thread (%ld snapshots of %d tokens)\n", r.id.c_str(),
                          streamer.busy_ms, streamer.n_parsed, o.n_gen);
     {
@@ -1069,6 +1086,20 @@ ojson message_item(const std::string & id, const std::string & text, bool done) 
 
 } // namespace
 
+// a crash (SIGSEGV / SIGBUS / SIGILL / SIGFPE / SIGABRT): the faulting thread's name, id and backtrace to stderr (the log;
+// frames as module(+offset), resolved offline with addr2line / the library's symbols), then the default action
+static void crash_report(int sig, siginfo_t * si, void *) {
+    char name[32] = "?", buf[320];
+    pthread_getname_np(pthread_self(), name, sizeof name);
+    const int n = snprintf(buf, sizeof buf, "\nhyper-server: signal %d (%s), address %p, thread %ld \"%s\"; backtrace:\n", sig,
+                           strsignal(sig), si ? si->si_addr : nullptr, (long) syscall(SYS_gettid), name);
+    if (n > 0) { ssize_t w = write(2, buf, (size_t) n); (void) w; }
+    void * fr[64];
+    backtrace_symbols_fd(fr, backtrace(fr, 64), 2);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 int main(int argc, char ** argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s model.gguf [--host H] [--port P] [--ctx N] [--draft K] [--alias name]\n", argv[0]); return 1; }
     // SIGINT / SIGTERM: a thread waits for them (blocked in every thread, also when the shell started us as a background job with
@@ -1081,6 +1112,14 @@ int main(int argc, char ** argv) {
     signal(SIGINT, SIG_DFL);
     signal(SIGTERM, SIG_DFL);
     pthread_sigmask(SIG_BLOCK, &stop_sigs, nullptr);
+    {
+        void * fr[2];
+        backtrace(fr, 2);   // (loads libgcc's unwinder now, not inside the handler)
+        struct sigaction sa = {};
+        sa.sa_sigaction = crash_report;
+        sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+        for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(sig, &sa, nullptr);
+    }
     std::string host = "0.0.0.0", alias;
     int port = 8080, ctx = 262144, draft = 3, snaps = 48, cpu_threads = 30;
     float gpu_frac = 1.0f;
@@ -1109,6 +1148,10 @@ int main(int argc, char ** argv) {
             mcps.push_back({v.substr(0, eq), v.substr(eq + 1)});
         }
         else if (k == "--reasoning-effort") g_reasoning_effort = v;
+        else if (k == "--chat-template-kwargs") {
+            try { g_tmpl_kwargs = ojson::parse(v); } catch (const std::exception &) { g_tmpl_kwargs = nullptr; }
+            if (!g_tmpl_kwargs.is_object()) { fprintf(stderr, "--chat-template-kwargs expects a JSON object\n"); return 1; }
+        }
         else if (k == "--chat-template-file") template_file = v;
         else if (k == "--mmproj") mmproj_path = v;
         else if (k == "--vocab") vocab_path = v;
@@ -1215,6 +1258,7 @@ int main(int argc, char ** argv) {
         draft = e5->n_draft();
         engine = std::move(e5);
     } else if (arch == "deepseek41") {
+        c.ds41 = true;
         if (!ctx_given) ctx = 65536;
         // DeepSeek's recommended sampling: temperature 1.0, top_p 1.0
         if (!temp_given) c.defaults.temp = 1.0f;

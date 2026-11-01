@@ -13,17 +13,37 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <random>
 #include <string>
 #include <vector>
 
 using namespace hyper;
 
+// POLL=B: B blocks on every GPU spin on a mapped host flag during each job, as k_moe_reduce's waits do in the engines
+__global__ void k_poll(const volatile unsigned * f, unsigned want) { if (threadIdx.x == 0) while (*f != want) {} }
+
 int main(int argc, char ** argv) {
     if (argc < 2) { fprintf(stderr, "usage: cpumoebench model.gguf [layer] [threads] [experts/job] [tokens/job] [jobs]\n"); return 1; }
     const int layer = argc > 2 ? atoi(argv[2]) : 10, nth = argc > 3 ? atoi(argv[3]) : 30;
     const int epj = argc > 4 ? atoi(argv[4]) : 3, nt = argc > 5 ? atoi(argv[5]) : 1, jobs = argc > 6 ? atoi(argv[6]) : 2000;
     const int NE = getenv("NE") ? atoi(getenv("NE")) : 64;   // resident experts (working set far beyond the L3)
+    const double gap_us = getenv("GAP_US") ? atof(getenv("GAP_US")) : 0;
+    // GAP_PRE=1: the idle time comes before the record (the GPUs computing the layer while the job waits: HYPER_CPU_PREFETCH reads
+    // then); HIT=p: each expert of a token repeats one of the previous job's experts with probability p
+    const bool gap_pre = getenv("GAP_PRE") != nullptr;
+    const double hit_p = getenv("HIT") ? atof(getenv("HIT")) : -1.0;
+    const int poll_b = getenv("POLL") ? atoi(getenv("POLL")) : 0;
+    int npoll = 0;
+    unsigned * pflag = nullptr;
+    if (poll_b > 0) {
+        cudaGetDeviceCount(&npoll);
+        if (cudaHostAlloc((void **) &pflag, 4096, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) { fprintf(stderr, "cudaHostAlloc failed\n"); return 1; }
+        *pflag = 0;
+        for (int d = 0; d < npoll; ++d) { cudaSetDevice(d); k_poll<<<1, 32>>>(pflag, 0); cudaDeviceSynchronize(); }   // (contexts up)
+        fprintf(stderr, "POLL: %d blocks on each of %d GPUs\n", poll_b, npoll);
+    }
+    std::vector<int> prev_ids;
     if (getenv("QTEST")) {   // Q8_K quantizer of the CPU MoE vs ggml's, bitwise, on random rows of several shapes
         std::mt19937 rq(11);
         std::vector<float> xs(4096);
@@ -63,16 +83,38 @@ int main(int argc, char ** argv) {
     const GTensor & tg = g.need(p + "ffn_gate_exps.weight"), & tu = g.need(p + "ffn_up_exps.weight"), & td = g.need(p + "ffn_down_exps.weight");
     const int n = (int) tg.ne[0], ff = (int) tg.ne[1], E = (int) tg.ne[2];
     const size_t gb = tg.nbytes / E, db = td.nbytes / E;
-    const size_t bytes = (size_t) NE * (2 * gb + db), H = 2u << 20, sz = (bytes + H - 1) / H * H;
-    uint8_t * buf = (uint8_t *) mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // SPREAD=GB: the NE experts sit at random slots of a GB-sized expert array (as the engines' copies of every layer: a working
+    // set of ~140 GB, TLB / page-walk behaviour), only the used slots are touched
+    const int slots = getenv("SPREAD") ? std::max(NE, (int) (atof(getenv("SPREAD")) * 1e9 / (2 * gb + db))) : NE;
+    const size_t bytes = (size_t) slots * (2 * gb + db), H = 2u << 20, sz = (bytes + H - 1) / H * H;
+    uint8_t * buf = (uint8_t *) mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     madvise(buf, sz, getenv("NOHUGE") ? MADV_NOHUGEPAGE : MADV_HUGEPAGE);
     CpuExpertLayer cl;
     cl.tg = tg.type; cl.td = td.type; cl.gate_bytes = gb; cl.down_bytes = db;
-    cl.gate = buf; cl.up = buf + (size_t) NE * gb; cl.down = buf + (size_t) NE * 2 * gb;
+    cl.gate = buf; cl.up = buf + (size_t) slots * gb; cl.down = buf + (size_t) slots * 2 * gb;
+    if (slots > NE) {
+        std::vector<int> perm(slots);
+        for (int i = 0; i < slots; ++i) perm[i] = i;
+        std::mt19937 rs(5);
+        std::shuffle(perm.begin(), perm.end(), rs);
+        cl.cslot.assign(perm.begin(), perm.begin() + NE);
+    }
     for (int e = 0; e < NE; ++e) {   // experts E/2 .. E/2 + NE - 1 of the layer
-        memcpy((uint8_t *) cl.gate + (size_t) e * gb, tg.data + (size_t) (E / 2 + e) * gb, gb);
-        memcpy((uint8_t *) cl.up + (size_t) e * gb, tu.data + (size_t) (E / 2 + e) * gb, gb);
-        memcpy((uint8_t *) cl.down + (size_t) e * db, td.data + (size_t) (E / 2 + e) * db, db);
+        const size_t i = cl.index(e);
+        memcpy((uint8_t *) cl.gate + i * gb, tg.data + (size_t) (E / 2 + e) * gb, gb);
+        memcpy((uint8_t *) cl.up + i * gb, tu.data + (size_t) (E / 2 + e) * gb, gb);
+        memcpy((uint8_t *) cl.down + i * db, td.data + (size_t) (E / 2 + e) * db, db);
+    }
+    if (getenv("DOWN_PM") && atoi(getenv("DOWN_PM")) > 1) {   // the down copies part-major ([part][row][part's super-blocks]), as the engines may store them
+        const int S = atoi(getenv("DOWN_PM")), d_row = (int) (db / n), pb = d_row / S;
+        std::vector<uint8_t> tmp(db);
+        for (int e = 0; e < NE; ++e) {
+            uint8_t * d = (uint8_t *) cl.down + (size_t) e * db;
+            for (int r = 0; r < n; ++r)
+                for (int q = 0; q < S; ++q) memcpy(tmp.data() + ((size_t) q * n + r) * pb, d + (size_t) r * d_row + (size_t) q * pb, pb);
+            memcpy(d, tmp.data(), db);
+        }
+        cl.down_pm = S;
     }
     if (getenv("REG")) {   // pinned for the GPUs as in the engines
         if (cudaHostRegister(buf, sz, cudaHostRegisterPortable) != cudaSuccess) { fprintf(stderr, "cudaHostRegister failed\n"); return 1; }
@@ -95,6 +137,10 @@ int main(int argc, char ** argv) {
     for (int it = -50; it < jobs; ++it) {   // (50 warm-up jobs)
         const unsigned counter = (unsigned) (it + 100);
         cpu.expect(counter, {0});
+        if (gap_us > 0 && gap_pre) {
+            const auto tg0 = std::chrono::steady_clock::now();
+            while (std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - tg0).count() < gap_us) __builtin_ia32_pause();
+        }
         CpuMoeRec & r = recs[0];
         r.nt = nt;
         for (int t = 0; t < nt; ++t) {
@@ -103,6 +149,17 @@ int main(int argc, char ** argv) {
             for (int j = 0; j < epj; ++j) {
                 int e;
                 if (getenv("REPEAT")) e = (t * epj + j) % NE;   // the same experts every job: the oracle for prefetching
+                else if (hit_p >= 0) {
+                    bool dup;
+                    int tries = 0;
+                    do {
+                        const bool rep_ = !prev_ids.empty() && std::uniform_real_distribution<double>(0, 1)(rng) < hit_p && tries < 50;
+                        e = rep_ ? prev_ids[rng() % prev_ids.size()] : (int) (rng() % NE);
+                        dup = false;
+                        for (int q = 0; q < j; ++q) dup |= r.ids[t][q] == e;
+                        ++tries;
+                    } while (dup);
+                }
                 else if (t > 0 && j < epj / 2) e = r.ids[0][j];
                 else { do { e = (int) (rng() % NE); bool dup = false; for (int q = 0; q < j; ++q) dup |= r.ids[t][q] == e; if (!dup) break; } while (true); }
                 r.ids[t][j] = e; r.wts[t][j] = 0.1f + 0.01f * j;
@@ -110,10 +167,21 @@ int main(int argc, char ** argv) {
             memcpy(r.x[t], x.data() + (size_t) t * n, n * sizeof(float));
         }
         const unsigned want = counter * 64u;
+        for (int d = 0; d < npoll; ++d) { cudaSetDevice(d); k_poll<<<poll_b, 32>>>(pflag, want); }
         auto t0 = std::chrono::steady_clock::now();
         __atomic_store_n(&r.seq, want, __ATOMIC_RELEASE);
         while (__atomic_load_n(&outs[0].seq, __ATOMIC_ACQUIRE) != want) __builtin_ia32_pause();
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (npoll) {
+            *(volatile unsigned *) pflag = want;
+            for (int d = 0; d < npoll; ++d) { cudaSetDevice(d); cudaDeviceSynchronize(); }
+        }
+        prev_ids.clear();
+        for (int t = 0; t < nt; ++t) for (int j = 0; j < epj; ++j) prev_ids.push_back(r.ids[t][j]);
+        if (gap_us > 0 && !gap_pre) {   // (GAP_US: idle time between jobs, as the GPU part of a layer leaves in the server)
+            const auto tg0 = std::chrono::steady_clock::now();
+            while (std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - tg0).count() < gap_us) __builtin_ia32_pause();
+        }
         if (it < 0) continue;
         sum_t += dt;
         std::vector<int> uniq;

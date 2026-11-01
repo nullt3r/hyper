@@ -6,6 +6,7 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <sys/mman.h>
+#include <pthread.h>
 
 #include <algorithm>
 #include <array>
@@ -33,16 +34,20 @@ constexpr int R5 = MOE_BULK_ROWS;   // activation rows (prefill chunk)
 constexpr int GSCORE_ROWS = 64;     // indexer: tokens scored at a time
 constexpr int GLIST = 2052;         // max attended cells per token: 512 pools * 4 + 3 tail cells (+1)
 
-// dense weight: Q8_0 (fragment-ordered int8), Q4_K / Q6_K as KQ (same bits, the LM head), or anything else dequantized to
-// fp16 at load
+// dense weight: Q8_0 (fragment-ordered int8), Q4_K / Q6_K as KQ (same bits), segments of those (as engine4: runs of parts
+// with one type, e.g. Maya's Q6_K attention next to Q8_0 projections), or anything else dequantized to fp16 at load
+struct DWSeg { bool kq = false; Q8W q8; KQW w; int off = 0; };
 struct DW {
     Q8W q8;
     BF16W f;
     bool f16 = false, kq = false;
     KQW kw;
-    int n() const { return kq ? kw.n : f16 ? f.n : q8.n; }
-    int k() const { return kq ? kw.k : f16 ? f.k : q8.k; }
+    std::vector<DWSeg> seg;
+    int sn = 0, sk = 0;
+    int n() const { return !seg.empty() ? sn : kq ? kw.n : f16 ? f.n : q8.n; }
+    int k() const { return !seg.empty() ? sk : kq ? kw.k : f16 ? f.k : q8.k; }
 };
+size_t g5_kq_max_elems = 0;   // largest KQ segment (rows x k): the prefill dequantization scratch
 struct RowRange { const GTensor * t; int64_t r0, r1; };
 using ColRanges = std::vector<std::pair<int64_t, int64_t>>;
 using Alloc = std::function<void *(size_t)>;
@@ -116,6 +121,109 @@ DW upload_dense(const Alloc & alloc, int dev, const std::vector<RowRange> & part
     if (all_q8) { w.q8 = upload_q8(alloc, dev, parts, cols); return w; }
     const int64_t k_full = parts[0].t->ne[0];
     if (cols.empty()) cols.push_back({0, k_full / 32});
+    // native segments (Q8_0 / Q5_0 / Q4_0 as int8 fragments, Q4_K / Q6_K as KQ): the file's values exactly; Maya-L's Q6_K
+    // attention / shared experts were fp16 copies before (2.4x the bytes per decode GEMV and ~2.6 GB per GPU less for experts)
+    static const bool dense_f16 = getenv("HYPER5_DENSE_F16") != nullptr;   // (A/B: the fp16 copies)
+    auto seg_type = [](GType t) {   // 0: fp16 fallback, 1: Q8 fragments, 2: KQ
+        switch (t) {
+            case GType::Q8_0: case GType::Q5_0: case GType::Q4_0: return 1;
+            case GType::Q4_K: case GType::Q6_K: return 2;
+            default: return 0;
+        }
+    };
+    bool native = !dense_f16 && !requant;
+    for (auto & p : parts) if (!seg_type(p.t->type) || p.t->ne[0] != k_full) { native = false; break; }
+    if (native && getenv("HYPER5_KQ_ONLY")) {   // (debugging: native only for tensors whose name contains one of these)
+        bool any = false;
+        for (const char * q = getenv("HYPER5_KQ_ONLY"); *q;) {
+            const char * e = q; while (*e && *e != ',') ++e;
+            if (parts[0].t->name.find(std::string(q, e)) != std::string::npos) any = true;
+            q = *e ? e + 1 : e;
+        }
+        native = any;
+    }
+    if (getenv("HYPER5_SEGLOG"))
+        fprintf(stderr, "hyper5: dense %s (%s, %zu parts, cols %zu [%lld, %lld)) -> %s\n", parts[0].t->name.c_str(), gtype_name(parts[0].t->type),
+                parts.size(), cols.size(), (long long) cols[0].first * 32, (long long) cols[0].second * 32, native ? "native" : "fp16/q8");
+    if (native) {   // runs of parts with one type -> one segment: the file's blocks restricted to the column ranges
+        int kk = 0;
+        for (auto & [b0, b1] : cols) kk += (int) (b1 - b0) * 32;
+        for (size_t p0 = 0; p0 < parts.size();) {
+            const GType ty = parts[p0].t->type;
+            size_t p1 = p0 + 1;
+            while (p1 < parts.size() && parts[p1].t->type == ty) ++p1;
+            const bool kq = ty == GType::Q4_K || ty == GType::Q6_K;
+            // KQ: full source rows (the repack gathers the column blocks); Q8 types: the selected blocks
+            const size_t bb = gtype_block_bytes(ty), be = gtype_block_elems(ty), rb = kq ? (size_t) k_full / be * bb : kk / be * bb;
+            int nr = 0;
+            for (size_t q = p0; q < p1; ++q) nr += (int) (parts[q].r1 - parts[q].r0);
+            std::vector<uint8_t> buf(rb * nr);
+            int rbase = 0;
+            for (size_t q = p0; q < p1; ++q) {
+                const RowRange & p = parts[q];
+                const int pr = (int) (p.r1 - p.r0);
+#pragma omp parallel for schedule(static)
+                for (int r = 0; r < pr; ++r) {
+                    uint8_t * dst = buf.data() + (size_t) (rbase + r) * rb;
+                    const uint8_t * src = p.t->data + (size_t) (p.r0 + r) * p.t->row_bytes();
+                    if (kq) { memcpy(dst, src, rb); continue; }
+                    for (auto & [b0, b1] : cols) {
+                        const size_t len = (size_t) (b1 - b0) * 32 / be * bb;
+                        memcpy(dst, src + (size_t) b0 * 32 / be * bb, len);
+                        dst += len;
+                    }
+                }
+                rbase += pr;
+            }
+            p0 = p1;
+            DWSeg sg;
+            sg.off = w.sn;
+            if (!kq) {   // -> int8 + fp16 scale, exactly (q - 16, q - 8 fit in int8)
+                const int kb = kk / 32;
+                std::vector<int8_t> qs((size_t) nr * kk);
+                std::vector<half> d((size_t) nr * kb);
+#pragma omp parallel for schedule(static)
+                for (int r = 0; r < nr; ++r)
+                    for (int b = 0; b < kb; ++b) {
+                        const uint8_t * blk = buf.data() + (size_t) r * rb + (size_t) b * bb;
+                        int8_t * q = qs.data() + (size_t) r * kk + b * 32;
+                        memcpy(&d[(size_t) r * kb + b], blk, 2);
+                        if (ty == GType::Q8_0) memcpy(q, blk + 2, 32);
+                        else if (ty == GType::Q4_0) for (int l = 0; l < 16; ++l) { q[l] = (int8_t) ((blk[2 + l] & 0xF) - 8); q[l + 16] = (int8_t) ((blk[2 + l] >> 4) - 8); }
+                        else {   // Q5_0: d, qh[4], qs[16]
+                            uint32_t qh; memcpy(&qh, blk + 2, 4);
+                            for (int l = 0; l < 16; ++l) {
+                                q[l] = (int8_t) (((blk[6 + l] & 0xF) | (((qh >> l) << 4) & 0x10)) - 16);
+                                q[l + 16] = (int8_t) (((blk[6 + l] >> 4) | ((qh >> (l + 12)) & 0x10)) - 16);
+                            }
+                        }
+                    }
+                sg.q8 = to_device_q8(alloc, dev, qs.data(), d.data(), nr, kk);
+            } else {
+                KQHost h;
+                const KQ kt = ty == GType::Q4_K ? KQ::Q4K : KQ::Q6K;
+                std::vector<int> kbl;
+                for (auto & [b0, b1] : cols) for (int64_t b = b0; b < b1; ++b) kbl.push_back((int) b);
+                const int dg = repack_kq(kt, buf.data(), rb, nr, kbl, h);
+                CUDA_CHECK(cudaSetDevice(dev));
+                auto up = [&](const auto & v) -> void * {
+                    if (v.empty()) return nullptr;
+                    void * pd = alloc(v.size() * sizeof(v[0]));
+                    CUDA_CHECK(cudaMemcpy(pd, v.data(), v.size() * sizeof(v[0]), cudaMemcpyHostToDevice));
+                    return pd;
+                };
+                sg.kq = true;
+                sg.w.type = kt; sg.w.n = nr; sg.w.k = kk; sg.w.dg = dg;
+                sg.w.lo = (const uint2 *) up(h.lo); sg.w.hi = (const unsigned *) up(h.hi);
+                sg.w.scm = (const uint16_t *) up(h.scm); sg.w.sc6 = (const int8_t *) up(h.sc6); sg.w.d = (const half2 *) up(h.d);
+                g5_kq_max_elems = std::max(g5_kq_max_elems, (size_t) nr * kk);
+            }
+            w.seg.push_back(sg);
+            w.sn += nr;
+        }
+        w.sk = kk;
+        return w;
+    }
     std::vector<int64_t> cidx;
     for (auto & [b0, b1] : cols) for (int64_t c = b0 * 32; c < b1 * 32; ++c) cidx.push_back(c);
     const int k = (int) cidx.size();
@@ -171,6 +279,8 @@ struct Engine5::DevLayer {
     // mHC (replicated): fn [24][4n], scale [3], base [24]; block norms
     DW hca_fn, hcf_fn;
     uint8_t * hca_raw = nullptr, * hcf_raw = nullptr;   // the same rows as raw GGUF Q8_0 (fused mHC mix; nullptr: not Q8_0)
+    float * hcf32 = nullptr;   // HYPER5_PRED=2 without hcf_raw: hc_ffn_fn in fp32 for the prediction's mix (side stream)
+    int hcf_rows = 0;
     float * hca_scale = nullptr, * hca_base = nullptr, * hcf_scale = nullptr, * hcf_base = nullptr;
     float * attn_norm = nullptr, * ffn_norm = nullptr;
     int nh = 0, h0 = 0;          // local heads (KDA or MLA)
@@ -202,6 +312,7 @@ struct Engine5::DevLayer {
     // prefill streaming: this GPU's share of the CPU-owned experts in two halves (st_list[h], uploaded into staging buffer h);
     // st_slot[h][e] = index in the half or -1; owner_bulk[e] = the GPU that computes e in a prefill chunk
     int * st_slot[2] = {}, * owner_bulk = nullptr;
+    bool cpu_keep = false;   // a streamed chunk leaves some CPU experts on the CPU (rebuild_stream)
     std::vector<int> st_list[2];
 };
 
@@ -226,6 +337,14 @@ struct Engine5::Device {
     float * router32 = nullptr;   // prefill: a bf16 router widened
     float * rlog = nullptr, * wts = nullptr, * sg = nullptr, * shgu = nullptr, * shh = nullptr, * shpart = nullptr;
     float * plog = nullptr, * pwts = nullptr, * psg = nullptr;
+    // HYPER5_PRED=2 (GPU 0): a MoE layer's routing predicted from its input before the token mixer, on a side stream, for the
+    // CPU's prefetch (CpuMoe prefetch mode 2)
+    cudaStream_t pstream = nullptr;
+    cudaEvent_t ev_pf0 = nullptr, ev_pf1 = nullptr;
+    float * pmixpart = nullptr, * phcw = nullptr, * pxn = nullptr;
+    // early prediction: the next MoE layer's router on this layer's MoE input (side stream; d.xn is not rewritten before it is done)
+    cudaEvent_t ev_pe0 = nullptr, ev_pe1 = nullptr;
+    bool pe_pending = false;
     float * hzc = nullptr, * yzc = nullptr;   // zero-copy share of the CPU experts: hidden slice, partial outputs
     unsigned * ticket = nullptr;              // fused route + publish: blocks done
     int * pids = nullptr;
@@ -236,6 +355,8 @@ struct Engine5::Device {
     half * xh = nullptr, * p16 = nullptr, * recv = nullptr, * mix16 = nullptr, * h16 = nullptr;
     float * hf32 = nullptr;          // prefill: one layer's Q8_0 per-head matrix as exact fp32
     size_t hf32_n = 0;
+    half * ggs = nullptr;            // native KQ dense weights: fp16 slice for prefill GEMMs
+    size_t ggs_elems = 0;
     float * topk = nullptr;
     float * lstat = nullptr;   // sampling: a logit row slice's max and sum exp
     int big_stride = 0;
@@ -328,6 +449,17 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
         for (auto & ev : dev->ev_ar) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         CUDA_CHECK(cudaStreamCreateWithFlags(&dev->cstream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaStreamCreateWithFlags(&dev->fstream, cudaStreamNonBlocking));
+        // HYPER5_PSTREAM_PRIO: the prediction side stream at the highest priority (with the graphs' per-node priorities), so its
+        // few small kernels are not queued behind the token mixer's: the CPU's prefetch gets the prediction sooner
+        if (pstream_prio_) {
+            int lo = 0, hi = 0;
+            CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+            CUDA_CHECK(cudaStreamCreateWithPriority(&dev->pstream, cudaStreamNonBlocking, hi));
+        } else CUDA_CHECK(cudaStreamCreateWithFlags(&dev->pstream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&dev->ev_pf0, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&dev->ev_pf1, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&dev->ev_pe0, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&dev->ev_pe1, cudaEventDisableTiming));
         for (auto & ev : dev->ev_up) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         for (auto & ev : dev->ev_free) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&dev->ev_arh, cudaEventDisableTiming));
@@ -353,6 +485,11 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
         for (const char * q = zs; *q;) { zc_blocks_.push_back(atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
         if (zc_blocks_.size() < 2) zc_blocks_.clear();
     }
+    if (const char * rt = getenv("HYPER5_ROUTE_TRACE")) {
+        route_trace_ = fopen(rt, "ab");
+        if (!route_trace_) throw std::runtime_error(std::string("hyper5: cannot open ") + rt);
+        fprintf(stderr, "hyper5: routing trace -> %s\n", rt);
+    }
     if (getenv("HYPER5_PREDSTAT")) pred_k_ = std::max(1, std::min(MOE_MAX_USED, atoi(getenv("HYPER5_PREDSTAT"))));
     CUDA_CHECK(cudaHostAlloc(&h_pred_, (size_t) cfg_.n_layer * MOE_MAX_USED * sizeof(int), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_ids_, (size_t) nl_tot() * mc_max_ * R5 * cfg_.n_expert_used * sizeof(int), cudaHostAllocPortable));
@@ -363,6 +500,10 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
     CUDA_CHECK(cudaHostAlloc(&cpu_rec_, (size_t) slots * sizeof(CpuMoeRec), cudaHostAllocPortable | cudaHostAllocMapped));
     CUDA_CHECK(cudaHostAlloc(&cpu_out_, (size_t) slots * sizeof(CpuMoeOut), cudaHostAllocPortable | cudaHostAllocMapped));
     memset((void *) cpu_rec_, 0, (size_t) slots * sizeof(CpuMoeRec));
+    CUDA_CHECK(cudaHostAlloc(&cpu_pred_, (size_t) slots * sizeof(CpuMoeRec), cudaHostAllocPortable | cudaHostAllocMapped));
+    memset((void *) cpu_pred_, 0, (size_t) slots * sizeof(CpuMoeRec));
+    CUDA_CHECK(cudaHostAlloc(&cpu_pred1_, (size_t) slots * sizeof(CpuMoeRec), cudaHostAllocPortable | cudaHostAllocMapped));
+    memset((void *) cpu_pred1_, 0, (size_t) slots * sizeof(CpuMoeRec));
     memset((void *) cpu_out_, 0, (size_t) slots * sizeof(CpuMoeOut));
     if (const char * sp = getenv("HYPER4_STATS")) {
         FILE * f = fopen(sp, "rb");
@@ -380,10 +521,18 @@ Engine5::Engine5(const std::string & model_path, const Engine5Options & opt) : o
     cpu_ = std::make_unique<CpuMoe>(opt_.cpu_threads, n, cfg_.n_ff_exp, cfg_.n_expert_used, cpu_rec_, cpu_out_, slots, cpu_bulk_,
                                     cpu_bulk_out_);
     cpu_->set_clamp(cfg_.clamp_exp);
+    cpu_->set_pred(cpu_pred_);
+    if (pred_mode_ == 2 && pred_early_) {
+        cpu_->set_pred1(cpu_pred1_);
+        if (!getenv("HYPER_CPU_PREFETCH")) cpu_->set_helpers(false);   // (tests switch them on per mode)
+    }
     adapt_ = !getenv("HYPER5_ADAPT") || atoi(getenv("HYPER5_ADAPT")) != 0;
     if (getenv("HYPER5_MTP_PMIN")) mtp_pmin_ = atof(getenv("HYPER5_MTP_PMIN"));
+    if (getenv("HYPER5_MTP_CPU_MAX")) mtp_cpu_max_ = atof(getenv("HYPER5_MTP_CPU_MAX"));
     mtp_full_ = getenv("HYPER5_MTP_FULL") != nullptr;
     if (getenv("HYPER5_STREAM_MIN")) stream_min_ = atoi(getenv("HYPER5_STREAM_MIN"));
+    if (getenv("HYPER5_STREAM_CPU")) stream_cpu_ = std::max(0.0, atof(getenv("HYPER5_STREAM_CPU")));
+    if (getenv("HYPER5_STREAM_CPU_MAX")) stream_cpu_max_ = std::max(0.0, std::min(0.95, atof(getenv("HYPER5_STREAM_CPU_MAX"))));
     if (getenv("HYPER5_UP_PARTS")) up_parts_ = std::max(0, atoi(getenv("HYPER5_UP_PARTS")));
     if (getenv("HYPER5_DECAY")) adapt_decay_ = atof(getenv("HYPER5_DECAY"));
     if (getenv("HYPER5_PROMPT_W")) prompt_weight_ = atof(getenv("HYPER5_PROMPT_W"));
@@ -573,6 +722,7 @@ int Engine5::fill_extra(int budget) {
     fill_cancel_.store(false);
     if (fill_th_.joinable()) fill_th_.join();
     fill_th_ = std::thread([this] {
+        pthread_setname_np(pthread_self(), "h5-fill");
         try {
             for (Fill & f : fill_list_) {
                 if (fill_cancel_.load()) break;
@@ -592,6 +742,7 @@ int Engine5::fill_extra(int budget) {
         } catch (const std::exception & ex) {
             fprintf(stderr, "hyper5: elastic fill failed: %s\n", ex.what());
             for (Fill & f : fill_list_) f.copied = false;
+            for (auto & dp : devs_) { cudaSetDevice(dp->id); cudaStreamSynchronize(dp->fstream); }
         }
         fill_busy_.store(false);
     });
@@ -664,17 +815,21 @@ void Engine5::fill_wait(bool cancel) {
 }
 
 Engine5::~Engine5() {
+    launch_stop_.store(true);
+    for (auto & l : launchers_) { l->go.fetch_add(1); if (l->th.joinable()) l->th.join(); }
     if (fill_th_.joinable()) { fill_cancel_.store(true); fill_th_.join(); }
     for (auto & sn : snaps_) snap_pool_.push_back(sn.h);
     park_.release(snap_pool_);
     for (auto & v : snap_pool_) for (float * p : v) cudaFreeHost(p);
     if (h_topk_) cudaFreeHost(h_topk_);
     if (h_ids_) cudaFreeHost(h_ids_);
+    if (route_trace_) fclose(route_trace_);
     cpu_.reset();
+    for (void * p : host_reg_) cudaHostUnregister(p);
     for (auto & [p, sz] : host_bufs_) munmap(p, sz);
     devs_.clear();
     if (h_mtopk_) cudaFreeHost(h_mtopk_);
-    for (void * p : {(void *) h_embd_, (void *) h_pos_, (void *) h_res_, (void *) ar_ll_, (void *) cpu_rec_, (void *) cpu_out_,
+    for (void * p : {(void *) h_embd_, (void *) h_pos_, (void *) h_res_, (void *) ar_ll_, (void *) cpu_rec_, (void *) cpu_pred_, (void *) cpu_pred1_, (void *) cpu_out_,
                      (void *) h_stage_, (void *) cpu_bulk_, (void *) cpu_bulk_out_})
         if (p) cudaFreeHost(p);
 }
@@ -706,6 +861,12 @@ void Engine5::load_layer(Device & dev, DevLayer & L, int il) {
         for (auto [nm, dst] : {std::pair<const char *, uint8_t **>{"hc_attn_fn.weight", &L.hca_raw}, {"hc_ffn_fn.weight", &L.hcf_raw}}) {
             const GTensor & t = G.need(p + nm);
             if (t.type == GType::Q8_0) *dst = dev.upload(t.data, t.nbytes);   // (other types, e.g. Maya's F32: the unfused mix)
+        }
+        if (pred_mode_ == 2 && !L.hcf_raw && L.moe && g == 0) {
+            const GTensor & t = G.need(p + "hc_ffn_fn.weight");
+            const std::vector<float> v = to_f32(t);
+            L.hcf32 = dev.upload(v.data(), v.size());
+            L.hcf_rows = (int) t.rows();
         }
         L.hca_scale = f32(p + "hc_attn_scale.weight");
         L.hca_base = f32(p + "hc_attn_base.weight");
@@ -870,6 +1031,8 @@ void Engine5::load_experts(int il, const std::vector<int> & quota) {
     // host copy of every expert (2 MB pages, pinned): the CPU computes whichever experts it owns at the moment, the GPUs
     // stream them in a prefill chunk and take them over when the routing shifts
     const size_t bytes = (size_t) E * (2 * gb + db);
+    auto tl0 = std::chrono::steady_clock::now();
+    auto lap_ld = [&](int k) { const auto t = std::chrono::steady_clock::now(); t_ld_[k] += std::chrono::duration<double>(t - tl0).count(); tl0 = t; };
     uint8_t * buf = (uint8_t *) host_huge_alloc(bytes);
     CpuExpertLayer cl;
     cl.tg = tg.type; cl.td = tdn.type;
@@ -881,8 +1044,12 @@ void Engine5::load_experts(int il, const std::vector<int> & quota) {
         memcpy((uint8_t *) cl.up + (size_t) e * gb, tu.data + (size_t) e * gb, gb);
         memcpy((uint8_t *) cl.down + (size_t) e * db, tdn.data + (size_t) e * db, db);
     }
+    lap_ld(0);
     collapse_huge(buf, bytes);
+    lap_ld(1);
     CUDA_CHECK(cudaHostRegister(buf, bytes, cudaHostRegisterPortable | (zc_blocks_.empty() ? 0 : cudaHostRegisterMapped)));
+    host_reg_.push_back(buf);
+    lap_ld(2);
     if (!zc_blocks_.empty()) {   // hidden 256-blocks: [0, zc_blocks_[0]) on the CPU, then zc_blocks_[1 + g] for GPU g
         const size_t rbd = db / n;
         const bool ok = ff % 256 == 0 && (gb / ff) % 8 == 0 && rbd % 8 == 0 && (rbd / (ff / 256)) % 8 == 0;
@@ -990,6 +1157,19 @@ void Engine5::rebuild_stream(int il) {
     const int nd = opt_.n_devices, E = cfg_.n_expert;
     std::vector<int> cpu;
     for (int e = 0; e < E; ++e) if (H.owner[e] == CPU_OWNER) cpu.push_back(e);
+    // a single streamed chunk leaves the coldest stream_cpu_ share to the CPU: experts the chunk does not route cost nothing
+    // there, those of a few tokens little, and none of them crosses PCIe (the uploads were moving every CPU expert)
+    std::vector<uint8_t> keep;
+    if (stream_cpu_built_ > 0.0 && !cpu.empty()) {
+        std::stable_sort(cpu.begin(), cpu.end(), [&](int a, int b) { return H.score[a] < H.score[b]; });
+        const int nk = std::min((int) cpu.size(), (int) (cpu.size() * stream_cpu_built_ + 0.5));
+        keep.assign(E, 0);
+        for (int i = 0; i < nk; ++i) keep[cpu[i]] = 1;
+        cpu.erase(cpu.begin(), cpu.begin() + nk);
+        std::sort(cpu.begin(), cpu.end());
+    }
+    cpu_->set_owned_bulk(il, keep);
+    for (auto & dp : devs_) dp->layers[il].cpu_keep = !keep.empty();
     const int nc = (int) cpu.size();
     std::vector<double> wbw(nd, 2.0);
     if (nd > 1) wbw[1] = 1.0;
@@ -1018,6 +1198,23 @@ void Engine5::rebuild_stream(int il) {
         CUDA_CHECK(cudaMemcpy(dp->layers[il].owner_bulk, bulk_owner.data(), E * sizeof(int), cudaMemcpyHostToDevice));
     }
     H.stream_dirty = false;
+}
+
+// routing trace record: int32 type (1 prompt rows, 2 decode rows), rows, MoE layers, K; then per MoE layer rows x K int16 ids
+template <typename F> void Engine5::trace_routing(int type, int nrows, F && id) {
+    if (!route_trace_ || nrows <= 0) return;
+    const int K = cfg_.n_expert_used;
+    int nm = 0;
+    for (int il = 0; il < cfg_.n_layer; ++il) nm += is_moe(il);
+    const int32_t hdr[4] = {type, nrows, nm, K};
+    fwrite(hdr, sizeof hdr, 1, route_trace_);
+    std::vector<int16_t> v((size_t) nrows * K);
+    for (int il = 0; il < cfg_.n_layer; ++il) {
+        if (!is_moe(il)) continue;
+        for (int i = 0; i < nrows * K; ++i) v[i] = (int16_t) id(il, i);
+        fwrite(v.data(), sizeof(int16_t), v.size(), route_trace_);
+    }
+    fflush(route_trace_);
 }
 
 // adaptive placement: routing scores (decayed counts: prompt routing of the prefill chunks, the CPU side's decode counts)
@@ -1178,8 +1375,15 @@ void Engine5::load_weights() {
             dev.hzc = dev.alloc<float>((size_t) MAX_NT * c.n_expert_used * c.n_ff_exp);
             dev.yzc = dev.alloc<float>((size_t) MAX_NT * c.n_expert_used * n);
         }
-        if (pred_k_) { dev.plog = dev.alloc<float>((size_t) MAX_NT * c.n_expert); dev.pids = dev.alloc<int>(MAX_NT * MOE_MAX_USED);
-                       dev.pwts = dev.alloc<float>(MAX_NT * MOE_MAX_USED); dev.psg = dev.alloc<float>(MAX_NT * 4); }
+        if (pred_k_ || pred_mode_ == 2) {
+            dev.plog = dev.alloc<float>((size_t) MAX_NT * c.n_expert); dev.pids = dev.alloc<int>(MAX_NT * MOE_MAX_USED);
+            dev.pwts = dev.alloc<float>(MAX_NT * MOE_MAX_USED); dev.psg = dev.alloc<float>(MAX_NT * 16);
+        }
+        if (pred_mode_ == 2) {
+            dev.pmixpart = dev.alloc<float>((size_t) MAX_NT * (hcn / 256) * 25);
+            dev.phcw = dev.alloc<float>((size_t) MAX_NT * MHC_W);
+            dev.pxn = dev.alloc<float>((size_t) MAX_NT * n);
+        }
         dev.ids = dev.alloc<int>((size_t) R * K);
         dev.wts = dev.alloc<float>((size_t) R * K);
         dev.sg = dev.alloc<float>(R);
@@ -1190,6 +1394,10 @@ void Engine5::load_weights() {
         dev.yexp = dev.alloc<float>((size_t) R * K * n);
         dev.logits = dev.alloc<float>((size_t) MAX_NT * dev.output.n());
         dev.xh = dev.alloc<half>((size_t) R * std::max({hcn, ffl, nh_max * MLA_LAT}));
+        if (g5_kq_max_elems) {
+            dev.ggs_elems = std::max<size_t>(std::min<size_t>(g5_kq_max_elems, (size_t) 32 << 20), (size_t) 16 * 16384);
+            dev.ggs = dev.alloc<half>(dev.ggs_elems);
+        }
         dev.hf32_n = (size_t) nh_max * MLA_LAT * std::max(c.qk_dim, c.v_dim);   // (one layer's wkb or wvb as fp32, prefill)
         dev.hf32 = dev.alloc<float>(dev.hf32_n);
         dev.p16 = dev.alloc<half>((size_t) R * n);
@@ -1257,7 +1465,8 @@ void Engine5::load_weights() {
     }
     for (auto & dp : devs_) fprintf(stderr, "hyper5: device %d holds %.2f GiB\n", dp->id, dp->used / 1073741824.0);
     double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    fprintf(stderr, "hyper5: weights loaded in %.1f s (%d GPUs)\n", s, nd);
+    fprintf(stderr, "hyper5: weights loaded in %.1f s (%d GPUs); host expert copies: file -> RAM %.1f s, huge pages %.1f s, pinning %.1f s\n",
+            s, nd, t_ld_[0], t_ld_[1], t_ld_[2]);
 }
 
 void Engine5::reset() {
@@ -1285,6 +1494,41 @@ void Engine5::record_main(int gi, int nt, int kind) {
         if (W.kq) {   // (the LM head: a few rows)
             for (int r0 = 0; r0 < rows; r0 += MAX_NT)
                 gemv_kq(W.kw, x + (size_t) r0 * xs, xs, y + (size_t) r0 * ys, ys, std::min(MAX_NT, rows - r0), s, ni);
+            return;
+        }
+        if (!W.seg.empty()) {   // segments: Q8 fragments or KQ (prefill: dequantized to fp16 in slices + cuBLAS)
+            if (rows <= MAX_NT) {
+                for (auto & g : W.seg) {
+                    if (g.kq) gemv_kq(g.w, x, xs, y + g.off, ys, rows, s, ni);
+                    else gemv_q8(g.q8, x, xs, y + g.off, ys, nullptr, rows, s, ni);
+                }
+                return;
+            }
+            // short chunks (an agent's tool output, a chat turn): the KQ segments as GEMVs of 8 rows (the MMA's token width) --
+            // dequantizing the whole matrix to fp16 for cuBLAS reads + writes ~4.4 bytes a weight, a GEMV pass 0.41 (break-even
+            // ~90 rows);
+            // the bulk callers have applied the input norm already (ni not used, as for the GEMMs)
+            static const int kq_gemv_rows = getenv("HYPER5_KQ_GEMV_ROWS") ? atoi(getenv("HYPER5_KQ_GEMV_ROWS")) : 96;
+            const bool kq_loop = rows <= kq_gemv_rows;
+            if (kq_loop)
+                for (auto & g : W.seg)
+                    if (g.kq)
+                        for (int r0 = 0; r0 < rows; r0 += 8)
+                            gemv_kq(g.w, x + (size_t) r0 * xs, xs, y + (size_t) r0 * ys + g.off, ys, std::min(8, rows - r0), s);
+            to_half(x, xs, nullptr, W.k(), 0.0f, d.xh, rows, s);
+            const float one = 1.0f, zero = 0.0f;
+            for (auto & g : W.seg) {
+                if (!g.kq) { gemm_q8(g.q8, d.xh, rows, y + g.off, ys, nullptr, s); continue; }
+                if (kq_loop) continue;
+                const int step = std::max(16, (int) (d.ggs_elems / g.w.k) / 16 * 16);
+                for (int r0 = 0; r0 < g.w.n; r0 += step) {
+                    const int r1 = std::min(g.w.n, r0 + step);
+                    deq_kq_f16(g.w, r0, r1, d.ggs, s);
+                    if (cublasGemmEx(d.blas, CUBLAS_OP_T, CUBLAS_OP_N, r1 - r0, rows, g.w.k, &one, d.ggs, CUDA_R_16F, g.w.k, d.xh, CUDA_R_16F,
+                                     g.w.k, &zero, y + g.off + r0, CUDA_R_32F, ys, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+                        throw std::runtime_error("mm: cublasGemmEx failed");
+                }
+            }
             return;
         }
         if (rows <= MAX_NT) {
@@ -1443,6 +1687,28 @@ void Engine5::record_main(int gi, int nt, int kind) {
         const bool last_ck = ci == nck - 1;   // (the streamed experts' staging is released after the last chunk)
         DevLayer & L = d.layers[il];
         const int nh = L.nh;
+        // HYPER5_PRED=2: this MoE layer's routing predicted from its input (the token mixer's contribution left out) on the side
+        // stream while the token mixer runs; it reads R, which the token mixer's block output rewrites (that waits for ev_pf1)
+        if (d.pe_pending) { CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_pe1, 0)); d.pe_pending = false; }
+        const bool pred2 = pred_mode_ == 2 && !bulk && !mtp && d.g == 0 && L.moe && nt <= MAX_NT && (L.hcf_raw || L.hcf32);
+        if (pred2) {
+            cudaStream_t ps = d.pstream;
+            CUDA_CHECK(cudaEventRecord(d.ev_pf0, s));
+            CUDA_CHECK(cudaStreamWaitEvent(ps, d.ev_pf0, 0));
+            if (L.hcf_raw)
+                mhc_pre_fused(R, L.hcf_raw, d.pmixpart, L.hcf_scale, L.hcf_base, L.ffn_norm, eps, c.hc_eps, c.sinkhorn, n, d.phcw, d.pxn, nt, ps);
+            else {
+                gemv_f32(L.hcf32, L.hcf_rows, hcn, R, hcn, d.pmixpart, 32, nt, ps);
+                mhc_pre(R, d.pmixpart, 32, L.hcf_scale, L.hcf_base, L.ffn_norm, eps, c.hc_eps, c.sinkhorn, n, d.phcw, d.pxn, nt, ps);
+            }
+            const int E = cfg_.n_expert;
+            if (L.router16) gemv_bf16w(L.router16, E, n, d.pxn, n, d.plog, E, nt, ps);
+            else gemv_f32(L.router, E, n, d.pxn, n, d.plog, E, nt, ps);
+            moe_route_sig(d.plog, E, L.exp_bias, E, K, c.w_scale, d.pids, d.pwts, d.psg, nt, ps);
+            moe_publish(&cpu_pred_[il].seq, &cpu_pred_[il].nt, &cpu_pred_[il].ids[0][0], &cpu_pred_[il].wts[0][0], &cpu_pred_[il].x[0][0],
+                        d.pxn, n, 0, d.pids, d.pwts, K, nt, d.counter, (unsigned) il, ps);
+            CUDA_CHECK(cudaEventRecord(d.ev_pf1, ps));
+        }
         // ---- token mixer ----
         if (mtp) rmsnorm(R, n, L.attn_norm, d.xn, n, n, nt, eps, s);   // (the MTP block: plain pre-norm residual layer)
         else hc_pre(L.hca_fn, L.hca_raw, L.hca_scale, L.hca_base, L.attn_norm);
@@ -1496,6 +1762,7 @@ void Engine5::record_main(int gi, int nt, int kind) {
             mm(L.wo, d.o, nh * c.v_dim, d.part, n, nt);
         }
         dbg(L.mla ? "mla_part" : "kda_part", il, d.part, (size_t) nt * n);
+        if (pred2) CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_pf1, 0));
         if (mtp) allreduce(R); else block_out();
         dbg("attn_res", il, R, (size_t) nt * (mtp ? n : hcn));
         // ---- FFN ----
@@ -1530,10 +1797,26 @@ void Engine5::record_main(int gi, int nt, int kind) {
                 moe_route_sig(d.plog, c.n_expert, N.exp_bias, c.n_expert, pred_k_, c.w_scale, d.pids, d.pwts, d.psg, 1, s);
                 CUDA_CHECK(cudaMemcpyAsync(h_pred_ + (size_t) (il + 1) * MOE_MAX_USED, d.pids, pred_k_ * sizeof(int), cudaMemcpyDeviceToHost, s));
             }
+            if (pred_early_ && pred_mode_ == 2 && !bulk && !mtp && d.g == 0 && nt <= MAX_NT && il + 1 < c.n_layer && is_moe(il + 1)) {
+                // early prediction of the next layer's routing for the CPU's helpers (they read during this layer's CPU job)
+                const DevLayer & N = d.layers[il + 1];
+                cudaStream_t ps = d.pstream;
+                const int E = cfg_.n_expert;
+                CUDA_CHECK(cudaEventRecord(d.ev_pe0, s));
+                CUDA_CHECK(cudaStreamWaitEvent(ps, d.ev_pe0, 0));
+                if (N.router16) gemv_bf16w(N.router16, E, n, d.xn, n, d.plog, E, nt, ps);
+                else gemv_f32(N.router, E, n, d.xn, n, d.plog, E, nt, ps);
+                moe_route_sig(d.plog, E, N.exp_bias, E, K, c.w_scale, d.pids, d.pwts, d.psg, nt, ps);
+                moe_publish(&cpu_pred1_[il + 1].seq, &cpu_pred1_[il + 1].nt, &cpu_pred1_[il + 1].ids[0][0], &cpu_pred1_[il + 1].wts[0][0],
+                            &cpu_pred1_[il + 1].x[0][0], d.xn, n, 0, d.pids, d.pwts, K, nt, d.counter, (unsigned) (il + 1), ps);
+                CUDA_CHECK(cudaEventRecord(d.ev_pe1, ps));
+                d.pe_pending = true;
+            }
             if (bulk && d.g == 0 && adapt_)   // prompt routing for the adaptive placement
                 CUDA_CHECK(cudaMemcpyAsync(h_ids_ + ((size_t) il * mc_max_ + ci) * R5 * K, d.ids, (size_t) nt * K * sizeof(int), cudaMemcpyDeviceToHost, s));
             const bool stream = streaming && L.owner_bulk;
-            if (d.g == 0 && !stream) {
+            const bool cpu_part = !stream || (L.cpu_keep && mc_n_ == 1);   // (a streamed chunk with CPU-kept experts publishes too)
+            if (d.g == 0 && cpu_part) {
                 if (bulk) moe_publish(&cpu_bulk_->seq, &cpu_bulk_->nt, &cpu_bulk_->ids[0][0], &cpu_bulk_->wts[0][0], &cpu_bulk_->x[0][0],
                                       d.xn, n, n, d.ids, d.wts, K, nt, d.counter, (unsigned) il, s);
                 else if (!fused_pub)
@@ -1578,7 +1861,7 @@ void Engine5::record_main(int gi, int nt, int kind) {
                 if (L.zc.f1 > L.zc.f0) moe_zc(L.zc, d.xn, n, d.ids, d.wts, K, d.hzc, d.yzc, nt, s);
             }
             const bool zcl = !bulk && L.zc.f1 > L.zc.f0;
-            const volatile unsigned * cflag = d.g == 0 && !nocpu_ && !stream ? (bulk ? &cpu_bulk_out_->seq : &cpu_out_[il].seq) : nullptr;
+            const volatile unsigned * cflag = d.g == 0 && !nocpu_ && cpu_part ? (bulk ? &cpu_bulk_out_->seq : &cpu_out_[il].seq) : nullptr;
             moe_reduce(d.shpart, d.sg, d.yexp, K, d.part, n, nt, d.ids, stream ? L.owner_bulk : L.owner, d.g, CPU_OWNER, cflag,
                        bulk ? &cpu_bulk_out_->y[0][0] : &cpu_out_[il].y[0][0], d.counter, (unsigned) il, s, zcl ? d.yzc : nullptr);
         }
@@ -1660,7 +1943,7 @@ void Engine5::build_graphs() {
             CUDA_CHECK(cudaStreamBeginCapture(d.stream, cudaStreamCaptureModeThreadLocal));
             record_main(gi, nt);
             CUDA_CHECK(cudaStreamEndCapture(d.stream, &graph));
-            CUDA_CHECK(cudaGraphInstantiate(&d.g_main[nt], graph, 0));
+            CUDA_CHECK(cudaGraphInstantiate(&d.g_main[nt], graph, pstream_prio_ ? cudaGraphInstantiateFlagUseNodePriority : 0));
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
         if (mtp_g_)   // MTP: update over the kept verification rows (1..MAX_NT), chained (1 row)
@@ -1703,11 +1986,12 @@ void Engine5::run(int nt, int kind) {
         build_graphs();
     }
     ++fwd_counter_;
-    if (!(bulk && opt_.stream_experts && nt >= stream_min_) && !(kind == 1 && mtp_shift_ && !mtp_full_)) {   // (MTP prompt rows: no FFN)
+    const bool streamed = bulk && opt_.stream_experts && nt >= stream_min_;
+    if ((!streamed || (stream_cpu_built_ > 0.0 && mc_n_ == 1)) && !(kind == 1 && mtp_shift_ && !mtp_full_)) {   // (MTP prompt rows: no FFN)
         std::vector<int> slots;
-        if (kind) slots.push_back(cfg_.n_layer);
-        else for (int i = 0; i < cfg_.n_layer; ++i) if (is_moe(i)) slots.push_back(i);
-        cpu_->expect(fwd_counter_, slots, bulk);
+        if (kind) { if (!streamed || devs_[0]->layers[cfg_.n_layer].cpu_keep) slots.push_back(cfg_.n_layer); }
+        else for (int i = 0; i < cfg_.n_layer; ++i) if (is_moe(i) && (!streamed || devs_[0]->layers[i].cpu_keep)) slots.push_back(i);
+        if (!slots.empty()) cpu_->expect(fwd_counter_, slots, bulk);
     }
     if (bulk) {
         std::vector<std::thread> th;
@@ -1722,12 +2006,7 @@ void Engine5::run(int nt, int kind) {
         for (auto & m : err) if (!m.empty() && (first.empty() || first.rfind("barrier:", 0) == 0)) first = m;
         if (!first.empty()) { barrier_->reset(); throw std::runtime_error(first); }
     } else {
-        for (int gi = 0; gi < (int) devs_.size(); ++gi) {
-            auto & dp = devs_[gi];
-            CUDA_CHECK(cudaSetDevice(dp->id));
-            if (debug_ || (kind == 1 && mtp_shift_)) { record_main(gi, nt, kind); continue; }   // (short prefill tail: no graph)
-            CUDA_CHECK(cudaGraphLaunch(kind == 2 ? dp->g_chain : kind == 1 ? dp->g_mtp[nt] : dp->g_main[nt], dp->stream));
-        }
+        launch_all(nt, kind);
     }
     auto t_wait = std::chrono::steady_clock::now();
     bool reported = false;
@@ -1743,6 +2022,77 @@ void Engine5::run(int nt, int kind) {
             }
             std::this_thread::yield();
         }
+    }
+}
+
+void Engine5::launch_all(int nt, int kind) {
+    static const bool prof = getenv("HYPER5_LAUNCHPROF") != nullptr;
+    // (measured 2026-10-25: a decode graph launch costs 15-21 us of host time -- the ~1.3 ms seen under nsys was its
+    // --cuda-graph-trace=node; parallel launches gained nothing (31.6 vs 31.5 t/s) and their threads compete with the CPU
+    // experts' for cores: off unless HYPER5_PAR_LAUNCH=1)
+    static const bool par = getenv("HYPER5_PAR_LAUNCH") && atoi(getenv("HYPER5_PAR_LAUNCH")) != 0;
+    const int nd = (int) devs_.size();
+    auto exec_of = [&](Device & dp) { return kind == 2 ? dp.g_chain : kind == 1 ? dp.g_mtp[nt] : dp.g_main[nt]; };
+    if (debug_ || (kind == 1 && mtp_shift_) || !par || nd < 2) {
+        for (int gi = 0; gi < nd; ++gi) {
+            auto & dp = devs_[gi];
+            CUDA_CHECK(cudaSetDevice(dp->id));
+            if (debug_ || (kind == 1 && mtp_shift_)) { record_main(gi, nt, kind); continue; }   // (short prefill tail: no graph)
+            const auto t0 = std::chrono::steady_clock::now();
+            CUDA_CHECK(cudaGraphLaunch(exec_of(*dp), dp->stream));
+            if (prof) t_launch_[std::min(gi, 7)] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        }
+    } else {
+        if ((int) launchers_.size() != nd - 1) {   // threads for devices 1..nd-1 (spin while decoding, sleep when idle)
+            for (int gi = 1; gi < nd; ++gi) {
+                auto l = std::make_unique<Launcher>();
+                Launcher * lp = l.get();
+                const int dev_id = devs_[gi]->id;
+                cudaStream_t st = devs_[gi]->stream;
+                l->th = std::thread([this, lp, dev_id, st, gi] {
+                    cudaSetDevice(dev_id);
+                    unsigned seen = 0;
+                    while (true) {
+                        int spins = 0;
+                        while (lp->go.load(std::memory_order_acquire) == seen) {
+                            if (launch_stop_.load()) return;
+                            if (++spins < 20000) __builtin_ia32_pause(); else std::this_thread::sleep_for(std::chrono::microseconds(100));
+                        }
+                        seen = lp->go.load(std::memory_order_acquire);
+                        if (launch_stop_.load()) return;
+                        const auto t0 = std::chrono::steady_clock::now();
+                        const cudaError_t e = cudaGraphLaunch(lp->ge, st);
+                        if (prof) t_launch_[std::min(gi, 7)] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                        lp->done.store(e == cudaSuccess ? seen : ~0u, std::memory_order_release);
+                    }
+                });
+                launchers_.push_back(std::move(l));
+            }
+        }
+        unsigned want[8] = {};
+        for (int gi = 1; gi < nd; ++gi) {
+            Launcher & l = *launchers_[gi - 1];
+            l.ge = exec_of(*devs_[gi]);
+            want[gi] = l.go.fetch_add(1, std::memory_order_acq_rel) + 1;
+        }
+        auto & d0 = devs_[0];
+        CUDA_CHECK(cudaSetDevice(d0->id));
+        const auto t0 = std::chrono::steady_clock::now();
+        CUDA_CHECK(cudaGraphLaunch(exec_of(*d0), d0->stream));
+        if (prof) t_launch_[0] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        for (int gi = 1; gi < nd; ++gi) {   // (the launches queued: the wait for completion follows in run())
+            Launcher & l = *launchers_[gi - 1];
+            unsigned d;
+            while ((d = l.done.load(std::memory_order_acquire)) != want[gi]) {
+                if (d == ~0u) throw std::runtime_error("hyper5: graph launch failed on device " + std::to_string(devs_[gi]->id));
+                __builtin_ia32_pause();
+            }
+        }
+    }
+    if (prof && ++n_launch_ % 500 == 0) {
+        fprintf(stderr, "hyper5: graph launch host time per forward:");
+        for (int gi = 0; gi < nd; ++gi) { fprintf(stderr, " dev%d %.0f us", gi, t_launch_[std::min(gi, 7)] / 500); t_launch_[std::min(gi, 7)] = 0; }
+        fprintf(stderr, " (%s)\n", par ? "parallel" : "serial");
     }
 }
 
@@ -1762,8 +2112,34 @@ std::vector<int> Engine5::forward(const int * tokens, int nt, int pos) {
         if (prompt_routed_) { rebalance(1 << 20); prompt_routed_ = false; steps_ = 0; }
         else if (++steps_ % adapt_every_ == 0) rebalance(adapt_budget_);
     }
-    if (bulk) for (int il = 0; il < cfg_.n_layer; ++il) if (is_moe(il) && ehost_[il].stream_dirty) rebuild_stream(il);
+    if (bulk) {
+        // the CPU's share falls with the chunk's tokens (its cost grows with them, the uploads' does not): min(0.5, c / nt) with
+        // c = HYPER5_STREAM_CPU tokens (pfsweep, Maya-L at 4k: 128 / 200 / 400 / 700 tokens best at 0.5 / 0.5 / 0.35 / 0.2,
+        // 1000 at ~0; 2.00 -> 1.32 s, 2.03 -> 1.52, 2.07 -> 1.76, 2.13 -> 1.97), in steps of 0.05 (the lists are rebuilt on a change)
+        double want = nt >= stream_min_ && stream_cpu_ > 0 ? std::min(stream_cpu_max_, stream_cpu_ / nt) : 0.0;
+        want = std::floor(want * 20.0 + 0.5) / 20.0;
+        if (want != stream_cpu_built_) {
+            cpu_->drain();
+            stream_cpu_built_ = want;
+            for (int il = 0; il < cfg_.n_layer; ++il) if (is_moe(il)) ehost_[il].stream_dirty = true;
+        }
+        for (int il = 0; il < cfg_.n_layer; ++il) if (is_moe(il) && ehost_[il].stream_dirty) rebuild_stream(il);
+    }
     run(nt);
+    if (!bulk) {   // the MTP gate's CPU load: row 0's experts held by the CPU, per MoE layer
+        const int K = cfg_.n_expert_used;
+        int ncpu = 0, nl = 0;
+        for (int il = 0; il < cfg_.n_layer; ++il) {
+            if (!is_moe(il)) continue;
+            ++nl;
+            for (int j = 0; j < K; ++j) {
+                const int e = cpu_rec_[il].ids[0][j];
+                if (e >= 0 && e < cfg_.n_expert && ehost_[il].owner[e] == CPU_OWNER) ++ncpu;
+            }
+        }
+        if (nl) cpu_ema_ = 0.9 * cpu_ema_ + 0.1 * (double) ncpu / nl;
+    }
+    if (route_trace_ && !bulk) trace_routing(2, nt, [&](int il, int i) { return cpu_rec_[il].ids[i / cfg_.n_expert_used][i % cfg_.n_expert_used]; });
     if (pred_k_ && !bulk) {
         const int K = cfg_.n_expert_used;
         for (int il = 1; il < cfg_.n_layer; ++il) {
@@ -1791,6 +2167,7 @@ std::vector<int> Engine5::forward(const int * tokens, int nt, int pos) {
             auto & sc = ehost_[il].score;
             for (int i = 0; i < nt * K; ++i) { const int e = h_ids_[(size_t) il * mc_max_ * R5 * K + i]; if (e >= 0 && e < cfg_.n_expert) sc[e] += prompt_weight_; }
         }
+        trace_routing(1, nt, [&](int il, int i) { return h_ids_[(size_t) il * mc_max_ * R5 * K + i]; });
         prompt_routed_ = true;
     }
     last_nt_ = nt;
@@ -1925,11 +2302,15 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
     const int P = (int) prompt.size();
     int s = 0;
     if (opt_.prompt_cache) {
+        // a fill batch started in the previous request's decode may still be mapping VRAM and copying on its own thread:
+        // it finishes before parking / resuming allocates, frees and copies pinned memory (no other change: the batch
+        // still hands over at its due step)
+        if (fill_th_.joinable()) fill_th_.join();
         const int L = park_.resolve(prompt, hist_, snaps_, snap_pool_, park_devs(), "hyper5");   // (see park.h)
         for (size_t i = 0; i < snaps_.size();)
             if (snaps_[i].pos > L) { snap_pool_.push_back(snaps_[i].h); snaps_.erase(snaps_.begin() + i); } else ++i;
         Snap * best = nullptr;
-        for (auto & sn : snaps_) if (sn.pos <= std::min(L - 1, P - 1) && (!best || sn.pos > best->pos)) best = &sn;
+        for (auto & sn : snaps_) if (sn.pos <= std::min(L, P - 1) && (!best || sn.pos > best->pos)) best = &sn;
         if (best) { s = best->pos; snap_copy(*best, false); }
     }
     if (s == 0) reset();
@@ -2010,6 +2391,7 @@ std::vector<int> Engine5::generate(const std::vector<int> & prompt, int n_gen, b
         auto extend = [&](int pos) {   // drafts[0] just made (token at pos + 1): the chained ones, the count to verify
             double pc = mtp_p_;
             if (pc < pmin) return 0;
+            if (cpu_ema_ > mtp_cpu_max_) { st.gated++; return 0; }   // (CPU-paced steps: verification rows would cost more)
             int k = 1;
             for (; k < kc; ++k) {
                 drafts[k] = mtp_chain(drafts[k - 1], pos + k);
@@ -2173,6 +2555,11 @@ int Engine5::forward_multi(const int * tokens, const int * lens, int nck, int po
     }
     if (pos + off > opt_.max_pos) throw std::runtime_error("forward_multi: position exceeds max_pos");
     ensure_kv(pos + off + 2 * MAX_NT);
+    if (stream_cpu_built_ != 0.0) {   // (several chunks in one pass: everything streams, the CPU bulk record holds one chunk)
+        cpu_->drain();
+        stream_cpu_built_ = 0.0;
+        for (int il = 0; il < cfg_.n_layer; ++il) if (is_moe(il)) ehost_[il].stream_dirty = true;
+    }
     for (int il = 0; il < cfg_.n_layer; ++il) if (is_moe(il) && ehost_[il].stream_dirty) rebuild_stream(il);
     mc_n_ = nck;
     try { run(lens[0]); } catch (...) { mc_n_ = 1; throw; }
@@ -2188,6 +2575,8 @@ int Engine5::forward_multi(const int * tokens, const int * lens, int nck, int po
                     if (e >= 0 && e < cfg_.n_expert) sc[e] += prompt_weight_;
                 }
         }
+        for (int ci = 0; ci < nck; ++ci)
+            trace_routing(1, lens[ci], [&](int il, int i) { return h_ids_[((size_t) il * mc_max_ + ci) * R5 * K + i]; });
         prompt_routed_ = true;
     }
     last_nt_ = lens[nck - 1];

@@ -89,6 +89,20 @@ $(BUILD)/mlabench: $(OBJ4) tools/mlabench.cu
 	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/mlabench.cu $(OBJ4) -o $@ \
 	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)
 
+$(BUILD)/fp16gemm: tools/fp16gemm.cu
+	$(NVCC) $(NVFLAGS) tools/fp16gemm.cu -o $@ $(LIBS)
+
+$(BUILD)/kqbench: tools/kqbench.cu $(BUILD)/kernels.o $(BUILD)/gguf.o
+	$(NVCC) $(NVFLAGS) -Isrc tools/kqbench.cu $(BUILD)/kernels.o $(BUILD)/gguf.o -o $@ $(LIBS)
+
+$(BUILD)/iq3bench: tools/iq3bench.cpp src/iq3s_dot.h src/gguf.cpp
+	$(CXX) $(CXXFLAGS) -Isrc $(GGML_INC) tools/iq3bench.cpp src/gguf.cpp -o $@ \
+	  -Wl,--start-group $(LLAMA)/build/ggml/src/libggml-cpu.a $(LLAMA)/build/ggml/src/libggml-base.a -Wl,--end-group -ldl -lpthread
+
+$(BUILD)/iq2bench: tools/iq2bench.cpp src/iq2_dot.h src/gguf.cpp
+	$(CXX) $(CXXFLAGS) -Isrc $(GGML_INC) tools/iq2bench.cpp src/gguf.cpp -o $@ \
+	  -Wl,--start-group $(LLAMA)/build/ggml/src/libggml-cpu.a $(LLAMA)/build/ggml/src/libggml-base.a -Wl,--end-group -ldl -lpthread
+
 $(BUILD)/cpumoebench: $(OBJ4) tools/cpumoebench.cu
 	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/cpumoebench.cu $(OBJ4) -o $@ \
 	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)

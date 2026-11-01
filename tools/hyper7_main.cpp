@@ -4,6 +4,7 @@
 //                                                 after a header {rows, vocab, first}: positions < split go through the
 //                                                 chunked prefill path, the rest in decode steps of up to 4 rows
 #include "engine7.h"
+#include "cpu_moe.h"
 
 #include <algorithm>
 #include <chrono>
@@ -50,6 +51,32 @@ int main(int argc, char ** argv) {
             for (int t : out) printf(" %d", t);
             printf("\ndecode %d tokens: %.2f s (%.2f t/s), %d steps, %d/%d drafts accepted\n", st.tokens, st.seconds, st.tokens / st.seconds, st.steps, st.accepted, st.drafted);
             if (getenv("HYPER7_SAVE_STATS")) eng.save_expert_stats(getenv("HYPER7_SAVE_STATS"));
+        } else if (cmd == "ab") {   // CPU expert scheduling A/B in one process: HYPER7_AB modes (0 dynamic, 1 L3 groups,
+            // 2 groups + prefetch of the previous step's experts, 3 groups + prefetch of the GPU's prediction: HYPER7_PRED=1),
+            // interleaved over rounds; greedy outputs must match
+            const int n_gen = argc > 4 ? atoi(argv[4]) : 256, rounds = argc > 5 ? atoi(argv[5]) : 3;
+            std::vector<int> modes;
+            {   std::string m = getenv("HYPER7_AB") ? getenv("HYPER7_AB") : "0,1,2";
+                for (char & ch : m) if (ch == ',') ch = ' ';
+                std::istringstream is(m); int x; while (is >> x) modes.push_back(x); }
+            std::vector<std::vector<double>> tps(modes.size());
+            std::vector<int> ref;
+            const bool spec = getenv("HYPER7_SPEC") != nullptr;
+            for (int r = 0; r < rounds; ++r)
+                for (size_t mi = 0; mi < modes.size(); ++mi) {
+                    eng.cpu_moe()->set_sched(modes[mi] >= 1, modes[mi] >= 2 ? modes[mi] - 1 : 0);
+                    GenStats st;
+                    const std::vector<int> out = eng.generate(ids, n_gen, spec, &st);
+                    if (ref.empty()) ref = out;
+                    tps[mi].push_back(st.tokens / st.seconds);
+                    printf("round %d mode %d: %.2f t/s, %d steps%s\n", r, modes[mi], st.tokens / st.seconds, st.steps, out == ref ? "" : "  OUTPUT DIFFERS");
+                    fflush(stdout);
+                }
+            for (size_t mi = 0; mi < modes.size(); ++mi) {
+                std::vector<double> v = tps[mi];
+                std::sort(v.begin(), v.end());
+                printf("mode %d: median %.2f t/s (min %.2f max %.2f)\n", modes[mi], v[v.size() / 2], v.front(), v.back());
+            }
         } else if (cmd == "dump") {
             if (argc < 5) throw std::runtime_error("dump: output path missing");
             const int split = argc > 5 ? atoi(argv[5]) : 0, T = (int) ids.size();

@@ -134,6 +134,9 @@ struct Engine7::Layer {
     float * attn_norm = nullptr, * ffn_norm = nullptr, * sink = nullptr;
     float * hca_fn = nullptr, * hca_scale = nullptr, * hca_base = nullptr, * hcf_fn = nullptr, * hcf_scale = nullptr, * hcf_base = nullptr;
     float * router = nullptr, * bias = nullptr, * eg_w = nullptr, * ik_w = nullptr, * iproj = nullptr;
+    // HYPER7_PRED: the next layer's router on this device, its columns scaled by ffn_norm(il + 1) / ffn_norm(il): applied to
+    // this layer's MoE input it predicts the next layer's experts for the CPU's prefetch
+    float * pr_router = nullptr, * pr_bias = nullptr;
     uint16_t * ring = nullptr;                        // [ring][head_dim] bf16
     float * c_kv = nullptr, * c_score = nullptr;      // the compressor's open group [ratio][head_dim]
     uint16_t * ckv = nullptr, * ik = nullptr;         // KV sources: compressed rows [max_pos / ratio][head_dim], index keys [..][ix_hd]
@@ -175,6 +178,10 @@ struct Engine7::Device {
     cudaEvent_t ev_done = nullptr, ev_taken = nullptr;   // this chunk's rows done / the previous device's rows copied in
     cudaStream_t cstream = nullptr;                     // prefill: expert uploads
     cudaEvent_t ev_up[2] = {}, ev_free[2] = {};
+    // HYPER7_PRED=2: a layer's routing predicted from its input (before the attention) on a side stream, for the CPU's prefetch
+    cudaStream_t pstream = nullptr;
+    cudaEvent_t ev_pf0 = nullptr, ev_pf1 = nullptr;
+    float * pmix = nullptr, * ppre = nullptr, * ppost = nullptr, * pcomb = nullptr, * px = nullptr, * prlog = nullptr;
     uint8_t * stage[2] = {};
     size_t stage_bytes = 0;
     int * owner_all = nullptr;                          // [E] = this device (prefill: every expert computed here)
@@ -195,7 +202,8 @@ struct Engine7::Device {
           * shh = nullptr, * shout = nullptr, * hexp = nullptr, * yexp = nullptr, * ffo = nullptr, * eg_x = nullptr, * eg_kvo = nullptr,
           * logits = nullptr, * outp = nullptr;
     int * ids = nullptr, * sel = nullptr, * cand = nullptr, * ncand = nullptr, * order = nullptr, * order_n = nullptr, * egrp = nullptr,
-        * counter = nullptr;
+        * counter = nullptr, * pids = nullptr;
+    float * pwts = nullptr;
     half * xh = nullptr, * x16 = nullptr, * h16 = nullptr;
     long long score_w = 0, bm_w = 0;
     float * freqs_win = nullptr, * freqs_comp = nullptr;
@@ -226,6 +234,7 @@ struct Engine7::Device {
         for (auto & ev : ev_up) if (ev) cudaEventDestroy(ev);
         for (auto & ev : ev_free) if (ev) cudaEventDestroy(ev);
         if (cstream) cudaStreamDestroy(cstream);
+        if (pstream) cudaStreamDestroy(pstream);
         if (dstream) cudaStreamDestroy(dstream);
         if (ev_seed) cudaEventDestroy(ev_seed);
         for (void * p : allocs) cudaFree(p);
@@ -277,6 +286,9 @@ Engine7::Engine7(const std::string & model_path, const Engine7Options & opt) : o
         CUDA_CHECK(cudaEventCreateWithFlags(&d->ev_taken, cudaEventDisableTiming));
         if (g > 0) CUDA_CHECK(cudaHostAlloc(&d->h_in, (size_t) R_ * (c.hc * c.n_embd + 8) * sizeof(float), cudaHostAllocPortable));
         CUDA_CHECK(cudaStreamCreateWithFlags(&d->cstream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&d->pstream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&d->ev_pf0, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&d->ev_pf1, cudaEventDisableTiming));
         CUDA_CHECK(cudaStreamCreateWithFlags(&d->dstream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&d->ev_seed, cudaEventDisableTiming));
         for (auto & ev : d->ev_up) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
@@ -302,6 +314,8 @@ Engine7::Engine7(const std::string & model_path, const Engine7Options & opt) : o
     CUDA_CHECK(cudaHostAlloc(&cpu_bulk_, sizeof(CpuMoeBulk), cudaHostAllocPortable | cudaHostAllocMapped));
     CUDA_CHECK(cudaHostAlloc(&cpu_bulk_out_, sizeof(CpuMoeBulkOut), cudaHostAllocPortable | cudaHostAllocMapped));
     memset((void *) cpu_rec_, 0, (size_t) c.n_layer * sizeof(CpuMoeRec));
+    CUDA_CHECK(cudaHostAlloc(&cpu_pred_, (size_t) c.n_layer * sizeof(CpuMoeRec), cudaHostAllocPortable | cudaHostAllocMapped));
+    memset((void *) cpu_pred_, 0, (size_t) c.n_layer * sizeof(CpuMoeRec));
     memset((void *) cpu_out_, 0, (size_t) c.n_layer * sizeof(CpuMoeOut));
     memset((void *) cpu_bulk_, 0, sizeof(CpuMoeBulk));
     memset((void *) cpu_bulk_out_, 0, sizeof(CpuMoeBulkOut));
@@ -317,6 +331,7 @@ Engine7::Engine7(const std::string & model_path, const Engine7Options & opt) : o
         }
     }
     cpu_ = std::make_unique<CpuMoe>(opt_.cpu_threads, n, c.ff, c.n_used, cpu_rec_, cpu_out_, c.n_layer, cpu_bulk_, cpu_bulk_out_);
+    cpu_->set_pred(cpu_pred_);
     cpu_->set_clamp(c.clamp_exp);
     const auto t0 = std::chrono::steady_clock::now();
     for (int il = 0; il < c.n_layer; ++il) has_r2_ |= c.ratio[il] > 1;
@@ -354,6 +369,16 @@ Engine7::Engine7(const std::string & model_path, const Engine7Options & opt) : o
         d.rlog = d.alloc<float>(R * c.n_expert);
         d.ids = d.alloc<int>(R * K);
         d.wts = d.alloc<float>(R * K);
+        d.pids = d.alloc<int>(MAX_NT * MOE_MAX_USED);
+        d.pwts = d.alloc<float>(MAX_NT * MOE_MAX_USED);
+        if (pred_mode_ == 2) {
+            d.pmix = d.alloc<float>(MAX_NT * 32);
+            d.ppre = d.alloc<float>(MAX_NT * 8);
+            d.ppost = d.alloc<float>(MAX_NT * 8);
+            d.pcomb = d.alloc<float>(MAX_NT * 64);
+            d.px = d.alloc<float>(MAX_NT * n);
+            d.prlog = d.alloc<float>(MAX_NT * c.n_expert);
+        }
         d.ones = d.alloc<float>(R);
         fill7(d.ones, 1.0f, (int) R, d.stream);
         d.shgu = d.alloc<float>(R * 2 * c.ff);
@@ -458,7 +483,7 @@ void Engine7::load_layer(Device & d, Layer & L) {
     { const GTensor * t = T("attn_q_b.weight"); L.wq_b = upload_dense(A, d.id, {{t, 0, t->rows()}}); }
     {   // wo_a: group g = rows g * o_lora .. on input values g * (HQ / groups) ..
         const GTensor * t = T("attn_output_a.weight");
-        if (t->ne[1] != (int64_t) c.o_groups * c.o_lora || t->ne[0] != (int64_t) c.n_head * c.head_dim / c.o_groups)
+        if (t->rows() != (int64_t) c.o_groups * c.o_lora || t->ne[0] != (int64_t) c.n_head * c.head_dim / c.o_groups)   // ([in][groups * o_lora] or ISTA's [in][o_lora][groups])
             throw std::runtime_error("hyper7: attn_output_a shape");
         for (int gi = 0; gi < c.o_groups; ++gi) L.wo_a.push_back(upload_dense(A, d.id, {{t, (int64_t) gi * c.o_lora, (int64_t) (gi + 1) * c.o_lora}}));
     }
@@ -503,10 +528,27 @@ void Engine7::load_layer(Device & d, Layer & L) {
     }
     L.router = f32("ffn_gate_inp.weight");
     L.bias = f32("exp_probs_b.bias");
+    if (pred_mode_ == 1 && il + 1 < c.n_layer) {
+        const std::string pn = "blk." + std::to_string(il + 1) + ".";
+        std::vector<float> W = to_f32(G.need(pn + "ffn_gate_inp.weight")), b = to_f32(G.need(pn + "exp_probs_b.bias"));
+        const std::vector<float> n0 = to_f32(G.need(p + "ffn_norm.weight")), n1 = to_f32(G.need(pn + "ffn_norm.weight"));
+        const size_t k = n0.size();
+        if (W.size() != k * (size_t) c.n_expert) throw std::runtime_error("hyper7: router shape");
+        for (size_t e = 0; e < (size_t) c.n_expert; ++e)
+            for (size_t j = 0; j < k; ++j) W[e * k + j] *= std::fabs(n0[j]) > 1e-6f ? n1[j] / n0[j] : 0.0f;
+        L.pr_router = d.upload(W.data(), W.size());
+        L.pr_bias = d.upload(b.data(), b.size());
+    }
     if (L.eg >= 0) {
-        const GTensor * t = T("engram_kv.weight");
+        const GTensor * t = G.tensor(p + "engram_kv.weight") ? T("engram_kv.weight") : T("engram_wkv.weight");
         L.eg_kv = upload_dense(A, d.id, {{t, 0, t->rows()}});
-        L.eg_w = f32("engram_gate.weight");
+        if (G.tensor(p + "engram_gate.weight")) L.eg_w = f32("engram_gate.weight");
+        else {   // (ISTA-DASLab: q_weight and k_weight apart, BF16 -- their product is exact in F32)
+            std::vector<float> q = to_f32(G.need(p + "engram_q.weight")), k = to_f32(G.need(p + "engram_k.weight"));
+            if (q.size() != k.size() || q.size() != (size_t) c.hc * c.n_embd) throw std::runtime_error("hyper7: engram_q / engram_k shape");
+            for (size_t i = 0; i < q.size(); ++i) q[i] *= k[i];
+            L.eg_w = d.upload(q.data(), q.size());
+        }
     }
     L.owner = d.alloc<int>(c.n_expert);
 }
@@ -911,7 +953,7 @@ Engine7::~Engine7() {
         if (ev_chunk_[k]) cudaEventDestroy(ev_chunk_[k]);
     }
     if (dsp_map_) munmap(dsp_map_, dsp_size_);
-    for (void * p : {(void *) h_out_, (void *) h_dsp_, (void *) h_dout_, (void *) cpu_rec_, (void *) cpu_out_, (void *) cpu_bulk_, (void *) cpu_bulk_out_})
+    for (void * p : {(void *) h_out_, (void *) h_dsp_, (void *) h_dout_, (void *) cpu_rec_, (void *) cpu_pred_, (void *) cpu_out_, (void *) cpu_bulk_, (void *) cpu_bulk_out_})
         if (p) cudaFreeHost(p);
 }
 
@@ -957,6 +999,25 @@ void Engine7::run_layer(Device & d, Layer & L, int nt, int64_t p0) {
         CUDA_CHECK(cudaMemcpyAsync(d.eg_x, h_eg_[cur_set_][L.eg], (size_t) nt * ecols * sizeof(float), cudaMemcpyHostToDevice, s));
         mm(L.eg_kv, d.eg_x, ecols, d.eg_kvo, (c.hc + 1) * n, nt);
         engram_gate7(d.h, d.eg_kvo, L.eg_w, c.hc, n, eps, nt, s);
+    }
+    // HYPER7_PRED=2: this layer's MoE routing predicted from its input (the attention's contribution left out) on the side
+    // stream, published for the CPU's prefetch while the attention runs; the prediction reads d.h, which the MoE's output
+    // overwrites at the end of the layer (it waits for ev_pf1 there)
+    const bool pred2 = pred_mode_ == 2 && !bulk && !stream_exp && nt <= MAX_NT && L.n_gpu < c.n_expert;
+    if (pred2) {
+        cudaStream_t ps = d.pstream;
+        CUDA_CHECK(cudaEventRecord(d.ev_pf0, s));
+        CUDA_CHECK(cudaStreamWaitEvent(ps, d.ev_pf0, 0));
+        hc7_mix(d.h, L.hcf_fn, hcn, (2 + c.hc) * c.hc, eps, d.pmix, nt, ps);
+        hc7_split(d.pmix, L.hcf_scale, L.hcf_base, c.hc, c.sinkhorn, c.hc_eps, d.ppre, d.ppost, d.pcomb, nt, ps);
+        hc7_pre_norm(d.h, d.ppre, L.ffn_norm, n, c.hc, eps, d.px, nt, ps);
+        gemv_f32(L.router, c.n_expert, n, d.px, n, d.prlog, c.n_expert, nt, ps);
+        // (HYPER7_PRED_K: more candidates than the routing takes, best first: the prefetch reads the ones it has time for)
+        const int pk = pred_k_ > 0 ? std::min(pred_k_, MOE_MAX_USED) : K;
+        route7(d.prlog, c.n_expert, L.bias, c.n_expert, pk, c.w_scale, d.pids, d.pwts, nt, ps);
+        moe_publish(&cpu_pred_[il].seq, &cpu_pred_[il].nt, &cpu_pred_[il].ids[0][0], &cpu_pred_[il].wts[0][0], &cpu_pred_[il].x[0][0],
+                    d.px, n, 0, d.pids, d.pwts, pk, nt, d.counter, (unsigned) il, ps);
+        CUDA_CHECK(cudaEventRecord(d.ev_pf1, ps));
     }
     // ---- attention ----
     hc7_mix(d.h, L.hca_fn, hcn, (2 + c.hc) * c.hc, eps, d.mix, nt, s);
@@ -1087,10 +1148,18 @@ void Engine7::run_layer(Device & d, Layer & L, int nt, int64_t p0) {
             if (j + 2 < L.np()) stage_copy(j + 2);
         }
     }
+    if (pred_mode_ == 1 && L.pr_router && !bulk && !stream_exp && nt <= MAX_NT && il + 1 < c.n_layer) {
+        // the next layer's experts from this layer's MoE input, for the CPU's prefetch while the GPUs run the next attention
+        mf32(L.pr_router, c.n_expert, n, d.x, n, d.rlog, c.n_expert, nt);
+        route7(d.rlog, c.n_expert, L.pr_bias, c.n_expert, K, c.w_scale, d.pids, d.pwts, nt, s);
+        moe_publish(&cpu_pred_[il + 1].seq, &cpu_pred_[il + 1].nt, &cpu_pred_[il + 1].ids[0][0], &cpu_pred_[il + 1].wts[0][0],
+                    &cpu_pred_[il + 1].x[0][0], d.x, n, 0, d.pids, d.pwts, K, nt, d.counter, (unsigned) (il + 1), s);
+    }
     if (stream_exp) moe_reduce(d.shout, d.ones, d.yexp, K, d.ffo, n, nt, d.ids, d.owner_all, d.g, CPU_OWNER, nullptr, nullptr, d.counter,
                                (unsigned) il, s);
     else moe_reduce(d.shout, d.ones, d.yexp, K, d.ffo, n, nt, d.ids, L.owner, d.g, CPU_OWNER, bulk ? &cpu_bulk_out_->seq : &cpu_out_[il].seq,
                bulk ? &cpu_bulk_out_->y[0][0] : &cpu_out_[il].y[0][0], d.counter, (unsigned) il, s);
+    if (pred2) CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_pf1, 0));
     hc7_post(d.ffo, d.h, d.f_post, d.f_comb, n, c.hc, d.h2, nt, s);
     std::swap(d.h, d.h2);
     std::swap(d.pre, d.f_pre);   // the next block's attention mixes the streams with this block's FFN pre-weights
@@ -1157,7 +1226,9 @@ int Engine7::enqueue(const int * tokens, int nt, int pos, int nlog) {
     }
     const int cols = c.eg_cols(), hd = c.eg_hd;
     for (size_t i = 0; i < c.eg_layers.size(); ++i) {
-        const GTensor & tab = gguf_->need("blk." + std::to_string(c.eg_layers[i]) + ".engram_embd.weight");
+        // (unsloth: one table per_layer_token_embd for every Engram layer, its offsets global)
+        const std::string tn = "blk." + std::to_string(c.eg_layers[i]) + ".engram_embd.weight";
+        const GTensor & tab = gguf_->tensor(tn) ? gguf_->need(tn) : gguf_->need("per_layer_token_embd.weight");
         const auto * tr = ggml_get_type_traits((ggml_type) tab.type);
         const size_t rb = tab.row_bytes();
         float * eg = h_eg_[set][i];

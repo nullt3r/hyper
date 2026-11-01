@@ -14,7 +14,7 @@
 int main() {
     using hyper::GType;
     const GType types[] = {GType::Q5_0, GType::Q5_1, GType::Q8_0, GType::Q4_K, GType::Q5_K, GType::Q6_K, GType::IQ4_XS, GType::Q3_K, GType::MXFP4,
-                           GType::IQ3_S, GType::IQ2_XXS, GType::IQ2_S, GType::IQ3_XXS};
+                           GType::IQ3_S, GType::IQ2_XXS, GType::IQ2_S, GType::IQ3_XXS, GType::IQ4_NL, GType::Q2_K, GType::IQ1_S};
     const int n = 2560;
     std::mt19937 rng(1);
     int bad = 0;
@@ -29,6 +29,7 @@ int main() {
             auto put = [&](size_t off) { const __half h = __float2half(0.01f + 0.01f * (rng() % 100) / 100.0f); memcpy(blk + off, &h, 2); };
             if (t == GType::MXFP4) blk[0] = (uint8_t) (110 + rng() % 30);   // (E8M0 scale in a sane range)
             else if (t == GType::Q6_K || t == GType::Q3_K) put(bb - 2);
+            else if (t == GType::Q2_K) { put(80); put(82); }
             else { put(0); if (t == GType::Q5_1 || t == GType::Q4_K || t == GType::Q5_K) put(2); }
         }
         std::vector<float> ref(n), got(n);

@@ -29,8 +29,12 @@ const char * gtype_name(GType t) {
         case GType::IQ4_XS: return "IQ4_XS";
         case GType::MXFP4: return "MXFP4";
         case GType::IQ2_XXS: return "IQ2_XXS";
+        case GType::IQ2_XS: return "IQ2_XS";
         case GType::IQ2_S: return "IQ2_S";
         case GType::IQ3_XXS: return "IQ3_XXS";
+        case GType::IQ1_S: return "IQ1_S";
+        case GType::I32: return "I32";
+        case GType::I64: return "I64";
         default:          return "?";
     }
 }
@@ -38,6 +42,8 @@ const char * gtype_name(GType t) {
 size_t gtype_block_bytes(GType t) {
     switch (t) {
         case GType::F32:  return 4;
+        case GType::I32:  return 4;
+        case GType::I64:  return 8;
         case GType::F16:  return 2;
         case GType::BF16: return 2;
         case GType::Q8_0: return 34;
@@ -53,8 +59,10 @@ size_t gtype_block_bytes(GType t) {
         case GType::Q6_K: return 210;
         case GType::IQ3_S: return 110;
         case GType::IQ2_XXS: return 66;
+        case GType::IQ2_XS: return 74;
         case GType::IQ2_S: return 82;
         case GType::IQ3_XXS: return 98;
+        case GType::IQ1_S: return 50;
         case GType::IQ4_XS: return 136;
         case GType::MXFP4: return 17;
         default: throw std::runtime_error(std::string("unsupported tensor type ") + std::to_string((uint32_t) t));
@@ -63,10 +71,10 @@ size_t gtype_block_bytes(GType t) {
 
 size_t gtype_block_elems(GType t) {
     switch (t) {
-        case GType::F32: case GType::F16: case GType::BF16: return 1;
+        case GType::F32: case GType::F16: case GType::BF16: case GType::I32: case GType::I64: return 1;
         case GType::Q8_0: case GType::Q4_0: case GType::Q4_1: case GType::Q5_0: case GType::Q5_1: case GType::IQ4_NL: case GType::MXFP4: return 32;
         case GType::Q2_K: case GType::Q3_K: case GType::Q4_K: case GType::Q5_K: case GType::Q6_K: case GType::IQ3_S: case GType::IQ4_XS:
-        case GType::IQ2_XXS: case GType::IQ2_S: case GType::IQ3_XXS:
+        case GType::IQ2_XXS: case GType::IQ2_XS: case GType::IQ2_S: case GType::IQ3_XXS: case GType::IQ1_S:
             return 256;
         default: throw std::runtime_error(std::string("unsupported tensor type ") + std::to_string((uint32_t) t));
     }
@@ -139,9 +147,21 @@ GGUF::GGUF(const std::string & path) {
         load_shard(path, true);
     }
     arch_ = get_str("general.architecture");
+    // tensors kept in a separate file beside the model (ISTA-DASLab's DeepSeek-V4.1 GGUFs: the Engram tables, shared by
+    // every build): <arch>.engram.file, the same <arch>.engram.source in both
+    if (has(arch_ + ".engram.file")) {
+        const size_t sl = path.rfind('/');
+        const std::string p = (sl == std::string::npos ? std::string() : path.substr(0, sl + 1)) + get_str(arch_ + ".engram.file");
+        const auto kv = load_shard(p, false);
+        const std::string sk = arch_ + ".engram.source";
+        auto it = kv.find(sk);
+        if (has(sk) && (it == kv.end() || !std::holds_alternative<std::string>(it->second) ||
+                        std::get<std::string>(it->second) != get_str(sk)))
+            throw std::runtime_error("gguf: " + p + " is not the Engram file of this model (" + sk + " differs)");
+    }
 }
 
-void GGUF::load_shard(const std::string & path, bool first) {
+std::map<std::string, GValue> GGUF::load_shard(const std::string & path, bool first) {
     Map m;
     m.fd = open(path.c_str(), O_RDONLY);
     if (m.fd < 0) throw std::runtime_error("gguf: cannot open " + path);
@@ -174,6 +194,7 @@ void GGUF::load_shard(const std::string & path, bool first) {
         for (uint32_t d = 0; d < nd; ++d) t.ne.push_back((int64_t) c.get<uint64_t>());
         t.type = (GType) c.get<uint32_t>();
         uint64_t off = c.get<uint64_t>();
+        if (tensors_.count(t.name)) throw std::runtime_error("gguf: tensor " + t.name + " in two files");
         tensors_[t.name] = t;
         offsets.emplace_back(t.name, off);
     }
@@ -184,6 +205,7 @@ void GGUF::load_shard(const std::string & path, bool first) {
         t.nbytes = t.row_bytes() * (size_t) t.rows();
         if (t.data + t.nbytes > m.p + m.size) throw std::runtime_error("gguf: tensor out of bounds: " + name);
     }
+    return kv;
 }
 
 GGUF::~GGUF() {

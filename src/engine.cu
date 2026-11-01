@@ -1042,7 +1042,7 @@ std::vector<int> Engine::generate(const std::vector<int> & prompt, int n_gen, bo
         for (size_t i = 0; i < snaps_.size();)
             if (snaps_[i].pos > L) { snap_pool_.push_back(snaps_[i].h); snaps_.erase(snaps_.begin() + i); } else ++i;
         const Snap * best = nullptr;
-        for (auto & sn : snaps_) if (sn.pos <= std::min(L - 1, P - 1) && (!best || sn.pos > best->pos)) best = &sn;
+        for (auto & sn : snaps_) if (sn.pos <= std::min(L, P - 1) && (!best || sn.pos > best->pos)) best = &sn;
         if (best) { s = best->pos; snap_copy(*const_cast<Snap *>(best), false); }
     }
     if (s == 0) reset();

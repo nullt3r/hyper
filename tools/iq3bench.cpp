@@ -51,6 +51,7 @@ int main(int argc, char ** argv) {
         {"ggml", [](int n, float * s, const void * vx, const void * vy) { ggml_get_type_traits_cpu(GGML_TYPE_IQ3_S)->vec_dot(n, s, 0, vx, 0, vy, 0, 1); }},
         {"scalar64", iq3s_dot_v1},
         {"gather", iq3s_dot_v2},
+        {"vecidx", iq3s_dot_v3},
     };
     const size_t RC = std::min<size_t>(R, 2048);   // cached: 2048 rows (~3.5 MB) over and over, one thread
     for (const V & v : vs) {
@@ -73,6 +74,32 @@ int main(int argc, char ** argv) {
         printf("%-9s 1 thread cached: %6.1f ns/row (%5.2f GB/s)   %d threads streaming: %5.1f GB/s   bitwise mismatches %d of %zu\n",
                v.name, best / RC * 1e9, RC * rb / best / 1e9, nth, R * rb / bests / 1e9, bad, R);
     }
+    // pairs of rows (gate + up of one hidden row) through iq3s_dot2_t: speed per row and bitwise equality
+    auto pairs = [&](const char * name, auto fn) {
+        int bad = 0;
+        for (size_t r = 0; r + 1 < R; r += 2) {
+            fn(k, w.data() + r * rb, w.data() + (r + 1) * rb, q8.data(), &y[r], &y[r + 1]);
+            bad += (memcmp(&y[r], &ref[r], 4) != 0) + (memcmp(&y[r + 1], &ref[r + 1], 4) != 0);
+        }
+        double best = 1e9;
+        for (int rep = 0; rep < 7; ++rep) {
+            auto t0 = std::chrono::steady_clock::now();
+            for (size_t r = 0; r + 1 < RC; r += 2) fn(k, w.data() + r * rb, w.data() + (r + 1) * rb, q8.data(), &y[r], &y[r + 1]);
+            best = std::min(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        }
+        double bests = 1e9;
+        for (int rep = 0; rep < 5; ++rep) {
+            auto t0 = std::chrono::steady_clock::now();
+#pragma omp parallel for num_threads(nth) schedule(dynamic, 1)
+            for (size_t c = 0; c < R / 16; ++c)
+                for (size_t r = c * 16; r < c * 16 + 16; r += 2) fn(k, w.data() + r * rb, w.data() + (r + 1) * rb, q8.data(), &y[r], &y[r + 1]);
+            bests = std::min(bests, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        }
+        printf("%-9s 1 thread cached: %6.1f ns/row (%5.2f GB/s)   %d threads streaming: %5.1f GB/s   bitwise mismatches %d of %zu\n",
+               name, best / RC * 1e9, RC * rb / best / 1e9, nth, R * rb / bests / 1e9, bad, R);
+    };
+    pairs("pair64", [](int n, const void * a, const void * b, const void * y, float * s0, float * s1) { iq3s_dot2_t<iq3s_grid8_v1>(n, a, b, y, s0, s1); });
+    pairs("pairvec", [](int n, const void * a, const void * b, const void * y, float * s0, float * s1) { iq3s_dot2_t<iq3s_grid8_v3>(n, a, b, y, s0, s1); });
     {   // IQ4_XS down rows: 4 resumed parts vs ggml's vec_dot, bitwise
         const GTensor & td = g.need("blk." + std::to_string(layer) + ".ffn_down_exps.weight");
         if (td.type == GType::IQ4_XS) {

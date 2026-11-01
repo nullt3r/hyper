@@ -68,10 +68,13 @@ public:
             while (n < prompt.size() && n < h.size() && prompt[n] == h[n]) ++n;
             return (int) n;
         };
-        // (what a conversation saves: the latest snapshot inside the common prefix -- the recurrent state resumes there)
-        auto usable = [](const std::vector<Snap> & ss, int l) {
+        // (what a conversation saves: the latest snapshot inside the common prefix -- the recurrent state resumes there; a
+        // snapshot at pos holds the state after [0, pos), so pos == l is usable: a prompt that replaces the last message at
+        // its start token, e.g. a new question after a cancelled answer, resumes at that message's snapshot)
+        const int pmax = (int) prompt.size() - 1;
+        auto usable = [pmax](const std::vector<Snap> & ss, int l) {
             int u = 0;
-            for (auto & sn : ss) if (sn.pos <= l - 1 && sn.pos > u) u = sn.pos;
+            for (auto & sn : ss) if (sn.pos <= std::min(l, pmax) && sn.pos > u) u = sn.pos;
             return u;
         };
         const int L = common(hist), cur = (int) hist.size(), U = usable(snaps, L);
@@ -120,7 +123,7 @@ public:
             Snap kept{};
             int ki = -1;
             for (int i = 0; i < (int) snaps.size(); ++i)
-                if (snaps[i].pos <= L - 1 && (ki < 0 || snaps[i].pos > snaps[ki].pos)) ki = i;
+                if (snaps[i].pos <= L && (ki < 0 || snaps[i].pos > snaps[ki].pos)) ki = i;
             if (ki >= 0) { kept = snaps[ki]; snaps.erase(snaps.begin() + ki); }
             int k = -1;
             for (int i = 0; i < (int) slots_.size() && k < 0; ++i)   // an earlier state of this conversation is replaced

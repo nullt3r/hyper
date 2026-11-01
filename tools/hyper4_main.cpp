@@ -6,6 +6,7 @@
 #include "engine6.h"
 
 #include <cuda_profiler_api.h>
+#include <cuda_runtime.h>
 #include <csignal>
 #include <execinfo.h>
 #include <unistd.h>
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <map>
+#include <sstream>
 #include <string>
 #include <algorithm>
 #include <type_traits>
@@ -154,6 +156,21 @@ static int run_cmd(int argc, char ** argv) {
             const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             printf("CHECK4 nt=%d n=%d top1 %.2f%%  KL mean %.6f max %.5f  (%.1f tok/s incl. logits download)%s\n", nt, cmp.n,
                    100.0 * cmp.top1 / cmp.n, cmp.kl_sum / cmp.n, cmp.kl_max, cmp.n / s, cmp.ppl().c_str());
+        } else if (cmd == "dumpref") {   // this engine's own decode logits for the reference tokens -> argv[4] (the ref format: a
+            // reference for A/B checks of exact rewrites where llama.cpp cannot load the file); argv[5]: tokens (default all)
+            const int n = std::min<int>(argc > 5 ? atoi(argv[5]) : (int) toks.size(), (int) toks.size());
+            FILE * f = fopen(argv[4], "wb");
+            if (!f) { fprintf(stderr, "cannot write %s\n", argv[4]); return 1; }
+            fwrite(&n, 4, 1, f); fwrite(&nv, 4, 1, f); fwrite(toks.data(), 4, n, f);
+            std::vector<float> lg;
+            eng.reset();
+            for (int i = 0; i < n; ++i) {
+                eng.forward(&toks[i], 1, i);
+                eng.get_logits(0, lg);
+                fwrite(lg.data(), 4, nv, f);
+            }
+            fclose(f);
+            printf("DUMPREF %d positions -> %s\n", n, argv[4]);
         } else if (cmd == "checkpf") {   // prefill the first n_pf tokens in chunks, then decode the rest token by token
             int n_pf = argc > 4 ? atoi(argv[4]) : 128;
             if (g_ref_first > 0) n_pf = g_ref_first + 1;   // v2 reference: logits from g_ref_first on
@@ -440,6 +457,31 @@ static int run_cmd(int argc, char ** argv) {
                        (unsigned long long) h, (unsigned long long) hd);
                 fflush(stdout);
             }
+        } else if (cmd == "pfsweep") {   // an agent's increments: HYPER_PFS_BASE context tokens (default 4096), then prompts of
+            // 8 16 32 64 96 128 200 400 1000 tokens appended one after another (each timed, 3 rounds), reference tokens repeated
+            const int base = getenv("HYPER_PFS_BASE") ? atoi(getenv("HYPER_PFS_BASE")) : 4096;
+            std::vector<int> lens = {8, 16, 32, 64, 96, 128, 200, 400, 1000};
+            if (const char * ls = getenv("HYPER_PFS_LENS")) {   // e.g. "200" or "64,200"
+                lens.clear();
+                for (const char * q = ls; *q;) { lens.push_back(atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
+            }
+            int sum = 0;
+            for (int n : lens) sum += n;
+            std::vector<int> all(base + 3 * sum + 16);
+            for (size_t i = 0; i < all.size(); ++i) all[i] = toks[i % toks.size()];
+            eng.reset();
+            eng.prefill(all.data(), base, 0);
+            int pos = base;
+            if (getenv("HYPER_TF_MARK")) cudaProfilerStart();
+            for (int round = 0; round < 3; ++round)
+                for (int n : lens) {
+                    cudaDeviceSynchronize();
+                    auto t0 = std::chrono::steady_clock::now();
+                    eng.prefill(all.data() + pos, n, pos);
+                    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    pos += n;
+                    if (round > 0) printf("PFSWEEP n=%4d at %6d: %7.1f ms  %7.1f t/s\n", n, pos - n, 1e3 * s, n / s);
+                }
         } else if (cmd == "pfbench") {   // prompt of n tokens (reference tokens repeated): prefill speed, then 64 decoded tokens
             const int n = argc > 4 ? atoi(argv[4]) : 2048;
             if (getenv("HYPER4_PFREAL") && (int) toks.size() < n) { fprintf(stderr, "reference too short for a real-text prompt\n"); return 1; }
@@ -499,6 +541,38 @@ static int run_cmd(int argc, char ** argv) {
             for (int i = pf; i < pf + n_tok; ++i) eng.forward(&toks[i], 1, i);
             const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             printf("TFBENCH decode %d fixed tokens: %.2f t/s (%.2f ms/token)\n", n_tok, n_tok / s, 1e3 * s / n_tok);
+        } else if (cmd == "tfab") {   // CPU expert scheduling A/B on fixed content (as tfbench), in one process: HYPER_AB modes
+            // (0 dynamic, 1 L3 groups, 3 groups + prefetch of the GPU's routing prediction: HYPER5_PRED=2), interleaved over rounds
+            if constexpr (std::is_same_v<Engine, Engine5>) {
+                const int pf = getenv("HYPER_TF_PF") ? atoi(getenv("HYPER_TF_PF")) : 64;
+                const int n_tok = std::min<int>(argc > 4 ? atoi(argv[4]) : 256, (int) toks.size() - pf);
+                const int rounds = getenv("HYPER_AB_ROUNDS") ? atoi(getenv("HYPER_AB_ROUNDS")) : 3;
+                std::vector<int> modes;
+                {   std::string m = getenv("HYPER_AB") ? getenv("HYPER_AB") : "0,1,3";
+                    for (char & ch : m) if (ch == ',') ch = ' ';
+                    std::istringstream is(m); int x; while (is >> x) modes.push_back(x); }
+                std::vector<std::vector<double>> tps(modes.size());
+                for (int r = 0; r < rounds; ++r)
+                    for (size_t mi = 0; mi < modes.size(); ++mi) {
+                        // (mode 4: mode 3 + the early-prediction helpers)
+                        eng.cpu_moe()->set_sched(modes[mi] >= 1, modes[mi] >= 2 ? std::min(modes[mi], 3) - 1 : 0);
+                        eng.cpu_moe()->set_helpers(modes[mi] == 4);
+                        eng.reset();
+                        eng.prefill(toks.data(), pf, 0);
+                        uint64_t h = 1469598103934665603ull;
+                        auto t0 = std::chrono::steady_clock::now();
+                        for (int i = pf; i < pf + n_tok; ++i) { const int o = eng.forward(&toks[i], 1, i)[0]; h = (h ^ (uint64_t) o) * 1099511628211ull; }
+                        const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                        tps[mi].push_back(n_tok / sec);
+                        printf("round %d mode %d: %.2f t/s  greedy hash %016llx\n", r, modes[mi], n_tok / sec, (unsigned long long) h);
+                        fflush(stdout);
+                    }
+                for (size_t mi = 0; mi < modes.size(); ++mi) {
+                    std::vector<double> v = tps[mi];
+                    std::sort(v.begin(), v.end());
+                    printf("mode %d: median %.2f t/s (min %.2f max %.2f)\n", modes[mi], v[v.size() / 2], v.front(), v.back());
+                }
+            } else throw std::runtime_error("tfab: Engine5 only");
         } else if (cmd == "bench") {
             const int n_gen = argc > 4 ? atoi(argv[4]) : 128;
             eng.reset();

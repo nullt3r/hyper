@@ -1,6 +1,7 @@
 #include "model7.h"
 
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <stdexcept>
 
@@ -9,6 +10,22 @@ namespace hyper {
 Ds4Config Ds4Config::from_gguf(const GGUF & g) {
     if (g.arch() != "deepseek41") throw std::runtime_error("expected deepseek41 model, got " + g.arch());
     const std::string a = "deepseek41.";
+    // (ISTA-DASLab's GGUFs name some keys differently and hold the Engram hash tables as tensors: K picks the key present)
+    // (unsloth's, after llama.cpp PR 30817, call the Engram tables "per-layer embeddings": K3 adds a third name)
+    auto K = [&](const std::string & k, const std::string & alt) { return g.has(a + k) || !g.has(a + alt) ? a + k : a + alt; };
+    auto K3 = [&](const std::string & k, const std::string & alt, const std::string & alt2) {
+        return g.has(a + k) || g.has(a + alt) || !g.has(a + alt2) ? K(k, alt) : a + alt2;
+    };
+    auto ints = [&](const std::string & k, const std::string & tensor, const std::string & alt = "") {
+        if (g.has(a + k)) return g.get_int_arr(a + k);
+        if (!alt.empty() && g.has(a + alt)) return g.get_int_arr(a + alt);
+        const GTensor & t = g.need(tensor);
+        std::vector<int64_t> v(t.nelements());
+        if (t.type == GType::I64) memcpy(v.data(), t.data, v.size() * 8);
+        else if (t.type == GType::I32) for (size_t i = 0; i < v.size(); ++i) { int32_t x; memcpy(&x, t.data + 4 * i, 4); v[i] = x; }
+        else throw std::runtime_error("deepseek41: " + tensor + " is not an integer tensor");
+        return v;
+    };
     Ds4Config c;
     c.n_layer = (int) g.get_int(a + "block_count");
     c.n_embd = (int) g.get_int(a + "embedding_length");
@@ -29,8 +46,8 @@ Ds4Config Ds4Config::from_gguf(const GGUF & g) {
     for (int il = 0; il < c.n_layer; ++il) c.ratio[il] = (int) ratios.at(il);
     c.kv_src.assign(c.n_layer, 0);
     c.ix_src.assign(c.n_layer, 0);
-    for (auto l : g.get_int_arr(a + "attention.kv_source_layers")) c.kv_src.at(l) = 1;
-    for (auto l : g.get_int_arr(a + "attention.indexer.source_layers")) c.ix_src.at(l) = 1;
+    for (auto l : g.get_int_arr(K("attention.kv_source_layers", "kv_source_layer_ids"))) c.kv_src.at(l) = 1;
+    for (auto l : g.get_int_arr(K("attention.indexer.source_layers", "index_source_layer_ids"))) c.ix_src.at(l) = 1;
     c.kv_of.assign(c.n_layer, -1);
     c.ix_of.assign(c.n_layer, -1);
     int kv = -1, ix = -1;
@@ -44,9 +61,9 @@ Ds4Config Ds4Config::from_gguf(const GGUF & g) {
             c.ix_of[il] = ix;
         }
     }
-    c.cand_src = (int) g.get_int(a + "attention.indexer.candidate_source_layer", -1);
-    c.cand_topk = (int) g.get_int(a + "attention.indexer.candidate_top_k_blocks");
-    c.cand_blk = (int) g.get_int(a + "attention.indexer.candidate_block_size");
+    c.cand_src = (int) g.get_int(K("attention.indexer.candidate_source_layer", "attention.candidate_source_layer_id"), -1);
+    c.cand_topk = (int) g.get_int(K("attention.indexer.candidate_top_k_blocks", "attention.candidate_topk_blocks"));
+    c.cand_blk = (int) g.get_int(K("attention.indexer.candidate_block_size", "attention.candidate_block_size"));
     c.ix_heads = (int) g.get_int(a + "attention.indexer.head_count");
     c.ix_hd = (int) g.get_int(a + "attention.indexer.key_length");
     c.ix_topk = (int) g.get_int(a + "attention.indexer.top_k");
@@ -63,16 +80,16 @@ Ds4Config Ds4Config::from_gguf(const GGUF & g) {
     c.beta_fast = (float) g.get_float(a + "rope.scaling.yarn_beta_fast");
     c.beta_slow = (float) g.get_float(a + "rope.scaling.yarn_beta_slow");
     c.orig_ctx = (int) g.get_int(a + "rope.scaling.original_context_length");
-    for (auto l : g.get_int_arr(a + "engram.layers")) c.eg_layers.push_back((int) l);
-    c.eg_ngram = (int) g.get_int(a + "engram.max_ngram_size");
-    c.eg_heads = (int) g.get_int(a + "engram.head_count");
-    c.eg_hd = (int) g.get_int(a + "engram.head_dim");
-    const auto tm = g.get_int_arr(a + "engram.token_map");
+    for (auto l : g.get_int_arr(K3("engram.layers", "engram.layer_ids", "ple.layers"))) c.eg_layers.push_back((int) l);
+    c.eg_ngram = (int) g.get_int(K3("engram.max_ngram_size", "engram_max_ngram_size", "ple.ngram_size"));
+    c.eg_heads = (int) g.get_int(K3("engram.head_count", "engram_n_heads", "ple.heads_per_ngram"));
+    c.eg_hd = (int) g.get_int(K3("engram.head_dim", "engram_head_dim", "embedding_length_per_layer_input"));
+    const auto tm = ints("engram.token_map", "engram_token_map.weight");
     c.eg_tmap.assign(tm.begin(), tm.end());
-    c.eg_pad = c.eg_tmap.at((size_t) g.get_int(a + "engram.pad_token_id"));
-    c.eg_mult = g.get_int_arr(a + "engram.multipliers");
-    c.eg_primes = g.get_int_arr(a + "engram.primes");
-    c.eg_off = g.get_int_arr(a + "engram.offsets");
+    c.eg_pad = c.eg_tmap.at((size_t) g.get_int(K("engram.pad_token_id", "engram_pad_token_id")));
+    c.eg_mult = ints("engram.multipliers", "engram_multipliers.weight", "ple.layer_multipliers");
+    c.eg_primes = ints("engram.primes", "engram_primes.weight", "ple.head_vocab_sizes");
+    c.eg_off = ints("engram.offsets", "engram_offsets.weight", "ple.head_offsets");
     const size_t ne = c.eg_layers.size();
     if (c.eg_mult.size() != ne * c.eg_ngram || c.eg_primes.size() != ne * c.eg_cols() || c.eg_off.size() != ne * c.eg_cols())
         throw std::runtime_error("deepseek41: Engram hash tables do not match the layout");

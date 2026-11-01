@@ -66,11 +66,18 @@ public:
             p.location.id = dev_;
             CUmemGenericAllocationHandle h = 0;
             CU_CHECK(cuMemCreate(&h, gran_, &p, 0));
-            CU_CHECK(cuMemMap(base_ + i * gran_, gran_, 0, h, 0));
+            if (cuMemMap(base_ + i * gran_, gran_, 0, h, 0) != CUDA_SUCCESS) {
+                cuMemRelease(h);
+                throw std::runtime_error("VmmBuf::map: cuMemMap failed");
+            }
             CUmemAccessDesc a = {};
             a.location = p.location;
             a.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-            CU_CHECK(cuMemSetAccess(base_ + i * gran_, gran_, &a, 1));
+            if (cuMemSetAccess(base_ + i * gran_, gran_, &a, 1) != CUDA_SUCCESS) {
+                cuMemUnmap(base_ + i * gran_, gran_);
+                cuMemRelease(h);
+                throw std::runtime_error("VmmBuf::map: cuMemSetAccess failed");
+            }
             h_[i] = h;
             ++mapped_;
             if (zero) {

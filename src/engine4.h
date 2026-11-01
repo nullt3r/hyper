@@ -142,6 +142,7 @@ private:
     int64_t mtp_pos_ = 0;      // the position of the token the next MTP pass drafts
     float * h_mtopk_ = nullptr;   // pinned [ndev][TOPK][2]: the MTP head's candidates per vocab slice (coupled drafts)
     std::vector<std::pair<void *, size_t>> host_bufs_;
+    std::vector<void *> host_reg_;   // host_bufs_ registered with CUDA (unregistered before the unmap)
 
     Engine4Options opt_;
     std::unique_ptr<GGUF> gguf_, mtp_g_;

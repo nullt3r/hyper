@@ -185,7 +185,7 @@ __device__ __forceinline__ unsigned h2sub(unsigned a, unsigned b) {
     return r;
 }
 // same structure as k_mma_q8 (block per 16-row tile, warps over k blocks, optional split-K over gridDim.y)
-template <KQ T>
+template <KQ T, int U = 1>
 __global__ void k_mma_kq(KQW W, const float * __restrict__ x, int xs, float * __restrict__ y, int ys, int nt, NormIn nin,
                          float * __restrict__ kpart, unsigned * kcnt) {
     const int tile = blockIdx.x, part = blockIdx.y, P = gridDim.y;
@@ -198,10 +198,26 @@ __global__ void k_mma_kq(KQW W, const float * __restrict__ x, int xs, float * __
     float acc[4] = {0, 0, 0, 0};
     const unsigned ones[4] = {0x3C003C00u, 0x3C003C00u, 0x3C003C00u, 0x3C003C00u};
     const int b_end = (int) ((int64_t) (part + 1) * kb / P);
-    for (int b = (int) ((int64_t) part * kb / P) + w; b < b_end; b += nw) {
+    // (U > 1: the weight words of the warp's next U blocks are loaded before the first of them is used -- more bytes in
+    // flight per warp; the blocks are still accumulated one after another in the same order: the same result bits)
+    for (int b0 = (int) ((int64_t) part * kb / P) + w; b0 < b_end; b0 += nw * U) {
+      uint2 qq[U]; unsigned hh[U];
+#pragma unroll
+      for (int u = 0; u < U; ++u) {
+          const int bu = b0 + u * nw;
+          if (bu < b_end) {
+              const size_t tbu = (size_t) tile * kb + bu;
+              qq[u] = __ldg(W.lo + tbu * 32 + lane);
+              hh[u] = T == KQ::Q6K ? __ldg(W.hi + tbu * 32 + lane) : 0u;
+          }
+      }
+#pragma unroll
+      for (int u = 0; u < U; ++u) {
+        const int b = b0 + u * nw;
+        if (b >= b_end) break;
         const size_t tb = (size_t) tile * kb + b;
-        const uint2 q = __ldg(W.lo + tb * 32 + lane);
-        const unsigned hb = T == KQ::Q6K ? __ldg(W.hi + tb * 32 + lane) : 0u;
+        const uint2 q = qq[u];
+        const unsigned hb = hh[u];
         const float2 dlo = __half22float2(W.d[((size_t) tile * nsb + b / W.dg) * 16 + gid]);
         const float2 dhi = __half22float2(W.d[((size_t) tile * nsb + b / W.dg) * 16 + gid + 8]);
         float tmp[2][4] = {}, tx[4] = {0, 0, 0, 0};
@@ -239,6 +255,7 @@ __global__ void k_mma_kq(KQW W, const float * __restrict__ x, int xs, float * __
                 acc[2] += tmp[ks][2] * s_hi; acc[3] += tmp[ks][3] * s_hi;
             }
         }
+      }
     }
     __shared__ float red[8][32][4];
 #pragma unroll
@@ -2001,8 +2018,11 @@ void gemv_kq(const KQW & W, const float * x, int xs, float * y, int ys, int nt, 
         P = std::max(1, std::min({KSPLIT_MAX, g_ksplit_blocks / tiles, kb / g_ksplit_minkb}));
     float * kp = P > 1 ? g_ksplit_dev(dev).part : nullptr;
     unsigned * kc = P > 1 ? g_ksplit_dev(dev).cnt : nullptr;
-    if (W.type == KQ::Q4K) k_mma_kq<KQ::Q4K><<<dim3(tiles, P), 256, 0, s>>>(W, x, xs, y, ys, nt, nin, kp, kc);
-    else k_mma_kq<KQ::Q6K><<<dim3(tiles, P), 256, 0, s>>>(W, x, xs, y, ys, nt, nin, kp, kc);
+    static const int U = getenv("HYPER_KQ_UNROLL") ? atoi(getenv("HYPER_KQ_UNROLL")) : 1;
+#define KQ_LAUNCH(TT, UU) k_mma_kq<TT, UU><<<dim3(tiles, P), 256, 0, s>>>(W, x, xs, y, ys, nt, nin, kp, kc)
+    if (W.type == KQ::Q4K) { if (U >= 4) KQ_LAUNCH(KQ::Q4K, 4); else if (U == 2) KQ_LAUNCH(KQ::Q4K, 2); else KQ_LAUNCH(KQ::Q4K, 1); }
+    else { if (U >= 4) KQ_LAUNCH(KQ::Q6K, 4); else if (U == 2) KQ_LAUNCH(KQ::Q6K, 2); else KQ_LAUNCH(KQ::Q6K, 1); }
+#undef KQ_LAUNCH
 }
 void deq_kq_f16(const KQW & W, int r0, int r1, half * out, cudaStream_t s) {
     if (r0 % 16) throw std::runtime_error("deq_kq_f16: r0 must be a multiple of 16");

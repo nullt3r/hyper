@@ -2,6 +2,7 @@
 // mHC mixers, the MLA latent cache and the indexer replicated, experts split between the GPUs and the CPU.
 #pragma once
 #include "cpu_moe.h"
+#include <cstdlib>
 #include "engine4.h"   // Barrier4
 #include "gguf.h"
 #include "kernels4.cuh"
@@ -47,6 +48,7 @@ public:
     int prefill(const int * tokens, int n, int pos);
     void get_logits(int t, std::vector<float> & out);
     void reset();
+    CpuMoe * cpu_moe() { return cpu_.get(); }   // (tests)
     const Glm5Config & config() const { return cfg_; }
     std::vector<int> generate(const std::vector<int> & prompt, int n_gen, bool spec, GenStats * stats,
                               const std::function<bool(int)> & on_token = {}, const SamplingParams & sp = {}) override;
@@ -103,8 +105,20 @@ private:
     float samp_invT_ = 0.0f;   // MTP drafts: 1 / temperature when sampling (coupled to the noise), 0: greedy drafts
     SamplingParams samp_;      // this request's sampling (the drafts' truncation)
     int64_t mtp_pos_ = 0;      // the position of the token the next MTP pass drafts
+    // CPU load gate of the MTP drafts: EMA of row 0's CPU-held experts per MoE layer and step; drafts are verified only while
+    // it stays under mtp_cpu_max_ (a verification row reads its own CPU experts from RAM: worth it when the GPUs pace a step)
+    double cpu_ema_ = 8.0, mtp_cpu_max_ = 1.5;
+    // decode graph launches for devices 1.. from their own threads, at the same time as device 0's: a cudaGraphLaunch of a
+    // decode graph costs ~1 ms of host time (thousands of nodes), and one after another the last device started ~2.5 ms
+    // after the first, which waited for it in the first allreduce of every token -- under nsys only (HYPER5_PAR_LAUNCH=1: on)
+    struct Launcher { std::thread th; std::atomic<unsigned> go{0}, done{0}; cudaGraph_t g = nullptr; cudaGraphExec_t ge = nullptr; };
+    std::vector<std::unique_ptr<Launcher>> launchers_;
+    std::atomic<bool> launch_stop_{false};
+    double t_launch_[8] = {}; uint64_t n_launch_ = 0;   // (HYPER5_LAUNCHPROF: host time per launch and device)
+    void launch_all(int nt, int kind);
     float * h_mtopk_ = nullptr;   // pinned [ndev][TOPK][2]: the MTP head's candidates per vocab slice (coupled drafts)
     std::vector<std::pair<void *, size_t>> host_bufs_;
+    std::vector<void *> host_reg_;   // host_bufs_ registered with CUDA (unregistered before the unmap)
 
     Engine5Options opt_;
     std::unique_ptr<GGUF> gguf_, mtp_g_;
@@ -122,7 +136,11 @@ private:
     int * h_pos_ = nullptr;
     float * h_res_ = nullptr;
     uint2 * ar_ll_ = nullptr;
-    CpuMoeRec * cpu_rec_ = nullptr;
+    CpuMoeRec * cpu_rec_ = nullptr, * cpu_pred_ = nullptr, * cpu_pred1_ = nullptr;   // pred1: the early (previous layer's) prediction   // pred: HYPER5_PRED=2's routing predictions per layer (ids only)
+    const int pred_mode_ = getenv("HYPER5_PRED") ? atoi(getenv("HYPER5_PRED")) : 0;
+    // HYPER5_PRED_EARLY=1: also the next layer's prediction during this one, for the CpuMoe helpers (measured slower on GLM)
+    const bool pred_early_ = getenv("HYPER5_PRED_EARLY") && atoi(getenv("HYPER5_PRED_EARLY")) != 0;
+    const bool pstream_prio_ = getenv("HYPER5_PSTREAM_PRIO") && atoi(getenv("HYPER5_PSTREAM_PRIO")) != 0;
     CpuMoeOut * cpu_out_ = nullptr;
     CpuMoeBulk * cpu_bulk_ = nullptr;
     CpuMoeBulkOut * cpu_bulk_out_ = nullptr;
@@ -154,11 +172,18 @@ private:
     int adapt_every_ = 16, adapt_budget_ = 64;
     double adapt_min_ = 6.0, adapt_ratio_ = 1.25;   // swap when score_in >= ratio * score_out + min
     double t_rebalance_ = 0;      // ms spent in rebalance (decode stalls)
+    double t_ld_[4] = {0, 0, 0, 0};   // load: host copies (file -> huge pages), collapse, cudaHostRegister, rest of the layer (s)
     int steps_ = 0, n_swaps_ = 0;
     double acc_rate_ = 0.5;       // speculation: running fraction of drafted tokens accepted
     int up_parts_ = 1;            // prefill expert uploads: parts per half, each after an allreduce's downloads (HYPER5_UP_PARTS; 0: at once)
+    // HYPER5_STREAM_CPU (tokens, 0 = off): a streamed single chunk of nt tokens leaves min(stream_cpu_max_, c / nt) of the CPU
+    // experts (the coldest) on the CPU
+    double stream_cpu_ = 120.0, stream_cpu_max_ = 0.5;
+    double stream_cpu_built_ = -1.0;   // (the share the stream lists were built with)
     int stream_min_ = 280;        // prefill chunks this long stream the CPU experts to the GPUs; shorter ones use the CPU
     int * h_ids_ = nullptr;       // pinned [n_layer][R][K]: prefill routing from GPU 0
+    FILE * route_trace_ = nullptr;   // HYPER5_ROUTE_TRACE=file: expert ids of every routed row (no text), for placement studies
+    template <typename F> void trace_routing(int type, int nrows, F && id);
     // HYPER5_PREDSTAT (decode, measurement): layer l+1's router applied to layer l's router input on GPU 0; how many of
     // the CPU experts layer l+1 then really routes to were predicted
     std::vector<int> zc_blocks_;   // HYPER5_ZC "cpu,g0,g1,g2": hidden 256-blocks of the CPU experts per side (decode)

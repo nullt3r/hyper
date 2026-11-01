@@ -10,6 +10,7 @@
 #include "llm.h"
 #include "model7.h"
 
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <string>
@@ -50,6 +51,7 @@ public:
     bool has_mtp() const override { return false; }
     void reset_cache() override { hist_.clear(); parked_.clear(); }
     void save_expert_stats(const std::string & path);
+    CpuMoe * cpu_moe() { return cpu_.get(); }   // (tests)
 
 private:
     struct Layer;
@@ -68,7 +70,9 @@ private:
     std::vector<std::unique_ptr<Device>> devs_;
     std::vector<int> dev_of_;        // layer -> device
     std::unique_ptr<CpuMoe> cpu_;
-    CpuMoeRec * cpu_rec_ = nullptr;
+    CpuMoeRec * cpu_rec_ = nullptr, * cpu_pred_ = nullptr;
+    const int pred_mode_ = getenv("HYPER7_PRED") ? atoi(getenv("HYPER7_PRED")) : 0;
+    const int pred_k_ = getenv("HYPER7_PRED_K") ? atoi(getenv("HYPER7_PRED_K")) : 0;   // 1: next layer's router on this layer's input, 2: on its own input   // pred: HYPER7_PRED's next-layer routing per layer (ids only)
     CpuMoeOut * cpu_out_ = nullptr;
     CpuMoeBulk * cpu_bulk_ = nullptr;
     CpuMoeBulkOut * cpu_bulk_out_ = nullptr;

@@ -6,6 +6,7 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <sys/mman.h>
+#include <pthread.h>
 
 #include <algorithm>
 #include <deque>
@@ -190,13 +191,20 @@ namespace {
 
 struct RowRange { const GTensor * t; int64_t r0, r1; };
 
-// bf16 rows -> fp16 fragment-ordered weight
+// bf16 (or f16: Swift's indexer) rows -> fp16 fragment-ordered weight
 BF16W upload_bf16(const std::function<void *(size_t)> & alloc, int dev, const GTensor & t) {
-    if (t.type != GType::BF16) throw std::runtime_error("expected BF16: " + t.name);
+    if (t.type != GType::BF16 && t.type != GType::F16) throw std::runtime_error("expected BF16/F16: " + t.name);
     const int n = (int) t.rows(), k = (int) t.ne[0];
     const size_t ntile = (n + 15) / 16;
     std::vector<uint8_t> fq(ntile * (k / 16) * 512);
-    repack_bf16_frag((const uint16_t *) t.data, n, k, (size_t) k, fq.data());
+    if (t.type == GType::F16) {   // f16 -> f32 -> f16: exact
+        std::vector<float> f((size_t) n * k);
+        const auto * tr = ggml_get_type_traits(GGML_TYPE_F16);
+#pragma omp parallel for schedule(static)
+        for (int r = 0; r < n; ++r) tr->to_float(t.data + (size_t) r * t.row_bytes(), f.data() + (size_t) r * k, k);
+        repack_f32_frag(f.data(), n, k, (size_t) k, fq.data());
+    } else
+        repack_bf16_frag((const uint16_t *) t.data, n, k, (size_t) k, fq.data());
     CUDA_CHECK(cudaSetDevice(dev));
     BF16W w; w.n = n; w.k = k;
     void * p = alloc(fq.size());
@@ -729,6 +737,7 @@ int Engine4::fill_extra(int budget) {
     fill_cancel_.store(false);
     if (fill_th_.joinable()) fill_th_.join();
     fill_th_ = std::thread([this] {
+        pthread_setname_np(pthread_self(), "h4-fill");
         try {
             for (Fill & f : fill_list_) {
                 if (fill_cancel_.load()) break;
@@ -748,6 +757,7 @@ int Engine4::fill_extra(int budget) {
         } catch (const std::exception & ex) {
             fprintf(stderr, "hyper4: elastic fill failed: %s\n", ex.what());
             for (Fill & f : fill_list_) f.copied = false;
+            for (auto & dp : devs_) { cudaSetDevice(dp->id); cudaStreamSynchronize(dp->fstream); }
         }
         fill_busy_.store(false);
     });
@@ -832,6 +842,7 @@ Engine4::~Engine4() {
     if (h_mtopk_) cudaFreeHost(h_mtopk_);
     if (h_ids_) cudaFreeHost(h_ids_);
     cpu_.reset();
+    for (void * p : host_reg_) cudaHostUnregister(p);
     for (auto & [p, sz] : host_bufs_) munmap(p, sz);
     devs_.clear();
     for (void * p : {(void *) h_embd_, (void *) h_ple_, (void *) h_pos_, (void *) h_res_, (void *) ar_ll_, (void *) cpu_rec_, (void *) cpu_out_,
@@ -1083,6 +1094,7 @@ void Engine4::load_experts(int il, const std::vector<int> & quota) {
     }
     collapse_huge(buf, bytes);
     CUDA_CHECK(cudaHostRegister(buf, bytes, cudaHostRegisterPortable));
+    host_reg_.push_back(buf);
     cpu_->set_layer(il, cl);
     ExpertHost & H = ehost_[il];
     if (il < (int) stats_.size()) {   // prior: the calibration's routing shares, weighted like ~256 tokens of routing
@@ -2392,11 +2404,15 @@ std::vector<int> Engine4::generate(const std::vector<int> & prompt, int n_gen, b
     const std::vector<int> & key = md ? md->keys : prompt;
     int s = 0;
     if (opt_.prompt_cache) {
+        // a fill batch started in the previous request's decode may still be mapping VRAM and copying on its own thread:
+        // it finishes before parking / resuming allocates, frees and copies pinned memory (no other change: the batch
+        // still hands over at its due step)
+        if (fill_th_.joinable()) fill_th_.join();
         const int L = park_.resolve(key, hist_, snaps_, snap_pool_, park_devs(), "hyper4");   // (see park.h)
         for (size_t i = 0; i < snaps_.size();)
             if (snaps_[i].pos > L) { snap_pool_.push_back(snaps_[i].h); snaps_.erase(snaps_.begin() + i); } else ++i;
         Snap * best = nullptr;
-        for (auto & sn : snaps_) if (sn.pos <= std::min(L - 1, P - 1) && (!best || sn.pos > best->pos)) best = &sn;
+        for (auto & sn : snaps_) if (sn.pos <= std::min(L, P - 1) && (!best || sn.pos > best->pos)) best = &sn;
         if (best) { s = best->pos; snap_copy(*best, false); }
     }
     if (s == 0) reset();

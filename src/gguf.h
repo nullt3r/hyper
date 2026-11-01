@@ -61,7 +61,7 @@ public:
 
 private:
     struct Map { int fd = -1; uint8_t * p = nullptr; size_t size = 0; };
-    void load_shard(const std::string & path, bool first);
+    std::map<std::string, GValue> load_shard(const std::string & path, bool first);   // (returns the file's metadata)
     std::vector<Map> maps_;
     std::string arch_;
     std::map<std::string, GValue> kv_;

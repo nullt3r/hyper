@@ -74,20 +74,74 @@ static inline float iq3s_dot_t(int n, const void * vx, const void * vy) {
     }
     return iq3s_hsum8(accumf);
 }
+// v3: the 8 grid indices built in a vector (qs bytes | qh bit << 8), stored, then 8 scalar loads of the grid
+static inline __m256i iq3s_grid8_v3(const uint8_t * qs, uint32_t qh) {
+    const __m128i lo = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *) qs));
+    const __m128i hb = _mm_and_si128(_mm_mullo_epi16(_mm_set1_epi16((short) qh), _mm_setr_epi16(256, 128, 64, 32, 16, 8, 4, 2)),
+                                     _mm_set1_epi16(256));
+    alignas(16) uint16_t ix[8];
+    _mm_store_si128((__m128i *) ix, _mm_or_si128(lo, hb));
+    const uint64_t a = iq3s_grid[ix[0]] | (uint64_t) iq3s_grid[ix[1]] << 32, b = iq3s_grid[ix[2]] | (uint64_t) iq3s_grid[ix[3]] << 32;
+    const uint64_t c = iq3s_grid[ix[4]] | (uint64_t) iq3s_grid[ix[5]] << 32, d = iq3s_grid[ix[6]] | (uint64_t) iq3s_grid[ix[7]] << 32;
+    const __m128i l = _mm_insert_epi64(_mm_cvtsi64_si128((long long) a), (long long) b, 1);
+    const __m128i h = _mm_insert_epi64(_mm_cvtsi64_si128((long long) c), (long long) d, 1);
+    return _mm256_inserti128_si256(_mm256_castsi128_si256(l), h, 1);
+}
+
+// two rows against one activation row (a gate row and its up row): the q8 loads shared, two independent chains in flight;
+// each result bit-identical to iq3s_dot_t's
+template <__m256i (*grid8)(const uint8_t *, uint32_t)>
+static inline void iq3s_dot2_t(int n, const void * vx0, const void * vx1, const void * vy, float * s0, float * s1) {
+    const block_iq3_s * xa = (const block_iq3_s *) vx0, * xb = (const block_iq3_s *) vx1;
+    const block_q8_K * y = (const block_q8_K *) vy;
+    const int nb = n / 256;
+    __m256 acca = _mm256_setzero_ps(), accb = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float da = iq3s_h2f(xa[i].d) * y[i].d, db = iq3s_h2f(xb[i].d) * y[i].d;
+        const uint8_t * qsa = xa[i].qs, * qha = xa[i].qh, * qsb = xb[i].qs, * qhb = xb[i].qh;
+        const uint16_t * sga = (const uint16_t *) xa[i].signs, * sgb = (const uint16_t *) xb[i].signs;
+        const int8_t * q8 = y[i].qs;
+        __m256i sa1 = _mm256_setzero_si256(), sa2 = _mm256_setzero_si256(), sb1 = _mm256_setzero_si256(), sb2 = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *) q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *) q8); q8 += 32;
+            const __m256i ga1 = grid8(qsa, qha[ib32]), ga2 = grid8(qsa + 8, qha[ib32 + 1]);
+            const __m256i gb1 = grid8(qsb, qhb[ib32]), gb2 = grid8(qsb + 8, qhb[ib32 + 1]);
+            qsa += 16; qsb += 16;
+            const __m256i qa1 = iq3s_signed_q8(q8_1, sga[0] | ((uint32_t) sga[1] << 16));
+            const __m256i qa2 = iq3s_signed_q8(q8_2, sga[2] | ((uint32_t) sga[3] << 16));
+            const __m256i qb1 = iq3s_signed_q8(q8_1, sgb[0] | ((uint32_t) sgb[1] << 16));
+            const __m256i qb2 = iq3s_signed_q8(q8_2, sgb[2] | ((uint32_t) sgb[3] << 16));
+            sga += 4; sgb += 4;
+            const uint16_t la1 = xa[i].scales[ib32 / 2] & 0xf, la2 = xa[i].scales[ib32 / 2] >> 4;
+            const uint16_t lb1 = xb[i].scales[ib32 / 2] & 0xf, lb2 = xb[i].scales[ib32 / 2] >> 4;
+            sa1 = _mm256_add_epi32(sa1, _mm256_madd_epi16(_mm256_maddubs_epi16(ga1, qa1), _mm256_set1_epi16((short) (2 * la1 + 1))));
+            sa2 = _mm256_add_epi32(sa2, _mm256_madd_epi16(_mm256_maddubs_epi16(ga2, qa2), _mm256_set1_epi16((short) (2 * la2 + 1))));
+            sb1 = _mm256_add_epi32(sb1, _mm256_madd_epi16(_mm256_maddubs_epi16(gb1, qb1), _mm256_set1_epi16((short) (2 * lb1 + 1))));
+            sb2 = _mm256_add_epi32(sb2, _mm256_madd_epi16(_mm256_maddubs_epi16(gb2, qb2), _mm256_set1_epi16((short) (2 * lb2 + 1))));
+        }
+        acca = _mm256_fmadd_ps(_mm256_set1_ps(da), _mm256_cvtepi32_ps(_mm256_add_epi32(sa1, sa2)), acca);
+        accb = _mm256_fmadd_ps(_mm256_set1_ps(db), _mm256_cvtepi32_ps(_mm256_add_epi32(sb1, sb2)), accb);
+    }
+    *s0 = iq3s_hsum8(acca);
+    *s1 = iq3s_hsum8(accb);
+}
 static inline void iq3s_dot_v1(int n, float * s, const void * vx, const void * vy) { *s = iq3s_dot_t<iq3s_grid8_v1>(n, vx, vy); }
+static inline void iq3s_dot_v3(int n, float * s, const void * vx, const void * vy) { *s = iq3s_dot_t<iq3s_grid8_v3>(n, vx, vy); }
 static inline void iq3s_dot_v2(int n, float * s, const void * vx, const void * vy) { *s = iq3s_dot_t<iq3s_grid8_v2>(n, vx, vy); }
 
 // IQ4_XS x Q8_K over super-blocks [b0, b1) of a row, continuing ggml's ggml_vec_dot_iq4_xs_q8_K accumulator `accum`
 // (one fma per super-block in order): parts [0, a) [a, b) ... chained and then iq3s_hsum8 give its result bit for bit
-static inline __m256 iq4xs_dot_part(const void * vx, const void * vy, int b0, int b1, __m256 accum) {
-    const block_iq4_xs * x = (const block_iq4_xs *) vx;
+// (seg: x points at super-block b0 of the row -- a part stored on its own, as in the CPU MoE's part-major down copies)
+static inline __m256 iq4xs_dot_seg(const void * xseg, const void * vy, int b0, int b1, __m256 accum) {
+    const block_iq4_xs * x = (const block_iq4_xs *) xseg;
     const block_q8_K * y = (const block_q8_K *) vy;
     const __m128i values128 = _mm_loadu_si128((const __m128i *) kvalues_iq4nl);
     const __m128i m4b = _mm_set1_epi8(0x0f);
     for (int ibl = b0; ibl < b1; ++ibl) {
-        const uint8_t * qs = x[ibl].qs;
+        const uint8_t * qs = x[ibl - b0].qs;
         const int8_t * q8 = y[ibl].qs;
-        uint16_t sh = x[ibl].scales_h;
+        uint16_t sh = x[ibl - b0].scales_h;
         __m256i sumi1 = _mm256_setzero_si256(), sumi2 = _mm256_setzero_si256();
         for (int ib = 0; ib < 8; ib += 2) {
             const __m128i q4bits_1 = _mm_loadu_si128((const __m128i *) qs); qs += 16;
@@ -100,15 +154,18 @@ static inline __m256 iq4xs_dot_part(const void * vx, const void * vy, int b0, in
                                                           _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)), 1);
             const __m256i p16_1 = _mm256_maddubs_epi16(_mm256_sign_epi8(q4b_1, q4b_1), _mm256_sign_epi8(q8b_1, q4b_1));
             const __m256i p16_2 = _mm256_maddubs_epi16(_mm256_sign_epi8(q4b_2, q4b_2), _mm256_sign_epi8(q8b_2, q4b_2));
-            const int16_t ls1 = ((x[ibl].scales_l[ib / 2] & 0xf) | ((sh << 4) & 0x30)) - 32;
-            const int16_t ls2 = ((x[ibl].scales_l[ib / 2] >> 4) | ((sh << 2) & 0x30)) - 32;
+            const int16_t ls1 = ((x[ibl - b0].scales_l[ib / 2] & 0xf) | ((sh << 4) & 0x30)) - 32;
+            const int16_t ls2 = ((x[ibl - b0].scales_l[ib / 2] >> 4) | ((sh << 2) & 0x30)) - 32;
             sh >>= 4;
             sumi1 = _mm256_add_epi32(_mm256_madd_epi16(p16_1, _mm256_set1_epi16(ls1)), sumi1);
             sumi2 = _mm256_add_epi32(_mm256_madd_epi16(p16_2, _mm256_set1_epi16(ls2)), sumi2);
         }
-        accum = _mm256_fmadd_ps(_mm256_set1_ps(iq3s_h2f(x[ibl].d) * y[ibl].d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accum);
+        accum = _mm256_fmadd_ps(_mm256_set1_ps(iq3s_h2f(x[ibl - b0].d) * y[ibl].d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accum);
     }
     return accum;
+}
+static inline __m256 iq4xs_dot_part(const void * vx, const void * vy, int b0, int b1, __m256 accum) {
+    return iq4xs_dot_seg((const block_iq4_xs *) vx + b0, vy, b0, b1, accum);
 }
 
 } // namespace hyper

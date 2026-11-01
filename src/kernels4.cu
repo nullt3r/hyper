@@ -558,10 +558,10 @@ __shared__ uint8_t s_ksigns[128];
 template <GType T> __device__ __forceinline__ void load_tables() {
     if (T == GType::IQ2_XXS) for (int i = threadIdx.x; i < 256; i += blockDim.x) s_iq2xxs_grid[i] = g_iq2xxs_grid[i];
     if (T == GType::IQ3_XXS) for (int i = threadIdx.x; i < 256; i += blockDim.x) s_iq3xxs_grid[i] = g_iq3xxs_grid[i];
-    if (T == GType::IQ2_XXS || T == GType::IQ2_S || T == GType::IQ3_XXS)
+    if (T == GType::IQ2_XXS || T == GType::IQ2_XS || T == GType::IQ2_S || T == GType::IQ3_XXS)
         for (int i = threadIdx.x; i < 128; i += blockDim.x) s_ksigns[i] = g_ksigns_iq2xs[i];
     if (T == GType::IQ3_S) for (int i = threadIdx.x; i < 512; i += blockDim.x) s_iq3s_grid[i] = g_iq3s_grid[i];
-    if (T == GType::IQ4_XS) for (int i = threadIdx.x; i < 16; i += blockDim.x) s_iq4nl[i] = g_iq4nl[i];
+    if (T == GType::IQ4_XS || T == GType::IQ4_NL) for (int i = threadIdx.x; i < 16; i += blockDim.x) s_iq4nl[i] = g_iq4nl[i];
     if (T == GType::MXFP4) for (int i = threadIdx.x; i < 16; i += blockDim.x) s_mxfp4[i] = g_mxfp4[i];
 }
 // ggml_e8m0_to_fp32_half: 2^(e - 128) (e < 2: the denormals)
@@ -584,6 +584,18 @@ template <> __device__ __forceinline__ void deq8<GType::IQ2_XXS>(const uint8_t *
     const float db = h2f(b) * (0.5f + (float) (a1 >> 28)) * 0.25f;
     const uint64_t g = s_iq2xxs_grid[b[2 + ib * 8 + l]];
     const uint8_t sg = s_ksigns[(a1 >> (7 * l)) & 127];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = db * (float) ((g >> (8 * j)) & 0xff) * ((sg >> j) & 1 ? -1.0f : 1.0f);
+}
+// IQ2_XS (74 B: d, qs[32] u16, scales[8]): 8-group l of 32-group ib: grid row qs[4 ib + l] & 511, signs ksigns[qs >> 9],
+// scale nibble (l / 2) of scales[ib] (ggml's dequantize_row_iq2_xs; the 4 KB grid in global memory, as IQ2_S's)
+template <> __device__ __forceinline__ void deq8<GType::IQ2_XS>(const uint8_t * __restrict__ row, int c, float * v) {
+    const uint8_t * b = row + (size_t) (c >> 5) * 74;
+    const int cc = c & 31, ib = cc >> 2, l = cc & 3;
+    const float db = h2f(b) * (0.5f + (float) ((b[66 + ib] >> (4 * (l >> 1))) & 0xf)) * 0.25f;
+    const int q = b[2 + 2 * (4 * ib + l)] | (b[3 + 2 * (4 * ib + l)] << 8);
+    const uint64_t g = __ldg(&g_iq2xs_grid[q & 511]);
+    const uint8_t sg = s_ksigns[q >> 9];
 #pragma unroll
     for (int j = 0; j < 8; ++j) v[j] = db * (float) ((g >> (8 * j)) & 0xff) * ((sg >> j) & 1 ? -1.0f : 1.0f);
 }
@@ -612,6 +624,38 @@ template <> __device__ __forceinline__ void deq8<GType::IQ3_XXS>(const uint8_t *
         v[j] = db * (float) ((g1 >> (8 * j)) & 0xff) * ((sg >> j) & 1 ? -1.0f : 1.0f);
         v[4 + j] = db * (float) ((g2 >> (8 * j)) & 0xff) * ((sg >> (4 + j)) & 1 ? -1.0f : 1.0f);
     }
+}
+// IQ4_NL (18 B: d, qs[16]; Swift's down experts): value j < 16 = kv[qs[j] & 15] * d, value 16 + j = kv[qs[j] >> 4] * d
+template <> __device__ __forceinline__ void deq8<GType::IQ4_NL>(const uint8_t * __restrict__ row, int c, float * v) {
+    const uint8_t * b = row + (size_t) (c >> 2) * 18;
+    const float d = h2f(b);
+    const int o = (c & 3) * 8, sh = o & 16 ? 4 : 0;
+    const uint8_t * q = b + 2 + (o & 15);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = s_iq4nl[(q[i] >> sh) & 0xf] * d;
+}
+// Q2_K (84 B: scales[16], qs[64], d, dmin; unsloth's DeepSeek layer 0 down): element e of the super-block is half n = e / 128,
+// 32-group j, 16-group s: 2 bits at shift 2 j of qs[32 n + 16 s + l], scale byte scales[8 n + 2 j + s] (ggml's dequantize_row_q2_K)
+template <> __device__ __forceinline__ void deq8<GType::Q2_K>(const uint8_t * __restrict__ row, int c, float * v) {
+    const uint8_t * b = row + (size_t) (c >> 5) * 84;
+    const int e = (c & 31) * 8, n = e >> 7, j = (e >> 5) & 3, sb = (e >> 4) & 1, l = e & 15;
+    const uint8_t sc = b[8 * n + 2 * j + sb];
+    const float dl = h2f(b + 80) * (sc & 0xF), ml = h2f(b + 82) * (sc >> 4);
+    const uint8_t * q = b + 16 + 32 * n + 16 * sb + l;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = dl * (int8_t) ((q[i] >> (2 * j)) & 3) - ml;
+}
+// IQ1_S (50 B: d, qs[32], qh[8] u16): 8-group l of 32-group ib: grid row qs[4 ib + l] | 3 bits (3 l) of qh[ib] << 8, scale
+// 2 ((qh >> 12) & 7) + 1, delta -+0.125 by qh's top bit (ggml's dequantize_row_iq1_s; the 16 KB grid in global memory)
+template <> __device__ __forceinline__ void deq8<GType::IQ1_S>(const uint8_t * __restrict__ row, int c, float * v) {
+    const uint8_t * b = row + (size_t) (c >> 5) * 50;
+    const int cc = c & 31, ib = cc >> 2, l = cc & 3;
+    const int qh = b[34 + 2 * ib] | (b[35 + 2 * ib] << 8);
+    const float dl = h2f(b) * (2 * ((qh >> 12) & 7) + 1);
+    const float delta = qh & 0x8000 ? -0.125f : 0.125f;
+    const uint64_t g = __ldg(&g_iq1s_grid[b[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8)]);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = dl * ((float) (int8_t) ((g >> (8 * i)) & 0xff) + delta);
 }
 template <> __device__ __forceinline__ void deq8<GType::IQ4_XS>(const uint8_t * __restrict__ row, int c, float * v) {
     const uint8_t * b = row + (size_t) (c >> 5) * 136;
@@ -757,6 +801,22 @@ template <> __device__ __forceinline__ float dot32<GType::IQ2_XXS>(const uint8_t
         acc += sdot8(__ldg(&g_iq2xxs_grid[(a0 >> (8 * l)) & 0xff]), __ldg(&g_ksigns_iq2xs[(a1 >> (7 * l)) & 127]), __ldg(xv + 2 * l), __ldg(xv + 2 * l + 1));
     return db * acc;
 }
+template <> __device__ __forceinline__ float dot32<GType::IQ2_XS>(const uint8_t * __restrict__ row, int grp, const float * __restrict__ x) {
+    const uint8_t * b = row + (size_t) (grp >> 3) * 74;
+    const int ib = grp & 7;
+    const float d = h2f(b);
+    const int sc = b[66 + ib];
+    const uint32_t q01 = ld32u(b + 2 + 8 * ib), q23 = ld32u(b + 2 + 8 * ib + 4);
+    const float4 * xv = (const float4 *) (x + grp * 32);
+    float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t q = ((l < 2 ? q01 : q23) >> (16 * (l & 1))) & 0xffff;
+        const float v = sdot8(__ldg(&g_iq2xs_grid[q & 511]), __ldg(&g_ksigns_iq2xs[q >> 9]), __ldg(xv + 2 * l), __ldg(xv + 2 * l + 1));
+        if (l < 2) a0 += v; else a1 += v;
+    }
+    return d * 0.25f * ((0.5f + (float) (sc & 0xf)) * a0 + (0.5f + (float) (sc >> 4)) * a1);
+}
 template <> __device__ __forceinline__ float dot32<GType::IQ2_S>(const uint8_t * __restrict__ row, int grp, const float * __restrict__ x) {
     const uint8_t * b = row + (size_t) (grp >> 3) * 82;
     const int ib = grp & 7;
@@ -787,6 +847,46 @@ template <> __device__ __forceinline__ float dot32<GType::IQ3_XXS>(const uint8_t
         acc += sdot8(g, __ldg(&g_ksigns_iq2xs[(a >> (7 * l)) & 127]), __ldg(xv + 2 * l), __ldg(xv + 2 * l + 1));
     }
     return db * acc;
+}
+// IQ3_S (110-byte blocks: d, qs[64], qh[8], signs[32], scales[4]): group ib's 8 grid indices are qs[8 ib + i] with bit 8
+// from qh[ib] (bit i), its 32 signs signs[4 ib ..], its scale d (1 + 2 nibble ib of scales) -- ggml's dequantize_row_iq3_s
+template <> __device__ __forceinline__ float dot32<GType::IQ3_S>(const uint8_t * __restrict__ row, int grp, const float * __restrict__ x) {
+    const uint8_t * b = row + (size_t) (grp >> 3) * 110;
+    const int ib = grp & 7;
+    const float db = h2f(b) * (float) (1 + 2 * ((b[106 + (ib >> 1)] >> (4 * (ib & 1))) & 0xf));
+    const uint8_t * q = b + 2 + 8 * ib;
+    const int qh = b[66 + ib];
+    const uint32_t sg = ld32u(b + 74 + 4 * ib);
+    const float4 * xv = (const float4 *) (x + grp * 32);
+    float acc = 0.0f;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint64_t g = (uint64_t) __ldg(&g_iq3s_grid[q[2 * l] | ((qh << (8 - 2 * l)) & 256)]) |
+                           ((uint64_t) __ldg(&g_iq3s_grid[q[2 * l + 1] | ((qh << (7 - 2 * l)) & 256)]) << 32);
+        acc += sdot8(g, (sg >> (8 * l)) & 0xff, __ldg(xv + 2 * l), __ldg(xv + 2 * l + 1));
+    }
+    return db * acc;
+}
+// IQ4_XS (136-byte blocks: d, scales_h, scales_l[4], qs[128]): group ib = 16 bytes, low nibbles values 0..15, high 16..31
+template <> __device__ __forceinline__ float dot32<GType::IQ4_XS>(const uint8_t * __restrict__ row, int grp, const float * __restrict__ x) {
+    const uint8_t * b = row + (size_t) (grp >> 3) * 136;
+    const int ib = grp & 7;
+    const uint32_t sh = (uint32_t) b[2] | ((uint32_t) b[3] << 8);
+    const int ls = ((b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 0xf) | (((sh >> (2 * ib)) & 3) << 4);
+    const float dl = h2f(b) * (float) (ls - 32);
+    const uint8_t * q = b + 8 + 16 * ib;
+    const float4 * xv = (const float4 *) (x + grp * 32);
+    float acc = 0.0f;
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        const uint32_t qq = ld32u(q + 4 * w);
+        const float4 xl = __ldg(xv + w), xh = __ldg(xv + 4 + w);
+        acc += (float) __ldg(&g_iq4nl[qq & 0xf]) * xl.x + (float) __ldg(&g_iq4nl[(qq >> 8) & 0xf]) * xl.y +
+               (float) __ldg(&g_iq4nl[(qq >> 16) & 0xf]) * xl.z + (float) __ldg(&g_iq4nl[(qq >> 24) & 0xf]) * xl.w +
+               (float) __ldg(&g_iq4nl[(qq >> 4) & 0xf]) * xh.x + (float) __ldg(&g_iq4nl[(qq >> 12) & 0xf]) * xh.y +
+               (float) __ldg(&g_iq4nl[(qq >> 20) & 0xf]) * xh.z + (float) __ldg(&g_iq4nl[(qq >> 28) & 0xf]) * xh.w;
+    }
+    return dl * acc;
 }
 // decode gate/up for the grid types: a warp takes RW rows of gate and of up at once (2 RW independent row streams), a lane
 // whole 32-value groups; x read through L1 (no per-block shared copy: blocks are short). g32bench (6 IQ2_XXS experts):
@@ -976,12 +1076,19 @@ __global__ void __launch_bounds__(256) k_moe_gu_q4k(MoeDev m, const float * __re
     }
 }
 // ---- zero-copy share of the CPU experts: hidden slice [f0, f1) read straight from mapped host memory ----
+// the expert's index in the mapped copy, -1 when the CPU does not own it: a compact copy (cslot, DeepSeek) or every expert at
+// its own index while owner[e] == cpu_owner (GLM's full host copy; cslot null -- it was dereferenced unconditionally)
+__device__ __forceinline__ int zc_index(const MoeZC & z, int e) {
+    if (e < 0) return -1;
+    if (z.cslot) return z.cslot[e];
+    return z.owner && z.owner[e] == z.cpu_owner ? e : -1;
+}
 // row bytes staged through shared memory with 8-byte loads (PCIe reads stay coalesced), then the usual block dot
 template <GType T>
 __global__ void __launch_bounds__(256) k_moe_zc_gate_up(MoeZC z, const float * __restrict__ x, int xs, const int * __restrict__ ids, int k,
                                                        float * __restrict__ h, int kdim) {
     const int p = blockIdx.x, t = p / k;
-    const int cs = z.cslot[ids[p]];
+    const int cs = zc_index(z, ids[p]);
     if (cs < 0) return;
     extern __shared__ __align__(16) unsigned char zsm[];
     float * xsm = (float *) zsm;
@@ -1008,7 +1115,7 @@ template <GType T>
 __global__ void __launch_bounds__(256) k_moe_zc_down(MoeZC z, const float * __restrict__ h, const int * __restrict__ ids,
                                                     const float * __restrict__ wts, int k, float * __restrict__ y) {
     const int p = blockIdx.x;
-    const int cs = z.cslot[ids[p]];
+    const int cs = zc_index(z, ids[p]);
     if (cs < 0) return;
     const int len = z.f1 - z.f0;
     extern __shared__ __align__(16) unsigned char zsm[];
@@ -1776,9 +1883,13 @@ bool moe_route_publish(const float * logits, int ls, int n_expert, int k, int * 
         case GType::IQ4_XS: { constexpr GType TT = GType::IQ4_XS; CALL; } break;   \
         case GType::IQ3_S: { constexpr GType TT = GType::IQ3_S; CALL; } break;     \
         case GType::IQ2_XXS: { constexpr GType TT = GType::IQ2_XXS; CALL; } break; \
+        case GType::IQ2_XS: { constexpr GType TT = GType::IQ2_XS; CALL; } break;   \
         case GType::IQ2_S: { constexpr GType TT = GType::IQ2_S; CALL; } break;     \
         case GType::IQ3_XXS: { constexpr GType TT = GType::IQ3_XXS; CALL; } break; \
         case GType::MXFP4: { constexpr GType TT = GType::MXFP4; CALL; } break;     \
+        case GType::IQ4_NL: { constexpr GType TT = GType::IQ4_NL; CALL; } break;   \
+        case GType::IQ1_S: { constexpr GType TT = GType::IQ1_S; CALL; } break;     \
+        case GType::Q2_K: { constexpr GType TT = GType::Q2_K; CALL; } break;       \
         default: throw std::runtime_error(std::string("moe: unsupported expert type ") + gtype_name(T)); \
     }
 
@@ -1794,17 +1905,22 @@ void moe_gate_up(const MoeDev & m, const float * x, int xs, const int * ids, int
         return;
     }
     static const bool g32 = getenv("HYPER_MOE_G32") ? atoi(getenv("HYPER_MOE_G32")) != 0 : true;
-    if (g32 && !order && kdim % 256 == 0 && (m.tg == GType::IQ2_XXS || m.tg == GType::IQ2_S || m.tg == GType::IQ3_XXS)) {
+    // (IQ3_S: GLM Maya's gate/up; HYPER_MOE_G32S=0: the deq8 kernel)
+    static const bool g32s = getenv("HYPER_MOE_G32S") ? atoi(getenv("HYPER_MOE_G32S")) != 0 : true;
+    if (g32 && !order && kdim % 256 == 0 && (m.tg == GType::IQ2_XXS || m.tg == GType::IQ2_XS || m.tg == GType::IQ2_S || m.tg == GType::IQ3_XXS ||
+                                             (g32s && m.tg == GType::IQ3_S))) {
         const dim3 gr(nt * k, (m.ff + G32_RW * G32_WB - 1) / (G32_RW * G32_WB));
         if (xs % 4) throw std::runtime_error("moe_gate_up: x rows not 16-byte aligned");
         if (m.tg == GType::IQ2_XXS) k_moe_gu_g32<GType::IQ2_XXS><<<gr, 32 * G32_WB, 0, s>>>(m, x, xs, ids, k, h, kdim);
+        else if (m.tg == GType::IQ2_XS) k_moe_gu_g32<GType::IQ2_XS><<<gr, 32 * G32_WB, 0, s>>>(m, x, xs, ids, k, h, kdim);
         else if (m.tg == GType::IQ2_S) k_moe_gu_g32<GType::IQ2_S><<<gr, 32 * G32_WB, 0, s>>>(m, x, xs, ids, k, h, kdim);
+        else if (m.tg == GType::IQ3_S) k_moe_gu_g32<GType::IQ3_S><<<gr, 32 * G32_WB, 0, s>>>(m, x, xs, ids, k, h, kdim);
         else k_moe_gu_g32<GType::IQ3_XXS><<<gr, 32 * G32_WB, 0, s>>>(m, x, xs, ids, k, h, kdim);
         return;
     }
     // (IQ2 / IQ3 experts: 4 rows a warp -- the block's x copy and grid tables shared by 4x the rows; HYPER_MOE_IQ_ROWS=8: one)
     static const int iq_rows = getenv("HYPER_MOE_IQ_ROWS") ? atoi(getenv("HYPER_MOE_IQ_ROWS")) : 8;   // (measured: 32 no faster)
-    if (iq_rows == 32 && (m.tg == GType::IQ2_XXS || m.tg == GType::IQ2_S || m.tg == GType::IQ3_XXS || m.tg == GType::IQ3_S) && m.ff % 32 == 0) {
+    if (iq_rows == 32 && (m.tg == GType::IQ2_XXS || m.tg == GType::IQ2_XS || m.tg == GType::IQ2_S || m.tg == GType::IQ3_XXS || m.tg == GType::IQ3_S) && m.ff % 32 == 0) {
         MOE_TYPE_SWITCH(m.tg, (k_moe_gate_up<TT, 32><<<dim3(nt * k, m.ff / 32), 256, kdim * sizeof(float), s>>>(m, x, xs, ids, k, h, kdim, order, order_n)));
         return;
     }
@@ -1813,10 +1929,14 @@ void moe_gate_up(const MoeDev & m, const float * x, int xs, const int * ids, int
 void moe_down(const MoeDev & m, const float * h, const int * ids, const float * wts, int k, float * y, int nt, cudaStream_t s,
               const int * order, const int * order_n) {
     static const bool g32 = getenv("HYPER_MOE_G32") ? atoi(getenv("HYPER_MOE_G32")) != 0 : true;
-    if (g32 && !order && m.ff % 256 == 0 && (m.td == GType::IQ2_XXS || m.td == GType::IQ2_S || m.td == GType::IQ3_XXS)) {
+    static const bool g32s = getenv("HYPER_MOE_G32S") ? atoi(getenv("HYPER_MOE_G32S")) != 0 : true;   // (IQ4_XS down: GLM Maya)
+    if (g32 && !order && m.ff % 256 == 0 && (m.td == GType::IQ2_XXS || m.td == GType::IQ2_XS || m.td == GType::IQ2_S || m.td == GType::IQ3_XXS ||
+                                             (g32s && m.td == GType::IQ4_XS))) {
         const dim3 gr(nt * k, (m.n + G32_RW * G32_WB - 1) / (G32_RW * G32_WB));
         if (m.td == GType::IQ2_XXS) k_moe_down_g32<GType::IQ2_XXS><<<gr, 32 * G32_WB, 0, s>>>(m, h, ids, wts, k, y);
+        else if (m.td == GType::IQ2_XS) k_moe_down_g32<GType::IQ2_XS><<<gr, 32 * G32_WB, 0, s>>>(m, h, ids, wts, k, y);
         else if (m.td == GType::IQ2_S) k_moe_down_g32<GType::IQ2_S><<<gr, 32 * G32_WB, 0, s>>>(m, h, ids, wts, k, y);
+        else if (m.td == GType::IQ4_XS) k_moe_down_g32<GType::IQ4_XS><<<gr, 32 * G32_WB, 0, s>>>(m, h, ids, wts, k, y);
         else k_moe_down_g32<GType::IQ3_XXS><<<gr, 32 * G32_WB, 0, s>>>(m, h, ids, wts, k, y);
         return;
     }
@@ -1854,7 +1974,8 @@ void moe_zc_init() {
                    (const void *) k_moe_zc_gate_up<GType::Q4_K>, (const void *) k_moe_zc_gate_up<GType::Q5_K>,
                    (const void *) k_moe_zc_gate_up<GType::Q6_K>, (const void *) k_moe_zc_gate_up<GType::Q8_0>, (const void *) k_moe_zc_gate_up<GType::Q5_1>,
                    (const void *) k_moe_zc_gate_up<GType::Q5_0>, (const void *) k_moe_zc_gate_up<GType::IQ2_XXS>,
-                   (const void *) k_moe_zc_gate_up<GType::IQ2_S>, (const void *) k_moe_zc_gate_up<GType::IQ3_XXS>})
+                   (const void *) k_moe_zc_gate_up<GType::IQ2_S>, (const void *) k_moe_zc_gate_up<GType::IQ3_XXS>,
+                   (const void *) k_moe_zc_gate_up<GType::IQ2_XS>})
         cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
 }
 void moe_order(const MoeDev & m, const int * ids, int n_pairs, int n_expert, int * order, int * order_n, cudaStream_t s, int * egrp) {

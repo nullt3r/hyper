@@ -366,6 +366,7 @@ input[type=range]{width:100%;accent-color:var(--acc);height:28px;margin:0}
    <div class="row"><div class="lb">Top-k<small>0 = off, empty = server default</small></div><input type="number" id="topk" min="0" step="1" inputmode="numeric"></div>
    <div class="row"><div class="lb">Min-p<small>Empty = server default</small></div><input type="number" id="minp" min="0" max="1" step="0.01" inputmode="decimal"></div>
    <div class="row"><div class="lb">Max new tokens<small>Empty = up to the context size</small></div><input type="number" id="maxt" min="16" step="256" inputmode="numeric" placeholder="no limit"></div>
+   <div class="row"><div class="lb">Max tool rounds<small>Tool calls per answer (web, Python); empty = 25</small></div><input type="number" id="rounds" min="1" max="1000" step="5" inputmode="numeric" placeholder="25"></div>
    <div class="row"><div class="lb"><small id="s-def"></small></div><button class="btn sm" onclick="resetSampling()">Use defaults</button></div>
   </div>
   <div class="sec">Interface</div>
@@ -417,7 +418,7 @@ const IC={menu:sv('<path d="M4 8h16M4 16h11"/>'),side:sv('<rect x="3" y="4" widt
 document.querySelectorAll('[data-i]').forEach(e=>e.insertAdjacentHTML('beforeend',IC[e.dataset.i]));
 const touch=matchMedia('(hover:none)').matches,narrow=()=>innerWidth<=768;
 let convs=S.get('hyper.convs',[]).filter(c=>c.msgs&&c.msgs.length),cur=S.get('hyper.cur',null),busy=null,gen=null,live={},defaults={},online=true,editing=-1,renaming=null,menuId=null;
-const cfg=Object.assign({sys:'',temp:'',topp:'',topk:'',minp:'',maxt:'',think:true,web:true,code:true,theme:'system',enter:!touch,wrap:false},S.get('hyper.cfg',{}));
+const cfg=Object.assign({sys:'',temp:'',topp:'',topk:'',minp:'',maxt:'',rounds:'',think:true,web:true,code:true,theme:'system',enter:!touch,wrap:false},S.get('hyper.cfg',{}));
 if(cfg.maxt===16384)cfg.maxt='';
 if(!cfg.effort)cfg.effort=cfg.think===false?'off':'high';   // (thinking effort: off / low / medium / high = the model's default)
 const MCP={tools:[],map:{},servers:[]};   // tools of the MCP servers the server forwards to (--mcp)
@@ -450,7 +451,7 @@ if(S.get('hyper.side',false))document.body.classList.add('side-off');
 function openSet(on){if(on){if(narrow())side(false);IN.blur();syncSet();updState()}$('sheet').classList.toggle('on',on);$('scrim').classList.toggle('on',on)}
 /* ---------- settings ---------- */
 function syncSet(){const dT=defaults.temp??1,dP=defaults.top_p??.95;
- $('sys').value=cfg.sys;$('maxt').value=cfg.maxt;$('topk').value=cfg.topk;$('minp').value=cfg.minp;
+ $('sys').value=cfg.sys;$('maxt').value=cfg.maxt;$('rounds').value=cfg.rounds;$('topk').value=cfg.topk;$('minp').value=cfg.minp;
  $('topk').placeholder=defaults.top_k??'';$('minp').placeholder=defaults.min_p!=null?num(defaults.min_p):'';
  $('temp').value=cfg.temp===''?dT:cfg.temp;$('tempv').textContent=cfg.temp===''?(+dT).toFixed(2)+' · default':(+cfg.temp).toFixed(2);
  $('topp').value=cfg.topp===''?dP:cfg.topp;$('toppv').textContent=cfg.topp===''?(+dP).toFixed(2)+' · default':(+cfg.topp).toFixed(2);
@@ -459,6 +460,7 @@ function syncSet(){const dT=defaults.temp??1,dP=defaults.top_p??.95;
  $('s-def').textContent=`Server defaults: temperature ${num(defaults.temp)} · top-p ${num(defaults.top_p)} · top-k ${num(defaults.top_k)} · min-p ${num(defaults.min_p)}`}
 $('sys').oninput=()=>{cfg.sys=$('sys').value;saveCfg()};
 $('maxt').onchange=()=>{const v=$('maxt').value.trim();cfg.maxt=v===''?'':Math.max(16,parseInt(v)||16);saveCfg();syncSet()};
+$('rounds').onchange=()=>{const v=$('rounds').value.trim();cfg.rounds=v===''?'':Math.min(1000,Math.max(1,parseInt(v)||1));saveCfg();syncSet()};
 $('s-web').onchange=()=>{cfg.web=$('s-web').checked;saveCfg();syncSet()};
 $('s-code').onchange=()=>{cfg.code=$('s-code').checked;saveCfg();syncSet()};
 $('temp').oninput=()=>{cfg.temp=$('temp').value;saveCfg();syncSet()};$('topp').oninput=()=>{cfg.topp=$('topp').value;saveCfg();syncSet()};
@@ -961,7 +963,7 @@ async function runTools(c,a,ctl){const k=c.msgs.indexOf(a);
   catch(e){delete x.status;x.result='Error: '+(e.message||e);x.isError=true}
   x.result=x.result.slice(0,40000);delete x.state;save();if(conv()===c){const st=nearBottom();rerender(k);if(st)toBottom()}}
  return !ctl.signal.aborted}
-const MAX_TOOL_ROUNDS=25;   // (then one more answer without tools, from what was found)
+const toolRounds=()=>cfg.rounds!==''&&+cfg.rounds>0?+cfg.rounds:25;   // (settings; then one more answer without tools, from what was found)
 /* ---------- generation ---------- */
 // smooth streaming: received text is revealed at a steady pace that follows its backlog (token bursts are spread
 // out), the newest characters fade in, and the markdown is re-rendered at most once per frame (less often when slow)
@@ -1026,8 +1028,8 @@ async function generate(vers,round,final){round=round||0;const c=conv();
  if(a.calls)a.calls=a.calls.filter(Boolean);
  if(!aborted&&!a.err&&a.calls&&a.calls.length&&tools){   // the model called tools: run them, then continue
   gen=null;save();if(conv()===c){const st=nearBottom();render();if(st)toBottom()}
-  if(round>=MAX_TOOL_ROUNDS){   // the tool budget is used up: the calls are answered with a note, then a final answer without tools
-   for(const x of a.calls)x.result=`Not run: the limit of ${MAX_TOOL_ROUNDS} tool rounds was reached. Answer now from what you have found so far.`;
+  if(round>=toolRounds()){   // the tool budget is used up: the calls are answered with a note, then a final answer without tools
+   for(const x of a.calls)x.result=`Not run: the limit of ${toolRounds()} tool rounds was reached. Answer now from what you have found so far.`;
    save();if(busy===ctl){c.t=Date.now();return generate(undefined,round+1,true)}}
   else if(await runTools(c,a,ctl)&&busy===ctl){c.t=Date.now();save();return generate(undefined,round+1)}}
  busy=null;gen=null;c.t=Date.now();convs.sort((x,y)=>(y.t||0)-(x.t||0));save();
