@@ -966,7 +966,10 @@ void sparse_attn7(const float * q, const uint16_t * ring, int ring_rows, int win
                   long long p0, int R, int kcap, const float * sink, int heads, int d, float scale, float * out, int T, cudaStream_t s) {
     if (d != 512) throw std::runtime_error("sparse_attn7: d must be 512");
     static const bool no_tc = getenv("HYPER7_ATTN_OLD") != nullptr;
-    if (T > 4 && !no_tc && heads % kTcH == 0 && win + kcap <= kTcMax) {
+    // HYPER7_ATTN_TC_DECODE=1: the tensor-core kernel for decode rows too (the scalar one: a block per head and row, 640
+    // serial dots and 640 serial loads per thread -- ~157 us a layer at 26k)
+    static const bool tc_dec = getenv("HYPER7_ATTN_TC_DECODE") && atoi(getenv("HYPER7_ATTN_TC_DECODE")) != 0;
+    if ((T > 4 || tc_dec) && !no_tc && heads % kTcH == 0 && win + kcap <= kTcMax) {
         int dev = 0;
         cudaGetDevice(&dev);
         static unsigned done_mask = 0;
@@ -1007,6 +1010,50 @@ void markov7(const float * logits, const uint16_t * mh, const uint16_t * emb, in
 void dconf7(const float * xh, int dim, const uint16_t * emb, int rank, const float * w, const float * pairs, int y, float * conf, int T,
             cudaStream_t s) {
     k_dconf7<<<T, 256, 0, s>>>(xh, dim, emb, rank, w, pairs, y, conf);
+}
+// speculative sampling: log of token tok's probability in softmax(row / T): (row[tok] - M) / T - log Z (mz = max_sumexp's
+// {M, Z}); tok from an argmax pair's index bits (tok_pair) or given
+__global__ void k_qlog7(const float * __restrict__ row, const float * __restrict__ mz, double invT, const float * tok_pair, int tok, float * out) {
+    if (tok_pair) { int t; memcpy(&t, tok_pair + 1, 4); tok = t; }
+    out[0] = (float) (((double) row[tok] - mz[0]) * invT - log((double) mz[1]));
+}
+// a draw from the residual max(0, p - q) (p = softmax(tl / T), q = softmax(ql / T), stats {M, Z} each): argmax over the
+// tokens of log(p - q) + G(seed, pos, v) (tokens with p <= q excluded)
+__global__ void __launch_bounds__(1024) k_resid7(const float * __restrict__ tl, const float * __restrict__ tmz, const float * __restrict__ ql,
+                                                 const float * __restrict__ qmz, int n, double invT, uint64_t seed, long long pos, int * out) {
+    __shared__ double bv[32];
+    __shared__ int bi[32];
+    double best = -INFINITY;
+    int bix = 0x7fffffff;
+    const double tz = 1.0 / tmz[1], qz = 1.0 / qmz[1];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const double r = exp(((double) tl[i] - tmz[0]) * invT) * tz - exp(((double) ql[i] - qmz[0]) * invT) * qz;
+        if (!(r > 0.0)) continue;
+        const uint64_t kk = gmix64d(seed ^ gmix64d(((uint64_t) (uint32_t) pos << 32) | (uint32_t) i));
+        const double u = ((double) (kk >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+        const double v = log(r) - log(-log(u));
+        if (v > best || (v == best && i < bix)) { best = v; bix = i; }
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        const double ov = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+        if (ov > best || (ov == best && oi < bix)) { best = ov; bix = oi; }
+    }
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    if (lane == 0) { bv[w] = best; bi[w] = bix; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int j = 1; j < (int) (blockDim.x >> 5); ++j)
+            if (bv[j] > best || (bv[j] == best && bi[j] < bix)) { best = bv[j]; bix = bi[j]; }
+        *out = bix == 0x7fffffff ? 0 : bix;
+    }
+}
+void qlog7(const float * row, const float * mz, float temp, const float * tok_pair, int tok, float * out, cudaStream_t s) {
+    k_qlog7<<<1, 1, 0, s>>>(row, mz, 1.0 / (double) temp, tok_pair, tok, out);
+}
+void resid7(const float * tl, const float * tmz, const float * ql, const float * qmz, int n, float temp, uint64_t seed, long long pos, int * out,
+            cudaStream_t s) {
+    k_resid7<<<1, 1024, 0, s>>>(tl, tmz, ql, qmz, n, 1.0 / (double) temp, seed, pos, out);
 }
 void fill7(float * x, float v, int n, cudaStream_t s) { k_fill7<<<(n + 255) / 256, 256, 0, s>>>(x, v, n); }
 void engram_gate7(float * h, const float * kv, const float * w, int hc, int dim, float eps, int nt, cudaStream_t s) {

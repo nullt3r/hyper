@@ -817,6 +817,45 @@ template <> __device__ __forceinline__ float dot32<GType::IQ2_XS>(const uint8_t 
     }
     return d * 0.25f * ((0.5f + (float) (sc & 0xf)) * a0 + (0.5f + (float) (sc >> 4)) * a1);
 }
+// MXFP4 (17 B per 32: e, qs[16]; DeepSeek's DSpark drafter experts): value j < 16 = kv[qs[j] & 15], 16 + j = kv[qs[j] >> 4],
+// the E8M0 scale halved as in deq8
+template <> __device__ __forceinline__ float dot32<GType::MXFP4>(const uint8_t * __restrict__ row, int grp, const float * __restrict__ x) {
+    const uint8_t * b = row + (size_t) grp * 17;
+    const float d = e8m0_half(b[0]);
+    const float4 * xv = (const float4 *) (x + grp * 32);
+    float a = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float4 x0 = __ldg(xv + j), x1 = __ldg(xv + 4 + j);
+        const float xs0[4] = {x0.x, x0.y, x0.z, x0.w}, xs1[4] = {x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int q = b[1 + 4 * j + i];
+            a += (float) __ldg(&g_mxfp4[q & 15]) * xs0[i] + (float) __ldg(&g_mxfp4[q >> 4]) * xs1[i];
+        }
+    }
+    return d * a;
+}
+// IQ1_S (50 B: d, qs[32], qh[8] u16): group ib's 4 grid rows qs[4 ib + l] | 3 bits (3 l) of qh[ib], scale 2 ((qh >> 12) & 7) + 1,
+// every value offset by -+0.125 (qh's top bit): dot = dl * (grid . x + delta * sum x)
+template <> __device__ __forceinline__ float dot32<GType::IQ1_S>(const uint8_t * __restrict__ row, int grp, const float * __restrict__ x) {
+    const uint8_t * b = row + (size_t) (grp >> 3) * 50;
+    const int ib = grp & 7;
+    const int qh = b[34 + 2 * ib] | (b[35 + 2 * ib] << 8);
+    const float dl = h2f(b) * (float) (2 * ((qh >> 12) & 7) + 1);
+    const float delta = qh & 0x8000 ? -0.125f : 0.125f;
+    const float4 * xv = (const float4 *) (x + grp * 32);
+    float a = 0.0f, sx = 0.0f;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint64_t g = __ldg(&g_iq1s_grid[b[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8)]);
+        const float4 x0 = __ldg(xv + 2 * l), x1 = __ldg(xv + 2 * l + 1);
+        const float xs[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { a += (float) (int8_t) ((g >> (8 * j)) & 0xff) * xs[j]; sx += xs[j]; }
+    }
+    return dl * (a + delta * sx);
+}
 template <> __device__ __forceinline__ float dot32<GType::IQ2_S>(const uint8_t * __restrict__ row, int grp, const float * __restrict__ x) {
     const uint8_t * b = row + (size_t) (grp >> 3) * 82;
     const int ib = grp & 7;
@@ -1143,14 +1182,16 @@ __global__ void __launch_bounds__(256) k_moe_zc_down(MoeZC z, const float * __re
 __global__ void k_moe_reduce(const float * __restrict__ shexp, const float * __restrict__ sg, const float * __restrict__ y, int k,
                              float * __restrict__ out, int n, const int * __restrict__ ids, const int * __restrict__ owner, int g, int cpu_owner,
                              const volatile unsigned * cpu_flag, const float * cpu_y, const int * counter, unsigned seq_tag,
-                             const float * __restrict__ yzc) {
+                             const float * __restrict__ yzc, int host_owner, const volatile unsigned * host_flag, const float * host_y) {
     const int t = blockIdx.y, r = blockIdx.x * blockDim.x + threadIdx.x;
-    bool need = false;
+    bool need = false, need_h = false;
     if (cpu_flag) for (int j = 0; j < k; ++j) need |= owner[ids[t * k + j]] == cpu_owner;
-    if (need) {
+    if (host_flag) for (int j = 0; j < k; ++j) need_h |= owner[ids[t * k + j]] == host_owner;
+    if (need || need_h) {
         if (threadIdx.x == 0) {
             const unsigned want = (unsigned) (*counter) * 64u + seq_tag;
-            while (*cpu_flag != want) {}
+            if (need) while (*cpu_flag != want) {}
+            if (need_h) while (*host_flag != want) {}
             __threadfence_system();
         }
         __syncthreads();
@@ -1160,7 +1201,32 @@ __global__ void k_moe_reduce(const float * __restrict__ shexp, const float * __r
     for (int j = 0; j < k; ++j) if (owner[ids[t * k + j]] == g) acc += y[(size_t) (t * k + j) * n + r];
     if (yzc) for (int j = 0; j < k; ++j) if (owner[ids[t * k + j]] == cpu_owner) acc += yzc[(size_t) (t * k + j) * n + r];
     if (need) acc += __ldcv(cpu_y + (size_t) t * CPU_ROW + r);
+    if (need_h) acc += __ldcv(host_y + (size_t) t * CPU_ROW + r);
     out[(size_t) t * n + r] = acc;
+}
+
+// expert host (a GPU holding other layers' experts): the owner's decode record, once published (like the CPU takes it)
+__global__ void k_host_take(const volatile unsigned * seq, const int * counter, unsigned seq_tag, const int * rec_ids, const float * rec_wts,
+                            const float * rec_x, int * ids, float * wts, float * x, int n, int k, int nt) {
+    if (threadIdx.x == 0) {
+        const unsigned want = (unsigned) (*counter) * 64u + seq_tag;
+        while (*seq != want) {}
+        __threadfence_system();
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < nt * n; i += blockDim.x) { const int t = i / n, e = i % n; x[i] = __ldcv(rec_x + (size_t) t * CPU_ROW + e); }
+    for (int i = threadIdx.x; i < nt * k; i += blockDim.x) {
+        const int t = i / k, j = i % k;
+        ids[i] = __ldcv(rec_ids + t * MOE_MAX_USED + j);
+        wts[i] = __ldcv(rec_wts + t * MOE_MAX_USED + j);
+    }
+}
+// its weighted sum into the host record (CPU_ROW stride), then the tag (one block: ordered by the barrier + system fences)
+__global__ void k_host_put(volatile unsigned * seq, float * y_dst, const float * __restrict__ y, int n, int nt, const int * counter, unsigned seq_tag) {
+    for (int i = threadIdx.x; i < nt * n; i += blockDim.x) { const int t = i / n, e = i % n; y_dst[(size_t) t * CPU_ROW + e] = y[i]; }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) { __threadfence_system(); *seq = (unsigned) (*counter) * 64u + seq_tag; }
 }
 
 __global__ void k_moe_publish(int * ntp, int * ids_dst, float * wts_dst, float * x_dst, const float * __restrict__ x, int xs, int n,
@@ -1908,12 +1974,13 @@ void moe_gate_up(const MoeDev & m, const float * x, int xs, const int * ids, int
     // (IQ3_S: GLM Maya's gate/up; HYPER_MOE_G32S=0: the deq8 kernel)
     static const bool g32s = getenv("HYPER_MOE_G32S") ? atoi(getenv("HYPER_MOE_G32S")) != 0 : true;
     if (g32 && !order && kdim % 256 == 0 && (m.tg == GType::IQ2_XXS || m.tg == GType::IQ2_XS || m.tg == GType::IQ2_S || m.tg == GType::IQ3_XXS ||
-                                             (g32s && m.tg == GType::IQ3_S))) {
+                                             m.tg == GType::IQ1_S || (g32s && m.tg == GType::IQ3_S))) {   // (MXFP4: g32 measured no faster)
         const dim3 gr(nt * k, (m.ff + G32_RW * G32_WB - 1) / (G32_RW * G32_WB));
         if (xs % 4) throw std::runtime_error("moe_gate_up: x rows not 16-byte aligned");
         if (m.tg == GType::IQ2_XXS) k_moe_gu_g32<GType::IQ2_XXS><<<gr, 32 * G32_WB, 0, s>>>(m, x, xs, ids, k, h, kdim);
         else if (m.tg == GType::IQ2_XS) k_moe_gu_g32<GType::IQ2_XS><<<gr, 32 * G32_WB, 0, s>>>(m, x, xs, ids, k, h, kdim);
         else if (m.tg == GType::IQ2_S) k_moe_gu_g32<GType::IQ2_S><<<gr, 32 * G32_WB, 0, s>>>(m, x, xs, ids, k, h, kdim);
+        else if (m.tg == GType::IQ1_S) k_moe_gu_g32<GType::IQ1_S><<<gr, 32 * G32_WB, 0, s>>>(m, x, xs, ids, k, h, kdim);
         else if (m.tg == GType::IQ3_S) k_moe_gu_g32<GType::IQ3_S><<<gr, 32 * G32_WB, 0, s>>>(m, x, xs, ids, k, h, kdim);
         else k_moe_gu_g32<GType::IQ3_XXS><<<gr, 32 * G32_WB, 0, s>>>(m, x, xs, ids, k, h, kdim);
         return;
@@ -2015,9 +2082,17 @@ void moe_gemm_down(const MoeDev & m, const half * h16, const int * order, const 
 }
 void moe_reduce(const float * shexp, const float * sg, const float * y, int k, float * out, int n, int nt,
                 const int * ids, const int * owner, int g, int cpu_owner, const volatile unsigned * cpu_flag, const float * cpu_y,
-                const int * counter, unsigned seq_tag, cudaStream_t s, const float * yzc) {
+                const int * counter, unsigned seq_tag, cudaStream_t s, const float * yzc, int host_owner, const volatile unsigned * host_flag,
+                const float * host_y) {
     k_moe_reduce<<<dim3((n + 255) / 256, nt), 256, 0, s>>>(shexp, sg, y, k, out, n, ids, owner, g, cpu_owner, cpu_flag, cpu_y, counter, seq_tag,
-                                                            yzc);
+                                                            yzc, host_owner, host_flag, host_y);
+}
+void host_take(const volatile unsigned * seq, const int * counter, unsigned seq_tag, const int * rec_ids, const float * rec_wts,
+               const float * rec_x, int * ids, float * wts, float * x, int n, int k, int nt, cudaStream_t s) {
+    k_host_take<<<1, 1024, 0, s>>>(seq, counter, seq_tag, rec_ids, rec_wts, rec_x, ids, wts, x, n, k, nt);
+}
+void host_put(volatile unsigned * seq, float * y_dst, const float * y, int n, int nt, const int * counter, unsigned seq_tag, cudaStream_t s) {
+    k_host_put<<<1, 1024, 0, s>>>(seq, y_dst, y, n, nt, counter, seq_tag);
 }
 void moe_publish(volatile unsigned * seq, int * ntp, int * ids_dst, float * wts_dst, float * x_dst, const float * x, int xs, int n,
                  const int * ids, const float * wts, int k, int nt, const int * counter, unsigned seq_tag, cudaStream_t s) {

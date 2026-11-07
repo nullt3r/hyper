@@ -1,4 +1,5 @@
 #include "engine7.h"
+#include "dense.h"
 #include "sampling.h"
 
 #include "ggml.h"
@@ -23,112 +24,30 @@
 
 namespace hyper {
 
-#define CUDA_CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) \
-    throw std::runtime_error(std::string("CUDA: ") + cudaGetErrorString(e_) + " at " + __FILE__ + ":" + std::to_string(__LINE__)); } while (0)
 
 namespace {
 
-constexpr int CPU_OWNER = 3;
 constexpr int SUB = 64;   // indexer: queries scored at a time
 
-// dense weight: Q8_0 rows (fragment order) or, for other sources, re-quantized to Q8_0 at load
-struct DW {
-    Q8W q8;
-    int n() const { return q8.n; }
-    int k() const { return q8.k; }
-};
-struct RowRange { const GTensor * t; int64_t r0, r1; };
-using Alloc = std::function<void *(size_t)>;
-
-Q8W to_device_q8(const Alloc & alloc, int dev, const int8_t * qs, const half * d, int n, int k) {
-    const size_t ntile = (n + 15) / 16, kb = k / 32;
-    std::vector<uint8_t> fq(ntile * kb * 512);
-    std::vector<half> fs(ntile * kb * 16);
-    repack_q8_frag(qs, d, n, k, fq.data(), fs.data());
-    CUDA_CHECK(cudaSetDevice(dev));
-    Q8W w; w.n = n; w.k = k;
-    void * pq = alloc(fq.size());
-    void * ps = alloc(fs.size() * sizeof(half));
-    CUDA_CHECK(cudaMemcpy(pq, fq.data(), fq.size(), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(ps, fs.data(), fs.size() * sizeof(half), cudaMemcpyHostToDevice));
-    w.q = (const uint4 *) pq; w.s = (const half *) ps;
-    return w;
-}
-
-std::vector<float> to_f32(const GTensor & t, int64_t r0 = 0, int64_t r1 = -1) {
-    if (r1 < 0) r1 = t.rows();
-    const int64_t k = t.ne[0];
-    std::vector<float> out((size_t) (r1 - r0) * k);
-    if (t.type == GType::F32) { memcpy(out.data(), t.data + (size_t) r0 * t.row_bytes(), out.size() * sizeof(float)); return out; }
-    const auto * tr = ggml_get_type_traits((ggml_type) t.type);
-    if (!tr || !tr->to_float) throw std::runtime_error("to_f32: no dequantizer for " + t.name);
-#pragma omp parallel for schedule(static)
-    for (int64_t r = r0; r < r1; ++r) tr->to_float(t.data + (size_t) r * t.row_bytes(), out.data() + (size_t) (r - r0) * k, k);
-    return out;
-}
-
-// rows of several Q8_0 tensors (same k) stacked; other types are re-quantized to Q8_0
-DW upload_dense(const Alloc & alloc, int dev, const std::vector<RowRange> & parts) {
-    const int64_t k = parts[0].t->ne[0], kb = k / 32;
-    int64_t n = 0;
-    for (auto & p : parts) {
-        if (p.t->ne[0] != k) throw std::runtime_error("upload_dense: k mismatch " + p.t->name);
-        n += p.r1 - p.r0;
-    }
-    std::vector<int8_t> qs((size_t) n * k);
-    std::vector<half> d((size_t) n * kb);
-    int64_t row0 = 0;
-    for (auto & p : parts) {
-        if (p.t->type == GType::Q8_0) {
-            const size_t rb = p.t->row_bytes();
-#pragma omp parallel for schedule(static)
-            for (int64_t r = p.r0; r < p.r1; ++r) {
-                const int64_t orow = row0 + (r - p.r0);
-                const uint8_t * src = p.t->data + (size_t) r * rb;
-                for (int64_t j = 0; j < kb; ++j) {
-                    memcpy(&d[(size_t) orow * kb + j], src + j * 34, 2);
-                    memcpy(&qs[(size_t) orow * k + j * 32], src + j * 34 + 2, 32);
-                }
-            }
-        } else {
-            const std::vector<float> rows = to_f32(*p.t, p.r0, p.r1);
-#pragma omp parallel for schedule(static)
-            for (int64_t i = 0; i < (p.r1 - p.r0) * kb; ++i) {
-                const float * x = rows.data() + (size_t) i * 32;
-                float amax = 0.0f;
-                for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[j]));
-                const float dd = amax / 127.0f, id = dd > 0.0f ? 1.0f / dd : 0.0f;
-                d[(size_t) row0 * kb + i] = __float2half(dd);
-                for (int j = 0; j < 32; ++j) qs[(size_t) row0 * k + (size_t) i * 32 + j] = (int8_t) roundf(x[j] * id);
-            }
-        }
-        row0 += p.r1 - p.r0;
-    }
-    DW w;
-    w.q8 = to_device_q8(alloc, dev, qs.data(), d.data(), (int) n, (int) k);
-    return w;
-}
-
-inline uint16_t f2bf(float f) {   // round to nearest even
-    uint32_t u;
-    memcpy(&u, &f, 4);
-    u += 0x7fffu + ((u >> 16) & 1u);
-    return (uint16_t) (u >> 16);
-}
-inline float bf_round(float f) {
-    uint32_t u = (uint32_t) f2bf(f) << 16;
-    float r;
-    memcpy(&r, &u, 4);
-    return r;
-}
 
 } // namespace
+
+struct Engine7::Share {
+    int dev = 0, c0 = 0, c1 = 0;
+    std::vector<int> part_i0;      // compact indices (absolute)
+    std::vector<int *> part_slot;  // on device dev
+    int * owner_tab = nullptr;     // on device dev
+    int np() const { return part_i0.empty() ? 0 : (int) part_i0.size() - 1; }
+};
 
 struct Engine7::Layer {
     int il = 0, ratio = 0, eg = -1;
     bool kv_src = false, ix_src = false, cand_src = false, uses_cand = false;
     int w_out = 0, off_kv = 0, off_ckv = 0, off_cg = 0;   // fused input projection: rows [q_a | kv | c_kv | c_gate]
     DW win, wq_b, iq_b, wo_b, sh_gu, sh_down, eg_kv;
+    // wo_a: the o_groups blocks of the block-diagonal output projection stacked ([groups * o_lora][HQ / groups]): decode runs
+    // them as one grouped GEMV (wo_a_all; 8 launches of 4 MB each ran ~3x their bandwidth time), prefill the views per group
+    DW wo_a_all;
     std::vector<DW> wo_a;
     float * q_norm = nullptr, * kv_norm = nullptr, * c_norm = nullptr, * ik_norm = nullptr;
     float * attn_norm = nullptr, * ffn_norm = nullptr, * sink = nullptr;
@@ -140,23 +59,28 @@ struct Engine7::Layer {
     uint16_t * ring = nullptr;                        // [ring][head_dim] bf16
     float * c_kv = nullptr, * c_score = nullptr;      // the compressor's open group [ratio][head_dim]
     uint16_t * ckv = nullptr, * ik = nullptr;         // KV sources: compressed rows [max_pos / ratio][head_dim], index keys [..][ix_hd]
-    // experts on this GPU
-    MoeDev moex;
-    int * owner = nullptr;
+    // experts: this GPU's (place_->dev(g, il)), the compact host copy (place_->host(il)); n_gpu of them in VRAM here
     int n_gpu = 0;
+    size_t gb = 0, db = 0;   // bytes of one expert's gate (= up) / down matrix
     // prefill: the CPU's experts streamed to the GPU in parts (from the pinned compact host copy, index i): part j holds compact
     // indices [part_i0[j], part_i0[j + 1]), part_slot[j] maps an expert to its index in the part (-1: not in it)
-    const uint8_t * hg = nullptr, * hu = nullptr, * hd = nullptr;
-    size_t gb = 0, db = 0;
     std::vector<int> part_i0;
     std::vector<int *> part_slot;
     int np() const { return part_i0.empty() ? 0 : (int) part_i0.size() - 1; }
+    // EP prefill: compact indices [c0, c1) of this layer's CPU experts streamed by device dev (its parts / slots there), the
+    // owner's own share is [0, n_own); owner_tab (owner device) / Share::owner_tab (helper): the experts the device sums
+    int n_own = 0;
+    int * owner_tab = nullptr;
+    std::vector<Engine7::Share> shares;
+    // expert host: this layer's pooled experts on device host_dev (their copies, slots and owner table: place_->dev(host_dev, il);
+    // the owner device's owner_bulk table has them as CPU experts, for the non-streamed bulk path)
+    int host_dev = -1, n_host = 0;
 };
 
 struct Engine7::DBlock {
     int b = 0, dev = 0;
     DW win, wq_b, wo_b, sh_gu, sh_down, main_proj;
-    std::vector<DW> wo_a;
+    DW wo_a_all;   // (as the trunk's: one grouped GEMV)
     float * q_norm = nullptr, * kv_norm = nullptr, * attn_norm = nullptr, * ffn_norm = nullptr, * sink = nullptr;
     float * hca_fn = nullptr, * hca_scale = nullptr, * hca_base = nullptr, * hcf_fn = nullptr, * hcf_scale = nullptr, * hcf_base = nullptr;
     float * router = nullptr, * bias = nullptr;
@@ -168,32 +92,55 @@ struct Engine7::DBlock {
     float * norm = nullptr, * conf_w = nullptr, * main_norm = nullptr;
     uint16_t * mk_emb = nullptr, * mk_head = nullptr;
     float * mrow = nullptr, * pairs = nullptr, * conf = nullptr;
+    // sampled drafts (speculative sampling): the drafter's rows [8][vocab] with their {max, sum exp} [8][2], the drafts'
+    // log q [8]; the target rows' {M, Z} [8][2] and log p [8]; the residual draw
+    float * dq = nullptr, * qmz = nullptr, * qlog = nullptr, * tmz = nullptr, * plog = nullptr;
+    int * resid = nullptr;
 };
 
-struct Engine7::Device {
-    int id = 0, g = 0;
+struct Engine7::Device : DevBase {
     int l0 = 0, l1 = 0;   // layers [l0, l1)
-    cudaStream_t stream = nullptr;
-    cublasHandle_t blas = nullptr;
-    cudaEvent_t ev_done = nullptr, ev_taken = nullptr;   // this chunk's rows done / the previous device's rows copied in
-    cudaStream_t cstream = nullptr;                     // prefill: expert uploads
-    cudaEvent_t ev_up[2] = {}, ev_free[2] = {};
+    cudaEvent_t ev_done[NSET] = {}, ev_taken[NSET] = {};   // per chunk set: its rows done / the previous device's rows copied in
+    int cur_set = 0;                                    // the chunk set being issued on this device
     // HYPER7_PRED=2: a layer's routing predicted from its input (before the attention) on a side stream, for the CPU's prefetch
-    cudaStream_t pstream = nullptr;
-    cudaEvent_t ev_pf0 = nullptr, ev_pf1 = nullptr;
+    cudaEvent_t ev_pf0 = nullptr, ev_pf1 = nullptr;   // (pe: HYPER7_PRED_EARLY, in the base)
     float * pmix = nullptr, * ppre = nullptr, * ppost = nullptr, * pcomb = nullptr, * px = nullptr, * prlog = nullptr;
-    uint8_t * stage[2] = {};
-    size_t stage_bytes = 0;
     int * owner_all = nullptr;                          // [E] = this device (prefill: every expert computed here)
+    // EP prefill helper (taker) resources, one set per owner device it helps (hres[owner's g]): the owner's issuing thread
+    // runs its share on these streams, beside this device's own layers and the other owner's share
+    bool taker = false;
+    size_t hstage_bytes = 0;
+    struct HelperRes {
+        cudaStream_t hstream = nullptr, hcstream = nullptr;   // helper compute / helper expert uploads
+        uint8_t * hstage[2] = {};
+        cudaEvent_t hev_up[2] = {}, hev_free[2] = {};
+        float * hx = nullptr, * hwts = nullptr, * hyexp = nullptr, * hpart = nullptr;
+        int * hids = nullptr, * horder = nullptr, * horder_n = nullptr, * hegrp = nullptr;
+        half * hx16 = nullptr, * hh16 = nullptr;
+        // the pinned ring between the owner and this helper: input rows + routing in, partials out
+        float * ring_x[EP_RING] = {}, * ring_p[EP_RING] = {}, * ring_wts[EP_RING] = {};
+        int * ring_ids[EP_RING] = {};
+        // (an event is recorded on its own device's streams: the helper's ev_xfree / ev_p, the owner's ev_x / ev_pfree)
+        cudaEvent_t ev_xfree[EP_RING] = {}, ev_p[EP_RING] = {};
+        int ring_next = 0;
+    };
+    std::vector<HelperRes> hres;
+    float * zeros = nullptr;
+    cudaEvent_t ev_x[EP_RING] = {}, ev_pfree[EP_RING] = {};   // as an owner: rows written / partial taken, per ring slot (one helper)
+    float * hp_in = nullptr;                            // owner side: a helper's partial copied in [R][n]
+    // expert host: decode scratch for the pooled experts (x, routing, hidden, per-pair outputs, the partial, zeros)
+    float * qx = nullptr, * qwts = nullptr, * qhexp = nullptr, * qyexp = nullptr, * qout = nullptr, * qzx = nullptr, * qzs = nullptr;
+    int * qids = nullptr;
+    cudaEvent_t ev_plast = nullptr;                     // owner side: the last partial copied in (the next layer's expert
+                                                        // uploads queue behind it: the copy engine served them first, ~80 ms a layer)
     float * h_in = nullptr;                             // pinned [R][hc * n + 8]: this device's input rows (no P2P: through the host)
     // DSpark: the target taps (the device of layers 37..39), main_x rows, the seeds' own stream and fp16 scratch
     float * taps = nullptr, * mainx = nullptr;
     half * xh2 = nullptr;
     cudaStream_t dstream = nullptr;
     cudaEvent_t ev_seed = nullptr;
+    cudaEvent_t ev_t[4] = {};   // HYPER7_PROF: timing events around the head (0, 1) and the DSpark seed (2, 3)
     std::vector<Layer> layers;
-    std::vector<void *> allocs;
-    size_t used = 0;
     // activations (R rows)
     float * h = nullptr, * h2 = nullptr, * x = nullptr, * mix = nullptr, * pre = nullptr, * a_pre = nullptr, * a_post = nullptr,
           * a_comb = nullptr, * f_pre = nullptr, * f_post = nullptr, * f_comb = nullptr;
@@ -205,40 +152,34 @@ struct Engine7::Device {
         * counter = nullptr, * pids = nullptr;
     float * pwts = nullptr;
     half * xh = nullptr, * x16 = nullptr, * h16 = nullptr;
+    half * ggs = nullptr;   // KQ dense weights: prefill dequantization scratch
+    size_t ggs_elems = 0;
     long long score_w = 0, bm_w = 0;
     float * freqs_win = nullptr, * freqs_comp = nullptr;
     // the head (last device)
     float * out_norm = nullptr;
     DW output;
 
-    template <typename T> T * alloc(size_t n) {
-        void * p = nullptr;
-        CUDA_CHECK(cudaSetDevice(id));
-        CUDA_CHECK(cudaMalloc(&p, std::max<size_t>(n, 1) * sizeof(T)));
-        CUDA_CHECK(cudaMemset(p, 0, std::max<size_t>(n, 1) * sizeof(T)));
-        allocs.push_back(p);
-        used += n * sizeof(T);
-        return (T *) p;
-    }
-    template <typename T> T * upload(const T * src, size_t n) {
-        T * p = alloc<T>(n);
-        CUDA_CHECK(cudaMemcpy(p, src, n * sizeof(T), cudaMemcpyHostToDevice));
-        return p;
-    }
     ~Device() {
         cudaSetDevice(id);
-        if (blas) cublasDestroy(blas);
-        if (ev_done) cudaEventDestroy(ev_done);
-        if (ev_taken) cudaEventDestroy(ev_taken);
+        for (auto ev : ev_done) if (ev) cudaEventDestroy(ev);
+        for (auto ev : ev_taken) if (ev) cudaEventDestroy(ev);
         if (h_in) cudaFreeHost(h_in);
-        for (auto & ev : ev_up) if (ev) cudaEventDestroy(ev);
-        for (auto & ev : ev_free) if (ev) cudaEventDestroy(ev);
-        if (cstream) cudaStreamDestroy(cstream);
-        if (pstream) cudaStreamDestroy(pstream);
         if (dstream) cudaStreamDestroy(dstream);
         if (ev_seed) cudaEventDestroy(ev_seed);
-        for (void * p : allocs) cudaFree(p);
-        if (stream) cudaStreamDestroy(stream);
+        for (auto ev : {ev_pf0, ev_pf1}) if (ev) cudaEventDestroy(ev);
+        for (int r = 0; r < EP_RING; ++r) for (auto ev : {ev_x[r], ev_pfree[r]}) if (ev) cudaEventDestroy(ev);
+        for (HelperRes & H : hres) {
+            for (int r = 0; r < EP_RING; ++r) {
+                for (auto ev : {H.ev_xfree[r], H.ev_p[r]}) if (ev) cudaEventDestroy(ev);
+                for (void * p : {(void *) H.ring_x[r], (void *) H.ring_p[r], (void *) H.ring_wts[r], (void *) H.ring_ids[r]}) if (p) cudaFreeHost(p);
+            }
+            for (auto ev : H.hev_up) if (ev) cudaEventDestroy(ev);
+            for (auto ev : H.hev_free) if (ev) cudaEventDestroy(ev);
+            if (H.hstream) cudaStreamDestroy(H.hstream);
+            if (H.hcstream) cudaStreamDestroy(H.hcstream);
+        }
+        for (auto ev : ev_t) if (ev) cudaEventDestroy(ev);
     }
 };
 
@@ -255,9 +196,14 @@ Engine7::Engine7(const std::string & model_path, const Engine7Options & opt) : o
     if (getenv("HYPER7_RING")) ring_ = atoi(getenv("HYPER7_RING"));
     if (ring_ < R_ + c.win + 64) ring_ = R_ + c.win + 64;
     if (opt_.max_pos % 64) opt_.max_pos += 64 - opt_.max_pos % 64;
-    int ndev = 0;
-    CUDA_CHECK(cudaGetDeviceCount(&ndev));
-    const int nd = std::min(opt_.n_devices, ndev);
+    const int nd = opt_.n_devices = device_count(opt_.n_devices, "HYPER7_NDEV", "hyper7");   // (a 4th GPU: with HYPER7_SPLIT)
+    // expert hosts: the other devices' spare VRAM (after their own experts) holds the hottest CPU experts of the target
+    // device's layers (2026-11-05: pooling 12 GiB out of a host's own budget gained ~0; the spare VRAM is free gain)
+    host_on_ = getenv("HYPER7_HOST") ? atoi(getenv("HYPER7_HOST")) != 0 : nd >= 4;
+    host_dev_ = getenv("HYPER7_HOST_DEV") ? atoi(getenv("HYPER7_HOST_DEV")) : -1;
+    if (host_dev_ >= nd) host_dev_ = -1;
+    host_pool_bytes_ = (size_t) ((getenv("HYPER7_HOST_GIB") ? atof(getenv("HYPER7_HOST_GIB")) : 64.0) * 1073741824.0);
+    host_layers_.assign(nd, {});
     // layers over the devices along the KV-source groups (HYPER7_SPLIT="8,20": the first layers of devices 1, 2, ..)
     std::vector<int> starts = {0};
     if (const char * sp = getenv("HYPER7_SPLIT")) {
@@ -277,26 +223,16 @@ Engine7::Engine7(const std::string & model_path, const Engine7Options & opt) : o
     const int n = c.n_embd;
     for (int g = 0; g < (int) starts.size(); ++g) {
         auto d = std::make_unique<Device>();
-        d->id = g; d->g = g;
+        d->init_base(g, g, true);
         d->l0 = starts[g];
         d->l1 = g + 1 < (int) starts.size() ? starts[g + 1] : c.n_layer;
-        CUDA_CHECK(cudaSetDevice(g));
-        CUDA_CHECK(cudaStreamCreateWithFlags(&d->stream, cudaStreamNonBlocking));
-        CUDA_CHECK(cudaEventCreateWithFlags(&d->ev_done, cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventCreateWithFlags(&d->ev_taken, cudaEventDisableTiming));
+        for (auto & ev : d->ev_done) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+        for (auto & ev : d->ev_taken) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         if (g > 0) CUDA_CHECK(cudaHostAlloc(&d->h_in, (size_t) R_ * (c.hc * c.n_embd + 8) * sizeof(float), cudaHostAllocPortable));
-        CUDA_CHECK(cudaStreamCreateWithFlags(&d->cstream, cudaStreamNonBlocking));
-        CUDA_CHECK(cudaStreamCreateWithFlags(&d->pstream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&d->ev_pf0, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&d->ev_pf1, cudaEventDisableTiming));
         CUDA_CHECK(cudaStreamCreateWithFlags(&d->dstream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&d->ev_seed, cudaEventDisableTiming));
-        for (auto & ev : d->ev_up) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
-        for (auto & ev : d->ev_free) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
-        if (cublasCreate(&d->blas) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasCreate failed");
-        cublasSetStream(d->blas, d->stream);
-        cublasSetMathMode(d->blas, CUBLAS_PEDANTIC_MATH);
-        gemv_init(g);
         devs_.push_back(std::move(d));
     }
     for (int k = 0; k < NSET; ++k) {
@@ -309,30 +245,9 @@ Engine7::Engine7(const std::string & model_path, const Engine7Options & opt) : o
         CUDA_CHECK(cudaHostAlloc(&h_ids_[k], (size_t) c.n_layer * R_ * c.n_used * sizeof(int), cudaHostAllocPortable));
     }
     CUDA_CHECK(cudaHostAlloc(&h_out_, (size_t) MAX_NT * TOPK * 2 * sizeof(float) + 64, cudaHostAllocPortable));
-    CUDA_CHECK(cudaHostAlloc(&cpu_rec_, (size_t) c.n_layer * sizeof(CpuMoeRec), cudaHostAllocPortable | cudaHostAllocMapped));
-    CUDA_CHECK(cudaHostAlloc(&cpu_out_, (size_t) c.n_layer * sizeof(CpuMoeOut), cudaHostAllocPortable | cudaHostAllocMapped));
-    CUDA_CHECK(cudaHostAlloc(&cpu_bulk_, sizeof(CpuMoeBulk), cudaHostAllocPortable | cudaHostAllocMapped));
-    CUDA_CHECK(cudaHostAlloc(&cpu_bulk_out_, sizeof(CpuMoeBulkOut), cudaHostAllocPortable | cudaHostAllocMapped));
-    memset((void *) cpu_rec_, 0, (size_t) c.n_layer * sizeof(CpuMoeRec));
-    CUDA_CHECK(cudaHostAlloc(&cpu_pred_, (size_t) c.n_layer * sizeof(CpuMoeRec), cudaHostAllocPortable | cudaHostAllocMapped));
-    memset((void *) cpu_pred_, 0, (size_t) c.n_layer * sizeof(CpuMoeRec));
-    memset((void *) cpu_out_, 0, (size_t) c.n_layer * sizeof(CpuMoeOut));
-    memset((void *) cpu_bulk_, 0, sizeof(CpuMoeBulk));
-    memset((void *) cpu_bulk_out_, 0, sizeof(CpuMoeBulkOut));
-    if (const char * sp = getenv("HYPER4_STATS")) {
-        if (FILE * f = fopen(sp, "rb")) {
-            int nl = 0, w = 0;
-            if (fread(&nl, 4, 1, f) == 1 && fread(&w, 4, 1, f) == 1 && nl == c.n_layer) {
-                stats_.assign(nl, std::vector<uint64_t>(w));
-                for (auto & s : stats_) if (fread(s.data(), 8, w, f) != (size_t) w) { stats_.clear(); break; }
-            }
-            fclose(f);
-            fprintf(stderr, "hyper7: expert placement from %s (%s)\n", sp, stats_.empty() ? "unreadable, ignored" : "ok");
-        }
-    }
-    cpu_ = std::make_unique<CpuMoe>(opt_.cpu_threads, n, c.ff, c.n_used, cpu_rec_, cpu_out_, c.n_layer, cpu_bulk_, cpu_bulk_out_);
-    cpu_->set_pred(cpu_pred_);
-    cpu_->set_clamp(c.clamp_exp);
+    CUDA_CHECK(cudaHostAlloc(&host_out_, (size_t) c.n_layer * sizeof(CpuMoeOut), cudaHostAllocPortable | cudaHostAllocMapped));
+    memset((void *) host_out_, 0, (size_t) c.n_layer * sizeof(CpuMoeOut));
+    init_cpu_side(opt_.cpu_threads, n, c.ff, c.n_used, c.n_layer, c.clamp_exp, pred_mode_ == 2 && pred_early_);
     const auto t0 = std::chrono::steady_clock::now();
     for (int il = 0; il < c.n_layer; ++il) has_r2_ |= c.ratio[il] > 1;
     // per-device buffers
@@ -419,11 +334,32 @@ Engine7::Engine7(const std::string & model_path, const Engine7Options & opt) : o
         fprintf(stderr, "hyper7: device %d: layers %d..%d, dense weights + caches + buffers %.2f GiB\n", d.id, d.l0, d.l1 - 1,
                 d.used / 1073741824.0);
     }
+    if (dense_ggs_elems())   // (KQ dense weights: unsloth's Q6_K attention, shared experts, head)
+        for (auto & dp : devs_) {
+            CUDA_CHECK(cudaSetDevice(dp->id));
+            dp->ggs_elems = dense_ggs_elems();
+            dp->ggs = dp->alloc<half>(dp->ggs_elems);
+        }
     {
         std::string dp = opt_.dspark;
         if (getenv("HYPER7_DSPARK")) dp = getenv("HYPER7_DSPARK");
         dsp_conf_ = getenv("HYPER7_DSPARK_CONF") ? (float) atof(getenv("HYPER7_DSPARK_CONF")) : opt_.dspark_conf;
+        // speculative sampling (sampled drafts, min(1, p/q)) measured 2026-11-05 at T=1 over 256 tokens: drafts accepted 59 %
+        // vs 60 % with the exact match of greedy drafts, and ~20 ms more a step (extra stream syncs): off unless asked
+        dsp_coupled_ = !(getenv("HYPER7_DSPARK_SPECSAMP") && atoi(getenv("HYPER7_DSPARK_SPECSAMP")) != 0);
         if (!dp.empty() && dp != "none") load_dspark(dp);
+    }
+    {   // the experts' placement (shared with the other engines): routing statistics, adaptive exchanges
+        MoePlace::Params pp;
+        pp.tag = "hyper7"; pp.env = "HYPER7";
+        pp.E = c.n_expert; pp.K = c.n_used; pp.nl = c.n_layer;
+        pp.ff = c.ff; pp.n = n; pp.clamp = c.clamp_exp;
+        pp.tp = false; pp.halves = 0; pp.elastic_ok = false;
+        pp.adapt_budget = 8; pp.adapt_after_prompt = false;   // (26k A/B: budget 32 cost 2 t/s of 46, 8 within noise)
+        std::vector<DevBase *> db;
+        for (auto & dp : devs_) db.push_back(dp.get());
+        init_place(pp, db, c.n_layer);
+        place_->on_changed = [this](int il) { Device & d = *devs_[dev_of_[il]]; rebuild_part_slots(d.layers[il - d.l0]); };
     }
     place_experts();
     CUDA_CHECK(cudaSetDevice(devs_.back()->id));
@@ -485,7 +421,13 @@ void Engine7::load_layer(Device & d, Layer & L) {
         const GTensor * t = T("attn_output_a.weight");
         if (t->rows() != (int64_t) c.o_groups * c.o_lora || t->ne[0] != (int64_t) c.n_head * c.head_dim / c.o_groups)   // ([in][groups * o_lora] or ISTA's [in][o_lora][groups])
             throw std::runtime_error("hyper7: attn_output_a shape");
-        for (int gi = 0; gi < c.o_groups; ++gi) L.wo_a.push_back(upload_dense(A, d.id, {{t, (int64_t) gi * c.o_lora, (int64_t) (gi + 1) * c.o_lora}}));
+        L.wo_a_all = upload_dense(A, d.id, {{t, 0, t->rows()}});
+        for (int gi = 0; gi < c.o_groups; ++gi) L.wo_a.push_back(dense_rows_view(L.wo_a_all, gi * c.o_lora, (gi + 1) * c.o_lora));
+        if (L.wo_a[0].n() != c.o_lora || c.o_lora % 16) {   // (no view of this form: the groups uploaded apart, decode loops)
+            L.wo_a.clear();
+            L.wo_a_all = DW{};
+            for (int gi = 0; gi < c.o_groups; ++gi) L.wo_a.push_back(upload_dense(A, d.id, {{t, (int64_t) gi * c.o_lora, (int64_t) (gi + 1) * c.o_lora}}));
+        }
     }
     { const GTensor * t = T("attn_output_b.weight"); L.wo_b = upload_dense(A, d.id, {{t, 0, t->rows()}}); }
     L.q_norm = f32("attn_q_a_norm.weight");
@@ -528,7 +470,7 @@ void Engine7::load_layer(Device & d, Layer & L) {
     }
     L.router = f32("ffn_gate_inp.weight");
     L.bias = f32("exp_probs_b.bias");
-    if (pred_mode_ == 1 && il + 1 < c.n_layer) {
+    if ((pred_mode_ == 1 || (pred_mode_ == 2 && pred_early_)) && il + 1 < c.n_layer) {
         const std::string pn = "blk." + std::to_string(il + 1) + ".";
         std::vector<float> W = to_f32(G.need(pn + "ffn_gate_inp.weight")), b = to_f32(G.need(pn + "exp_probs_b.bias"));
         const std::vector<float> n0 = to_f32(G.need(p + "ffn_norm.weight")), n1 = to_f32(G.need(pn + "ffn_norm.weight"));
@@ -550,7 +492,6 @@ void Engine7::load_layer(Device & d, Layer & L) {
             L.eg_w = d.upload(q.data(), q.size());
         }
     }
-    L.owner = d.alloc<int>(c.n_expert);
 }
 
 
@@ -612,7 +553,7 @@ void Engine7::load_dspark(const std::string & path) {
     for (int b = 0; b < nb; ++b) {
         auto B = std::make_unique<DBlock>();
         B->b = b;
-        B->dev = std::min(b, (int) devs_.size() - 1);
+        B->dev = std::min(b, (int) devs_.size() - 1) + std::max(0, (int) devs_.size() - 3);   // (the last block with the head: the last device)
         Device & d = *devs_[B->dev];
         const size_t used0 = d.used;
         auto A = [&](size_t bytes) { return (void *) d.alloc<uint8_t>(bytes); };
@@ -620,15 +561,14 @@ void Engine7::load_dspark(const std::string & path) {
         auto f32 = [&](const std::string & k) { const std::vector<float> v = to_f32(need(k)); return d.upload(v.data(), v.size()); };
         {
             const GTensor & qa = need(P + "attn.wq_a.weight"), & kv = need(P + "attn.wkv.weight");
-            B->win = upload_dense(A, d.id, {{&qa, 0, qa.rows()}, {&kv, 0, kv.rows()}});
+            B->win = upload_dense(A, d.id, {{&qa, 0, qa.rows()}, {&kv, 0, kv.rows()}}, {}, true);
         }
-        { const GTensor & t = need(P + "attn.wq_b.weight"); B->wq_b = upload_dense(A, d.id, {{&t, 0, t.rows()}}); }
-        { const GTensor & t = need(P + "attn.wo_a.weight");
-          for (int g = 0; g < c.o_groups; ++g) B->wo_a.push_back(upload_dense(A, d.id, {{&t, (int64_t) g * c.o_lora, (int64_t) (g + 1) * c.o_lora}})); }
-        { const GTensor & t = need(P + "attn.wo_b.weight"); B->wo_b = upload_dense(A, d.id, {{&t, 0, t.rows()}}); }
+        { const GTensor & t = need(P + "attn.wq_b.weight"); B->wq_b = upload_dense(A, d.id, {{&t, 0, t.rows()}}, {}, true); }
+        { const GTensor & t = need(P + "attn.wo_a.weight"); B->wo_a_all = upload_dense(A, d.id, {{&t, 0, t.rows()}}, {}, true); }
+        { const GTensor & t = need(P + "attn.wo_b.weight"); B->wo_b = upload_dense(A, d.id, {{&t, 0, t.rows()}}, {}, true); }
         { const GTensor & g1 = need(P + "ffn.shared_experts.w1.weight"), & g3 = need(P + "ffn.shared_experts.w3.weight"), & g2 = need(P + "ffn.shared_experts.w2.weight");
-          B->sh_gu = upload_dense(A, d.id, {{&g1, 0, g1.rows()}, {&g3, 0, g3.rows()}});
-          B->sh_down = upload_dense(A, d.id, {{&g2, 0, g2.rows()}}); }
+          B->sh_gu = upload_dense(A, d.id, {{&g1, 0, g1.rows()}, {&g3, 0, g3.rows()}}, {}, true);
+          B->sh_down = upload_dense(A, d.id, {{&g2, 0, g2.rows()}}, {}, true); }
         B->q_norm = f32(P + "attn.q_norm.weight");
         B->kv_norm = f32(P + "attn.kv_norm.weight");
         B->sink = f32(P + "attn.attn_sink");
@@ -675,6 +615,12 @@ void Engine7::load_dspark(const std::string & path) {
             B->mrow = d.alloc<float>(c.n_vocab);
             B->pairs = d.alloc<float>(2 * 8);
             B->conf = d.alloc<float>(8);
+            B->dq = d.alloc<float>((size_t) 8 * c.n_vocab);
+            B->qmz = d.alloc<float>(16);
+            B->qlog = d.alloc<float>(8);
+            B->tmz = d.alloc<float>(16);
+            B->plog = d.alloc<float>(8);
+            B->resid = d.alloc<int>(1);
         }
         tot += d.used - used0;
         dblk_.push_back(std::move(B));
@@ -683,7 +629,7 @@ void Engine7::load_dspark(const std::string & path) {
         Device & td = *devs_[dev_of_[dsp_tap0_]];
         DBlock & B0 = *dblk_[0];
         const GTensor & mp = need("mtp.0.main_proj.weight");
-        B0.main_proj = upload_dense([&](size_t bytes) { return (void *) td.alloc<uint8_t>(bytes); }, td.id, {{&mp, 0, mp.rows()}});
+        B0.main_proj = upload_dense([&](size_t bytes) { return (void *) td.alloc<uint8_t>(bytes); }, td.id, {{&mp, 0, mp.rows()}}, {}, true);
         B0.main_norm = td.upload(to_f32(need("mtp.0.main_norm.weight")).data(), n);
         td.taps = td.alloc<float>((size_t) R_ * 3 * n);
         for (auto & dp : devs_) {
@@ -750,7 +696,8 @@ void Engine7::dspark_seed(int nt, int64_t pos) {
 
 // a draft round: y (the token at p0, not fed yet) and noise tokens at p0 .. p0 + T - 1 through the three blocks; drafts[i] is
 // the token at p0 + 1 + i, conf[i] its confidence
-int Engine7::dspark_draft(int y, int64_t p0, std::vector<int> & drafts, std::vector<float> & conf) {
+int Engine7::dspark_draft(int y, int64_t p0, std::vector<int> & drafts, std::vector<float> & conf, float temp, uint64_t seed,
+                          std::vector<float> * logq) {
     const Ds4Config & c = cfg_;
     const int n = c.n_embd, hcn = c.hc * n, HD = c.head_dim, HQ = c.n_head * HD, T = dsp_T_;
     // the block's input rows (the token embedding as BF16, as the trunk's)
@@ -775,7 +722,7 @@ int Engine7::dspark_draft(int y, int64_t p0, std::vector<int> & drafts, std::vec
             CUDA_CHECK(cudaMemcpyAsync(d.pre, h_dsp_ + (size_t) T * hcn, (size_t) T * 8 * sizeof(float), cudaMemcpyHostToDevice, s));
         }
         auto mm = [&](const DW & W, const float * x, int xs, float * y_, int ys, const NormIn & ni = NormIn{}) {
-            gemv_q8(W.q8, x, xs, y_, ys, nullptr, T, s, ni);
+            gemv_q8(W.q8, x, xs, y_, ys, nullptr, T, s, ni);   // (the drafter's weights: one Q8 matrix each, requant)
         };
         const int wo = c.q_lora + HD;
         // attention
@@ -792,7 +739,7 @@ int Engine7::dspark_draft(int y, int64_t p0, std::vector<int> & drafts, std::vec
         {   Fin7 f; f.rd = c.rd; f.freqs = d.freqs_win; f.pos = p0; f.vpp = c.n_head; f.inverse = true; f.quant = 1;
             fin7(d.o, T * c.n_head, HD, HD, f, s); }
         const int per = HQ / c.o_groups, ol = c.o_groups * c.o_lora;
-        for (int gi = 0; gi < c.o_groups; ++gi) gemv_q8(B.wo_a[gi].q8, d.o + (size_t) gi * per, HQ, d.oa + (size_t) gi * c.o_lora, ol, nullptr, T, s);
+        {   NormIn g; g.xg_tiles = c.o_lora / 16; g.xg_stride = per; gemv_q8(B.wo_a_all.q8, d.o, HQ, d.oa, ol, nullptr, T, s, g); }
         mm(B.wo_b, d.oa, ol, d.ao, n);
         hc7_post(d.ao, d.h, d.a_post, d.a_comb, n, c.hc, d.h2, T, s);
         std::swap(d.h, d.h2);
@@ -824,24 +771,139 @@ int Engine7::dspark_draft(int y, int64_t p0, std::vector<int> & drafts, std::vec
     cudaStream_t s = d.stream;
     hc7_pre_norm(d.h, d.pre, nullptr, n, c.hc, c.eps, d.ffo, T, s);   // xh (no norm)
     hc7_pre_norm(d.h, d.pre, B.norm, n, c.hc, c.eps, d.x, T, s);      // rms(xh) * norm
-    gemv_q8(d.output.q8, d.x, n, d.logits, c.n_vocab, nullptr, T, s);
+    head_mm(d, d.x, T, s);
     for (int i = 0; i < T; ++i) {
+        if (temp > 0.0f) {   // sampled drafts: d_i ~ q_i = softmax(row_i / T), the chain on the drawn tokens; log q_i(d_i) for the verification
+            float * row = B.dq + (size_t) i * c.n_vocab;
+            markov7(d.logits + (size_t) i * c.n_vocab, B.mk_head, B.mk_emb, c.n_vocab, dsp_rank_, i == 0 ? nullptr : B.pairs + 2 * (i - 1), y, row, s);
+            max_sumexp(row, c.n_vocab, B.qmz + 2 * i, s, 1.0f / temp);
+            gumbel_argmax7(row, c.n_vocab, temp, seed, p0 + 1 + i, (int *) (B.pairs + 2 * i + 1), s);
+            qlog7(row, B.qmz + 2 * i, temp, B.pairs + 2 * i, 0, B.qlog + i, s);
+            continue;
+        }
         markov7(d.logits + (size_t) i * c.n_vocab, B.mk_head, B.mk_emb, c.n_vocab, dsp_rank_, i == 0 ? nullptr : B.pairs + 2 * (i - 1), y, B.mrow, s);
         argmax_pairs(B.mrow, c.n_vocab, c.n_vocab, 0, B.pairs + 2 * i, 1, s);
     }
     dconf7(d.ffo, n, B.mk_emb, dsp_rank_, B.conf_w, B.pairs, y, B.conf, T, s);
     CUDA_CHECK(cudaMemcpyAsync(h_dout_, B.pairs, (size_t) 2 * T * sizeof(float), cudaMemcpyDeviceToHost, s));
     CUDA_CHECK(cudaMemcpyAsync(h_dout_ + 16, B.conf, (size_t) T * sizeof(float), cudaMemcpyDeviceToHost, s));
+    if (temp > 0.0f) CUDA_CHECK(cudaMemcpyAsync(h_dout_ + 32, B.qlog, (size_t) T * sizeof(float), cudaMemcpyDeviceToHost, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
     drafts.resize(T);
     conf.resize(T);
     for (int i = 0; i < T; ++i) { int id; memcpy(&id, &h_dout_[2 * i + 1], 4); drafts[i] = id; conf[i] = h_dout_[16 + i]; }
+    if (logq) { logq->resize(T); for (int i = 0; i < T; ++i) (*logq)[i] = temp > 0.0f ? h_dout_[32 + i] : 0.0f; }
     return T;
+}
+
+// speculative sampling over sampled drafts (full-vocabulary sampling at temp): draft j is kept with probability
+// min(1, p_j(d_j) / q_j(d_j)) (p: the target's row off + j); the first one rejected is replaced by a draw from max(0, p - q);
+// all kept: the target's row after them is sampled. Returns the token after the kept drafts; m: how many were kept
+int Engine7::dspark_verify(int off, const std::vector<int> & dr, const std::vector<float> & logq, const SamplingParams & sp, int64_t p, int & m) {
+    const Ds4Config & c = cfg_;
+    DBlock & B = *dblk_.back();
+    Device & d = *devs_[B.dev];
+    CUDA_CHECK(cudaSetDevice(d.id));
+    cudaStream_t s = d.stream;
+    const int nd = (int) dr.size();
+    for (int j = 0; j < nd; ++j) {
+        const float * row = d.logits + (size_t) (off + j) * c.n_vocab;
+        max_sumexp(row, c.n_vocab, B.tmz + 2 * j, s, 1.0f / sp.temp);
+        qlog7(row, B.tmz + 2 * j, sp.temp, nullptr, dr[j], B.plog + j, s);
+    }
+    float plog[8] = {};
+    if (nd) CUDA_CHECK(cudaMemcpyAsync(plog, B.plog, (size_t) nd * sizeof(float), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    const uint64_t useed = samp_seed_ ^ 0xa5a5a5a55a5a5a5aull, rseed = samp_seed_ ^ 0x3c3c3c3cc3c3c3c3ull;
+    for (m = 0; m < nd; ++m) {
+        const int64_t pos = p + m + 1;
+        const uint64_t k = gmix64(useed ^ gmix64((uint64_t) pos));
+        const double u = ((double) (k >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+        if (u < std::exp((double) plog[m] - (double) logq[m])) continue;
+        // rejected: a draw from the residual
+        int tok = 0;
+        resid7(d.logits + (size_t) (off + m) * c.n_vocab, B.tmz + 2 * m, B.dq + (size_t) m * c.n_vocab, B.qmz + 2 * m, c.n_vocab, sp.temp, rseed,
+               pos, B.resid, s);
+        CUDA_CHECK(cudaMemcpyAsync(&tok, B.resid, sizeof(int), cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaStreamSynchronize(s));
+        return tok;
+    }
+    return sample_row(off + nd, sp, p + nd + 1);
 }
 
 void Engine7::place_experts() {
     const Ds4Config & c = cfg_;
-    const int E = c.n_expert, ff = c.ff, n = c.n_embd;
+    const int E = c.n_expert, ff = c.ff, n = c.n_embd, K = c.n_used;
+    const size_t R = (size_t) R_;
+    // EP prefill: the links' bandwidth (x16 : x8 : x16 on this box, as engine5's streaming shares) and which devices help:
+    // those whose own layers' expert bytes per unit of link bandwidth are well below the average (GPU 0 with its 8 layers)
+    std::vector<double> wbw = link_weights((int) devs_.size(), "HYPER7_EP_WEIGHTS");
+    if (ep_prefill_ && devs_.size() > 1) {
+        std::vector<double> load(devs_.size(), 0.0);
+        double tot = 0;
+        for (auto & dp : devs_)
+            for (Layer & L : dp->layers) {
+                const std::string p = "blk." + std::to_string(L.il) + ".";
+                const double b = (double) (gguf_->need(p + "ffn_gate_exps.weight").nbytes * 2 + gguf_->need(p + "ffn_down_exps.weight").nbytes);
+                load[dp->g] += b / wbw[dp->g];
+                tot += b / wbw[dp->g];
+            }
+        const size_t hst = (size_t) (getenv("HYPER7_HSTAGE_MIB") ? atoi(getenv("HYPER7_HSTAGE_MIB")) : 256) << 20;
+        // takers: devices whose own streaming (per link weight) is light: HYPER7_EP_TAKER_FRAC of the average (default 0.6),
+        // or listed explicitly (HYPER7_EP_TAKERS="0,1,2"); every taker helps every non-taker
+        const double tf = getenv("HYPER7_EP_TAKER_FRAC") ? atof(getenv("HYPER7_EP_TAKER_FRAC")) : 0.6;
+        for (auto & dp : devs_) dp->taker = load[dp->g] < tf * tot / (double) devs_.size();
+        if (const char * tk = getenv("HYPER7_EP_TAKERS")) {
+            for (auto & dp : devs_) dp->taker = false;
+            for (const char * q = tk; *q;) { const int g = atoi(q); if (g >= 0 && g < (int) devs_.size()) devs_[g]->taker = true; while (*q && *q != ',') ++q; if (*q) ++q; }
+        }
+        for (auto & dp : devs_) fprintf(stderr, "hyper7: EP prefill: device %d own streaming load %.1f GiB/weight%s\n", dp->id, load[dp->g] / 1073741824.0, dp->taker ? " (taker)" : "");
+        for (auto & dp : devs_) {
+            Device & d = *dp;
+            if (!d.taker) continue;
+            CUDA_CHECK(cudaSetDevice(d.id));
+            d.hstage_bytes = hst;
+            d.zeros = d.alloc<float>(R);
+            d.hres.resize(devs_.size());
+            for (auto & op : devs_) {   // one set of streams, staging and scratch per owner it helps
+                if (op->taker) continue;
+                Device::HelperRes & H = d.hres[op->g];
+                CUDA_CHECK(cudaStreamCreateWithFlags(&H.hstream, cudaStreamNonBlocking));
+                CUDA_CHECK(cudaStreamCreateWithFlags(&H.hcstream, cudaStreamNonBlocking));
+                for (auto & ev : H.hev_up) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+                for (auto & ev : H.hev_free) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+                for (auto & b : H.hstage) b = d.alloc<uint8_t>(hst);
+                H.hx = d.alloc<float>(R * n);
+                H.hx16 = d.alloc<half>(R * n);
+                H.hids = d.alloc<int>(R * K);
+                H.hwts = d.alloc<float>(R * K);
+                H.horder = d.alloc<int>(R * K);
+                H.horder_n = d.alloc<int>(4);
+                H.hegrp = d.alloc<int>(3 * E + 16);
+                H.hh16 = d.alloc<half>(R * K * ff);
+                H.hyexp = d.alloc<float>(R * K * n);
+                H.hpart = d.alloc<float>(R * n);
+                for (int r = 0; r < EP_RING; ++r) {
+                    CUDA_CHECK(cudaHostAlloc(&H.ring_x[r], R * n * sizeof(float), cudaHostAllocPortable));
+                    CUDA_CHECK(cudaHostAlloc(&H.ring_p[r], R * n * sizeof(float), cudaHostAllocPortable));
+                    CUDA_CHECK(cudaHostAlloc(&H.ring_wts[r], R * K * sizeof(float), cudaHostAllocPortable));
+                    CUDA_CHECK(cudaHostAlloc(&H.ring_ids[r], R * K * sizeof(int), cudaHostAllocPortable));
+                    for (auto * ev : {&H.ev_xfree[r], &H.ev_p[r]}) CUDA_CHECK(cudaEventCreateWithFlags(ev, cudaEventDisableTiming));
+                }
+            }
+            fprintf(stderr, "hyper7: device %d helps the others' prefill (staging 2 x %zu MiB per owner)\n", d.id, hst >> 20);
+        }
+        bool any = false;
+        for (auto & dp : devs_) any |= dp->taker;
+        if (any)
+            for (auto & dp : devs_) {
+                if (dp->taker) continue;
+                CUDA_CHECK(cudaSetDevice(dp->id));
+                dp->hp_in = dp->alloc<float>(R * n);
+                for (int r = 0; r < EP_RING; ++r)
+                    for (auto * ev : {&dp->ev_x[r], &dp->ev_pfree[r]}) CUDA_CHECK(cudaEventCreateWithFlags(ev, cudaEventDisableTiming));
+            }
+    }
     for (auto & dp : devs_) {
         Device & d = *dp;
         CUDA_CHECK(cudaSetDevice(d.id));
@@ -849,6 +911,13 @@ void Engine7::place_experts() {
         d.stage_bytes = (size_t) (getenv("HYPER7_STAGE_MIB") ? atoi(getenv("HYPER7_STAGE_MIB")) : 1024) << 20;
         for (auto & b : d.stage) b = d.alloc<uint8_t>(d.stage_bytes);
         {   std::vector<int> all(E, d.g); d.owner_all = d.upload(all.data(), E); }
+        if (host_on_) {   // expert host: decode scratch (every device may host)
+            d.qx = d.alloc<float>((size_t) MAX_NT * n); d.qwts = d.alloc<float>((size_t) MAX_NT * K); d.qids = d.alloc<int>((size_t) MAX_NT * K);
+            d.qhexp = d.alloc<float>((size_t) MAX_NT * K * ff); d.qyexp = d.alloc<float>((size_t) MAX_NT * K * n);
+            d.qout = d.alloc<float>((size_t) MAX_NT * n); d.qzx = d.alloc<float>((size_t) MAX_NT * n); d.qzs = d.alloc<float>(MAX_NT);
+            CUDA_CHECK(cudaMemset(d.qzx, 0, (size_t) MAX_NT * n * sizeof(float)));
+            CUDA_CHECK(cudaMemset(d.qzs, 0, (size_t) MAX_NT * sizeof(float)));
+        }
         size_t fr = 0, tot = 0;
         CUDA_CHECK(cudaMemGetInfo(&fr, &tot));
         const size_t reserve = (size_t) (opt_.vram_reserve_gib * 1073741824.0);
@@ -860,90 +929,242 @@ void Engine7::place_experts() {
             const std::string p = "blk." + std::to_string(L.il) + ".";
             per_all += (gguf_->need(p + "ffn_gate_exps.weight").nbytes * 2 + gguf_->need(p + "ffn_down_exps.weight").nbytes) / E;
         }
-        const int n_gpu = per_all ? (int) std::min<size_t>(E, budget / per_all) : 0;
+        int n_gpu = per_all ? (int) std::min<size_t>(E, budget / per_all) : 0;
+        if (const char * fx = getenv("HYPER7_GPU_EXPERTS")) {   // (tests: fixed counts per device, "n0,n1,n2", for identical placements)
+            int i = 0, v = n_gpu;
+            for (const char * q = fx; *q; ++i) { v = atoi(q); if (i == d.g) n_gpu = std::min(E, v); while (*q && *q != ',') ++q; if (*q) ++q; }
+        }
         size_t dev_bytes = 0, host_bytes = 0;
+        // expert host: the hottest of this device's CPU experts (count per byte, after its own VRAM experts) go to the pool
+        std::vector<int> npool(c.n_layer, 0), phost(c.n_layer, -1);
+        const int host_for = getenv("HYPER7_HOST_FOR") ? atoi(getenv("HYPER7_HOST_FOR")) : (int) devs_.size() - 1;
+        if (host_on_ && d.g == host_for) {
+            // the hosts' budgets: their spare VRAM now (their own experts are placed: devices are processed in order and the
+            // target is the last), capped
+            std::vector<size_t> remain(devs_.size(), 0);
+            for (auto & hp : devs_) {
+                if (hp->g == host_for || (host_dev_ >= 0 && hp->g != host_dev_)) continue;
+                CUDA_CHECK(cudaSetDevice(hp->id));
+                size_t hfr = 0, htot = 0;
+                CUDA_CHECK(cudaMemGetInfo(&hfr, &htot));
+                const size_t hres = (size_t) (opt_.vram_reserve_gib * 1073741824.0);
+                remain[hp->g] = std::min(host_pool_bytes_, hfr > hres ? hfr - hres : 0);
+                fprintf(stderr, "hyper7: device %d: %.2f GiB free after its own experts, %.2f GiB reserve -> %.2f GiB for pooled experts\n", hp->id,
+                        hfr / 1073741824.0, hres / 1073741824.0, remain[hp->g] / 1073741824.0);
+            }
+            CUDA_CHECK(cudaSetDevice(d.id));
+            struct Cand { double key; int il, r; size_t bytes; };
+            std::vector<Cand> cands;
+            for (Layer & L : d.layers) {
+                const int il = L.il;
+                const std::vector<uint64_t> * cnt = place_->stats_of(il);
+                if (!cnt) continue;
+                const std::string p = "blk." + std::to_string(il) + ".";
+                const size_t eb = (gguf_->need(p + "ffn_gate_exps.weight").nbytes * 2 + gguf_->need(p + "ffn_down_exps.weight").nbytes) / E;
+                const std::vector<int> order = expert_order(cnt, E);
+                for (int r = n_gpu; r < E; ++r) cands.push_back({(double) (*cnt)[order[r]] / (double) eb, il, r, eb});
+            }
+            std::stable_sort(cands.begin(), cands.end(), [](const Cand & a, const Cand & b) { return a.key > b.key; });
+            // a layer's pooled experts sit on one host (the owner's reduce takes one host partial): the host with the most
+            // room when the layer's first expert is taken
+            std::vector<size_t> used(devs_.size(), 0);
+            std::vector<int> nph(devs_.size(), 0);
+            for (const Cand & q : cands) {
+                if (q.r != n_gpu + npool[q.il]) continue;
+                int hh = phost[q.il];
+                if (hh < 0) { for (int g = 0; g < (int) devs_.size(); ++g) if (remain[g] >= q.bytes && (hh < 0 || remain[g] > remain[hh])) hh = g; if (hh < 0) continue; }
+                if (remain[hh] < q.bytes) continue;
+                phost[q.il] = hh; remain[hh] -= q.bytes; used[hh] += q.bytes; ++npool[q.il]; ++nph[hh];
+            }
+            for (int g = 0; g < (int) devs_.size(); ++g)
+                if (nph[g]) fprintf(stderr, "hyper7: device %d hosts %d experts of device %d's layers (%.1f GiB)\n", devs_[g]->id, nph[g], d.id, used[g] / 1073741824.0);
+        }
         for (Layer & L : d.layers) {
             const int il = L.il;
-            const std::string p = "blk." + std::to_string(il) + ".";
-            const GTensor & tg = gguf_->need(p + "ffn_gate_exps.weight"), & tu = gguf_->need(p + "ffn_up_exps.weight"),
-                          & tdn = gguf_->need(p + "ffn_down_exps.weight");
-            if (tu.type != tg.type) throw std::runtime_error("hyper7: expert gate/up types differ");
-            const size_t gb = tg.nbytes / E, db = tdn.nbytes / E;
-            std::vector<int> order(E);
-            for (int e = 0; e < E; ++e) order[e] = e;
-            if (il < (int) stats_.size()) {
-                const auto & cnt = stats_[il];
-                std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return cnt[a] > cnt[b]; });
-            }
-            std::vector<int> owner(E, CPU_OWNER), slot(E, -1);
+            const ExpertTensors xt = expert_tensors(*gguf_, il, E);
+            const std::vector<int> order = expert_order(place_->stats_of(il), E);
+            // owners: the hottest n_gpu here, the next npool on the host device, the rest on the CPU; the compact host copy
+            // holds the CPU's and the pooled ones (the bulk path computes the pooled experts on the CPU); pooled experts
+            // never swap
+            std::vector<int> owner(E, CPU_OWNER), owner_bulk(E, CPU_OWNER);
+            std::vector<char> pooled(E, 0), on_devs(devs_.size(), 0);
+            for (int r = 0; r < n_gpu; ++r) owner[order[r]] = owner_bulk[order[r]] = d.g;
+            for (int r = 0; r < npool[il]; ++r) { owner[order[n_gpu + r]] = phost[il]; pooled[order[n_gpu + r]] = 1; }
+            on_devs[d.g] = 1;
+            if (npool[il] > 0) on_devs[phost[il]] = 1;
+            place_->load_layer(il, xt, owner, npool[il] > 0 ? &pooled : nullptr, npool[il] > 0 ? &pooled : nullptr,
+                               npool[il] > 0 ? &owner_bulk : nullptr, &on_devs);
             L.n_gpu = n_gpu;
-            for (int r = 0; r < n_gpu; ++r) { owner[order[r]] = d.g; slot[order[r]] = r; }
-            // GPU copies
-            uint8_t * gg = d.alloc<uint8_t>((size_t) std::max(1, n_gpu) * gb), * gu = d.alloc<uint8_t>((size_t) std::max(1, n_gpu) * gb),
-                    * gd = d.alloc<uint8_t>((size_t) std::max(1, n_gpu) * db);
-            for (int e = 0; e < E; ++e) {
-                if (slot[e] < 0) continue;
-                CUDA_CHECK(cudaMemcpy(gg + (size_t) slot[e] * gb, tg.data + (size_t) e * gb, gb, cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(gu + (size_t) slot[e] * gb, tu.data + (size_t) e * gb, gb, cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(gd + (size_t) slot[e] * db, tdn.data + (size_t) e * db, db, cudaMemcpyHostToDevice));
-            }
-            dev_bytes += (size_t) n_gpu * (2 * gb + db);
-            MoeDev & m = L.moex;
-            m.gate = gg; m.up = gu; m.down = gd;
-            m.tg = tg.type; m.td = tdn.type;
-            m.gate_bytes = gb; m.down_bytes = db;
-            m.slot = d.upload(slot.data(), E);
-            m.ff = ff; m.n = n;
-            m.clamp = c.clamp_exp;
-            CUDA_CHECK(cudaMemcpy(L.owner, owner.data(), E * sizeof(int), cudaMemcpyHostToDevice));
-            // the CPU's experts: a compact copy (2 MB pages)
-            const int ncpu = E - n_gpu;
-            CpuExpertLayer cl;
-            cl.tg = tg.type; cl.td = tdn.type;
-            cl.gate_bytes = gb; cl.down_bytes = db;
-            cl.cslot.assign(E, -1);
-            if (ncpu > 0) {
-                const size_t bytes = (size_t) ncpu * (2 * gb + db);
-                uint8_t * buf = (uint8_t *) engine7_huge_alloc(bytes, host_bufs_);
-                cl.gate = buf; cl.up = buf + (size_t) ncpu * gb; cl.down = buf + (size_t) ncpu * 2 * gb;
-                std::vector<int> list;
-                for (int e = 0; e < E; ++e) if (owner[e] == CPU_OWNER) { cl.cslot[e] = (int) list.size(); list.push_back(e); }
-#pragma omp parallel for schedule(dynamic)
-                for (int i = 0; i < ncpu; ++i) {
-                    const int e = list[i];
-                    memcpy((uint8_t *) cl.gate + (size_t) i * gb, tg.data + (size_t) e * gb, gb);
-                    memcpy((uint8_t *) cl.up + (size_t) i * gb, tu.data + (size_t) e * gb, gb);
-                    memcpy((uint8_t *) cl.down + (size_t) i * db, tdn.data + (size_t) e * db, db);
-                }
-                collapse_huge(buf, bytes);
-                CUDA_CHECK(cudaHostRegister(buf, bytes, cudaHostRegisterPortable));
-                host_bytes += bytes;
-                // prefill parts: as many of the compact copy's experts as fit a staging buffer
-                L.hg = cl.gate; L.hu = cl.up; L.hd = cl.down; L.gb = gb; L.db = db;
-                const int per = std::max<int>(1, (int) (d.stage_bytes / (2 * gb + db)));
-                for (int i0 = 0; i0 < ncpu; i0 += per) L.part_i0.push_back(i0);
-                L.part_i0.push_back(ncpu);
-                for (int j = 0; j + 1 < (int) L.part_i0.size(); ++j) {
-                    std::vector<int> sl(E, -1);
-                    for (int i = L.part_i0[j]; i < L.part_i0[j + 1]; ++i) sl[list[i]] = i - L.part_i0[j];
-                    L.part_slot.push_back(d.upload(sl.data(), E));
-                }
-            }
-            for (const GTensor * t : {&tg, &tu, &tdn}) {   // (the file's pages are not needed any more)
-                const uintptr_t a0 = ((uintptr_t) t->data + 4095) & ~(uintptr_t) 4095, a1 = ((uintptr_t) t->data + t->nbytes) & ~(uintptr_t) 4095;
-                if (a1 > a0) madvise((void *) a0, a1 - a0, MADV_DONTNEED);
-            }
-            cl.owned.resize(E);
-            for (int e = 0; e < E; ++e) cl.owned[e] = owner[e] == CPU_OWNER;
-            cpu_->set_layer(il, cl);
+            L.gb = xt.gb; L.db = xt.db;
+            L.n_own = E - n_gpu;   // (the compact copy: CPU + pooled experts; the shares, if any, are cut below)
+            if (npool[il] > 0) { L.host_dev = phost[il]; L.n_host = npool[il]; host_layers_[phost[il]].push_back(il); }
+            dev_bytes += (size_t) n_gpu * (2 * xt.gb + xt.db);
+            host_bytes += place_->host(il).hx.bytes;
+            CUDA_CHECK(cudaSetDevice(d.id));
         }
         fprintf(stderr, "hyper7: device %d: %d of %d experts per layer in VRAM (%.1f GiB), %.1f GiB on the CPU\n", d.id, n_gpu, E,
                 dev_bytes / 1073741824.0, host_bytes / 1073741824.0);
     }
+    // EP prefill shares: every device's streamed bytes per chunk in proportion to its link (givers hand their excess to the
+    // takers in proportion to the takers' deficits); then the part tables of every layer
+    {
+        const int nd = (int) devs_.size();
+        std::vector<double> B(nd, 0.0);
+        double tot = 0, wsum = 0;
+        for (auto & dp : devs_) { for (Layer & L : dp->layers) B[dp->g] += (double) (L.n_own) * (2 * L.gb + L.db); tot += B[dp->g]; wsum += wbw[dp->g]; }
+        std::vector<double> T(nd), deficit(nd, 0.0), excess(nd, 0.0);
+        double D = 0, X = 0;
+        for (int g = 0; g < nd; ++g) {
+            T[g] = tot * wbw[g] / wsum;
+            if (devs_[g]->taker && B[g] < T[g]) { deficit[g] = T[g] - B[g]; D += deficit[g]; }
+            if (!devs_[g]->taker && B[g] > T[g]) { excess[g] = B[g] - T[g]; X += excess[g]; }
+        }
+        const double scale = X > 0 ? std::min(1.0, D / X) : 0.0;   // (the takers may not absorb every excess)
+        for (auto & dp : devs_) {
+            Device & d = *dp;
+            const double give = excess[d.g] * scale;
+            for (Layer & L : d.layers) {
+                if (L.n_own == 0 || B[d.g] <= 0) { rebuild_part_slots(L); continue; }
+                const int ncpu = L.n_own;
+                const int ngive = std::min(ncpu - 1, (int) (ncpu * give / B[d.g]));
+                int c0 = ncpu - ngive;
+                L.n_own = c0;
+                for (int h = 0; h < nd && ngive > 0; ++h) {
+                    if (deficit[h] <= 0) continue;
+                    const int cnt = (int) std::lround(ngive * deficit[h] / D);
+                    const int c1 = std::min(ncpu, c0 + cnt);
+                    if (c1 > c0) { Share sh; sh.dev = h; sh.c0 = c0; sh.c1 = c1; L.shares.push_back(sh); c0 = c1; }
+                }
+                if (c0 < ncpu) {   // (rounding: the rest to the last share, or back to the owner)
+                    if (!L.shares.empty()) L.shares.back().c1 = ncpu; else L.n_own = ncpu;
+                }
+                if (ep_debug_ == 1) L.n_own = ncpu;   // (the owner streams every expert; the helpers' shares overlap)
+                rebuild_part_slots(L);
+            }
+        }
+        if (ep_prefill_)
+            for (auto & dp : devs_) {
+                double own = 0, helped = 0;
+                for (Layer & L : dp->layers) own += (double) L.n_own * (2 * L.gb + L.db);
+                for (auto & op : devs_) for (Layer & L : op->layers) for (Share & sh : L.shares) if (sh.dev == dp->g) helped += (double) (sh.c1 - sh.c0) * (2 * L.gb + L.db);
+                fprintf(stderr, "hyper7: EP prefill: device %d streams %.1f GiB of its own CPU experts + %.1f GiB for the others per chunk\n",
+                        dp->id, own / 1073741824.0, helped / 1073741824.0);
+            }
+    }
+}
+
+// the part tables of a layer's CPU experts (the owner's own share and the helpers' shares) from the compact indices:
+// part j holds compact indices [part_i0[j], part_i0[j + 1]), its slot table maps an expert to its index in the part; the
+// owner tables mark the experts a device sums in its moe_reduce (its share + the experts in its VRAM for the owner)
+void Engine7::rebuild_part_slots(Layer & L) {
+    const Ds4Config & c = cfg_;
+    const int E = c.n_expert, il = L.il;
+    Device & d = *devs_[dev_of_[il]];
+    const std::vector<int> & cslot = place_->host(il).cslot;
+    auto build = [&](Device & dev, int c0, int c1, size_t stage_bytes, std::vector<int> & part_i0, std::vector<int *> & part_slot) {
+        std::vector<int> i0s;
+        if (c1 > c0 && 2 * L.gb + L.db > 0) {
+            const int per = std::max<int>(1, (int) (stage_bytes / (2 * L.gb + L.db)));
+            for (int i0 = c0; i0 < c1; i0 += per) i0s.push_back(i0);
+            i0s.push_back(c1);
+        }
+        CUDA_CHECK(cudaSetDevice(dev.id));
+        const int np = i0s.empty() ? 0 : (int) i0s.size() - 1;
+        while ((int) part_slot.size() < np) part_slot.push_back(dev.alloc<int>(E));
+        part_i0 = i0s;
+        for (int j = 0; j < np; ++j) {
+            std::vector<int> sl(E, -1);
+            for (int e = 0; e < E; ++e)
+                if (cslot[e] >= part_i0[j] && cslot[e] < part_i0[j + 1]) sl[e] = cslot[e] - part_i0[j];
+            CUDA_CHECK(cudaMemcpy(part_slot[j], sl.data(), E * sizeof(int), cudaMemcpyHostToDevice));
+        }
+    };
+    build(d, 0, L.n_own, d.stage_bytes, L.part_i0, L.part_slot);
+    if (!L.shares.empty()) {
+        std::vector<int> own(E, -1);
+        for (int e = 0; e < E; ++e) if (cslot[e] < 0 || cslot[e] < L.n_own) own[e] = d.g;
+        CUDA_CHECK(cudaSetDevice(d.id));
+        if (!L.owner_tab) L.owner_tab = d.alloc<int>(E);
+        CUDA_CHECK(cudaMemcpy(L.owner_tab, own.data(), E * sizeof(int), cudaMemcpyHostToDevice));
+    }
+    for (Share & sh : L.shares) {
+        Device & h = *devs_[sh.dev];
+        build(h, sh.c0, sh.c1, h.hstage_bytes, sh.part_i0, sh.part_slot);
+        std::vector<int> tab(E, -1);
+        for (int e = 0; e < E; ++e) if (cslot[e] >= sh.c0 && cslot[e] < sh.c1) tab[e] = h.g;
+        CUDA_CHECK(cudaSetDevice(h.id));
+        if (!sh.owner_tab) sh.owner_tab = h.alloc<int>(E);
+        CUDA_CHECK(cudaMemcpy(sh.owner_tab, tab.data(), E * sizeof(int), cudaMemcpyHostToDevice));
+    }
+}
+
+// a helper's work for one streamed layer: the owner has put the layer's MoE input rows and routing into ring slot r
+// (ev_x[r]); the helper streams its share of the experts through its own staging and returns the partial sum (ev_p[r])
+void Engine7::issue_helper(Layer & L, const Share & sh, int nt, int r) {
+    const Ds4Config & c = cfg_;
+    const int E = c.n_expert, n = c.n_embd, K = c.n_used;
+    Device & h = *devs_[sh.dev], & d = *devs_[dev_of_[L.il]];
+    const MoeLayerHost & HL = place_->host(L.il);
+    const MoeLayerDev & X = place_->dev(d.g, L.il);
+    CUDA_CHECK(cudaSetDevice(h.id));
+    Device::HelperRes & H = h.hres[d.g];
+    cudaStream_t hs = H.hstream;
+    CUDA_CHECK(cudaStreamWaitEvent(hs, d.ev_x[r], 0));
+    CUDA_CHECK(cudaMemcpyAsync(H.hx, H.ring_x[r], (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, hs));
+    CUDA_CHECK(cudaMemcpyAsync(H.hids, H.ring_ids[r], (size_t) nt * K * sizeof(int), cudaMemcpyHostToDevice, hs));
+    CUDA_CHECK(cudaMemcpyAsync(H.hwts, H.ring_wts[r], (size_t) nt * K * sizeof(float), cudaMemcpyHostToDevice, hs));
+    CUDA_CHECK(cudaEventRecord(H.ev_xfree[r], hs));
+    to_half(H.hx, n, nullptr, n, 0.0f, H.hx16, nt, hs);
+    if (ep_debug_ == 8) CUDA_CHECK(cudaMemsetAsync(H.hyexp, 0, (size_t) R_ * K * n * sizeof(float), hs));   // (test: no stale pair outputs)
+    auto stage_copy = [&](int j) {
+        const int b = j & 1, i0 = sh.part_i0[j], cnt = sh.part_i0[j + 1] - i0;
+        CUDA_CHECK(cudaStreamWaitEvent(H.hcstream, H.hev_free[b], 0));
+        uint8_t * st = H.hstage[b];
+        CUDA_CHECK(cudaMemcpyAsync(st, HL.hx.gate + (size_t) i0 * L.gb, (size_t) cnt * L.gb, cudaMemcpyHostToDevice, H.hcstream));
+        CUDA_CHECK(cudaMemcpyAsync(st + (size_t) cnt * L.gb, HL.hx.up + (size_t) i0 * L.gb, (size_t) cnt * L.gb, cudaMemcpyHostToDevice, H.hcstream));
+        CUDA_CHECK(cudaMemcpyAsync(st + (size_t) 2 * cnt * L.gb, HL.hx.down + (size_t) i0 * L.db, (size_t) cnt * L.db, cudaMemcpyHostToDevice, H.hcstream));
+        CUDA_CHECK(cudaEventRecord(H.hev_up[b], H.hcstream));
+    };
+    for (int j = 0; j < std::min(2, sh.np()); ++j) stage_copy(j);
+    for (int j = 0; j < sh.np(); ++j) {
+        const int b = j & 1, cnt = sh.part_i0[j + 1] - sh.part_i0[j];
+        MoeDev ms = X.moe;
+        ms.gate = H.hstage[b];
+        ms.up = H.hstage[b] + (size_t) cnt * L.gb;
+        ms.down = H.hstage[b] + (size_t) 2 * cnt * L.gb;
+        ms.slot = sh.part_slot[j];
+        CUDA_CHECK(cudaStreamWaitEvent(hs, H.hev_up[b], 0));
+        moe_order(ms, H.hids, nt * K, E, H.horder, H.horder_n, hs, H.hegrp);
+        if (ep_debug_ >= 7) {   // (tests) the pairs the part selected vs the routing's pairs of the share (from the ring's ids)
+            CUDA_CHECK(cudaStreamSynchronize(hs));
+            int on[2] = {0, 0};
+            CUDA_CHECK(cudaMemcpy(on, H.horder_n, 2 * sizeof(int), cudaMemcpyDeviceToHost));
+            const std::vector<int> & cs = HL.cslot;
+            int want = 0, exp_in = 0;
+            for (int p = 0; p < nt * K; ++p) { const int e = H.ring_ids[r][p]; if (cs[e] >= sh.part_i0[j] && cs[e] < sh.part_i0[j + 1]) ++want; }
+            for (int e = 0; e < E; ++e) if (cs[e] >= sh.part_i0[j] && cs[e] < sh.part_i0[j + 1]) ++exp_in;
+            fprintf(stderr, "hyper7: EP layer %d part %d [%d,%d) experts %d: pairs selected %d, routing's pairs in the part %d, groups %d\n",
+                    L.il, j, sh.part_i0[j], sh.part_i0[j + 1], exp_in, on[0], want, on[1]);
+        }
+        moe_gemm_gate_up(ms, H.hx16, n, K, H.horder, H.horder_n, H.hegrp, E, H.hh16, hs);
+        moe_gemm_down(ms, H.hh16, H.horder, H.horder_n, H.hegrp, E, H.hwts, H.hyexp, hs);
+        CUDA_CHECK(cudaEventRecord(H.hev_free[b], hs));
+        if (j + 2 < sh.np()) stage_copy(j + 2);
+    }
+    // the partial: the share's pairs only (owner_tab), no shared expert (sg = 0)
+    moe_reduce(H.hx, h.zeros, H.hyexp, K, H.hpart, n, nt, H.hids, sh.owner_tab, h.g, CPU_OWNER, nullptr, nullptr, h.counter, (unsigned) L.il, hs);
+    CUDA_CHECK(cudaStreamWaitEvent(hs, d.ev_pfree[r], 0));   // (the slot's previous partial taken by the owner)
+    CUDA_CHECK(cudaMemcpyAsync(H.ring_p[r], H.hpart, (size_t) nt * n * sizeof(float), cudaMemcpyDeviceToHost, hs));
+    CUDA_CHECK(cudaEventRecord(H.ev_p[r], hs));
 }
 
 Engine7::~Engine7() {
-    cpu_.reset();
+    if (!issuers_.empty()) {
+        { std::lock_guard<std::mutex> lk(imx_); stop_issuers_ = true; }
+        icv_.notify_all();
+        for (auto & I : issuers_) if (I->th.joinable()) I->th.join();
+    }
+    release_cpu_side();   // (the CPU side and the host copies first)
     for (auto & [p, sz] : host_bufs_) { cudaHostUnregister(p); munmap(p, sz); }
     devs_.clear();
     for (int k = 0; k < NSET; ++k) {
@@ -953,7 +1174,7 @@ Engine7::~Engine7() {
         if (ev_chunk_[k]) cudaEventDestroy(ev_chunk_[k]);
     }
     if (dsp_map_) munmap(dsp_map_, dsp_size_);
-    for (void * p : {(void *) h_out_, (void *) h_dsp_, (void *) h_dout_, (void *) cpu_rec_, (void *) cpu_pred_, (void *) cpu_out_, (void *) cpu_bulk_, (void *) cpu_bulk_out_})
+    for (void * p : {(void *) h_out_, (void *) h_dsp_, (void *) h_dout_, (void *) host_out_})
         if (p) cudaFreeHost(p);
 }
 
@@ -962,13 +1183,12 @@ void Engine7::reset() { hist_.clear(); }
 void Engine7::run_layer(Device & d, Layer & L, int nt, int64_t p0) {
     const Ds4Config & c = cfg_;
     cudaStream_t s = d.stream;
-    const int n = c.n_embd, hcn = c.hc * n, HQ = c.n_head * c.head_dim, HD = c.head_dim, K = c.n_used;
+    const int n = c.n_embd, hcn = c.hc * n, HQ = c.n_head * c.head_dim, HD = c.head_dim, K = c.n_used, il = L.il;
     const float eps = c.eps;
     const bool bulk = nt > MAX_NT;
+    const DenseRun dr{s, d.blas, d.xh, d.ggs, d.ggs_elems};
     auto mm = [&](const DW & W, const float * x, int xs, float * y, int ys, int rows, const NormIn & ni = NormIn{}) {
-        if (rows <= MAX_NT) { gemv_q8(W.q8, x, xs, y, ys, nullptr, rows, s, ni); return; }
-        to_half(x, xs, nullptr, W.k(), 0.0f, d.xh, rows, s);
-        gemm_q8(W.q8, d.xh, rows, y, ys, nullptr, s);
+        dense_mm(dr, W, x, xs, y, ys, rows, ni);
     };
     auto mf32 = [&](const float * W, int rows, int k, const float * x, int xs, float * y, int ys, int nr) {   // y = x W^T (fp32)
         if (nr <= MAX_NT) { gemv_f32(W, rows, k, x, xs, y, ys, nr, s); return; }
@@ -977,26 +1197,28 @@ void Engine7::run_layer(Device & d, Layer & L, int nt, int64_t p0) {
             throw std::runtime_error("hyper7: cublasSgemm failed");
     };
     const float * freqs = L.ratio ? d.freqs_comp : d.freqs_win;
-    const int il = L.il;
     if (!dblk_.empty() && il >= dsp_tap0_ && il < dsp_tap0_ + 3)   // DSpark taps: the streams' mean entering layers 37..39
         hc_mean7(d.h, c.n_embd, c.hc, d.taps + (size_t) (il - dsp_tap0_) * c.n_embd, 3 * c.n_embd, nt, d.stream);
     // prefill: the CPU's experts go to the GPU in parts through the two staging buffers (the first two copies overlap the
     // attention; part j + 2's copy is issued once part j's experts are done)
-    const bool stream_exp = bulk && stream_ && nt >= stream_min_ && L.np() > 0;
+    const bool stream_exp = bulk && stream_ && nt >= stream_min_ && (L.np() > 0 || !L.shares.empty());
+    const MoeLayerHost & HL = place_->host(il);   // the layer's compact host copy
+    const MoeLayerDev & X = place_->dev(d.g, il);  // its experts on this device
     auto stage_copy = [&](int j) {
         const int b = j & 1, i0 = L.part_i0[j], cnt = L.part_i0[j + 1] - i0;
         CUDA_CHECK(cudaStreamWaitEvent(d.cstream, d.ev_free[b], 0));
         uint8_t * st = d.stage[b];
-        CUDA_CHECK(cudaMemcpyAsync(st, L.hg + (size_t) i0 * L.gb, (size_t) cnt * L.gb, cudaMemcpyHostToDevice, d.cstream));
-        CUDA_CHECK(cudaMemcpyAsync(st + (size_t) cnt * L.gb, L.hu + (size_t) i0 * L.gb, (size_t) cnt * L.gb, cudaMemcpyHostToDevice, d.cstream));
-        CUDA_CHECK(cudaMemcpyAsync(st + (size_t) 2 * cnt * L.gb, L.hd + (size_t) i0 * L.db, (size_t) cnt * L.db, cudaMemcpyHostToDevice, d.cstream));
+        CUDA_CHECK(cudaMemcpyAsync(st, HL.hx.gate + (size_t) i0 * L.gb, (size_t) cnt * L.gb, cudaMemcpyHostToDevice, d.cstream));
+        CUDA_CHECK(cudaMemcpyAsync(st + (size_t) cnt * L.gb, HL.hx.up + (size_t) i0 * L.gb, (size_t) cnt * L.gb, cudaMemcpyHostToDevice, d.cstream));
+        CUDA_CHECK(cudaMemcpyAsync(st + (size_t) 2 * cnt * L.gb, HL.hx.down + (size_t) i0 * L.db, (size_t) cnt * L.db, cudaMemcpyHostToDevice, d.cstream));
         CUDA_CHECK(cudaEventRecord(d.ev_up[b], d.cstream));
     };
+    if (stream_exp && d.ev_plast) CUDA_CHECK(cudaStreamWaitEvent(d.cstream, d.ev_plast, 0));
     if (stream_exp) for (int j = 0; j < std::min(2, L.np()); ++j) stage_copy(j);
     // ---- Engram ----
     if (L.eg >= 0) {
         const int ecols = c.eg_cols() * c.eg_hd;
-        CUDA_CHECK(cudaMemcpyAsync(d.eg_x, h_eg_[cur_set_][L.eg], (size_t) nt * ecols * sizeof(float), cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(d.eg_x, h_eg_[d.cur_set][L.eg], (size_t) nt * ecols * sizeof(float), cudaMemcpyHostToDevice, s));
         mm(L.eg_kv, d.eg_x, ecols, d.eg_kvo, (c.hc + 1) * n, nt);
         engram_gate7(d.h, d.eg_kvo, L.eg_w, c.hc, n, eps, nt, s);
     }
@@ -1096,7 +1318,12 @@ void Engine7::run_layer(Device & d, Layer & L, int nt, int64_t p0) {
     {   Fin7 f; f.rd = c.rd; f.freqs = freqs; f.pos = p0; f.vpp = c.n_head; f.inverse = true; f.quant = 1;
         fin7(d.o, nt * c.n_head, HD, HD, f, s); }
     const int per = HQ / c.o_groups, ol = c.o_groups * c.o_lora;
-    for (int gi = 0; gi < c.o_groups; ++gi) mm(L.wo_a[gi], d.o + (size_t) gi * per, HQ, d.oa + (size_t) gi * c.o_lora, ol, nt);
+    static const bool wo_grp = !getenv("HYPER7_WO_GROUPED") || atoi(getenv("HYPER7_WO_GROUPED")) != 0;
+    if (wo_grp && nt <= MAX_NT && L.wo_a_all.n() > 0) {
+        NormIn g; g.xg_tiles = c.o_lora / 16; g.xg_stride = per;
+        mm(L.wo_a_all, d.o, HQ, d.oa, ol, nt, g);
+    } else
+        for (int gi = 0; gi < c.o_groups; ++gi) mm(L.wo_a[gi], d.o + (size_t) gi * per, HQ, d.oa + (size_t) gi * c.o_lora, ol, nt);
     mm(L.wo_b, d.oa, ol, d.ao, n, nt);
     hc7_post(d.ao, d.h, d.a_post, d.a_comb, n, c.hc, d.h2, nt, s);
     std::swap(d.h, d.h2);
@@ -1106,6 +1333,39 @@ void Engine7::run_layer(Device & d, Layer & L, int nt, int64_t p0) {
     hc7_pre_norm(d.h, d.a_pre, L.ffn_norm, n, c.hc, eps, d.x, nt, s);
     mf32(L.router, c.n_expert, n, d.x, n, d.rlog, c.n_expert, nt);
     route7(d.rlog, c.n_expert, L.bias, c.n_expert, K, c.w_scale, d.ids, d.wts, nt, s);
+    // HYPER7_PRED_EARLY: the next layer's experts from this layer's MoE input on the side stream, published as the early
+    // prediction (the CPU reads them after this layer's job until the next layer's own prediction arrives); joined below
+    const bool pred1 = pred_mode_ == 2 && pred_early_ && L.pr_router && !bulk && !stream_exp && nt <= MAX_NT && il + 1 < c.n_layer;
+    if (pred1) {
+        cudaStream_t ps = d.pstream;
+        CUDA_CHECK(cudaEventRecord(d.ev_pe0, s));
+        CUDA_CHECK(cudaStreamWaitEvent(ps, d.ev_pe0, 0));
+        gemv_f32(L.pr_router, c.n_expert, n, d.x, n, d.prlog, c.n_expert, nt, ps);
+        route7(d.prlog, c.n_expert, L.pr_bias, c.n_expert, K, c.w_scale, d.pids, d.pwts, nt, ps);
+        moe_publish(&cpu_pred1_[il + 1].seq, &cpu_pred1_[il + 1].nt, &cpu_pred1_[il + 1].ids[0][0], &cpu_pred1_[il + 1].wts[0][0],
+                    &cpu_pred1_[il + 1].x[0][0], d.x, n, 0, d.pids, d.pwts, K, nt, d.counter, (unsigned) (il + 1), ps);
+        CUDA_CHECK(cudaEventRecord(d.ev_pe1, ps));
+    }
+    std::vector<int> share_slot;   // EP prefill: the helpers' ring slots of this layer
+    if (stream_exp && !L.shares.empty()) {
+        // the MoE input rows and routing to the helpers through their pinned rings (slot r: after the helper has taken the
+        // previous rows of that slot), then their work on their own streams
+        for (const Share & sh : L.shares) {
+            Device & h = *devs_[sh.dev];
+            Device::HelperRes & H = h.hres[d.g];
+            const int r = H.ring_next % ep_ring_;
+            H.ring_next = (H.ring_next + 1) % ep_ring_;
+            share_slot.push_back(r);
+            CUDA_CHECK(cudaStreamWaitEvent(s, H.ev_xfree[r], 0));
+            CUDA_CHECK(cudaMemcpyAsync(H.ring_x[r], d.x, (size_t) nt * n * sizeof(float), cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaMemcpyAsync(H.ring_ids[r], d.ids, (size_t) nt * K * sizeof(int), cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaMemcpyAsync(H.ring_wts[r], d.wts, (size_t) nt * K * sizeof(float), cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaEventRecord(d.ev_x[r], s));
+            // (issued from this thread, in order: the ring's reuse waits then always follow the previous use's records)
+            issue_helper(L, sh, nt, r);
+            CUDA_CHECK(cudaSetDevice(d.id));
+        }
+    }
     if (stream_exp) {}
     else if (bulk) moe_publish(&cpu_bulk_->seq, &cpu_bulk_->nt, &cpu_bulk_->ids[0][0], &cpu_bulk_->wts[0][0], &cpu_bulk_->x[0][0], d.x, n, n,
                           d.ids, d.wts, K, nt, d.counter, (unsigned) il, s);
@@ -1121,21 +1381,21 @@ void Engine7::run_layer(Device & d, Layer & L, int nt, int64_t p0) {
     }
     if (L.n_gpu > 0) {
         if (bulk) {
-            moe_order(L.moex, d.ids, nt * K, c.n_expert, d.order, d.order_n, s, d.egrp);
+            moe_order(X.moe, d.ids, nt * K, c.n_expert, d.order, d.order_n, s, d.egrp);
             to_half(d.x, n, nullptr, n, 0.0f, d.x16, nt, s);
-            moe_gemm_gate_up(L.moex, d.x16, n, K, d.order, d.order_n, d.egrp, c.n_expert, d.h16, s);
-            moe_gemm_down(L.moex, d.h16, d.order, d.order_n, d.egrp, c.n_expert, d.wts, d.yexp, s);
+            moe_gemm_gate_up(X.moe, d.x16, n, K, d.order, d.order_n, d.egrp, c.n_expert, d.h16, s);
+            moe_gemm_down(X.moe, d.h16, d.order, d.order_n, d.egrp, c.n_expert, d.wts, d.yexp, s);
         } else {
-            moe_gate_up(L.moex, d.x, n, d.ids, K, d.hexp, nt, s);
-            moe_down(L.moex, d.hexp, d.ids, d.wts, K, d.yexp, nt, s);
+            moe_gate_up(X.moe, d.x, n, d.ids, K, d.hexp, nt, s);
+            moe_down(X.moe, d.hexp, d.ids, d.wts, K, d.yexp, nt, s);
         }
     }
     if (stream_exp) {   // (routing statistics: the CPU counts only the records it gets)
-        CUDA_CHECK(cudaMemcpyAsync(h_ids_[cur_set_] + (size_t) il * R_ * K, d.ids, (size_t) nt * K * sizeof(int), cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaMemcpyAsync(h_ids_[d.cur_set] + (size_t) il * R_ * K, d.ids, (size_t) nt * K * sizeof(int), cudaMemcpyDeviceToHost, s));
         if (L.n_gpu == 0) to_half(d.x, n, nullptr, n, 0.0f, d.x16, nt, s);
         for (int j = 0; j < L.np(); ++j) {
             const int b = j & 1, cnt = L.part_i0[j + 1] - L.part_i0[j];
-            MoeDev ms = L.moex;
+            MoeDev ms = X.moe;
             ms.gate = d.stage[b];
             ms.up = d.stage[b] + (size_t) cnt * L.gb;
             ms.down = d.stage[b] + (size_t) 2 * cnt * L.gb;
@@ -1155,16 +1415,47 @@ void Engine7::run_layer(Device & d, Layer & L, int nt, int64_t p0) {
         moe_publish(&cpu_pred_[il + 1].seq, &cpu_pred_[il + 1].nt, &cpu_pred_[il + 1].ids[0][0], &cpu_pred_[il + 1].wts[0][0],
                     &cpu_pred_[il + 1].x[0][0], d.x, n, 0, d.pids, d.pwts, K, nt, d.counter, (unsigned) (il + 1), s);
     }
-    if (stream_exp) moe_reduce(d.shout, d.ones, d.yexp, K, d.ffo, n, nt, d.ids, d.owner_all, d.g, CPU_OWNER, nullptr, nullptr, d.counter,
-                               (unsigned) il, s);
-    else moe_reduce(d.shout, d.ones, d.yexp, K, d.ffo, n, nt, d.ids, L.owner, d.g, CPU_OWNER, bulk ? &cpu_bulk_out_->seq : &cpu_out_[il].seq,
-               bulk ? &cpu_bulk_out_->y[0][0] : &cpu_out_[il].y[0][0], d.counter, (unsigned) il, s);
+    if (stream_exp) {
+        moe_reduce(d.shout, d.ones, d.yexp, K, d.ffo, n, nt, d.ids, L.shares.empty() || ep_debug_ == 1 ? d.owner_all : L.owner_tab, d.g, CPU_OWNER,
+                   nullptr, nullptr, d.counter, (unsigned) il, s);
+        for (size_t i = 0; i < share_slot.size(); ++i) {   // EP prefill: + the helpers' partials (through their rings)
+            Device & h = *devs_[L.shares[i].dev];
+            Device::HelperRes & H = h.hres[d.g];
+            const int r = share_slot[i];
+            CUDA_CHECK(cudaStreamWaitEvent(s, H.ev_p[r], 0));
+            CUDA_CHECK(cudaMemcpyAsync(d.hp_in, H.ring_p[r], (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
+            CUDA_CHECK(cudaEventRecord(d.ev_pfree[r], s));
+            d.ev_plast = d.ev_pfree[r];
+            if (ep_debug_ == 7 || ep_debug_ == 8) {   // (tests) the partial as received, appended to <HYPER7_DUMP>.p<il>
+                CUDA_CHECK(cudaStreamSynchronize(s));
+                std::vector<float> pv((size_t) nt * n);
+                CUDA_CHECK(cudaMemcpy(pv.data(), d.hp_in, pv.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                if (const char * dp = getenv("HYPER7_DUMP"))
+                    if (FILE * f = fopen((std::string(dp) + ".p" + std::to_string(il)).c_str(), "ab")) { fwrite(pv.data(), 4, pv.size(), f); fclose(f); }
+            }
+            if (ep_debug_ != 1 && ep_debug_ != 5) vec_add(d.ffo, d.hp_in, (size_t) nt * n, s);   // (5: the partial dropped, the owner's share only)
+        }
+    } else {
+        const bool hp = !bulk && L.host_dev >= 0;   // (the expert host's partial, decode only)
+        moe_reduce(d.shout, d.ones, d.yexp, K, d.ffo, n, nt, d.ids, bulk ? X.owner_bulk : X.owner, d.g, CPU_OWNER,
+                   bulk ? &cpu_bulk_out_->seq : &cpu_out_[il].seq, bulk ? &cpu_bulk_out_->y[0][0] : &cpu_out_[il].y[0][0], d.counter, (unsigned) il, s,
+                   nullptr, hp ? L.host_dev : -1, hp ? &host_out_[il].seq : nullptr, hp ? &host_out_[il].y[0][0] : nullptr);
+    }
     if (pred2) CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_pf1, 0));
+    if (pred1) CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_pe1, 0));
     hc7_post(d.ffo, d.h, d.f_post, d.f_comb, n, c.hc, d.h2, nt, s);
     std::swap(d.h, d.h2);
     std::swap(d.pre, d.f_pre);   // the next block's attention mixes the streams with this block's FFN pre-weights
     if (const char * dp = getenv("HYPER7_DUMP")) {   // (tests) every layer's residual streams [nt][hc][n], appended to <dp>.l<il>
         CUDA_CHECK(cudaStreamSynchronize(s));
+        if (ep_debug_) {   // + the FFN output before the post mix and the routing ids (EP prefill tests), <dp>.f<il> / .i<il>
+            std::vector<float> fv((size_t) nt * n);
+            CUDA_CHECK(cudaMemcpy(fv.data(), d.ffo, fv.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            if (FILE * f = fopen((std::string(dp) + ".f" + std::to_string(il)).c_str(), "ab")) { fwrite(fv.data(), 4, fv.size(), f); fclose(f); }
+            std::vector<int> iv((size_t) nt * K);
+            CUDA_CHECK(cudaMemcpy(iv.data(), d.ids, iv.size() * sizeof(int), cudaMemcpyDeviceToHost));
+            if (FILE * f = fopen((std::string(dp) + ".i" + std::to_string(il)).c_str(), "ab")) { fwrite(iv.data(), 4, iv.size(), f); fclose(f); }
+        }
         std::vector<float> hv((size_t) nt * hcn);
         CUDA_CHECK(cudaMemcpy(hv.data(), d.h, hv.size() * sizeof(float), cudaMemcpyDeviceToHost));
         if (FILE * f = fopen((std::string(dp) + ".l" + std::to_string(il)).c_str(), "ab")) { fwrite(hv.data(), 4, hv.size(), f); fclose(f); }
@@ -1179,10 +1470,48 @@ void Engine7::run_layer(Device & d, Layer & L, int nt, int64_t p0) {
     }
 }
 
+void Engine7::prefill_tick(bool force) {
+    if (!prefill_cb_ || !pf_active_) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && now - pf_tick_ < std::chrono::seconds(1)) return;
+    pf_tick_ = now;
+    // chunks done since the last tick (their event recorded by the issuing thread and passed), so the progress follows
+    // the pipeline instead of the set reuse (which showed the first chunk, then nothing until the last)
+    CUDA_CHECK(cudaSetDevice(devs_.back()->id));
+    for (int k = 0; k < NSET; ++k) {
+        if (!set_pending_[k]) continue;
+        bool recorded = false;
+        { std::lock_guard<std::mutex> lk(imx_); recorded = ev_chunk_seq_ >= set_seq_[k]; }
+        if (!recorded) continue;
+        const cudaError_t q = cudaEventQuery(ev_chunk_[k]);
+        if (q == cudaErrorNotReady) continue;
+        CUDA_CHECK(q);
+        set_pending_[k] = false;
+        pf_done_ += set_tokens_[k];
+    }
+    prefill_cb_(pf_done_, pf_total_, pf_reused_);
+}
+
 void Engine7::wait_set(int set) {
     const Ds4Config & c = cfg_;
+    for (;;) {   // (the set's chunk's event recorded by the last device's issuing thread first)
+        std::unique_lock<std::mutex> lk(imx_);
+        if (!issue_error_.empty()) throw std::runtime_error("hyper7: issuing failed: " + issue_error_);
+        if (ev_chunk_seq_ >= set_seq_[set]) break;
+        icv_.wait_for(lk, std::chrono::milliseconds(50));
+        lk.unlock();
+        prefill_tick(false);
+    }
     CUDA_CHECK(cudaSetDevice(devs_.back()->id));
-    CUDA_CHECK(cudaEventSynchronize(ev_chunk_[set]));
+    if (pf_active_) {
+        cudaError_t q;
+        while ((q = cudaEventQuery(ev_chunk_[set])) == cudaErrorNotReady) { prefill_tick(false); std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+        CUDA_CHECK(q);
+    } else CUDA_CHECK(cudaEventSynchronize(ev_chunk_[set]));
+    if (set_pending_[set]) {
+        set_pending_[set] = false;
+        if (pf_active_) { pf_done_ += set_tokens_[set]; prefill_tick(false); }
+    }
     if (ids_nt_[set] > 0) {   // the streamed chunk's routing into the statistics
         for (auto & dp : devs_)
             for (Layer & L : dp->layers) {
@@ -1192,6 +1521,134 @@ void Engine7::wait_set(int set) {
                 for (int i = 0; i < ids_nt_[set] * c.n_used; ++i) if (ids[i] >= 0 && ids[i] < (int) cnt.size()) cnt[ids[i]]++;
             }
         ids_nt_[set] = 0;
+    }
+}
+
+// a device's part of a chunk: its input rows (the previous device's, through the host), its layers, the rows for the next
+// device; the last device adds the head, the DSpark seeds and the chunk's event. The cross-device stream waits are issued
+// only after the other device's thread has recorded the event they wait for (a wait on a never-recorded event is a no-op)
+void Engine7::issue_device(int gi, const IssueJob & j) {
+    const Ds4Config & c = cfg_;
+    const int n = c.n_embd, nt = j.nt, set = j.set, nlog = j.nlog;
+    const bool bulk = nt > MAX_NT;
+    static const bool prof = getenv("HYPER7_PROF") != nullptr;
+    Device & d = *devs_[gi];
+    const int prev_set = (set + NSET - 1) % NSET;
+    auto wait_for = [&](auto pred) {
+        std::unique_lock<std::mutex> lk(imx_);
+        icv_.wait(lk, [&] { return !issue_error_.empty() || pred(); });
+        if (!issue_error_.empty()) throw std::runtime_error("hyper7: issuing failed: " + issue_error_);
+    };
+    auto mark = [&](long & v) { { std::lock_guard<std::mutex> lk(imx_); v = j.seq; } icv_.notify_all(); };
+    CUDA_CHECK(cudaSetDevice(d.id));
+    d.cur_set = set;
+    cudaStream_t s = d.stream;
+    // the next device has taken this device's rows of the previous chunk (they are about to be overwritten)
+    if (gi + 1 < (int) devs_.size()) {
+        wait_for([&] { return taken_seq_[gi + 1] >= j.seq - 1; });
+        CUDA_CHECK(cudaStreamWaitEvent(s, devs_[gi + 1]->ev_taken[prev_set], 0));
+    }
+    incr_counter(d.counter, s);
+    if (gi == 0) {
+        CUDA_CHECK(cudaMemcpyAsync(d.x, j.he, (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
+        embed7(d.x, d.h, n, c.hc, nt, s);
+        init_pre7(d.pre, nt, s);
+    } else {
+        // the previous device's rows through pinned host memory (cudaMemcpyPeerAsync without P2P blocks the host thread
+        // until the source is done: no pipeline)
+        wait_for([&] { return done_seq_[gi - 1] >= j.seq; });
+        CUDA_CHECK(cudaStreamWaitEvent(s, devs_[gi - 1]->ev_done[set], 0));   // (recorded after its copies into h_in)
+        CUDA_CHECK(cudaMemcpyAsync(d.h, d.h_in, (size_t) nt * c.hc * n * sizeof(float), cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(d.pre, d.h_in + (size_t) R_ * c.hc * n, (size_t) nt * 8 * sizeof(float), cudaMemcpyHostToDevice, s));
+    }
+    CUDA_CHECK(cudaEventRecord(d.ev_taken[set], s));
+    mark(taken_seq_[gi]);
+    for (Layer & L : d.layers) run_layer(d, L, nt, j.pos);
+    if (gi + 1 < (int) devs_.size()) {
+        Device & nd = *devs_[gi + 1];
+        CUDA_CHECK(cudaMemcpyAsync(nd.h_in, d.h, (size_t) nt * c.hc * n * sizeof(float), cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaMemcpyAsync(nd.h_in + (size_t) R_ * c.hc * n, d.pre, (size_t) nt * 8 * sizeof(float), cudaMemcpyDeviceToHost, s));
+    }
+    CUDA_CHECK(cudaEventRecord(d.ev_done[set], s));
+    mark(done_seq_[gi]);
+    // expert host: the pooled experts of the other device's layers, as their records arrive (after this device's rows went
+    // out: the chain's kernels spin on the stream until the owner publishes each layer)
+    if (!bulk) for (int il : host_layers_[gi]) host_chain(devs_[dev_of_[il]]->layers[il - devs_[dev_of_[il]]->l0], nt);
+    if (gi + 1 < (int) devs_.size()) return;
+    if (prof && !bulk && !d.ev_t[0]) for (auto & ev : d.ev_t) CUDA_CHECK(cudaEventCreate(&ev));
+    if (nlog > 0) {   // the head: the last nlog rows
+        if (prof && !bulk) CUDA_CHECK(cudaEventRecord(d.ev_t[0], s));
+        const int r0 = nt - nlog;
+        hc7_pre_norm(d.h + (size_t) r0 * c.hc * n, d.pre + (size_t) r0 * 8, d.out_norm, n, c.hc, c.eps, d.x, nlog, s);
+        head_mm(d, d.x, nlog, s);
+        argmax_pairs(d.logits, c.n_vocab, c.n_vocab, 0, d.outp, nlog, s);
+        CUDA_CHECK(cudaMemcpyAsync(h_out_, d.outp, (size_t) nlog * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
+        if (prof && !bulk) CUDA_CHECK(cudaEventRecord(d.ev_t[1], s));
+    }
+    if (prof && !bulk) CUDA_CHECK(cudaEventRecord(d.ev_t[2], d.stream));
+    if (!dblk_.empty()) dspark_seed(nt, j.pos);
+    if (prof && !bulk) CUDA_CHECK(cudaEventRecord(d.ev_t[3], d.stream));
+    CUDA_CHECK(cudaEventRecord(ev_chunk_[set], d.stream));
+    mark(ev_chunk_seq_);
+}
+
+// expert host, one decode layer: the owner's record (published for the CPU) -> the pooled experts -> the partial sum into
+// host_out_[il] with the step's tag, which the owner's reduce waits for (on this device's stream: in order, after its own
+// layers of the step; the kernels spin on the record like the owner's reduce spins on the CPU's output)
+void Engine7::host_chain(Layer & L, int nt) {
+    const Ds4Config & c = cfg_;
+    const int n = c.n_embd, K = c.n_used, il = L.il;
+    Device & h = *devs_[L.host_dev];
+    const MoeLayerDev & HX = place_->dev(L.host_dev, il);   // the pooled experts on the host device
+    CUDA_CHECK(cudaSetDevice(h.id));
+    cudaStream_t s = h.stream;
+    host_take(&cpu_rec_[il].seq, h.counter, (unsigned) il, &cpu_rec_[il].ids[0][0], &cpu_rec_[il].wts[0][0], &cpu_rec_[il].x[0][0],
+              h.qids, h.qwts, h.qx, n, K, nt, s);
+    moe_gate_up(HX.moe, h.qx, n, h.qids, K, h.qhexp, nt, s);
+    moe_down(HX.moe, h.qhexp, h.qids, h.qwts, K, h.qyexp, nt, s);
+    moe_reduce(h.qzx, h.qzs, h.qyexp, K, h.qout, n, nt, h.qids, HX.owner, L.host_dev, CPU_OWNER, nullptr, nullptr, h.counter, (unsigned) il, s);
+    host_put(&host_out_[il].seq, &host_out_[il].y[0][0], h.qout, n, nt, h.counter, (unsigned) il, s);
+}
+
+void Engine7::issue_thread(int g) {
+    Issuer & I = *issuers_[g];
+    for (;;) {
+        IssueJob j;
+        {
+            std::unique_lock<std::mutex> lk(imx_);
+            icv_.wait(lk, [&] { return stop_issuers_ || !I.q.empty(); });
+            if (stop_issuers_ && I.q.empty()) return;
+            j = I.q.front();
+            I.q.pop_front();
+            I.busy = true;
+        }
+        try { issue_device(g, j); }
+        catch (const std::exception & e) { std::lock_guard<std::mutex> lk(imx_); if (issue_error_.empty()) issue_error_ = e.what(); }
+        { std::lock_guard<std::mutex> lk(imx_); I.busy = false; issued_seq_[g] = j.seq; }
+        icv_.notify_all();
+    }
+}
+
+void Engine7::start_issuers() {
+    for (size_t g = 0; g < devs_.size(); ++g) {
+        issuers_.emplace_back(new Issuer);
+        issuers_.back()->th = std::thread(&Engine7::issue_thread, this, (int) g);
+    }
+    fprintf(stderr, "hyper7: streamed prefill issued by %zu device threads\n", devs_.size());
+}
+
+// every queued chunk issued (not necessarily executed): before anything else touches the streams from this thread
+void Engine7::issue_drain() {
+    if (issuers_.empty()) return;
+    for (;;) {
+        std::unique_lock<std::mutex> lk(imx_);
+        if (!issue_error_.empty()) throw std::runtime_error("hyper7: issuing failed: " + issue_error_);
+        bool idle = true;
+        for (auto & I : issuers_) if (I->busy || !I->q.empty()) idle = false;
+        if (idle) break;
+        icv_.wait_for(lk, std::chrono::milliseconds(50));
+        lk.unlock();
+        prefill_tick(false);
     }
 }
 
@@ -1205,9 +1662,9 @@ int Engine7::enqueue(const int * tokens, int nt, int pos, int nlog) {
     next_set_ = (next_set_ + 1) % NSET;
     static const bool prof = getenv("HYPER7_PROF") != nullptr;
     const auto tq0 = std::chrono::steady_clock::now();
+    if (taken_seq_.empty()) { taken_seq_.assign(devs_.size(), -1); done_seq_ = taken_seq_; issued_seq_ = taken_seq_; }
     wait_set(set);   // (its previous chunk has read the host rows)
     const auto tq1 = std::chrono::steady_clock::now();
-    cur_set_ = set;
     // token rows (Q8_0 dequantized, as BF16 like the reference) and the Engram rows (the n-grams need the tokens before pos)
     const GTensor & te = gguf_->need("token_embd.weight");
     const auto * te_tr = ggml_get_type_traits((ggml_type) te.type);
@@ -1259,54 +1716,32 @@ int Engine7::enqueue(const int * tokens, int nt, int pos, int nlog) {
     ++fwd_counter_;
     {
         std::vector<int> slots;
-        for (auto & dp : devs_) for (Layer & L : dp->layers) if (!(streamed && L.np() > 0) && L.n_gpu < c.n_expert) slots.push_back(L.il);
+        // (a layer whose CPU experts all went to EP helpers has no parts of its own but is streamed all the same)
+        for (auto & dp : devs_) for (Layer & L : dp->layers) if (!(streamed && (L.np() > 0 || !L.shares.empty())) && L.n_gpu < c.n_expert) slots.push_back(L.il);
         if (!slots.empty()) cpu_->expect(fwd_counter_, slots, bulk);
     }
-    for (size_t gi = 0; gi < devs_.size(); ++gi) {
-        Device & d = *devs_[gi];
-        CUDA_CHECK(cudaSetDevice(d.id));
-        cudaStream_t s = d.stream;
-        // the next device has taken this device's rows of the previous chunk (they are about to be overwritten)
-        if (gi + 1 < devs_.size()) CUDA_CHECK(cudaStreamWaitEvent(s, devs_[gi + 1]->ev_taken, 0));
-        incr_counter(d.counter, s);
-        if (gi == 0) {
-            CUDA_CHECK(cudaMemcpyAsync(d.x, he, (size_t) nt * n * sizeof(float), cudaMemcpyHostToDevice, s));
-            embed7(d.x, d.h, n, c.hc, nt, s);
-            init_pre7(d.pre, nt, s);
-        } else {
-            // the previous device's rows through pinned host memory (cudaMemcpyPeerAsync without P2P blocks the host thread
-            // until the source is done: no pipeline)
-            CUDA_CHECK(cudaStreamWaitEvent(s, devs_[gi - 1]->ev_done, 0));   // (recorded after its copies into h_in)
-            CUDA_CHECK(cudaMemcpyAsync(d.h, d.h_in, (size_t) nt * c.hc * n * sizeof(float), cudaMemcpyHostToDevice, s));
-            CUDA_CHECK(cudaMemcpyAsync(d.pre, d.h_in + (size_t) R_ * c.hc * n, (size_t) nt * 8 * sizeof(float), cudaMemcpyHostToDevice, s));
-        }
-        CUDA_CHECK(cudaEventRecord(d.ev_taken, s));
-        for (Layer & L : d.layers) run_layer(d, L, nt, pos);
-        if (gi + 1 < devs_.size()) {
-            Device & nd = *devs_[gi + 1];
-            CUDA_CHECK(cudaMemcpyAsync(nd.h_in, d.h, (size_t) nt * c.hc * n * sizeof(float), cudaMemcpyDeviceToHost, s));
-            CUDA_CHECK(cudaMemcpyAsync(nd.h_in + (size_t) R_ * c.hc * n, d.pre, (size_t) nt * 8 * sizeof(float), cudaMemcpyDeviceToHost, s));
-        }
-        CUDA_CHECK(cudaEventRecord(d.ev_done, s));
+    const long seq = ++chunk_seq_;
+    set_seq_[set] = seq;
+    set_tokens_[set] = nt;
+    set_pending_[set] = true;
+    const IssueJob job{set, nt, nlog, (int64_t) pos, seq, he};
+    if (streamed && issue_threads_) {
+        if (issuers_.empty()) start_issuers();
+        { std::lock_guard<std::mutex> lk(imx_); for (auto & I : issuers_) I->q.push_back(job); }
+        icv_.notify_all();
+    } else {
+        issue_drain();
+        for (size_t gi = 0; gi < devs_.size(); ++gi) issue_device((int) gi, job);
     }
     if (streamed) ids_nt_[set] = nt;
-    Device & d = *devs_.back();
-    CUDA_CHECK(cudaSetDevice(d.id));
-    if (nlog > 0) {   // the head: the last nlog rows
-        cudaStream_t s = d.stream;
-        const int r0 = nt - nlog;
-        hc7_pre_norm(d.h + (size_t) r0 * c.hc * n, d.pre + (size_t) r0 * 8, d.out_norm, n, c.hc, c.eps, d.x, nlog, s);
-        gemv_q8(d.output.q8, d.x, n, d.logits, c.n_vocab, nullptr, nlog, s);
-        argmax_pairs(d.logits, c.n_vocab, c.n_vocab, 0, d.outp, nlog, s);
-        CUDA_CHECK(cudaMemcpyAsync(h_out_, d.outp, (size_t) nlog * 2 * sizeof(float), cudaMemcpyDeviceToHost, s));
-        last_nlog_ = nlog;
-    }
-    if (!dblk_.empty()) dspark_seed(nt, pos);
-    CUDA_CHECK(cudaEventRecord(ev_chunk_[set], d.stream));
-    if (prof && bulk) {
+    if (nlog > 0) last_nlog_ = nlog;
+    if (prof) {
         auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-        fprintf(stderr, "hyper7: chunk %d at %d: wait %.1f ms, host rows %.1f ms, enqueue %.1f ms\n", nt, pos, ms(tq0, tq1), ms(tq1, tq2),
-                ms(tq2, std::chrono::steady_clock::now()));
+        Device & d = *devs_.back();
+        if (bulk)
+            fprintf(stderr, "hyper7: chunk %d at %d: wait %.1f ms, host rows %.1f ms, enqueue %.1f ms\n", nt, pos, ms(tq0, tq1), ms(tq1, tq2),
+                    ms(tq2, std::chrono::steady_clock::now()));
+        else { const double h = ms(tq1, tq2); t_hostrows_ += h; t_hostrows_max_ = std::max(t_hostrows_max_, h); ++n_hostrows_; }
     }
     // the state now holds these tokens
     hist_.resize(pos);
@@ -1316,7 +1751,10 @@ int Engine7::enqueue(const int * tokens, int nt, int pos, int nlog) {
 
 std::vector<int> Engine7::forward(const int * tokens, int nt, int pos, int nlog) {
     nlog = std::max(1, std::min({nlog, nt, MAX_NT}));
+    static const bool prof = getenv("HYPER7_PROF") != nullptr;
+    const auto tf0 = std::chrono::steady_clock::now();
     enqueue(tokens, nt, pos, nlog);
+    issue_drain();
     Device & d = *devs_.back();
     CUDA_CHECK(cudaSetDevice(d.id));
     auto t_wait = std::chrono::steady_clock::now();
@@ -1329,17 +1767,38 @@ std::vector<int> Engine7::forward(const int * tokens, int nt, int pos, int nlog)
             reported = true;
             fprintf(stderr, "hyper7: forward %u slow/stuck; cpu: %s\n", fwd_counter_, cpu_->state().c_str());
         }
-        std::this_thread::yield();
+        if (pf_active_) { prefill_tick(false); std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
+        else std::this_thread::yield();
     }
     for (int k = 0; k < NSET; ++k) wait_set(k);
     for (auto & dp : devs_) {
         CUDA_CHECK(cudaSetDevice(dp->id));
         CUDA_CHECK(cudaStreamSynchronize(dp->stream));
         CUDA_CHECK(cudaStreamSynchronize(dp->dstream));
+        for (auto & H : dp->hres) if (H.hstream) { CUDA_CHECK(cudaStreamSynchronize(H.hstream)); CUDA_CHECK(cudaStreamSynchronize(H.hcstream)); }
+    }
+    if (prof && nt <= MAX_NT && d.ev_t[0]) {
+        float ms = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, d.ev_t[0], d.ev_t[1])); t_head_ += ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, d.ev_t[2], d.ev_t[3])); t_seed_ += ms;
+        t_fwd_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf0).count();
+        ++n_fwd_;
     }
     std::vector<int> out(nlog);
     for (int t = 0; t < nlog; ++t) { int idx; memcpy(&idx, &h_out_[2 * t + 1], 4); out[t] = idx; }
     return out;
+}
+
+// the LM head: Q8_0 as one GEMV over every row (as before); KQ / segments (unsloth's Q6_K head) in GEMVs of MAX_NT rows
+void Engine7::head_mm(Device & d, const float * x, int rows, cudaStream_t s) {
+    const Ds4Config & c = cfg_;
+    if (d.output.seg.empty() && !d.output.kq && !d.output.f16) {
+        gemv_q8(d.output.q8, x, c.n_embd, d.logits, c.n_vocab, nullptr, rows, s);
+        return;
+    }
+    const DenseRun dr{s, d.blas, d.xh, d.ggs, d.ggs_elems};
+    for (int r0 = 0; r0 < rows; r0 += MAX_NT)
+        dense_mm(dr, d.output, x + (size_t) r0 * c.n_embd, c.n_embd, d.logits + (size_t) r0 * c.n_vocab, c.n_vocab, std::min(MAX_NT, rows - r0));
 }
 
 void Engine7::get_logits(int row, std::vector<float> & out) {
@@ -1538,35 +1997,35 @@ std::vector<int> Engine7::generate(const std::vector<int> & prompt, int n_gen, b
     GenStats st;
     auto tp = clk::now();
     int next = -1;
+    pf_active_ = true; pf_total_ = P; pf_reused_ = s; pf_done_ = s;
+    pf_tick_ = std::chrono::steady_clock::now();
     for (int c0 = s; c0 < P;) {
         // equal chunks of at most R_; all but the last enqueued without waiting (a pipeline over the GPUs) when streamed
         const int left = P - c0, nch = (left + R_ - 1) / R_, len = std::min(left, (left + nch - 1) / nch);
         if (c0 + len < P && len >= stream_min_ && stream_) enqueue(&prompt[c0], len, c0, 0);
         else next = forward(&prompt[c0], len, c0, 1)[0];
         c0 += len;
-        if (prefill_cb_) prefill_cb_(c0, P, s);
     }
+    pf_active_ = false;
+    if (prefill_cb_) prefill_cb_(P, P, s);
     if (sampling) next = sample_row(0, sp, P);
     if (getenv("HYPER7_DSPARK_DEBUG")) fprintf(stderr, "hyper7: prefill done (%d tokens), next %d\n", P, next);
     st.t_prefill = std::chrono::duration<double>(clk::now() - tp).count();
     st.prompt_reused = s;
-    std::vector<int> out;
+    Emitter em;
+    em.n_gen = n_gen; em.on_token = &on_token;
+    std::vector<int> & out = em.out;
+    bool & stop = em.stop;
+    auto emit = [&](int tok) { return em.emit(tok); };
     int p = P;
     auto t0 = clk::now();
-    bool stop = false;
-    auto emit = [&](int tok) {
-        if (stop) return false;
-        out.push_back(tok);
-        if (on_token && !on_token(tok)) stop = true;
-        if ((int) out.size() >= n_gen) stop = true;
-        return !stop;
-    };
     const int K = spec ? n_draft() : 0;
     if (K <= 0) {
         while (emit(next) && p + 1 < opt_.max_pos) {
             next = forward(&next, 1, p++, 1)[0];
             if (sampling) next = sample_row(0, sp, p);
             st.steps++;
+            place_->before_forward(false);   // (the placement follows the routing every few steps)
         }
     } else {
         // prompt-lookup speculation: drafts = the tokens that followed the latest earlier occurrence of the last NG tokens
@@ -1574,41 +2033,33 @@ std::vector<int> Engine7::generate(const std::vector<int> & prompt, int n_gen, b
         // Rejected rows leave nothing behind (their window-ring rows, compressed rows and selections are rewritten when the
         // positions come again) except a ratio-2 compressor's open group: when the next position is its second slot and a
         // rejected row overwrote the first, the step re-feeds the group's first token
-        constexpr int NG = 3;
-        std::vector<int> hist(prompt.begin(), prompt.end());
-        std::unordered_map<uint64_t, int> last;   // n-gram -> position after its latest occurrence
-        auto key = [&](size_t end) { uint64_t h = 1469598103934665603ull; for (size_t i = end - NG; i < end; ++i) h = (h ^ (uint32_t) hist[i]) * 1099511628211ull; return h; };
-        size_t indexed = NG;
-        auto index_upto = [&](size_t n) { for (; indexed <= n; ++indexed) last[key(indexed)] = (int) indexed; };
+        LookupDrafter lk(prompt);
+        const std::vector<int> & hist = lk.hist();
         int cur = next;
         bool refeed = false;
         std::vector<int> in(MAX_NT);
         while (!stop && p + K + 1 < opt_.max_pos) {
             if (!emit(cur)) break;
-            hist.push_back(cur);
+            lk.push(cur);
             const int kmax = K - (refeed ? 1 : 0);
             std::vector<int> dr;
+            std::vector<float> lq;
+            // speculative sampling: sampled drafts verified by min(1, p/q) (HYPER7_DSPARK_COUPLED=1: the old exact match)
+            const bool spec_samp = !dblk_.empty() && sampling && sp.top_k <= 0 && sp.top_p >= 1.0f && sp.min_p <= 0.0f && !dsp_coupled_;
             if (!dblk_.empty() && kmax > 0) {   // DSpark: the drafts while their confidence holds
                 std::vector<int> dd;
                 std::vector<float> cf;
                 auto ta = clk::now();
                 static const bool dbg = getenv("HYPER7_DSPARK_DEBUG") != nullptr;
                 if (dbg) fprintf(stderr, "hyper7: draft at %d (y %d)\n", p, cur);
-                dspark_draft(cur, p, dd, cf);
+                dspark_draft(cur, p, dd, cf, spec_samp ? sp.temp : 0.0f, samp_seed_ ^ 0x5d5d5d5dd5d5d5d5ull, &lq);
                 if (dbg) { fprintf(stderr, "hyper7: drafts"); for (size_t j = 0; j < dd.size(); ++j) fprintf(stderr, " %d (%.2f)", dd[j], cf[j]); fprintf(stderr, "\n"); }
                 st.t_mtp += std::chrono::duration<double>(clk::now() - ta).count();
                 for (int j = 0; j < (int) dd.size() && (int) dr.size() < kmax && cf[j] >= dsp_conf_; ++j) dr.push_back(dd[j]);
-            } else if (hist.size() > NG && kmax > 0) {
-                auto it = last.find(key(hist.size()));
-                index_upto(hist.size() - 1);
-                if (it != last.end()) {
-                    const int e0 = it->second, e1 = (int) hist.size();
-                    int ml = 0;
-                    while (ml < 32 && e0 - 1 - ml >= 0 && hist[e0 - 1 - ml] == hist[e1 - 1 - ml]) ++ml;
-                    const int need = acc_rate_ < 0.35 ? 8 : 5;
-                    const int kk = ml >= need + 6 ? kmax : ml >= need + 2 ? std::min(kmax, 2) : ml >= need ? 1 : 0;
-                    for (int j = e0; j < e1 && (int) dr.size() < kk; ++j) dr.push_back(hist[j]);
-                }
+                lq.resize(dr.size());
+            } else if (kmax > 0) {
+                dr.resize(kmax);
+                dr.resize(lk.draft(kmax, acc_rate_, dr.data()));
             }
             const int nd = (int) dr.size(), off = refeed ? 1 : 0, start = p - off;
             int n_in = 0;
@@ -1618,41 +2069,37 @@ std::vector<int> Engine7::generate(const std::vector<int> & prompt, int n_gen, b
             std::vector<int> a = forward(in.data(), n_in, start, n_in);
             st.steps++;
             st.drafted += nd;
-            int m = 0;
-            auto pick = [&](int j) { return sampling ? sample_row(off + j, sp, p + j + 1) : a[off + j]; };
-            int nxt = pick(0);
-            while (m < nd && nxt == dr[m]) { ++m; nxt = pick(m); }
+            int m = 0, nxt;
+            const auto ts0 = clk::now();
+            if (spec_samp && nd > 0) nxt = dspark_verify(off, dr, lq, sp, p, m);
+            else {
+                auto pick = [&](int j) { return sampling ? sample_row(off + j, sp, p + j + 1) : a[off + j]; };
+                nxt = pick(0);
+                while (m < nd && nxt == dr[m]) { ++m; nxt = pick(m); }
+            }
+            t_samp_ += std::chrono::duration<double, std::milli>(clk::now() - ts0).count();
             st.accepted += m;
             if (nd > 0) acc_rate_ = 0.9 * acc_rate_ + 0.1 * ((double) m / nd);
             int r = 0;
-            while (r < m) { hist.push_back(dr[r]); if (!emit(dr[r++])) break; }
+            while (r < m) { lk.push(dr[r]); if (!emit(dr[r++])) break; }
             if (stop) { p += r + 1; break; }
             p += m + 1;
             refeed = has_r2_ && (p & 1) && m + 2 <= nd;
             cur = nxt;
+            place_->before_forward(false);   // (the placement follows the routing every few steps)
         }
     }
     st.tokens = (int) out.size();
     st.seconds = std::chrono::duration<double>(clk::now() - t0).count();
+    if (n_hostrows_)
+        fprintf(stderr, "hyper7: decode host rows (embedding + Engram): %.2f ms/step mean, %.1f max over %d steps; rebalance %.1f ms (%d exchanges)\n",
+                t_hostrows_ / n_hostrows_, t_hostrows_max_, n_hostrows_, place_->t_rebalance(), place_->n_swaps());
+    if (n_fwd_)
+        fprintf(stderr, "hyper7: decode per step (%d): forward %.2f ms wall (head %.2f, DSpark seed %.2f GPU ms), draft %.2f ms, sampling %.2f ms, step %.2f ms\n",
+                n_fwd_, t_fwd_ / n_fwd_, t_head_ / n_fwd_, t_seed_ / n_fwd_, st.t_mtp * 1e3 / std::max(1, st.steps), t_samp_ / std::max(1, st.steps),
+                st.seconds * 1e3 / std::max(1, st.steps));
     if (stats) *stats = st;
     return out;
-}
-
-void Engine7::save_expert_stats(const std::string & path) {
-    const int nl = cfg_.n_layer, w = 1024;
-    std::vector<std::vector<uint64_t>> tot(nl, std::vector<uint64_t>(w, 0));
-    for (int l = 0; l < nl; ++l)
-        for (int e = 0; e < w; ++e) {
-            if (l < (int) stats_.size() && e < (int) stats_[l].size()) tot[l][e] += stats_[l][e];
-            if (l < (int) cpu_->counts.size() && e < (int) cpu_->counts[l].size()) tot[l][e] += cpu_->counts[l][e];
-        }
-    const std::string tmp = path + ".tmp";
-    FILE * f = fopen(tmp.c_str(), "wb");
-    if (!f) return;
-    fwrite(&nl, 4, 1, f); fwrite(&w, 4, 1, f);
-    for (auto & cc : tot) fwrite(cc.data(), 8, w, f);
-    fclose(f);
-    rename(tmp.c_str(), path.c_str());
 }
 
 } // namespace hyper

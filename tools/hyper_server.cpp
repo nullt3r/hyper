@@ -11,10 +11,8 @@
 //                     [--reasoning-effort low|high|max|none]   (template default when absent; requests may override)
 //                     [--chat-template-file t.jinja]   (instead of the GGUF's template)
 //                     [--chat-template-kwargs '{"reasoning_effort":75}']   (defaults; a request's chat_template_kwargs override)
-#include "engine.h"
 #include "engine4.h"
 #include "engine5.h"
-#include "engine6.h"
 #include "engine7.h"
 #include "chat_page.h"
 
@@ -252,6 +250,9 @@ std::string random_id(const char * prefix, long n) {
 
 struct Request {
     std::vector<int> prompt;
+    // streaming: an empty event every ~10 s of prefill (a long prompt sends nothing for minutes: Codex drops the stream
+    // after its 300 s idle timeout and re-sends the request); false when the client is gone
+    mutable std::function<bool()> keepalive;
     std::shared_ptr<PromptMedia> media;                        // images (vision): rows, positions, cache keys
     std::vector<std::shared_ptr<std::vector<float>>> media_keep;   // (their rows)
     common_chat_parser_params pp;
@@ -731,6 +732,24 @@ struct Streamer {
     ~Streamer() { finish(); }   // (an engine exception unwinds through run(): a joinable thread here would std::terminate)
 };
 
+// a streaming request's turn at the engine (requests run one at a time): an empty event every 10 s while it is queued, so
+// the client's read timeout does not drop it (parallel agents queue behind a long turn); false when the client is gone
+static bool queue_lock(Ctx & c, std::unique_lock<std::mutex> & lk, const std::string & id, const std::function<bool()> & keepalive) {
+    const auto t0 = clk::now();
+    auto t_ka = t0;
+    while (!lk.try_lock()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const auto now = clk::now();
+        if (secs(t_ka, now) >= 10.0) {
+            t_ka = now;
+            if (!keepalive()) { fprintf(stderr, "[%s] queued: client gone after %.0f s\n", id.c_str(), secs(t0, now)); return false; }
+        }
+    }
+    const double w = secs(t0, clk::now());
+    if (w >= 2.0) fprintf(stderr, "[%s] queued %.0f s behind other requests\n", id.c_str(), w);
+    return true;
+}
+
 GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::string &)> & on_text) {
     GenOut o;
     o.finish = "length";
@@ -756,9 +775,13 @@ GenOut run(Ctx & c, const Request & r, const std::function<bool(const std::strin
             fclose(f);
         }
     }
-    auto t_log = t0;
+    auto t_log = t0, t_ka = t0;
     c.eng->set_prefill_progress([&](int done, int total, int reused) {
         const auto now = clk::now();
+        if (r.keepalive && secs(t_ka, now) >= 10.0) {
+            t_ka = now;
+            if (!r.keepalive()) { fprintf(stderr, "[%s] prompt eval: client gone (keepalive write failed)\n", r.id.c_str()); r.keepalive = {}; }
+        }
         const double tps = (done - reused) / std::max(1e-9, secs(t0, now));
         {
             std::lock_guard<std::mutex> lk(lv.mu);
@@ -1212,7 +1235,7 @@ int main(int argc, char ** argv) {
     std::string arch;
     { GGUF g(path); arch = g.arch(); }
     // HYPER_ANSWER_REUSE=0/1: a request that repeats the previous answer resumes after it (its K/V and state as decoding computed
-    // them) instead of re-prefilling it from the message start. Default on for the 27B; off for the MoE models, whose decode
+    // them) instead of re-prefilling it from the message start. Default off: the MoE models' decode
     // runs the CPU-held experts on 8-bit activations (prefill streams them to the GPUs: the more precise K/V)
     auto answer_reuse = [](bool def) { return getenv("HYPER_ANSWER_REUSE") ? atoi(getenv("HYPER_ANSWER_REUSE")) != 0 : def; };
     c.glm = arch == "glm5-next";
@@ -1277,36 +1300,9 @@ int main(int argc, char ** argv) {
         }
         draft = e7->n_draft();
         engine = std::move(e7);
-    } else if (arch == "mimo2") {
-        if (!ctx_given) ctx = 65536;
-        // MiMo's recommended sampling: temperature 1.0, top_p 0.95
-        if (!temp_given) c.defaults.temp = 1.0f;
-        if (!top_p_given) c.defaults.top_p = 0.95f;
-        if (!top_k_given) c.defaults.top_k = 0;
-        Engine6Options o6;
-        o6.max_pos = ctx;
-        o6.gpu_expert_frac = gpu_frac;
-        o6.cpu_threads = cpu_threads;
-        o6.prompt_cache = true;
-        o6.max_snapshots = snaps;
-        o6.answer_reuse = answer_reuse(false);
-        o6.n_draft = draft;   // MTP drafts with --mtp (the mtp-*.gguf sidecar), else prompt-lookup speculation
-        o6.mtp_path = mtp_path;
-        auto e6 = std::make_unique<Engine6>(path, o6);
-        if (!stats_path.empty()) {
-            Engine6 * pe = e6.get();
-            c.after_request = [pe, stats_path] { pe->save_expert_stats(stats_path); };
-        }
-        draft = e6->n_draft();
-        engine = std::move(e6);
     } else {
-        EngineOptions opt;
-        opt.max_pos = ctx;
-        opt.n_draft = draft;
-        opt.prompt_cache = true;
-        opt.max_snapshots = snaps;
-        opt.answer_reuse = answer_reuse(true);
-        engine = std::make_unique<Engine>(path, opt);
+        fprintf(stderr, "hyper-server: unsupported architecture %s\n", arch.c_str());
+        return 1;
     }
     c.live.ctx_max = ctx;
     LLM & eng = *engine;
@@ -1456,8 +1452,9 @@ int main(int argc, char ** argv) {
                 return ojson({{"id", id}, {"object", "chat.completion.chunk"}, {"created", created}, {"model", c.alias},
                               {"choices", ojson::array({ojson({{"index", 0}, {"delta", delta}, {"finish_reason", finish}})})}});
             };
-            std::lock_guard<std::mutex> lk(c.mu);
             bool ok = send(chunk({{"role", "assistant"}, {"content", nullptr}}, nullptr));
+            std::unique_lock<std::mutex> lk(c.mu, std::defer_lock);
+            if (!ok || !queue_lock(c, lk, r->id, [&] { return send(chunk(ojson::object(), nullptr)); })) { sink.done(); return false; }
             common_chat_msg prev = common_chat_parse("", true, r->pp);
             std::vector<std::string> ids;
             long tc = 0;
@@ -1493,6 +1490,7 @@ int main(int argc, char ** argv) {
                 prev = msg;
                 return true;
             };
+            r->keepalive = [&] { return send(chunk(ojson::object(), nullptr)); };
             GenOut o;
             try {
                 o = run(c, *r, [&](const std::string & text) {
@@ -1591,13 +1589,17 @@ int main(int argc, char ** argv) {
                 const std::string s = std::string("event: ") + type + "\ndata: " + j.dump(-1, ' ', false, ojson::error_handler_t::replace) + "\n\n";
                 return sink.write(s.data(), s.size());
             };
-            std::lock_guard<std::mutex> lk(c.mu);
             {
                 ojson resp = *base;
                 resp["status"] = "in_progress";
                 resp["output"] = ojson::array();
                 send("response.created", {{"response", resp}});
                 send("response.in_progress", {{"response", resp}});
+            }
+            std::unique_lock<std::mutex> lk(c.mu, std::defer_lock);
+            if (!queue_lock(c, lk, r->id, [&] { ojson resp = *base; resp["status"] = "in_progress"; return send("response.in_progress", {{"response", resp}}); })) {
+                sink.done();
+                return false;
             }
             // open item state: 0 none, 1 reasoning, 2 message, 3 tool call
             int open = 0, out_index = -1;
@@ -1699,6 +1701,7 @@ int main(int argc, char ** argv) {
                 prev = msg;
                 return true;
             };
+            r->keepalive = [&] { ojson resp = *base; resp["status"] = "in_progress"; return send("response.in_progress", {{"response", resp}}); };
             GenOut o;
             try {
                 o = run(c, *r, [&](const std::string & text) {

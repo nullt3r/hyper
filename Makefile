@@ -2,20 +2,19 @@
 NVCC     ?= /usr/local/cuda-12.9/bin/nvcc
 CXX      ?= g++
 LLAMA    ?= $(HOME)/llama.cpp-src
-ARCH     := -gencode arch=compute_86,code=sm_86
+ARCH     ?= -gencode arch=compute_86,code=sm_86   # 4th GPU (Blackwell): make ARCH="... -gencode arch=compute_120,code=sm_120"
 CXXFLAGS := -O3 -march=native -std=c++17 -Wall -Wno-unused-function -fopenmp
 NVFLAGS  := -O3 -std=c++17 $(ARCH) -lineinfo --use_fast_math -Xcompiler "-O3 -march=native -fopenmp" $(EXTRA)
 LIBS     := -L/usr/local/cuda-12.9/lib64 -lcudart -lcublas -lcuda -lgomp -lpthread -ldl
 
 BUILD := build
-# v1 (qwen35 dense) objects; qwen4exp objects additionally need ggml (CPU experts)
-OBJ   := $(BUILD)/gguf.o $(BUILD)/model.o $(BUILD)/kernels.o $(BUILD)/engine.o
-OBJ4  := $(BUILD)/gguf.o $(BUILD)/model4.o $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/cpu_moe.o $(BUILD)/engine4.o \
-         $(BUILD)/model5.o $(BUILD)/kernels5.o $(BUILD)/engine5.o $(BUILD)/model6.o $(BUILD)/kernels6.o $(BUILD)/engine6.o \
+# engine objects (CPU experts through ggml)
+OBJ4  := $(BUILD)/gguf.o $(BUILD)/dense.o $(BUILD)/experts.o $(BUILD)/moe_place.o $(BUILD)/engine_base.o $(BUILD)/tp_engine.o $(BUILD)/model4.o $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/cpu_moe.o $(BUILD)/engine4.o \
+         $(BUILD)/model5.o $(BUILD)/kernels5.o $(BUILD)/engine5.o \
          $(BUILD)/model7.o $(BUILD)/kernels7.o $(BUILD)/engine7.o
 GGML_INC := -I$(LLAMA)/ggml/include -I$(LLAMA)/ggml/src
 
-all: $(BUILD)/hyper $(BUILD)/ref $(BUILD)/arbench
+all: $(BUILD)/hyper-server $(BUILD)/hyper4 $(BUILD)/hyper7 $(BUILD)/ref $(BUILD)/arbench
 
 $(BUILD)/%.o: src/%.cpp src/*.h
 	@mkdir -p $(BUILD)
@@ -29,9 +28,6 @@ $(BUILD)/%.o: src/%.cu src/*.h src/*.cuh
 $(BUILD)/kernels7.o: src/kernels7.cu src/kernels7.cuh
 	@mkdir -p $(BUILD)
 	$(NVCC) $(filter-out --use_fast_math,$(NVFLAGS)) $(GGML_INC) -c $< -o $@
-
-$(BUILD)/hyper: $(OBJ) tools/hyper_main.cpp
-	$(NVCC) $(NVFLAGS) -Isrc tools/hyper_main.cpp $(OBJ) -o $@ $(LIBS)
 
 # golden reference against mainline llama.cpp (static libs from $(LLAMA)/build)
 LLAMA_LIBS := $(LLAMA)/build/src/libllama.a $(LLAMA)/build/ggml/src/ggml-cuda/libggml-cuda.a \
@@ -103,6 +99,11 @@ $(BUILD)/iq2bench: tools/iq2bench.cpp src/iq2_dot.h src/gguf.cpp
 	$(CXX) $(CXXFLAGS) -Isrc $(GGML_INC) tools/iq2bench.cpp src/gguf.cpp -o $@ \
 	  -Wl,--start-group $(LLAMA)/build/ggml/src/libggml-cpu.a $(LLAMA)/build/ggml/src/libggml-base.a -Wl,--end-group -ldl -lpthread
 
+# CPU expert row dots per block type (ggml), real expert rows: compute cost and streaming bandwidth
+$(BUILD)/iqbench: tools/iqbench.cpp src/iq1s_dot.h src/gguf.cpp
+	$(CXX) $(CXXFLAGS) -Isrc $(GGML_INC) tools/iqbench.cpp src/gguf.cpp -o $@ \
+	  -Wl,--start-group $(LLAMA)/build/ggml/src/libggml-cpu.a $(LLAMA)/build/ggml/src/libggml-base.a -Wl,--end-group -ldl -lpthread
+
 $(BUILD)/cpumoebench: $(OBJ4) tools/cpumoebench.cu
 	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/cpumoebench.cu $(OBJ4) -o $@ \
 	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)
@@ -137,7 +138,7 @@ $(BUILD)/arbulk: tools/arbulk.cu $(BUILD)/kernels.o
 COMMON_LIBS := $(LLAMA)/build/common/libllama-common.a $(LLAMA)/build/common/libllama-common-base.a \
                $(LLAMA)/build/vendor/cpp-httplib/libcpp-httplib.a \
                $(LLAMA)/build/tools/mtmd/libmtmd.a $(LLAMA)/build/vendor/hash/libvendor-hash.a
-OBJ_ALL := $(sort $(OBJ) $(OBJ4))
+OBJ_ALL := $(OBJ4)
 $(BUILD)/hyper-server: $(OBJ_ALL) tools/hyper_server.cpp tools/chat_page.h
 	$(NVCC) $(NVFLAGS) -Isrc -I$(LLAMA)/include -I$(LLAMA)/ggml/include -I$(LLAMA)/common -I$(LLAMA)/vendor -I$(LLAMA)/tools/mtmd \
 	  tools/hyper_server.cpp $(OBJ_ALL) -o $@ \
@@ -153,3 +154,23 @@ $(BUILD)/hyper4: $(OBJ4) tools/hyper4_main.cpp
 
 $(BUILD)/g32bench: tools/g32bench.cu $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/gguf.o
 	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/g32bench.cu $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/gguf.o -o $@ $(LIBS)
+
+# grouped GEMV / row-tile views vs a CPU reference (DeepSeek attn_output_a)
+$(BUILD)/grouptest: tools/grouptest.cu $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/gguf.o $(BUILD)/dense.o
+	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) tools/grouptest.cu $(BUILD)/kernels.o $(BUILD)/kernels4.o $(BUILD)/gguf.o $(BUILD)/dense.o -o $@ \
+	  -Xlinker --start-group $(LLAMA_LIBS) -Xlinker --end-group $(LIBS)
+
+$(BUILD)/experts.o: src/experts.cu src/experts.h src/devices.h src/cuda_check.h src/cpu_moe.h src/gguf.h
+	$(NVCC) $(NVFLAGS) -Isrc $(GGML_INC) -c src/experts.cu -o $@
+
+$(BUILD)/moe_place.o: src/moe_place.cu src/moe_place.h src/experts.h src/devices.h src/cuda_check.h src/cpu_moe.h src/vmm.h src/kernels4.cuh
+	@mkdir -p $(BUILD)
+	$(NVCC) $(NVFLAGS) $(GGML_INC) -c $< -o $@
+
+$(BUILD)/tp_engine.o: src/tp_engine.cu src/tp_engine.h src/moe_place.h src/experts.h src/devices.h src/cuda_check.h src/cpu_moe.h src/vmm.h src/park.h src/kernels4.cuh src/llm.h src/sampling.h src/dense.h
+	@mkdir -p $(BUILD)
+	$(NVCC) $(NVFLAGS) $(GGML_INC) -c $< -o $@
+
+$(BUILD)/engine_base.o: src/engine_base.cu src/engine_base.h src/moe_place.h src/devices.h src/cuda_check.h src/cpu_moe.h src/llm.h
+	@mkdir -p $(BUILD)
+	$(NVCC) $(NVFLAGS) $(GGML_INC) -c $< -o $@

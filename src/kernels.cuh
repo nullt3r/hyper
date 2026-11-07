@@ -35,7 +35,10 @@ void repack_f32_frag(const float * w, int n, int k, size_t row_stride, uint8_t *
 // act (applied after the norm): 1 = silu(x * act_scale); 2 = silu(x[c]) * x[c + glu_off] (gated pair in one input row)
 //   3 = as 2 with the SwiGLU limit L = act_scale: silu(min(g, L)) * clamp(u, -L, L)
 struct NormIn { const float * w = nullptr; const float * ss = nullptr; int nss = 0; float eps = 1e-6f;
-                int act = 0; float act_scale = 1.0f; int glu_off = 0; };
+                int act = 0; float act_scale = 1.0f; int glu_off = 0;
+                // grouped GEMV (xg_tiles > 0): row tile t multiplies x + (t / xg_tiles) * xg_stride (a block-diagonal matrix
+                // stored as its blocks' rows stacked, e.g. DeepSeek's wo_a groups) -- decode GEMVs only
+                int xg_tiles = 0, xg_stride = 0; };
 
 // y[t][r] = (add ? add[t][r] : 0) + W x[t]   for t < nt; x rows have stride xs, y/add rows stride ys.
 // Q8: tensor cores (mma m16n8k16, fp16 activations, fp32 accumulation), split-K over 8 warps per row tile.

@@ -101,6 +101,7 @@ __global__ void k_mma_q8(const uint4 * __restrict__ wq, const half * __restrict_
     const bool tok_ok = gid < nt;
     const int tok = tok_ok ? gid : 0;
     const float * xr = x + (size_t) tok * xs;
+    if (nin.xg_tiles) xr += (size_t) (tile / nin.xg_tiles) * nin.xg_stride;   // (grouped GEMV)
     const float inv = input_inv_rms(nin.ss + tok * nin.nss, nin.nss, k, nin.w, nin.eps);
     float acc[4] = {0, 0, 0, 0};
     const int b_end = (int) ((int64_t) (part + 1) * kb / P);
@@ -195,6 +196,7 @@ __global__ void k_mma_kq(KQW W, const float * __restrict__ x, int xs, float * __
     const bool tok_ok = gid < nt;
     const int tok = tok_ok ? gid : 0;
     const float * xr = x + (size_t) tok * xs;
+    if (nin.xg_tiles) xr += (size_t) (tile / nin.xg_tiles) * nin.xg_stride;   // (grouped GEMV)
     float acc[4] = {0, 0, 0, 0};
     const unsigned ones[4] = {0x3C003C00u, 0x3C003C00u, 0x3C003C00u, 0x3C003C00u};
     const int b_end = (int) ((int64_t) (part + 1) * kb / P);
@@ -414,6 +416,7 @@ __global__ void k_mma_f16(const uint4 * __restrict__ wq, int n, int k,
     const bool tok_ok = gid < nt;
     const int tok = tok_ok ? gid : 0;
     const float * xr = x + (size_t) tok * xs;
+    if (nin.xg_tiles) xr += (size_t) (tile / nin.xg_tiles) * nin.xg_stride;   // (grouped GEMV)
     const float inv = input_inv_rms(nin.ss + tok * nin.nss, nin.nss, k, nin.w, nin.eps);
     float acc[4] = {0, 0, 0, 0};
     const int ks_end = (int) ((int64_t) (part + 1) * nks / P);
@@ -1975,7 +1978,7 @@ void gemv_q8(const Q8W & W, const float * x, int xs, float * y, int ys, const fl
     int dev = 0;
     cudaGetDevice(&dev);
     static const bool no_bal = getenv("HYPER_GEMV_NOBAL") != nullptr;
-    if (!no_bal && dev < 16 && g_ksplit_dev(dev).part && g_ksplit_dev(dev).gw > 0) {
+    if (!no_bal && !nin.xg_tiles && dev < 16 && g_ksplit_dev(dev).part && g_ksplit_dev(dev).gw > 0) {   // (no grouping in the balanced kernel)
         // balanced units when a block per tile would leave a large partial wave (resident blocks: g_ksplit_dev(dev).gw / 8)
         const int resident = g_ksplit_dev(dev).gw / 8;
         const double waves = (double) tiles / resident;

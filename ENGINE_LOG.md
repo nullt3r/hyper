@@ -832,3 +832,25 @@ vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), 
   llama.cpp (15 vrstev expertů na GPU): pp2048 120 t/s, tg 16,5 t/s.
 - Chybí: MTP (3 NextN vrstvy v sidecaru), vision, TC prefill attention, snapshoty / parkování (prompt cache jen navazuje
   na poslední konverzaci, dokud SWA kruh drží okno).
+
+## 2026-11-01 – 2026-11-07 – čtvrtá GPU, EP prefill, sjednocení enginů
+
+- RTX PRO 4500 Blackwell (32 GB, sm_120) jako čtvrtá karta: build `build-4g` (sm_86 + sm_120, chunk 4096). DeepSeek V4.1
+  UD-IQ2_XXS split 8/14/20 na 4 GPU: prefill ~1000 t/s (EP prefill: každá GPU vydává své chunky vlastním vláknem, CPU
+  experti streamují přes všechny linky, pomocné GPU počítají podíly přes pinned ringy), decode 32–40 t/s při T=1 (RAM-bound:
+  zbývá 74 GB expertů na CPU). Flash-Next 4 GPU: 87 % expertů ve VRAM, decode ~136–145 t/s, prefill ~2300 t/s. GLM-5.3-Flash
+  unsloth UD-Q4_K_XL (Maya-L opuštěna): 34 % ve VRAM, 22–26 t/s (T=1, MTP), s plnou kopií expertů na hostu (175 GB) se server
+  jednou zasekl v driveru (pinování pod tlakem RAM) → kompaktní kopie níže.
+- Server: keepalive při dlouhém prefillu a ve frontě (Codex `stream_idle_timeout_ms`, opencode SSE timeout), průběh prefillu
+  z dokončených chunků.
+- Sjednocení enginů (bitově ověřeno A/B proti checkpointu 345fed7 na pevných vstupech a statistikách, `~/unify/ab_*.sh`):
+  `devices.h` (DevBase, počet zařízení, váhy linek), `experts.{h,cu}` (tenzory expertů, pořadí, kopie, kvóty, přidělení),
+  `moe_place.{h,cu}` (rozmístění expertů pro všechny enginy: kompaktní pinned kopie jen CPU expertů, výměny podle skóre
+  jako výměna řádků, elastické sloty, streamovací seznamy, statistiky), `tp_engine.{h,cu}` (tensor-paralelní engine:
+  zařízení a společné buffery, grafy, forward / prefill po chunkách, generate s MTP drafty v pozicích tokenů a prompt-lookup,
+  snapshoty / parkování, elastická KV), `engine_base.{h,cu}` (CPU strana, rozmístění, historie, LookupDrafter, Emitter).
+  engine4.cu a engine5.cu jsou jen modelové vrstvy (1074 / 836 řádků místo 2310 / 2306), engine7 (DeepSeek pipeline) sdílí
+  základnu a rozmístění. Zero-copy varianta GLM (`HYPER5_ZC`) odstraněna.
+- Poučení: hashe ze serveru nejsou referencí – server přepisuje soubor statistik po každém požadavku a 74 produkčních
+  požadavků změnilo rozmístění Flash-Next (hash 935886e5 → 83c521dc beze změny kódu). Ověřovat A/B dvou buildů na pevných
+  statistikách, oba čerstvě.

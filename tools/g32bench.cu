@@ -108,13 +108,27 @@ __global__ void __launch_bounds__(256) k_gu_a(MoeDev m, const float * __restrict
     if (lane == 0) { const float g = fminf(acc[0], 10.0f), u = fminf(fmaxf(acc[1], -10.0f), 10.0f); h[(size_t) p * m.ff + r] = g / (1.0f + expf(-g)) * u; }
 }
 int main(int argc, char ** argv) {
+    // G32_SYN=mxfp4: synthetic MXFP4 experts (DeepSeek's DSpark drafter: 128 x [5120 -> 2304]) instead of a GGUF layer
+    const bool syn = getenv("G32_SYN") && std::string(getenv("G32_SYN")) == "mxfp4";
     GGUF g(argv[1]);
     const int layer = argc > 2 ? atoi(argv[2]) : 10, iters = 200, K = 6;
-    const std::string p = "blk." + std::to_string(layer) + ".";
-    const GTensor & tg = g.need(p + "ffn_gate_exps.weight"), & tu = g.need(p + "ffn_up_exps.weight");
+    const std::string p = syn ? "syn." : "blk." + std::to_string(layer) + ".";
+    GTensor tsyn_g, tsyn_u, tsyn_d;
+    std::vector<uint8_t> syn_g, syn_u, syn_d;
+    if (syn) {
+        std::mt19937 r0(7);
+        auto fill = [&](std::vector<uint8_t> & v, GTensor & t, int64_t k, int64_t rows, int64_t e) {
+            v.resize((size_t) k / 32 * 17 * rows * e);
+            const int e0 = getenv("G32_SYN_E0") ? atoi(getenv("G32_SYN_E0")) : 118, er = getenv("G32_SYN_ER") ? atoi(getenv("G32_SYN_ER")) : 20;   // E8M0 scale range
+            for (size_t i = 0; i < v.size(); ++i) v[i] = i % 17 == 0 ? (uint8_t) (e0 + r0() % er) : (uint8_t) r0();
+            t.type = GType::MXFP4; t.ne = {k, rows, e}; t.nbytes = v.size(); t.data = v.data(); t.name = "syn";
+        };
+        fill(syn_g, tsyn_g, 5120, 2304, 64); fill(syn_u, tsyn_u, 5120, 2304, 64); fill(syn_d, tsyn_d, 2304, 5120, 64);
+    }
+    const GTensor & tg = syn ? tsyn_g : g.need(p + "ffn_gate_exps.weight"), & tu = syn ? tsyn_u : g.need(p + "ffn_up_exps.weight");
     const int n = (int) tg.ne[0], ff = (int) tg.ne[1], E = (int) tg.ne[2];
     const size_t gb = tg.nbytes / E;
-    const int NE = 64;
+    const int NE = getenv("G32_NE") ? atoi(getenv("G32_NE")) : 64;   // (resident experts; small next to a running server)
     uint8_t * dg, * du; cudaMalloc(&dg, NE * gb); cudaMalloc(&du, NE * gb);
     cudaMemcpy(dg, tg.data, NE * gb, cudaMemcpyHostToDevice); cudaMemcpy(du, tu.data, NE * gb, cudaMemcpyHostToDevice);
     std::vector<int> slot(E, -1); for (int e = 0; e < NE; ++e) slot[e] = e;
@@ -134,6 +148,12 @@ int main(int argc, char ** argv) {
     const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / iters;
     std::vector<float> h(K * ff); cudaMemcpy(h.data(), dh, h.size() * 4, cudaMemcpyDeviceToHost);
     double cs = 0; for (float v : h) cs += v;
+    if (const char * dp = getenv("G32_DUMP")) {   // the production dispatch's outputs of the last id set (kernel A/B across processes)
+        moe_gate_up(m, dx, n, dids, K, dh, 1, s);
+        cudaStreamSynchronize(s);
+        cudaMemcpy(h.data(), dh, h.size() * 4, cudaMemcpyDeviceToHost);
+        FILE * f = fopen(dp, "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f);
+    }
     for (int var = 0; var < 6; ++var) {
         auto run = [&](int it) {
             if (var == 0) k_gu_a<0><<<dim3(K, ff / 8), 256, 0, s>>>(m, dx, dids + K * it, K, dh, n);
@@ -157,7 +177,7 @@ int main(int argc, char ** argv) {
     printf("G32BENCH %s %s: %.1f us/call, %.1f GB/s (6 experts gate+up %.1f MB), checksum %.9g\n", p.c_str(), gtype_name(tg.type), dt * 1e6,
            6.0 * 2 * gb / dt / 1e9, 6.0 * 2 * gb / 1e6, cs);
     {   // the down projection of the same 6 pairs (production dispatch: moe_down), time and checksum
-        const GTensor & td = g.need(p + "ffn_down_exps.weight");
+        const GTensor & td = syn ? tsyn_d : g.need(p + "ffn_down_exps.weight");
         const size_t db = td.nbytes / E;
         uint8_t * dd; cudaMalloc(&dd, NE * db);
         cudaMemcpy(dd, td.data, NE * db, cudaMemcpyHostToDevice);
@@ -173,6 +193,7 @@ int main(int argc, char ** argv) {
         cudaStreamSynchronize(s);
         const double d3 = std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count() / iters;
         std::vector<float> yv((size_t) K * n); cudaMemcpy(yv.data(), dy, yv.size() * 4, cudaMemcpyDeviceToHost);
+        if (const char * dp = getenv("G32_DUMP")) { std::string f2 = std::string(dp) + ".down"; FILE * f = fopen(f2.c_str(), "wb"); fwrite(yv.data(), 4, yv.size(), f); fclose(f); }
         double c3 = 0, a3 = 0; for (float v : yv) { c3 += v; a3 += fabs(v); }
         printf("G32BENCH down %s: %.1f us/call, %.1f GB/s, checksum %.9g (abs %.9g) (%s)\n", gtype_name(td.type), d3 * 1e6, 6.0 * db / d3 / 1e9, c3, a3,
                cudaGetErrorString(cudaGetLastError()));

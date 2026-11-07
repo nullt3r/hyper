@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -46,11 +47,30 @@ int main(int argc, char ** argv) {
         if (cmd == "run") {   // generate(): pipelined prefill, greedy decode
             const int n_gen = argc > 4 ? atoi(argv[4]) : 16;
             GenStats st;
-            const std::vector<int> out = eng.generate(ids, n_gen, getenv("HYPER7_SPEC") != nullptr, &st);
+            SamplingParams sp;   // HYPER7_TEMP: full-vocabulary sampling at that temperature (seed HYPER7_SEED, default 1234)
+            if (getenv("HYPER7_TEMP")) { sp.temp = (float) atof(getenv("HYPER7_TEMP")); sp.seed = getenv("HYPER7_SEED") ? strtoull(getenv("HYPER7_SEED"), nullptr, 10) : 1234; }
+            const std::vector<int> out = eng.generate(ids, n_gen, getenv("HYPER7_SPEC") != nullptr, &st, {}, sp);
             printf("prefill %zu tokens: %.2f s (%.1f t/s)\ngen:", ids.size(), st.t_prefill, ids.size() / st.t_prefill);
             for (int t : out) printf(" %d", t);
             printf("\ndecode %d tokens: %.2f s (%.2f t/s), %d steps, %d/%d drafts accepted\n", st.tokens, st.seconds, st.tokens / st.seconds, st.steps, st.accepted, st.drafted);
             if (getenv("HYPER7_SAVE_STATS")) eng.save_expert_stats(getenv("HYPER7_SAVE_STATS"));
+        } else if (cmd == "specstat") {   // sampling test: N draws of the first 2 tokens after the prompt at HYPER7_TEMP (seed = draw),
+            // the (tok0, tok1) pair counts; the cache keeps the prompt, so a draw costs one or two decode steps. Compared
+            // between HYPER7_DSPARK_COUPLED=1 (exact-match drafts: plain sampling) and speculative sampling (same distribution)
+            const int N = argc > 4 ? atoi(argv[4]) : 500;
+            SamplingParams sp;
+            sp.temp = getenv("HYPER7_TEMP") ? (float) atof(getenv("HYPER7_TEMP")) : 1.0f;
+            std::map<std::pair<int, int>, int> cnt;
+            long acc = 0, drafted = 0;
+            for (int i = 1; i <= N; ++i) {
+                sp.seed = (uint64_t) i * 7919u + 17;
+                GenStats st;
+                const std::vector<int> out = eng.generate(ids, 2, true, &st, {}, sp);
+                if (out.size() >= 2) cnt[{out[0], out[1]}]++;
+                acc += st.accepted; drafted += st.drafted;
+            }
+            printf("specstat %d draws, drafts accepted %ld / %ld\n", N, acc, drafted);
+            for (auto & kv : cnt) printf("pair %d %d %d\n", kv.first.first, kv.first.second, kv.second);
         } else if (cmd == "ab") {   // CPU expert scheduling A/B in one process: HYPER7_AB modes (0 dynamic, 1 L3 groups,
             // 2 groups + prefetch of the previous step's experts, 3 groups + prefetch of the GPU's prediction: HYPER7_PRED=1),
             // interleaved over rounds; greedy outputs must match

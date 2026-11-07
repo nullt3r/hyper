@@ -3,7 +3,6 @@
 //   hyper4 bench <model> <ref.bin> [n_gen=128] [gpu_frac]   greedy decode speed after the reference prompt
 #include "engine4.h"
 #include "engine5.h"
-#include "engine6.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -542,8 +541,9 @@ static int run_cmd(int argc, char ** argv) {
             const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             printf("TFBENCH decode %d fixed tokens: %.2f t/s (%.2f ms/token)\n", n_tok, n_tok / s, 1e3 * s / n_tok);
         } else if (cmd == "tfab") {   // CPU expert scheduling A/B on fixed content (as tfbench), in one process: HYPER_AB modes
-            // (0 dynamic, 1 L3 groups, 3 groups + prefetch of the GPU's routing prediction: HYPER5_PRED=2), interleaved over rounds
-            if constexpr (std::is_same_v<Engine, Engine5>) {
+            // (0 dynamic, 1 L3 groups, 3 groups + prefetch of the GPU's routing prediction: HYPER5_PRED=2 / HYPER4_PRED=1),
+            // interleaved over rounds
+            {
                 const int pf = getenv("HYPER_TF_PF") ? atoi(getenv("HYPER_TF_PF")) : 64;
                 const int n_tok = std::min<int>(argc > 4 ? atoi(argv[4]) : 256, (int) toks.size() - pf);
                 const int rounds = getenv("HYPER_AB_ROUNDS") ? atoi(getenv("HYPER_AB_ROUNDS")) : 3;
@@ -572,7 +572,7 @@ static int run_cmd(int argc, char ** argv) {
                     std::sort(v.begin(), v.end());
                     printf("mode %d: median %.2f t/s (min %.2f max %.2f)\n", modes[mi], v[v.size() / 2], v.front(), v.back());
                 }
-            } else throw std::runtime_error("tfab: Engine5 only");
+            }
         } else if (cmd == "bench") {
             const int n_gen = argc > 4 ? atoi(argv[4]) : 128;
             eng.reset();
@@ -601,6 +601,5 @@ int main(int argc, char ** argv) {
     std::string arch;
     try { arch = GGUF(argv[2]).arch(); } catch (const std::exception & e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
     if (arch == "glm5-next") return run_cmd<Engine5, Engine5Options>(argc, argv);
-    if (arch == "mimo2") return run_cmd<Engine6, Engine6Options>(argc, argv);
     return run_cmd<Engine4, Engine4Options>(argc, argv);
 }

@@ -6,6 +6,7 @@
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-common.h"
 #include "iq3s_dot.h"
+#include "iq1s_dot.h"
 
 #include <immintrin.h>
 #include <pthread.h>
@@ -80,10 +81,13 @@ void quantize_q8_K_avx2(const float * __restrict x, void * __restrict vy, int64_
 void iq3s_vec_dot(int n, float * s, size_t, const void * vx, size_t, const void * vy, size_t, int) { iq3s_dot_v1(n, s, vx, vy); }
 // (HYPER_IQ3_V3: grid indices built in a vector, iq3bench 1 thread cached 528 -> 506 ns per 4096-row; streaming equal)
 void iq3s_vec_dot3(int n, float * s, size_t, const void * vx, size_t, const void * vy, size_t, int) { iq3s_dot_v3(n, s, vx, vy); }
+// IQ1_S x Q8_K: ggml's AVX2 dot without its BMI2 index building (PDEP is microcode on Zen 2: ~19x slower), bit-identical
+void iq1s_vec_dot(int n, float * s, size_t, const void * vx, size_t, const void * vy, size_t, int) { iq1s_dot(n, s, vx, vy); }
 ggml_vec_dot_t vec_dot_fast(GType t, GType tv) {
     static const bool off = getenv("HYPER_CPU_REFDOT") != nullptr;
     static const bool v3 = getenv("HYPER_IQ3_V3") != nullptr;
     if (t == GType::IQ3_S && tv == GType::Q8_K && !off) return v3 ? iq3s_vec_dot3 : iq3s_vec_dot;
+    if (t == GType::IQ1_S && tv == GType::Q8_K && !off) return iq1s_vec_dot;
     return traits(t)->vec_dot;
 }
 ggml_from_float_t from_float_fast(GType t) {

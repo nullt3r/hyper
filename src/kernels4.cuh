@@ -82,8 +82,15 @@ void moe_gemm_down(const MoeDev & m, const half * h16, const int * order, const 
 // is there, when any of token t's experts lives on the CPU: owner[e] == cpu_owner)
 void moe_reduce(const float * shexp, const float * sg, const float * y, int k, float * out, int n, int nt,
                 const int * ids, const int * owner, int g, int cpu_owner, const volatile unsigned * cpu_flag, const float * cpu_y,
-                const int * counter, unsigned seq_tag, cudaStream_t s, const float * yzc = nullptr);
+                const int * counter, unsigned seq_tag, cudaStream_t s, const float * yzc = nullptr,
+                int host_owner = -1, const volatile unsigned * host_flag = nullptr, const float * host_y = nullptr);
 // + yzc[t*k + j] for the CPU-owned pairs (this GPU's zero-copy share of them), when given
+// + host_y rows (CPU_ROW stride) for the pairs owned by host_owner (an expert-host GPU), once host_flag reaches the tag
+// expert host: takes the owner's decode record (CpuMoeRec, once its seq reaches the tag) into device buffers; puts its
+// weighted sum into a CpuMoeOut record and raises its seq
+void host_take(const volatile unsigned * seq, const int * counter, unsigned seq_tag, const int * rec_ids, const float * rec_wts,
+               const float * rec_x, int * ids, float * wts, float * x, int n, int k, int nt, cudaStream_t s);
+void host_put(volatile unsigned * seq, float * y_dst, const float * y, int n, int nt, const int * counter, unsigned seq_tag, cudaStream_t s);
 
 // zero-copy share of the CPU experts: hidden slice [f0, f1) (whole 256-blocks) of every CPU-owned pair, weights read from
 // the mapped compact host copy (expert e at index cslot[e]); y[p] = w[p] * down[:, f0:f1] . h[f0:f1] (0-sized slice: no-op)

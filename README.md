@@ -15,11 +15,18 @@ three GPUs assumed, sm_86 only.
 
 | Model | GGUF architecture | Tested quantization | Notes |
 |---|---|---|---|
-| Qwen3.8-27B | `qwen35` | Unsloth UD-Q8_K_XL | dense, Gated DeltaNet + gated attention, built-in MTP head |
-| Qwen3.8-Flash-Next | `qwen4exp` | Unsloth UD-Q4_K_XL (4 shards) | MoE, hyper-connections, QSA sparse attention, PLE; optional separate NextN (MTP) GGUF |
-| GLM-5.3-Flash | `glm5-next` | Unsloth UD-IQ4_XS, mainline tensor layout | MoE (288 experts), mHC residual streams, KDA linear attention, nope-MLA with a k-pool DSA indexer; optional NextN (MTP) block read from the original Unsloth split GGUF |
+| Qwen3.8-Flash-Next | `qwen4exp` | Unsloth UD-Q4_K_XL (4 shards); fine-tunes such as Swift 1.5 Heretic (IQ4_NL mix) | MoE, hyper-connections, QSA sparse attention, PLE; optional separate NextN (MTP) GGUF; images with `--mmproj` |
+| Ornith-1.5-122B (Qwen3.5-122B-A10B style) | `qwen35moe` | Unsloth UD-Q5_K_XL | MoE, plain pre-norm residual, Gated DeltaNet + gated attention, NextN |
+| GLM-5.3-Flash | `glm5-next` | Unsloth UD-IQ4_XS, Maya-L; mainline tensor layout | MoE (288 experts), mHC residual streams, KDA linear attention, nope-MLA with a k-pool DSA indexer; optional NextN (MTP) block read from the original Unsloth split GGUF |
+| DeepSeek-V4.1-Flash-1017 | `deepseek41` | Maya-S, ISTA-DASLab GSQ IQ2_XS, Unsloth UD-IQ2_XXS | MoE (384 experts), mHC, compressed sparse attention with an indexer, Engram n-gram tables (in the GGUF or a separate file), DSpark drafter |
 
-The engine is picked from the GGUF architecture.
+The model is picked from the GGUF architecture. One engine serves them all: `EngineBase` (the CPU side of the experts,
+their placement, history, prompt-lookup drafts) carries two forward strategies, `TpEngine` (dense parts tensor-parallel
+over the GPUs, CUDA-graph decode, MTP drafts; the Qwen models as `engine4.cu`, GLM as `engine5.cu`, each only its layers)
+and the layer-split pipeline of `engine7.cu` (deepseek41, DSpark drafts). The experts' placement (`moe_place`: compact
+pinned host copies, adaptive exchanges, elastic slots, streamed prefill) and the dense weights (`dense.cu`) are shared.
+The Qwen3.8-27B (`qwen35`, git tag `v1-qwen27b`) and MiMo (`mimo2`) engines were removed in November 2026; they live on
+in the git history.
 
 ## Performance
 
@@ -29,20 +36,18 @@ All numbers: this machine, October 2026, greedy decoding, the same GGUF files fo
 
 | Model (quantization) | Decode | Decode, speculative | Prefill |
 |---|---|---|---|
-| Qwen3.8-27B (UD-Q8_K_XL) | **59.6 t/s** at 11k context | **149 t/s** (built-in MTP, 3 drafts) | **1771 t/s** (11k-token prompt) |
 | Qwen3.8-Flash-Next (UD-Q4_K_XL) | **97.5 t/s** at 11k context | **~140 t/s** (NextN MTP, up to 3 drafts) | **1774 t/s** (11k-token prompt) |
 | Qwen3.8-Flash-Next Uncensored (Q4_K_M) | **93 t/s** at 11k context | **~130 t/s** (the base model's NextN MTP, up to 3 drafts) | **1806 t/s** (11k-token prompt) |
 | GLM-5.3-Flash (UD-IQ4_XS) | **30.7 t/s** at 16k context | **~35 t/s** at 16k (NextN MTP, up to 3 drafts) | **998 t/s** (16k-token prompt) |
 
-- Decode: `hyper4 tfbench` / `hyper gen` – a prefilled prompt of real text (source code and notes), then the reference
+- Decode: `hyper4 tfbench` – a prefilled prompt of real text (source code and notes), then the reference
   tokens fed one per step, so the expert routing is that of real text.
-- Speculative: `mtpgen` / `gen`, 9–11k prompt. The speed depends on how predictable the text is; with greedy decoding
+- Speculative: `mtpgen`, 9–11k prompt. The speed depends on how predictable the text is; with greedy decoding
   the output is token-for-token the plain output.
 - GLM decode depends on the content: about a third of its experts fit in VRAM, the rest are computed by the CPU at
   the speed of system RAM.
 - Drafts stop once the MTP head's own probability of the drafted run falls below a floor (GLM 0.85, Flash-Next 0.5):
-  a verified row is not free, and a draft that is likely to be rejected costs more than it brings. The 27B verifies
-  rows almost for free (dense, all in VRAM) and always drafts 3.
+  a verified row is not free, and a draft that is likely to be rejected costs more than it brings.
 - The Uncensored model has no MTP head of its own; the base Flash-Next NextN GGUF drafts for it (exact as always,
   the main model verifies): +44 % at 9k context (90 → 130 t/s) vs +51 % for the base model.
 - GLM MTP: every verified row costs 0.6–0.75 of a plain step (consecutive tokens rarely share CPU-held experts), so
@@ -57,8 +62,6 @@ in VRAM on the CPU). The contexts are the closest ones that were measured on bot
 
 | Model | Metric | llama.cpp | hyper |
 |---|---|---|---|
-| Qwen3.8-27B | decode | 34.4 t/s at 8k (mainline, `-sm tensor`) | 59.6 t/s at 11k |
-| Qwen3.8-27B | prefill | 1396 t/s (pp512, mainline `-sm layer`) | 1771 t/s (11k prompt) |
 | Qwen3.8-Flash-Next | decode | 36.1 t/s at 32k (mainline), 38.4 t/s short (ik_llama) | 97.5 t/s at 11k |
 | Qwen3.8-Flash-Next | prefill | 584 t/s (pp2048 at 32k, mainline) | 1774 t/s (11k prompt) |
 | GLM-5.3-Flash | decode | 15.2 t/s at 32k (mainline), 15.7 t/s at 32k (ik_llama, patched) | 30.7 t/s at 16k |
@@ -75,7 +78,6 @@ Decode on reference text, the same GGUF files on both sides (this measures the i
 
 | Model | Tokens | KL hyper vs llama.cpp | KL llama.cpp vs itself¹ | Top-1 agreement | Perplexity hyper / llama.cpp |
 |---|---|---|---|---|---|
-| Qwen3.8-27B | 64 / 700 | 0.00022 / 0.00065 | – | 100 % / 98.4 % | – |
 | GLM-5.3-Flash | 512 / 2048 | 0.038–0.040 / 0.027 | 0.043 | 90–92 % / 92.8 % | 11.19 / 10.90–11.05; 7.64 / 7.69 |
 | Qwen3.8-Flash-Next | 256 / 2048 | 0.046–0.062 / 0.049 | 0.029–0.038 | 89–91 % / 90.2 % | 11.18 / 11.00–11.47; 6.502 / 6.504 |
 | Flash-Next Uncensored | 256 | 0.104–0.111 | 0.069 | 86–88 % | 14.71 / 14.37–14.56 |
@@ -100,6 +102,16 @@ which is why they agree with each other. Other checks:
   same effect (Uncensored: GPU vs CPU experts KL 0.069).
 
 ## How it works
+
+Shared backends (every engine uses the same code for these; a model-specific engine holds only its own layers' math):
+
+| Backend | Where | What |
+|---|---|---|
+| Dense weights | `dense.cu` | GGUF tensors in their fastest exact GPU form: Q8_0 / Q5_0 / Q4_0 as int8 fragments, Q4_K / Q6_K as KQ fragments, BF16 / F16 as fp16, per-type segments in fused projections; `dense_mm` picks GEMV, KQ GEMV loops or GEMMs by row count |
+| GPU experts | `kernels4.cu` | routed-expert kernels for every block type the models use (Q2_K … Q8_0, IQ1_S … IQ4_XS, IQ4_NL, MXFP4), decode and prefill |
+| CPU experts | `cpu_moe.cpp` | the thread team (L3-group pinning), its records, prefetch of predicted experts (`HYPER_CPU_PREFETCH=2`, `HYPER_CPU_PF1GAP=1`) |
+| Routing prediction | engines | the next layer's routing published early for the CPU prefetch: `HYPER4_PRED=1` (Flash-Next), `HYPER5_PRED=2` + `HYPER5_PRED_EARLY=1` (GLM), `HYPER7_PRED=2` + `HYPER7_PRED_EARLY=1` (DeepSeek) |
+| Conversation parking, sampling, server | `park.h`, `sampling.h`, `tools/` | prompt cache across conversations, exact sampling, OpenAI API |
 
 - **Tensor parallelism without P2P.** Attention heads, linear-attention heads and FFN hidden slices are split across the
   three GPUs. During decode, the per-layer allreduce runs through pinned, mapped host memory with an LL-style protocol
@@ -146,8 +158,8 @@ which is why they agree with each other. Other checks:
 
   A follow-up request in an agent loop therefore only recomputes the part after the last snapshot.
 - **Speculative decoding with exact sampling.**
-  - Draft sources: MTP heads (27B built-in, Flash-Next from a separate NextN GGUF, GLM from the original split GGUF)
-    or prompt-lookup n-grams (GLM without MTP).
+  - Draft sources: MTP heads (Flash-Next from a separate NextN GGUF, GLM from the original split GGUF), DeepSeek's
+    DSpark drafter, or prompt-lookup n-grams.
   - The NextN blocks (GLM, Flash-Next) are one attention + MoE layer. Prompt rows and kept verification rows only
     enter its cache (K/V or latents, indexer keys), so a prompt costs it a few small projections per token; only the
     row that drafts runs the whole block.
@@ -157,8 +169,7 @@ which is why they agree with each other. Other checks:
     speculative run produces the same text as a plain one, greedy or sampled (same seed).
   - Sampled drafts can use the same noise and truncation (top_k / top_p / min_p over the MTP head's candidates):
     the draft is then the main model's sample whenever the two distributions agree (idea from
-    [Strata](https://github.com/Niko1221/Strata)). Flash-Next at temperature 0.6: 128 → 132 t/s; off for the 27B,
-    whose greedy drafts are accepted more often (`HYPER_GUMBEL_DRAFT=0/1`).
+    [Strata](https://github.com/Niko1221/Strata)). Flash-Next at temperature 0.6: 128 → 132 t/s (`HYPER_GUMBEL_DRAFT=0/1`).
   - Rejected rows are rolled back from per-row state snapshots.
 - **GLM-5.3 specifics.**
   - mHC: 4 residual streams mixed by per-token Sinkhorn-normalized matrices, fused with the Q8_0 mixing projection.
@@ -187,7 +198,7 @@ cmake -S ~/llama.cpp-src -B ~/llama.cpp-src/build -DGGML_CUDA=ON -DBUILD_SHARED_
 cmake --build ~/llama.cpp-src/build -j
 
 # hyper
-make -j build/hyper-server build/hyper4 build/hyper build/ref
+make -j build/hyper-server build/hyper4 build/hyper7 build/ref
 ```
 
 ## Running the server
@@ -209,8 +220,10 @@ make -j build/hyper-server build/hyper4 build/hyper build/ref
 ./build/hyper-server Qwen3.8-Flash-Next-Uncensored-Q4_K_M-00001-of-00003.gguf --ctx 262144 \
     --mtp Qwen3.8-Flash-Next-MTP-Q4_K_M.gguf --draft 3 --expert-stats fnu_stats.bin
 
-# Qwen3.8-27B with its built-in MTP head
-./build/hyper-server Qwen3.8-27B-UD-Q8_K_XL.gguf --ctx 262144 --draft 3
+# DeepSeek-V4.1-Flash (unsloth UD-IQ2_XXS), thinking effort 75 by default (a request's reasoning_effort overrides it);
+# --vocab: libllama does not know deepseek41 (tokenizer and template only)
+HYPER_CPU_PIN=2 HYPER_CPU_PREFETCH=2 HYPER7_PRED=2 ./build/hyper-server DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
+    --vocab ds41-vocab.gguf --chat-template-kwargs '{"reasoning_effort":75}' --ctx 262144 --cpu-threads 32
 ```
 
 Endpoints:
@@ -224,12 +237,12 @@ Endpoints:
 | `/v1/models`, `/health`, `/stats`, `/props` | model list, health, statistics JSON, sampling defaults |
 | `/v1/mcp`, `/mcp/<name>` | the configured MCP servers and a proxy to them (streamable HTTP), for the chat page |
 
-Images (Qwen3.8-Flash-Next and Qwen3.8-27B with `--mmproj`, each with its own encoder): the encoder's rows replace the image token's at an image's positions. Those positions
+Images (Qwen3.8-Flash-Next with `--mmproj`): the encoder's rows replace the image token's at an image's positions. Those positions
 carry interleaved M-RoPE coordinates (t, h, w), kept per cache cell on every GPU. A text cell's three coordinates are its index,
 so text output stays bit-identical. The prompt cache tells images apart by a hash of their content, and an encoded image is
 reused while it is cached. The chat page sends attached images to such a model, at most 1536 px on the long side.
 Without `--mmproj` the encoder is not loaded and its VRAM (~1 GB on GPU 0) stays with the model; text output is the same
-either way. The env switches `HYPER4_NO_MROPE=1` (Flash-Next) and `HYPER_NO_MROPE=1` (27B) turn off the position table too.
+either way. The env switch `HYPER4_NO_MROPE=1` turns off the position table too.
 
 Python in the chat: the model gets a `run_python` tool that the page runs in the browser, not on the server.
 - **Runtime:** Pyodide (CPython 3.14 in WebAssembly, with numpy, pandas, scipy, matplotlib, scikit-learn, sympy and more). Pure-Python packages such as python-docx or openpyxl install from PyPI on import.
@@ -263,8 +276,8 @@ Selected environment variables:
 | `HYPER5_ADAPT=0`, `HYPER4_ADAPT=0` | GLM / Flash-Next: disable adaptive expert placement (fully deterministic placement) |
 | `HYPER4_ELASTIC=0`, `HYPER5_ELASTIC=0` | Flash-Next / GLM: fully allocated attention caches, no extra expert slots (`..._ELASTIC_LOG=1`: log mapping / fills / evictions) |
 | `HYPER_CPU_RG`, `HYPER_CPU_RD`, `HYPER_CPU_LEAD` | CPU expert tasks: rows per gate/up and down task (32 / 128), experts gate/up runs ahead (2) |
-| `HYPER_GUMBEL_DRAFT=0/1` | sampled MTP drafts coupled to the sampling noise (default on for Flash-Next and GLM, off for the 27B) |
-| `HYPER5_MTP_PMIN`, `HYPER4_MTP_PMIN`, `HYPER_MTP_PMIN` | MTP drafts while the drafted run's MTP probability is at least this: GLM (default 0.85), Flash-Next (0.5), 27B; 0: count from recent acceptance (Flash-Next, GLM) or always `--draft` (27B) |
+| `HYPER_GUMBEL_DRAFT=0/1` | sampled MTP drafts coupled to the sampling noise (default on for Flash-Next and GLM) |
+| `HYPER5_MTP_PMIN`, `HYPER4_MTP_PMIN` | MTP drafts while the drafted run's MTP probability is at least this: GLM (default 0.85), Flash-Next (0.5); 0: count from recent acceptance |
 | `HYPER4_STREAM_MIN`, `HYPER5_STREAM_MIN` | shortest prefill chunk that streams CPU experts to the GPUs (default 256 / 280) |
 | `HYPER_DUMP_REQUEST=dir` | save every request body to `dir` (for replay benchmarks) |
 | `HYPER_CPUPROF=1` | CPU expert timing and bandwidth in the log |
@@ -276,7 +289,7 @@ Selected environment variables:
 |---|---|
 | `ref` | runs mainline llama.cpp on a prompt and dumps the token ids and full logits (the reference). Supports experts on the CPU (`REF_CPU_MOE=1`), only the last N rows (`REF_LAST=N`), another batch size (`REF_UBATCH`), the tokens of an existing reference (`REF_TOKENS=file`) and the last token's value of named tensors (`REF_DUMPLAST=prefix,...`) |
 | `hyper4` | MoE engines (Flash-Next, GLM): `check` / `checkpf` (KL vs the reference), `bench`, `tfbench` (fixed-content decode), `pfbench` (prefill), `ntbench`, `calib` (routing statistics), `mtpgen` (plain vs speculative, must match; GLM with `HYPER5_ADAPT=0`, `HYPER_SWEEP=k:pmin,...` compares draft policies in one run), `cachetest`, `trace` (Flash-Next, `HYPER4_TRACE=dir`: residuals after every layer and stages of layers 0–1, named like llama.cpp's tensors) |
-| `hyper` | 27B engine: `check`, `checkn`, `gen`, `pfbench`, `cachetest`, `samptest` |
+| `hyper7` | DeepSeek engine: `run` (pipelined prefill + greedy decode), `dump` (per-layer states for the oracle comparison), `ab` (CPU expert scheduling / prefetch modes in one process) |
 | `gemvbench`, `arbench`, `arbulk`, `iqkbench`, `bwtest`, `zctest` | microbenchmarks: Q8 GEMV per shape, allreduce, CPU expert dot products (mainline vs ik_llama), PCIe and zero-copy bandwidth |
 | `samplertest` | exact sampling: the kept token set and probabilities from the GPUs' candidates or the whole row vs a full sort, on reference logits, for 90 settings |
 | `cpumoebench`, `iq3bench` | the CPU expert decode job on real expert weights (time per job, bandwidth, output bit hash); IQ3_S / IQ4_XS kernels vs ggml, bit for bit |
@@ -301,7 +314,9 @@ REF_CPU_MOE=1 ./build/ref model.gguf bench/prompt3.txt ref.bin 999 512
 ## Layout
 
 ```
-src/        engines (engine*.cu), kernels (kernels*.cu), CPU expert pool (cpu_moe), GGUF reader, model configs
+src/        engine_base (shared top), tp_engine (tensor-parallel strategy) with the models engine4.cu (Qwen) / engine5.cu
+            (GLM), engine7.cu (DeepSeek pipeline), moe_place (expert placement), experts / devices (shared pieces), dense
+            weights (dense.cu), kernels (kernels*.cu), CPU expert pool (cpu_moe), GGUF reader, model configs
 tools/      server (hyper_server.cpp + chat_page.h), CLIs, reference tool, microbenchmarks
 bench/      prompts used for validation and benchmarks
 ENGINE_LOG.md   development log with all measurements (Czech)

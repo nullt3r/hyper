@@ -91,6 +91,11 @@ void markov7(const float * logits, const uint16_t * mh, const uint16_t * emb, in
 // conf[i] = sigmoid([xh[i] | emb[prev_i]] . w): prev_0 = y, prev_i = pairs[i - 1]'s index
 void dconf7(const float * xh, int dim, const uint16_t * emb, int rank, const float * w, const float * pairs, int y, float * conf, int T,
             cudaStream_t s);
+// speculative sampling: log softmax(row / temp)[tok] (mz: max_sumexp's {M, Z}; tok from tok_pair's index bits when given)
+void qlog7(const float * row, const float * mz, float temp, const float * tok_pair, int tok, float * out, cudaStream_t s);
+// a draw from max(0, p - q) / sum (p, q: softmax of the target / drafter rows at temp)
+void resid7(const float * tl, const float * tmz, const float * ql, const float * qmz, int n, float temp, uint64_t seed, long long pos, int * out,
+            cudaStream_t s);
 // x[i] = v (n values)
 void fill7(float * x, float v, int n, cudaStream_t s);
 
