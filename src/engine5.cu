@@ -473,7 +473,7 @@ void Engine5::record_main(int gi, int nt, int kind) {
     const bool streaming = bulk && opt_.stream_experts && nt >= stream_min_ && !cache_only;
     if (streaming) stream_begin(d, il0, il1);
     int call = 0, dcall = 0;
-    auto dbg = [&](const char * what, int il, const float * buf, size_t cnt) { TpEngine::dbg(d, what, il, buf, cnt, 4); };
+    auto dbg = [&](const char * what, int il, const float * buf, size_t cnt) { TpEngine::dbg(d, what, il, buf, cnt, 4, nt); };
     auto allreduce = [&](float * x = nullptr) { TpEngine::allreduce(d, nt, call, dcall, bulk, x); };   // x += sum over the GPUs of d.part (default: d.bo = the sum)
     // block output: allreduce of d.part over the GPUs, scattered into the residual streams (decode: in the allreduce epilogue)
     static const bool old_post = getenv("HYPER5_OLDPOST") != nullptr;

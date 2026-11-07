@@ -81,7 +81,11 @@ void MoePlace::load_stats(const char * path, int n_layer) {
 
 std::vector<int> MoePlace::plan_tp(const std::vector<size_t> & free_bytes, double reserve_gib, double frac, size_t eb, size_t eb_max,
                                    int n_moe_layers, bool stream, double stage_factor) {
-    const std::vector<int> quota = plan_quotas_tp(free_bytes, reserve_gib, frac, eb, eb_max, std::max(n_moe_layers, 1), p_.E, stream, stage_factor);
+    std::vector<int> quota = plan_quotas_tp(free_bytes, reserve_gib, frac, eb, eb_max, std::max(n_moe_layers, 1), p_.E, stream, stage_factor);
+    if (const char * q = getenv("HYPER_QUOTA")) {   // (tests: fixed experts per layer per device, "130,128,126", for identical placements across builds)
+        size_t g = 0;
+        for (const char * c = q; *c && g < quota.size(); ++g) { quota[g] = std::min(p_.E, std::max(0, atoi(c))); while (*c && *c != ',') ++c; if (*c) ++c; }
+    }
     int tq = 0;
     for (int q : quota) tq += q;
     fprintf(stderr, "%s: experts per layer on GPUs:", p_.tag.c_str());

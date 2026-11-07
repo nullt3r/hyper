@@ -511,11 +511,33 @@ static int run_cmd(int argc, char ** argv) {
             const std::string out = argc > 6 ? argv[6] : "expert_stats.bin";
             eng.save_expert_stats(out);   // (loaded statistics + this run)
             printf("CALIB %d prompt + %d generated tokens -> %s\n", P, n_gen, out.c_str());
+        } else if (cmd == "rowcheck") {   // verification rows vs plain decode: a 2..MAX_NT-row forward after a prefill, then the same tokens
+            // one row at a time after the same prefill; every row's logits must match the plain step's bit for bit
+            const int pf = getenv("HYPER_TF_PF") ? atoi(getenv("HYPER_TF_PF")) : 512, nr = std::min(MAX_NT, argc > 4 ? atoi(argv[4]) : 2);
+            std::vector<std::vector<float>> multi(nr), single(nr), lg;
+            eng.reset();
+            eng.prefill(toks.data(), pf, 0);
+            fprintf(stderr, "MARK multi %d\n", nr);   // (HYPER4_DEBUG + HYPER4_SUMS: the stage sums that follow belong to this forward)
+            eng.forward(&toks[pf], nr, pf);
+            for (int r = 0; r < nr; ++r) eng.get_logits(r, multi[r]);
+            eng.reset();
+            eng.prefill(toks.data(), pf, 0);
+            for (int r = 0; r < nr; ++r) { fprintf(stderr, "MARK single %d\n", r); eng.forward(&toks[pf + r], 1, pf + r); eng.get_logits(0, single[r]); }
+            for (int r = 0; r < nr; ++r) {
+                size_t diff = 0; double md = 0; int am = 0, as = 0;
+                for (size_t i = 0; i < multi[r].size(); ++i) {
+                    if (multi[r][i] != single[r][i]) { ++diff; md = std::max(md, (double) std::fabs(multi[r][i] - single[r][i])); }
+                    if (multi[r][i] > multi[r][am]) am = (int) i;
+                    if (single[r][i] > single[r][as]) as = (int) i;
+                }
+                printf("ROWCHECK %d rows: row %d  %zu / %zu logits differ, max |diff| %.3g, argmax %d vs %d%s\n", nr, r, diff, multi[r].size(), md, am, as,
+                       diff ? "  MISMATCH" : "  identical");
+            }
         } else if (cmd == "ntbench") {   // decode-forward cost by rows (1..4) after a prefill of HYPER_TF_PF tokens
             const int pf = getenv("HYPER_TF_PF") ? atoi(getenv("HYPER_TF_PF")) : 256;
             eng.reset();
             eng.prefill(toks.data(), pf, 0);
-            for (int nt = 1; nt <= 4; ++nt) {
+            for (int nt = 1; nt <= MAX_NT; ++nt) {
                 const int reps = 60;
                 double tot = 0;
                 for (int r = 0; r < reps; ++r) {

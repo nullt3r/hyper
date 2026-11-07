@@ -478,7 +478,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
     const bool streaming = bulk && opt_.stream_experts && nt >= stream_min_ && (!kind || mtp_full_);
     if (streaming) stream_begin(d, kind ? c.n_layer : 0, kind ? c.n_layer + 1 : c.n_layer);
     int call = 0, dcall = 0;
-    auto dbg = [&](const char * what, int il, const float * buf, size_t cnt) { TpEngine::dbg(d, what, il, buf, cnt, 2); };
+    auto dbg = [&](const char * what, int il, const float * buf, size_t cnt) { TpEngine::dbg(d, what, il, buf, cnt, 2, nt); };
     dbg("embed", -1, d.res, (size_t) nt * hcn);
     auto allreduce = [&] { TpEngine::allreduce(d, nt, call, dcall, bulk); };
     // hyper-connection mixer: res -> mixed (and the inject logits)

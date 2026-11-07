@@ -39,6 +39,7 @@ int main(int argc, char ** argv) {
         Engine7Options o;
         o.max_pos = getenv("HYPER7_CTX") ? atoi(getenv("HYPER7_CTX")) : 8192;
         if (getenv("HYPER7_THREADS")) o.cpu_threads = atoi(getenv("HYPER7_THREADS"));
+        if (getenv("HYPER_DRAFT")) o.n_draft = atoi(getenv("HYPER_DRAFT"));
         Engine7 eng(argv[1], o);
         const std::string cmd = argv[2];
         const std::vector<int> ids = read_ids(argv[3]);
@@ -54,6 +55,43 @@ int main(int argc, char ** argv) {
             for (int t : out) printf(" %d", t);
             printf("\ndecode %d tokens: %.2f s (%.2f t/s), %d steps, %d/%d drafts accepted\n", st.tokens, st.seconds, st.tokens / st.seconds, st.steps, st.accepted, st.drafted);
             if (getenv("HYPER7_SAVE_STATS")) eng.save_expert_stats(getenv("HYPER7_SAVE_STATS"));
+        } else if (cmd == "rowcheck") {   // verification rows vs plain decode: an nr-row forward after the prompt, then the same tokens one
+            // row at a time after the same prompt; every row's logits must match the plain step's bit for bit
+            const int nr = std::min(MAX_NT, argc > 4 ? atoi(argv[4]) : 2);
+            const int P = (int) ids.size() - nr;
+            if (P < 1) throw std::runtime_error("rowcheck: the ids must hold the prompt and nr more tokens");
+            std::vector<std::vector<float>> multi(nr), single(nr);
+            auto prefill = [&] { eng.reset_cache(); eng.reset(); for (int c0 = 0; c0 < P; c0 += C) eng.forward(&ids[c0], std::min(C, P - c0), c0, 1); };
+            prefill();
+            eng.forward(&ids[P], nr, P, nr);
+            for (int r = 0; r < nr; ++r) eng.get_logits(r, multi[r]);
+            prefill();
+            for (int r = 0; r < nr; ++r) { eng.forward(&ids[P + r], 1, P + r, 1); eng.get_logits(0, single[r]); }
+            for (int r = 0; r < nr; ++r) {
+                size_t diff = 0; double md = 0; int am = 0, as = 0;
+                for (size_t i = 0; i < multi[r].size(); ++i) {
+                    if (multi[r][i] != single[r][i]) { ++diff; md = std::max(md, (double) std::fabs(multi[r][i] - single[r][i])); }
+                    if (multi[r][i] > multi[r][am]) am = (int) i;
+                    if (single[r][i] > single[r][as]) as = (int) i;
+                }
+                printf("ROWCHECK %d rows: row %d  %zu / %zu logits differ, max |diff| %.3g, argmax %d vs %d%s\n", nr, r, diff, multi[r].size(), md, am, as,
+                       diff ? "  MISMATCH" : "  identical");
+            }
+        } else if (cmd == "specgen") {   // greedy plain vs speculative (DSpark / lookup drafts) generation: identical output, speed
+            const int n_gen = argc > 4 ? atoi(argv[4]) : 128;
+            GenStats a, b;
+            eng.reset_cache();
+            const std::vector<int> plain = eng.generate(ids, n_gen, false, &a);
+            eng.reset_cache();
+            const std::vector<int> spec = eng.generate(ids, n_gen, true, &b);
+            int same = 0;
+            while (same < (int) std::min(plain.size(), spec.size()) && plain[same] == spec[same]) ++same;
+            uint64_t hs = 1469598103934665603ull;
+            for (int t : spec) hs = (hs ^ (uint32_t) t) * 1099511628211ull;
+            printf("SPECGEN plain %.2f t/s | spec %.2f t/s  steps %d  drafted/step %.2f  accepted/step %.2f  tokens/step %.2f\n", a.tokens / a.seconds,
+                   b.tokens / b.seconds, b.steps, (double) b.drafted / std::max(1, b.steps), (double) b.accepted / std::max(1, b.steps),
+                   (double) b.tokens / std::max(1, b.steps));
+            printf("SPECGEN identical prefix %d / %d%s  spec hash %016llx\n", same, n_gen, same == n_gen ? " (sequences match)" : "", (unsigned long long) hs);
         } else if (cmd == "specstat") {   // sampling test: N draws of the first 2 tokens after the prompt at HYPER7_TEMP (seed = draw),
             // the (tok0, tok1) pair counts; the cache keeps the prompt, so a draw costs one or two decode steps. Compared
             // between HYPER7_DSPARK_COUPLED=1 (exact-match drafts: plain sampling) and speculative sampling (same distribution)

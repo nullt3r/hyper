@@ -854,3 +854,21 @@ vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), 
 - Poučení: hashe ze serveru nejsou referencí – server přepisuje soubor statistik po každém požadavku a 74 produkčních
   požadavků změnilo rozmístění Flash-Next (hash 935886e5 → 83c521dc beze změny kódu). Ověřovat A/B dvou buildů na pevných
   statistikách, oba čerstvě.
+
+## 2026-11-07 – ověřovací okno 8 řádků, lookup drafty, oprava GLM MTP
+
+- Inspirace sFNX: `MAX_NT` 4 → 8 (tensor-core GEMV bere tokeny jako N rozměr MMA, 8 je strop), attention na tensor
+  cores pro všechny dekódovací řádky (bity řádku nezávisí na ostatních řádcích bloku), prompt-lookup drafty vedle MTP řetězce
+  (`LookupDrafter`, `<ENV>_MTP_LOOKUP=0` vypne). Cena okna Flash-Next (3× 3090): 1 řádek 11,8 ms, 3: 15,4, 5: 19,4, 7: 23,5, 8: 25,6.
+- Flash-Next produkce (4 GPU, `--draft 7`): opis textu 258 → 307 t/s (6,65/7 přijato), běžný text 149 → 148 (řetězec MTP se na
+  próze nepřijme). Výstupy shodné s obyčejným dekódováním (256/256).
+- GLM: chyba od portu DeepSeeku – `k_moe_route_sig_pub` zapisoval aktivace řádku t do CPU záznamu na `t * 4096`, ale
+  `CPU_ROW` je 5120 → řádky ≥ 1 ověření počítaly CPU experty z posunutých dat (hradlo `HYPER5_MTP_CPU_MAX` 1,5 to maskovalo:
+  skoro žádné drafty). Opraveno (`CPU_ROW`, `MOE_MAX_USED`); nový test `hyper4 rowcheck <model> <ref> <řádků>` (logity
+  vícerádkového forwardu vs. samostatné kroky, bit po bitu) a `hyper7 rowcheck` / `specgen`. GLM UD 4 GPU: K=3 pmin 0,85
+  +11 % (18,0 t/s), K=5/7 bez zisku (řádky čtou experty z RAM); produkce `--draft 3`, hradlo vypnuté.
+- DeepSeek: DSpark K=5 (dosud limit 3): greedy 2k prompt 27,4 → 51,6 (K=3) → 57,3 t/s (K=5), výstup shodný s obyčejným;
+  A/B proti checkpointu shodné. Produkce `--draft 5`. (Jeho rowcheck není vypovídající: komprimovaná KV po dvojicích pozic
+  a refeed řídí jen generate().)
+- Poučení: server přepisuje statistiky expertů po každém požadavku, serverové hashe nejsou referencí; A/B dvou buildů na
+  pevných statistikách (`~/unify/ab_*.sh`), `HYPER_QUOTA`/`HYPER7_GPU_EXPERTS` pro shodné rozmístění.

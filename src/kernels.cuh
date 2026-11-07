@@ -10,7 +10,7 @@
 
 namespace hyper {
 
-constexpr int MAX_NT = 4;
+constexpr int MAX_NT = 8;   // (the tensor-core GEMVs take the tokens as the MMA's N dimension: 8)
 
 // Q8_0 weight repacked into mma fragment order. Tile = 16 rows x 32 columns (one Q8 block per row) stored as
 // 512 lane-ordered bytes, tiles ordered [row tile][k block]; scales s[row tile][k block][16] fp16. Rows padded to 16.

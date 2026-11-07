@@ -210,7 +210,7 @@ protected:
     void mm(TpDevice & d, const DW & W, const float * x, int xs, float * y, int ys, int rows, const NormIn & ni = NormIn{}) const;
     void f32mm(TpDevice & d, const float * W, int rows, int k, const float * x, int xs, float * y, int ys, int nr) const;
     void router_mm(TpDevice & d, const float * router, const uint16_t * router16, int E, const float * x, float * y, int nr) const;
-    void dbg(TpDevice & d, const char * what, int il, const float * buf, size_t cnt, int sum_layers) const;
+    void dbg(TpDevice & d, const char * what, int il, const float * buf, size_t cnt, int sum_layers, int rows = 1) const;
     // x += sum over the GPUs of d.part (x nullptr: d.bo = the sum); bulk: the copy-engine allreduce through pinned staging
     void allreduce(TpDevice & d, int nt, int & call, int & dcall, bool bulk, float * x = nullptr);
     // the streamed experts' uploads at the start of a recording (the first layer's share) and the upload-part queue

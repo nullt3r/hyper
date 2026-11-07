@@ -1,4 +1,5 @@
 #include "kernels5.cuh"
+#include "kernels4.cuh"   // (CPU_ROW, MOE_MAX_USED: the CPU hand-off records)
 
 #include <algorithm>
 #include <cfloat>
@@ -1136,7 +1137,7 @@ __global__ void k_moe_route_sig_pub(const float * __restrict__ logits, int ls, c
     __syncthreads();
     if (threadIdx.x >= 32) {   // (x_dst sits in a host record, 8-byte aligned only)
         for (int i = threadIdx.x - 32; i < n / 2; i += blockDim.x - 32)
-            *(float2 *) (x_dst + (size_t) t * 4096 + 2 * i) = *(const float2 *) (x + (size_t) t * xs + 2 * i);
+            *(float2 *) (x_dst + (size_t) t * CPU_ROW + 2 * i) = *(const float2 *) (x + (size_t) t * xs + 2 * i);   // (the record's row stride)
     } else {
         const int lane = threadIdx.x;
         float chosen[16];
@@ -1149,14 +1150,14 @@ __global__ void k_moe_route_sig_pub(const float * __restrict__ logits, int ls, c
                 if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
             }
             __syncwarp();
-            if (lane == 0) { ids[t * k + j] = bi; ids_dst[t * 16 + j] = bi; sel[bi] = -FLT_MAX; }
+            if (lane == 0) { ids[t * k + j] = bi; ids_dst[t * MOE_MAX_USED + j] = bi; sel[bi] = -FLT_MAX; }
             chosen[j] = pr[bi];
             sum += chosen[j];
             __syncwarp();
         }
         if (lane == 0) {
             const float inv = scale / fmaxf(sum, 6.103515625e-5f);
-            for (int j = 0; j < k; ++j) { const float w = chosen[j] * inv; wts[t * k + j] = w; wts_dst[t * 16 + j] = w; }
+            for (int j = 0; j < k; ++j) { const float w = chosen[j] * inv; wts[t * k + j] = w; wts_dst[t * MOE_MAX_USED + j] = w; }
             sg[t] = 1.0f;
         }
     }

@@ -2348,9 +2348,9 @@ void attn_split(const float * qkv, int stride, const half * kcache, const half *
     static const int rows_env = getenv("HYPER_ATTN_ROWS") ? atoi(getenv("HYPER_ATTN_ROWS")) : -1;
     const bool rows_fast = rows_env >= 0 ? rows_env != 0 : (!list && nt > 1 && nt <= MAX_NT);
     const dim3 grid = rows_fast ? dim3(n_kv * n_chunk * nt, ns) : dim3(n_kv * n_chunk, ns, nt);
-    // dense decode-sized rows on the tensor cores (every dense call of 1..4 rows, so plain decoding and speculative verification
-    // share it; HYPER_ATTN_TC=0: k_attn_split)
-    if (attn_tc() && !list && nt <= std::min(4, MAX_NT)) {
+    // dense decode-sized rows on the tensor cores (every dense call of 1..MAX_NT rows, so plain decoding and speculative verification
+    // share it: a row's bits do not depend on the block's other rows; HYPER_ATTN_TC=0: k_attn_split)
+    if (attn_tc() && !list && nt <= MAX_NT) {
         const int ns = attn_tc_nsplit(n_kv);
         static bool attr_set[16] = {};
         int dev = 0; cudaGetDevice(&dev);

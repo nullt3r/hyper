@@ -307,7 +307,7 @@ void TpEngine::router_mm(TpDevice & d, const float * router, const uint16_t * ro
 }
 
 // debug (HYPER4_DEBUG, direct recording): sync after a stage, report errors and non-finite values; HYPER4_SUMS: every stage's sums
-void TpEngine::dbg(TpDevice & d, const char * what, int il, const float * buf, size_t cnt, int sum_layers) const {
+void TpEngine::dbg(TpDevice & d, const char * what, int il, const float * buf, size_t cnt, int sum_layers, int rows) const {
     if (!debug_) return;
     CUDA_CHECK(cudaStreamSynchronize(d.stream));
     const cudaError_t err = cudaGetLastError();
@@ -317,7 +317,14 @@ void TpEngine::dbg(TpDevice & d, const char * what, int il, const float * buf, s
     for (float v : h) { if (!std::isfinite(v)) ++bad; else { mx = std::max(mx, (double) std::fabs(v)); sum += v; sq += (double) v * v; } }
     if (bad || err != cudaSuccess || (il < sum_layers && !getenv("HYPER4_SUMS")))
         fprintf(stderr, "dbg L%d %-12s err=%s nonfinite=%d max|x|=%.3g\n", il, what, cudaGetErrorString(err), bad, mx);
-    if (getenv("HYPER4_SUMS")) fprintf(stderr, "SUMS %d %s %.17g %.17g\n", il, what, sum, sq);
+    if (getenv("HYPER4_SUMS")) {
+        fprintf(stderr, "SUMS %d %s %.17g %.17g\n", il, what, sum, sq);
+        if (rows > 1 && cnt % rows == 0) {   // the first row alone (a verification row vs a plain decode step)
+            double s0 = 0, q0 = 0;
+            for (size_t i = 0; i < cnt / rows; ++i) { s0 += h[i]; q0 += (double) h[i] * h[i]; }
+            fprintf(stderr, "SUMS0 %d %s %.17g %.17g\n", il, what, s0, q0);
+        }
+    }
     if (bad || err != cudaSuccess) throw std::runtime_error("debug stop");
 }
 
@@ -888,11 +895,26 @@ std::vector<int> TpEngine::generate(const std::vector<int> & prompt, int n_gen, 
             }
             return k;
         };
+        // prompt-lookup drafts beside the MTP chain (<ENV>_MTP_LOOKUP=0: off): when the recent tokens repeat an earlier passage
+        // (edits, quotes, code), the continuation found there replaces the chain when it is longer -- it costs no MTP pass
+        // and a verification window of K rows costs little more than one of three
+        static const bool lookup_too = !envp(m_.env, "MTP_LOOKUP", b) || atoi(envp(m_.env, "MTP_LOOKUP", b)) != 0;
+        LookupDrafter lk(prompt);
+        std::vector<int> lkd(K);
+        auto lookup = [&](int nd) {   // (more lookup drafts than the chain gave: take them instead)
+            if (!lookup_too || cpu_ema_ > mtp_cpu_max_) return nd;
+            const int nl = lk.draft(K, acc_rate_, lkd.data());
+            if (nl <= nd) return nd;
+            for (int j = 0; j < nl; ++j) drafts[j] = lkd[j];
+            return nl;
+        };
         int cur = next;   // token at position p, not yet in the main model
         auto ta = clk::now();
         drafts[0] = d0 >= 0 ? d0 : mtp_chain(cur, p, true);
         int nd = extend(p);
         st.t_mtp += since(ta);
+        lk.push(cur);
+        nd = lookup(nd);
         while (!stop && p + K + 1 < opt_.max_pos) {
             // the token at p is final before its forward: a stop on it leaves the state at p (nothing past the output)
             if (!emit(cur)) break;
@@ -907,8 +929,9 @@ std::vector<int> TpEngine::generate(const std::vector<int> & prompt, int n_gen, 
             if (sampling) { while (mm < nd && (a[mm] = sample_row(mm, sp, p + mm + 1)) == drafts[mm]) ++mm; if (mm == nd) a[nd] = sample_row(nd, sp, p + nd + 1); }
             else while (mm < nd && a[mm] == drafts[mm]) ++mm;
             st.accepted += mm;
+            if (nd > 0) acc_rate_ = 0.9 * acc_rate_ + 0.1 * ((double) mm / nd);
             int r = 0;   // drafts emitted
-            while (r < mm && emit(drafts[r++])) {}
+            while (r < mm) { lk.push(drafts[r]); if (!emit(drafts[r++])) break; }
             if (stop) {
                 // the output ends with drafts[r - 1] at p + r: keep rows 0..r-1 (the state up to its last token, as when a stop
                 // comes before a forward) and the MTP cache rows p+1..p+r, so the end-of-answer snapshot can serve the next request
@@ -928,11 +951,13 @@ std::vector<int> TpEngine::generate(const std::vector<int> & prompt, int n_gen, 
                 kc = std::max(1, std::min(K, (int) (avg_acc + 1.5)));
             }
             p += mm + 1;
+            lk.push(cur);
             if (p + K + 1 < opt_.max_pos) {   // (rows p - mm .. p: the kept rows' tokens after them)
                 ta = clk::now();
                 drafts[0] = mtp_update(mt.data(), mm + 1, p - mm, true);
                 nd = extend(p);
                 st.t_mtp += since(ta);
+                nd = lookup(nd);
             }
             gen_snapshot();
         }
