@@ -2,6 +2,7 @@
 // roundings follow the reference's F32 arithmetic (as maya-ds4's kernels, whose arithmetic these follow; MIT, Copyright (c)
 // 2026 Peasant Smith and the Project Maya contributors).
 #include "kernels7.cuh"
+#include "kernels.cuh"   // (MAX_NT: decode-sized row counts)
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -969,7 +970,7 @@ void sparse_attn7(const float * q, const uint16_t * ring, int ring_rows, int win
     // HYPER7_ATTN_TC_DECODE=1: the tensor-core kernel for decode rows too (the scalar one: a block per head and row, 640
     // serial dots and 640 serial loads per thread -- ~157 us a layer at 26k)
     static const bool tc_dec = getenv("HYPER7_ATTN_TC_DECODE") && atoi(getenv("HYPER7_ATTN_TC_DECODE")) != 0;
-    if ((T > 4 || tc_dec) && !no_tc && heads % kTcH == 0 && win + kcap <= kTcMax) {
+    if ((T > MAX_NT || tc_dec) && !no_tc && heads % kTcH == 0 && win + kcap <= kTcMax) {   // (decode-sized rows: the scalar kernel, as plain decoding)
         int dev = 0;
         cudaGetDevice(&dev);
         static unsigned done_mask = 0;
