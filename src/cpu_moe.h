@@ -68,6 +68,7 @@ public:
     void set_owned(int slot, int e, bool v) { layers_[slot].owned[e] = v; }   // (between jobs only)
     void set_cslot(int slot, int e, int i) { layers_[slot].cslot[e] = i; }   // (between jobs only; a compact copy's index)
     void set_owned_bulk(int slot, const std::vector<uint8_t> & m) { layers_[slot].owned_bulk = m; }   // (between jobs only; empty: owned)
+    void set_owned_bulk1(int slot, int e, bool v) { auto & m = layers_[slot].owned_bulk; if (!m.empty()) m[e] = v; }   // (one expert; between jobs)
     // decode jobs of this slot compute only the hidden slice [0, a) (the GPUs take the rest, zero-copy)
     void set_split(int slot, int a) { split_[slot] = a; }   // SwiGLU limit: silu(min(g, L)) * clamp(u, -L, L)
     // the next forward (device counter value `counter`) will publish these slots in order

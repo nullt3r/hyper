@@ -157,6 +157,7 @@ void MoePlace::load_layer(int il, const ExpertTensors & t, const std::vector<int
         D.moe.slot = d.upload(slot.data(), E);
         D.owner = d.upload(owner.data(), E);
         D.owner_bulk = d.upload(owner_bulk ? owner_bulk->data() : owner.data(), E);
+        if (owner_bulk) H.owner_bulk = *owner_bulk;
         for (int h = 0; h < p_.halves; ++h) D.st_slot[h] = d.alloc<int>(E);
     }
     for (const GTensor * tt : {t.g, t.u, t.d}) {   // (the file's pages are not needed any more)
@@ -326,6 +327,7 @@ void MoePlace::upload_tables(int il) {
         CUDA_CHECK(cudaSetDevice(devs_[g]->id));
         CUDA_CHECK(cudaMemcpy((void *) D.moe.slot, H.slot[g].data(), p_.E * sizeof(int), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(D.owner, H.owner.data(), p_.E * sizeof(int), cudaMemcpyHostToDevice));
+        if (!H.owner_bulk.empty()) CUDA_CHECK(cudaMemcpy(D.owner_bulk, H.owner_bulk.data(), p_.E * sizeof(int), cudaMemcpyHostToDevice));
     }
     H.tables_dirty = false;
     if (on_changed) on_changed(il);
@@ -432,6 +434,12 @@ void MoePlace::rebalance(int max_swaps) {
         }
         cpu_->set_owned(w.il, w.ein, false);
         cpu_->set_owned(w.il, w.eout, true);
+        if (!H.owner_bulk.empty()) {   // the bulk path's tables follow (an engine without streamed chunks never rebuilds them)
+            H.owner_bulk[w.ein] = w.g;
+            H.owner_bulk[w.eout] = CPU_OWNER;
+            cpu_->set_owned_bulk1(w.il, w.ein, false);
+            cpu_->set_owned_bulk1(w.il, w.eout, true);
+        }
         H.tables_dirty = true;
         H.stream_dirty = true;
     }

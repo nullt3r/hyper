@@ -92,6 +92,25 @@ int main(int argc, char ** argv) {
                    b.tokens / b.seconds, b.steps, (double) b.drafted / std::max(1, b.steps), (double) b.accepted / std::max(1, b.steps),
                    (double) b.tokens / std::max(1, b.steps));
             printf("SPECGEN identical prefix %d / %d%s  spec hash %016llx\n", same, n_gen, same == n_gen ? " (sequences match)" : "", (unsigned long long) hs);
+        } else if (cmd == "convo") {   // a conversation of several turns (HYPER7_TEMP sampling, drafts): generate n tokens, then the next turn
+            // appends the answer and `more` prompt tokens from the ids, R rounds -- the shape of the production failures
+            const int n_gen = argc > 4 ? atoi(argv[4]) : 200, more = argc > 5 ? atoi(argv[5]) : 300, rounds = argc > 6 ? atoi(argv[6]) : 3;
+            SamplingParams sp;
+            if (getenv("HYPER7_TEMP")) { sp.temp = (float) atof(getenv("HYPER7_TEMP")); sp.seed = 1234; }
+            std::vector<int> prompt(ids.begin(), ids.begin() + std::min<size_t>(ids.size(), (size_t) std::max(16, (int) ids.size() - more * rounds)));
+            size_t next = prompt.size();
+            for (int r = 0; r < rounds; ++r) {
+                GenStats st;
+                const std::vector<int> out = eng.generate(prompt, n_gen, true, &st, {}, sp);
+                printf("CONVO round %d: prompt %zu (reused %d) -> %d tokens, %.2f t/s, %d/%d drafts accepted\n", r, prompt.size(), st.prompt_reused, st.tokens,
+                       st.tokens / st.seconds, st.accepted, st.drafted);
+                fflush(stdout);
+                // HYPER7_CONVO_DROP=n: the next turn leaves out the first n tokens of the answer (a client that drops the
+                // reasoning): the prompt diverges inside the generated region
+                const int drop = getenv("HYPER7_CONVO_DROP") ? atoi(getenv("HYPER7_CONVO_DROP")) : 0;
+                prompt.insert(prompt.end(), out.begin() + std::min<size_t>(out.size(), (size_t) std::max(0, drop)), out.end());
+                for (int i = 0; i < more && next < ids.size(); ++i) prompt.push_back(ids[next++]);
+            }
         } else if (cmd == "specstat") {   // sampling test: N draws of the first 2 tokens after the prompt at HYPER7_TEMP (seed = draw),
             // the (tok0, tok1) pair counts; the cache keeps the prompt, so a draw costs one or two decode steps. Compared
             // between HYPER7_DSPARK_COUPLED=1 (exact-match drafts: plain sampling) and speculative sampling (same distribution)

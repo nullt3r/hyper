@@ -50,6 +50,7 @@ struct MoeLayerHost {
     std::vector<std::vector<int>> slot;    // [ndev][E]: the expert's slot on that device, -1
     std::vector<int> cslot;                // [E]: index in the compact copy, -1 (the CPU's experts and the extra-slot ones)
     std::vector<char> fixed;               // [E]: never swapped (an engine's pooled experts)
+    std::vector<int> owner_bulk;           // [E] optional: the bulk path's owner table (pooled experts as the CPU's); follows the exchanges
     std::vector<double> score;             // decayed routing counts
     std::vector<uint64_t> last_count;      // the CPU side's counts at the last rebalance
     std::vector<char> pend;                // elastic: on its way into an extra slot

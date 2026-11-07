@@ -872,3 +872,16 @@ vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), 
   a refeed řídí jen generate().)
 - Poučení: server přepisuje statistiky expertů po každém požadavku, serverové hashe nejsou referencí; A/B dvou buildů na
   pevných statistikách (`~/unify/ab_*.sh`), `HYPER_QUOTA`/`HYPER7_GPU_EXPERTS` pro shodné rozmístění.
+
+## 2026-11-07 večer – produkční pád DeepSeeku po sjednocení (tabulky vlastníků bulk cesty)
+
+- Příznak: po navázání konverzace (Codex vynechává reasoning → prompt se rozchází uvnitř předchozí odpovědi, prefill
+  9–4095 tokenů = bulk nestreamovaná cesta) „CUDA illegal memory access“, v testu segfault CPU workeru v `ggml_vec_dot`.
+- Příčina: `MoePlace::rebalance` po výměně expertů GPU↔RAM přepisoval `owner`/`slot`/`cslot`, ale ne tabulky bulk cesty
+  (`owner_bulk` na GPU, `owned_bulk` na CPU), které Engine7 má kvůli poolovaným expertům a nikdy je nepřestavuje
+  (`rebuild_stream` patří TP enginům). CPU počítal experta bez řádků v kompaktní kopii (cslot −1), GPU četl slot −1.
+  Do sjednocení měl engine7 vlastní kód; expozice jen dnešek. K=5 chybu jen zviditelnil.
+- Oprava: `MoeLayerHost::owner_bulk` (host kopie), výměna ji aktualizuje a `upload_tables` ji nahrává; `CpuMoe::set_owned_bulk1`.
+  Nový test `hyper7 convo <ids> <n_gen> <more> <rounds>` (`HYPER7_CONVO_DROP`, `HYPER7_TEMP`) = tvar produkce; před opravou
+  pád v 2. kole (K=3 i K=5), po opravě 4 kola na 8k a 3 kola na 16k bez chyby. Server nově loguje „generation failed“.
+- Nasazeno: DeepSeek `--draft 5` (17:45).

@@ -1499,6 +1499,7 @@ int main(int argc, char ** argv) {
                     return ok;
                 });
             } catch (const std::exception & e) {
+                fprintf(stderr, "[%s] generation failed: %s\n", r->id.c_str(), e.what());
                 send(ojson({{"error", {{"message", e.what()}}}}));
                 sink.done();
                 return false;
