@@ -1644,7 +1644,11 @@ __device__ __forceinline__ float2 ll_exchange(const float * __restrict__ part, c
         const uint2 * buf = slots.rd + poff;
         const __half2 mh = __floats2half2_rn(mine.x, mine.y);
         const unsigned long long pkt = ((unsigned long long) seq << 32) | (unsigned long long) *(const unsigned *) &mh;
-        for (int k = 0; k < slots.nw; ++k) *(volatile unsigned long long *) &slots.wr[k][poff + (size_t) g * n2 + i] = pkt;
+        if (slots.wide) {   // peer memory: let the warp's stores merge into wide transactions, then push them out
+            for (int k = 0; k < slots.nw; ++k) *(unsigned long long *) &slots.wr[k][poff + (size_t) g * n2 + i] = pkt;
+            __threadfence_system();
+        } else
+            for (int k = 0; k < slots.nw; ++k) *(volatile unsigned long long *) &slots.wr[k][poff + (size_t) g * n2 + i] = pkt;
         for (int dd = 0; dd < ndev; ++dd) {
             float2 f;
             if (dd == g) {
@@ -2494,5 +2498,27 @@ void allreduce_hc_ll16(float * res, const float * inj, int width, int hc, const 
     else k_allreduce_hc_ll16<false><<<(n2 + 255) / 256, 256, 0, s>>>(res, inj, width, hc, part, slots, g, ndev, n2, counter, call);
 }
 void incr_counter(int * c, cudaStream_t s) { k_incr<<<1, 1, 0, s>>>(c); }
+
+// ---- prefill ring allreduce pieces ----
+__global__ void k_ring_add(const half * __restrict__ in, const half * __restrict__ addend, half * __restrict__ out, int len) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < len) out[i] = __float2half_rn(__half2float(in[i]) + __half2float(addend[i]));
+}
+__global__ void k_ring_out(const half * __restrict__ in, float * __restrict__ x, int len) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < len) x[i] = __half2float(in[i]);
+}
+__device__ __forceinline__ unsigned long long ring_id(const int * counter, int call) { return ((unsigned long long) (unsigned) *counter << 20) | (unsigned) call | (1ull << 63); }
+__global__ void k_ring_tag(unsigned long long * tag, const int * counter, int call) { *tag = ring_id(counter, call); }
+__global__ void k_ring_wait(const unsigned long long * flag, const int * counter, int call, unsigned * err) {
+    const unsigned long long want = ring_id(counter, call);
+    const long long t0 = clock64();
+    while (*(const volatile unsigned long long *) flag != want)
+        if (clock64() - t0 > 20000000000LL) { atomicOr(err, 1u); break; }   // (~10 s: a lost peer)
+}
+void ring_add(const half * in, const half * addend, half * out, int len, cudaStream_t s) { k_ring_add<<<(len + 255) / 256, 256, 0, s>>>(in, addend, out, len); }
+void ring_out(const half * in, float * x, int len, cudaStream_t s) { k_ring_out<<<(len + 255) / 256, 256, 0, s>>>(in, x, len); }
+void ring_tag(unsigned long long * tag, const int * counter, int call, cudaStream_t s) { k_ring_tag<<<1, 1, 0, s>>>(tag, counter, call); }
+void ring_wait(const unsigned long long * flag, const int * counter, int call, unsigned * err, cudaStream_t s) { k_ring_wait<<<1, 1, 0, s>>>(flag, counter, call, err); }
 
 } // namespace hyper

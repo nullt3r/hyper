@@ -173,6 +173,7 @@ struct LLBuf {
     uint2 * rd = nullptr;
     uint2 * wr[8] = {};
     int nw = 0;
+    int wide = 0;   // 1: plain (coalescable) stores + a system fence instead of volatile 8-byte stores (peer memory)
 };
 void allreduce_add_ll16(float * x, const float * part, const LLBuf & slots, int g, int ndev, int n,
                         const int * counter, int call, cudaStream_t s, float * ss_out = nullptr);
@@ -189,6 +190,11 @@ void allreduce_add_bulk(float * x, const float * part, half * data, unsigned * f
                         const int * counter, int call, cudaStream_t s);
 // x[i] += own[i] + sum_{j < nparts} recv[j * stride + i]  (fp16 parts; copy-engine allreduce)
 void add_parts(float * x, const half * own, const half * recv, size_t stride, int nparts, int n, cudaStream_t s);
+// prefill ring allreduce over the copy engines (P2P): the pieces a device runs between its peer copies
+void ring_add(const half * in, const half * addend, half * out, int len, cudaStream_t s);      // out = f16(f32(in) + f32(addend))
+void ring_out(const half * in, float * x, int len, cudaStream_t s);                             // x = f32(in)
+void ring_tag(unsigned long long * tag, const int * counter, int call, cudaStream_t s);         // tag = the exchange's id (sent as the flag)
+void ring_wait(const unsigned long long * flag, const int * counter, int call, unsigned * err, cudaStream_t s);   // spins until the flag shows the id
 // sum of squares of each token row into ss[t * nss] (remaining nss-1 entries zeroed)
 void sumsq(const float * x, int xs, int n, int nt, float * ss, int nss, cudaStream_t s);
 void incr_counter(int * c, cudaStream_t s);

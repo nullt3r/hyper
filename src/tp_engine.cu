@@ -99,19 +99,22 @@ void TpEngine::init() {
             const cudaError_t e = cudaDeviceEnablePeerAccess(devs_[p]->id, 0);
             if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) { (void) cudaGetLastError(); p2p_ = false; }
         }
-    if (nd > 1) fprintf(stderr, "%s: allreduce %s\n", m_.tag.c_str(), p2p_ ? "through peer memory (P2P)" : "through host memory (no P2P)");
+    ll_p2p_ = p2p_ && envp(env, "LL_P2P", b) && atoi(envp(env, "LL_P2P", b)) != 0;
+    if (nd > 1) fprintf(stderr, "%s: prefill allreduce %s, decode LL packets %s\n", m_.tag.c_str(),
+                        p2p_ ? "as a ring over the copy engines (P2P)" : "through host memory (no P2P)", ll_p2p_ ? "into peer memory" : "through host memory");
     for (int g = 0; g < nd; ++g) {
         TpDevice & d = *devs_[g];
-        if (p2p_) {
+        if (ll_p2p_) {
             d.ll_buf = d.alloc<uint2>(ll);
             CUDA_CHECK(cudaMemset(d.ll_buf, 0xff, ll * sizeof(uint2)));
         }
     }
     for (int g = 0; g < nd; ++g) {
         TpDevice & d = *devs_[g];
-        if (p2p_) { d.ll.rd = d.ll_buf; d.ll.nw = 0; for (int p = 0; p < nd; ++p) if (p != g) d.ll.wr[d.ll.nw++] = devs_[p]->ll_buf; }
+        if (ll_p2p_) { d.ll.rd = d.ll_buf; d.ll.nw = 0; for (int p = 0; p < nd; ++p) if (p != g) d.ll.wr[d.ll.nw++] = devs_[p]->ll_buf; }
         else { d.ll.rd = ar_ll_; d.ll.nw = 1; d.ll.wr[0] = ar_ll_; }
     }
+    ring_ch_ = ((size_t) R() * n + nd - 1) / nd + 8;
     CUDA_CHECK(cudaHostAlloc(&h_ids_, (size_t) slots * mc_max_ * R() * m_.n_expert_used * sizeof(int), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_pred_, (size_t) std::max(1, m_.n_layer) * MOE_MAX_USED * sizeof(int), cudaHostAllocPortable));
     init_cpu_side(opt_.cpu_threads, n, m_.n_ff_exp, m_.n_expert_used, slots, m_.clamp_exp, pred_mode_ == 2 && pred_early_);
@@ -201,10 +204,21 @@ void TpEngine::alloc_common(TpDevice & dev, const CommonSizes & sz) {
     }
     for (int sl = 0; sl < mc_alloc_; ++sl) {   // (a slot per chunk of a multi-chunk pass: their exchanges are in flight together)
         dev.p16s.push_back(dev.alloc<half>((size_t) Rr * n));
-        dev.recvs.push_back(dev.alloc<half>((size_t) std::max(1, nd - 1) * Rr * n));
+        if (p2p_) {   // the ring: hop slots in, two send buffers, the gathered row
+            dev.rs_recv.push_back(dev.alloc<half>((size_t) std::max(1, nd - 1) * ring_ch_));
+            dev.rs_send0.push_back(dev.alloc<half>(ring_ch_));
+            dev.rs_send1.push_back(dev.alloc<half>(ring_ch_));
+            dev.ag.push_back(dev.alloc<half>((size_t) Rr * n));
+            dev.recvs.push_back(nullptr);
+        } else dev.recvs.push_back(dev.alloc<half>((size_t) std::max(1, nd - 1) * Rr * n));
     }
     dev.p16 = dev.p16s[0];
     dev.recv = dev.recvs[0];
+    if (p2p_) {
+        dev.ring_flags = dev.alloc<unsigned long long>((size_t) 2 * 8 * 16);   // [parity][slot][step]
+        dev.ring_tagv = dev.alloc<unsigned long long>((size_t) 2 * 8);        // [parity][slot]
+        dev.ring_err = dev.alloc<unsigned>(1);
+    }
     dev.order = dev.alloc<int>((size_t) Rr * K);
     dev.order_n = dev.alloc<int>(2);
     dev.topk = dev.alloc<float>((size_t) MAX_NT * TOPK * 2);
@@ -389,14 +403,57 @@ void TpEngine::ar_begin(TpDevice & d, int nt, int slot, int par) {
     CUDA_CHECK(cudaStreamWaitEvent(cs, d.ev_a[par][slot], 0));
     // the staging slot is free once every peer took the previous use of it (their downloads were enqueued before the last barrier)
     for (int p = 0; p < nd; ++p) if (p != d.g) CUDA_CHECK(cudaStreamWaitEvent(cs, devs_[p]->ev_dn[par][slot], 0));
-    if (p2p_) {   // straight into every peer's receive slot (its index of this device among its peers)
-        for (int p = 0; p < nd; ++p) {
-            if (p == d.g) continue;
-            const int j = d.g < p ? d.g : d.g - 1;
-            CUDA_CHECK(cudaMemcpyPeerAsync(devs_[p]->recvs[slot] + (size_t) j * R() * n, devs_[p]->id, p16, d.id, N * sizeof(half), cs));
-        }
-    } else CUDA_CHECK(cudaMemcpyAsync(stage(d.g), p16, N * sizeof(half), cudaMemcpyDeviceToHost, cs));
+    if (p2p_) { ar_ring(d, nt, slot, par); return; }
+    CUDA_CHECK(cudaMemcpyAsync(stage(d.g), p16, N * sizeof(half), cudaMemcpyDeviceToHost, cs));
     CUDA_CHECK(cudaEventRecord(d.ev_up2[par][slot], cs));
+}
+
+// The ring (as sfnx's prompt-path sum): the row in ndev parts; this device sends part g to the next device, each device
+// adds its own addend to what arrives and sends it on (reduce-scatter, ndev - 1 hops), then the finished parts go round
+// once more (all-gather). Copies on the copy stream, each followed by a flag written into the next device; the receiver
+// spins on the flag before touching the data, so no host barrier is needed. Transit in fp16 (the addends enter rounded
+// to fp16 as in the host path; the partial sums are rounded too). ar_sum waits for the last part and widens the row.
+void TpEngine::ar_ring(TpDevice & d, int nt, int slot, int par) {
+    cudaStream_t s = d.stream, cs = d.arstream;
+    const int nd = opt_.n_devices, n = m_.n_embd, g = d.g, nx = (g + 1) % nd;
+    TpDevice & N_ = *devs_[nx];
+    const size_t N = (size_t) nt * n;
+    auto lo = [&](int k) { return (size_t) k * N / nd; };
+    auto len = [&](int k) { return (int) (lo(k + 1) - lo(k)); };
+    auto flag = [&](TpDevice & dev, int step) { return dev.ring_flags + ((size_t) par * 8 + slot) * 16 + step; };
+    const int call = d.ar_calls++;
+    d.ar_call_of[par][slot] = call;
+    unsigned long long * tagv = d.ring_tagv + (size_t) par * 8 + slot;
+    // the addends: this chunk's partial as fp16 (p16, made on the compute stream before it moves on -- d.part is rewritten
+    // by the next chunk); the peers' slots are free (ar_begin waited for their ev_dn on cs)
+    const half * mine = d.p16s[slot];
+    half * rr = d.rs_recv[slot], * sb[2] = {d.rs_send0[slot], d.rs_send1[slot]}, * ag = d.ag[slot];
+    ring_tag(tagv, d.counter, call, cs);
+    auto send = [&](const half * src, half * dst, int cnt, int step) {   // to the next device, then its flag for this step
+        CUDA_CHECK(cudaMemcpyPeerAsync(dst, N_.id, src, d.id, (size_t) cnt * sizeof(half), cs));
+        CUDA_CHECK(cudaMemcpyPeerAsync(flag(N_, step), N_.id, tagv, d.id, sizeof(unsigned long long), cs));
+    };
+    auto wait = [&](int step, cudaStream_t on) { ring_wait(flag(d, step), d.counter, call, d.ring_err, on); };
+    send(mine + lo(g), N_.rs_recv[slot], len(g), 0);   // reduce-scatter hop 0: my addend of part g
+    for (int h = 1; h < nd - 1; ++h) {   // hop h: part g - h arrived with h addends; add mine, on it goes
+        const int c = (g - h + nd) % nd;
+        wait(h - 1, cs);
+        ring_add(rr + (size_t) (h - 1) * ring_ch_, mine + lo(c), sb[h & 1], len(c), cs);
+        send(sb[h & 1], N_.rs_recv[slot] + (size_t) h * ring_ch_, len(c), h);
+    }
+    {   // last hop: part g + 1 with every other addend; mine makes it final: into my gathered row, and on round the ring
+        const int c = (g + 1) % nd;
+        wait(nd - 2, cs);
+        ring_add(rr + (size_t) (nd - 2) * ring_ch_, mine + lo(c), ag + lo(c), len(c), cs);
+        send(ag + lo(c), N_.ag[slot] + lo(c), len(c), nd - 1);
+    }
+    for (int f = 1; f < nd - 1; ++f) {   // all-gather: part g - f + 1 arrived finished from the device before; forward it
+        const int c = (g - f + 1 + nd) % nd;
+        wait(nd - 2 + f, cs);
+        send(ag + lo(c), N_.ag[slot] + lo(c), len(c), nd - 1 + f);
+    }
+    CUDA_CHECK(cudaEventRecord(d.ev_up2[par][slot], cs));   // (this device's copies issued; the last part's arrival: flag 2 nd - 3)
+    (void) s;
 }
 
 void TpEngine::ar_fetch(TpDevice & d, int nt, int slot, int par) {
@@ -428,10 +485,10 @@ void TpEngine::ar_sum(TpDevice & d, int nt, int slot, int par, float * x) {
     const int nd = opt_.n_devices, n = m_.n_embd;
     const size_t N = (size_t) nt * n;
     if (!x) { x = d.bo; CUDA_CHECK(cudaMemsetAsync(d.bo, 0, N * sizeof(float), s)); }
-    if (p2p_) {
-        for (int p = 0; p < nd; ++p) if (p != d.g) CUDA_CHECK(cudaStreamWaitEvent(s, devs_[p]->ev_up2[par][slot], 0));   // their writes landed
-        add_parts(x, d.p16s[slot], d.recvs[slot], (size_t) R() * n, nd - 1, (int) N, s);
-        CUDA_CHECK(cudaEventRecord(d.ev_dn[par][slot], s));   // (the receive slot may be overwritten by the peers again)
+    if (p2p_) {   // the ring: the last finished part has arrived when flag 2 nd - 3 shows this exchange's id
+        ring_wait(d.ring_flags + ((size_t) par * 8 + slot) * 16 + (2 * nd - 3), d.counter, d.ar_call_of[par][slot], d.ring_err, s);
+        ring_out(d.ag[slot], x, (int) N, s);
+        CUDA_CHECK(cudaEventRecord(d.ev_dn[par][slot], s));   // (the slot's buffers may be written by the peers again)
         return;
     }
     CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_dn[par][slot], 0));
@@ -584,6 +641,7 @@ void TpEngine::run(int kind, int nt) {
         if (!slots.empty()) cpu_->expect(fwd_counter_, slots, bulk && mtp_full);
     }
     if (bulk) {   // record straight into the streams, one host thread per device (barriers inside the allreduces)
+        for (auto & dp : devs_) dp->ar_calls = 0;   // (the ring's exchange ids restart with the forward's counter)
         std::vector<std::thread> th;
         std::vector<std::string> err(devs_.size());
         for (int gi = 0; gi < (int) devs_.size(); ++gi)
@@ -595,6 +653,16 @@ void TpEngine::run(int kind, int nt) {
         std::string first;   // (the failing device's message, not the others' "barrier" ones)
         for (auto & mm : err) if (!mm.empty() && (first.empty() || first.rfind("barrier:", 0) == 0)) first = mm;
         if (!first.empty()) { barrier_->reset(); throw std::runtime_error(first); }
+        if (p2p_) {   // a ring flag never seen (a lost peer) shows up here, after the forward
+            static int checked = 0;
+            if (++checked % 16 == 0)
+                for (auto & dp : devs_) {
+                    unsigned e = 0;
+                    CUDA_CHECK(cudaSetDevice(dp->id));
+                    CUDA_CHECK(cudaMemcpy(&e, dp->ring_err, sizeof(unsigned), cudaMemcpyDeviceToHost));
+                    if (e) throw std::runtime_error(m_.tag + ": prefill ring: a flag timed out on device " + std::to_string(dp->id));
+                }
+        }
     } else {
         launch_all(nt, kind);
     }

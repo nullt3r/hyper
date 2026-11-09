@@ -110,6 +110,13 @@ struct TpDevice : DevBase {
     cudaStream_t arstream = nullptr;   // the allreduce copies: off the compute stream, so a chunk's exchange overlaps the next one's kernels
     uint2 * ll_buf = nullptr;          // P2P: this device's LL packet buffer (the peers write into it)
     LLBuf ll;                          // where this device's LL allreduce writes and reads
+    // P2P prefill ring (per chunk slot): the partial sums coming in from the device before (a slot per reduce-scatter hop),
+    // the two send buffers, the all-gathered row (fp16), flags [parity][slot][step] the device before writes, the tag source
+    std::vector<half *> rs_recv, rs_send0, rs_send1, ag;
+    unsigned long long * ring_flags = nullptr, * ring_tagv = nullptr;
+    unsigned * ring_err = nullptr;
+    int ar_calls = 0;                  // this forward's exchanges so far (the same sequence on every device: the flags' ids)
+    int ar_call_of[2][8] = {};         // the id each (parity, slot) exchange in flight uses
     half * ggs = nullptr;            // KQ dense weights: fp16 slice for prefill GEMMs
     size_t ggs_elems = 0;
     float * topk = nullptr;          // sampling candidates [MAX_NT][TOPK][2]
@@ -231,6 +238,7 @@ protected:
     // events exist then); par: 0 / 1 for the two allreduces of a layer, slot: the chunk
     void ar_begin(TpDevice & d, int nt, int slot, int par);
     void ar_fetch(TpDevice & d, int nt, int slot, int par);   // after the barrier: the peers' partials start downloading (copy stream)
+    void ar_ring(TpDevice & d, int nt, int slot, int par);    // P2P: the whole exchange as a ring over the copy engines (ar_begin calls it)
     void ar_sum(TpDevice & d, int nt, int slot, int par, float * x = nullptr);   // compute stream: waits for them, adds them all
     void ar_end(TpDevice & d, int nt, int slot, int par, float * x = nullptr) { ar_fetch(d, nt, slot, par); ar_sum(d, nt, slot, par, x); }
     // the streamed experts' uploads at the start of a recording (the first layer's share) and the upload-part queue
@@ -270,7 +278,9 @@ protected:
     float * h_mtopk_ = nullptr;     // pinned [ndev][TOPK][2]: the MTP head's candidates per vocab slice
     half * h_stage_ = nullptr;      // pinned DMA allreduce staging [parity][mc_alloc][ndev][R * n_embd]
     uint2 * ar_ll_ = nullptr;       // host-mode LL packet buffer (mapped)
-    bool p2p_ = false;              // peer access between every pair: LL packets and prefill partials go into the peers' VRAM
+    bool p2p_ = false;              // peer access between every pair (the prefill ring; <ENV>_P2P=0 keeps the host paths)
+    bool ll_p2p_ = false;           // <ENV>_LL_P2P=1: decode LL packets pushed into the peers' VRAM (slower on PCIe: 3x the writes)
+    size_t ring_ch_ = 0;            // elements a ring hop slot holds (R * n / ndev, rounded up)
     int * h_ids_ = nullptr;         // pinned [nl_tot][mc_max][R][K]: prefill routing from GPU 0
     int * h_pred_ = nullptr;        // pinned [n_layer][MOE_MAX_USED] (HYPER*_PREDSTAT)
     std::vector<std::pair<void *, size_t>> host_bufs_;

@@ -917,3 +917,9 @@ vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), 
   (`HYPER4_P2P=0` / `HYPER5_P2P=0`). Stejná aritmetika: hash logitů shodný host vs. P2P (a067f9342ca25a36 na 615).
 - Změna ovladače sama posunula poslední bity logitů (9cc54d28… → a067f934…, tokeny a MTP sekvence shodné); KL proti fp32
   referenci 0,0501 (dřív 0,046–0,062) → bez vlivu na kvalitu, nová referenční binárka pro A/B je nutná.
+- P2P měření: LL dekód (push paketů všem) 12,5 µs vs 7,0 µs přes RAM (zápisy z jader po PCIe ~2 GB/s, 3 kopie); i prefill
+  „každý každému“ pomalejší (3 794 vs 3 978 t/s: 63 MB ven i dovnitř na kartu). Podle sFNX přepsáno na **ring přes
+  kopírovací enginy** (`ar_ring`: reduce-scatter + all-gather, karta posílá jen následující, příznaky v VRAM místo bariér,
+  fp16 mezisoučty): 4 038 vs 3 967 t/s (+2 %), KL 0,0482 (přes RAM 0,0501), deterministický. Default s P2P zapnutý
+  (`HYPER4_P2P=0` = RAM), LL dekód zůstává přes RAM (`HYPER4_LL_P2P=1` = push). Závěr: linky po překrytí nejsou kritická
+  cesta; zbytek rozdílu 4,1 s vs 2,8 s kernelů je pravděpodobně nerovný výkon karet při rovném dělení TP (4500 čeká na 3090).
