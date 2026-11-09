@@ -26,7 +26,7 @@
 namespace hyper {
 
 struct Engine7Options {
-    int n_devices = 3;
+    int n_devices = 0;   // 0: every visible CUDA device (HYPER7_NDEV / HYPER_NDEV override)
     int max_pos = 8192;
     int cpu_threads = 30;
     bool prompt_cache = true;

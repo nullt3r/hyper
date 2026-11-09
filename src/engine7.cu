@@ -208,7 +208,8 @@ Engine7::Engine7(const std::string & model_path, const Engine7Options & opt) : o
     std::vector<int> starts = {0};
     if (const char * sp = getenv("HYPER7_SPLIT")) {
         for (const char * q = sp; *q;) { starts.push_back(atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
-    } else if (nd == 3) starts = {0, 8, 20};
+    } else if (nd == 4) starts = {0, 8, 14, 20};   // (the production split on this box: the 32 GB card takes layers 0-7)
+    else if (nd == 3) starts = {0, 8, 20};
     else if (nd == 2) starts = {0, 14};
     starts.resize(std::min<size_t>(starts.size(), nd));
     dev_of_.assign(c.n_layer, 0);

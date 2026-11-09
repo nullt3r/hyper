@@ -26,7 +26,7 @@
 namespace hyper {
 
 struct TpOptions {
-    int n_devices = 3;
+    int n_devices = 0;   // 0: every visible CUDA device (<ENV>_NDEV / HYPER_NDEV override)
     int max_pos = 8192;
     float gpu_expert_frac = 1.0f;   // cap on the fraction of each layer's experts on the GPUs (the rest: CPU)
     float vram_reserve_gib = 0.8f;  // left free on every GPU after the experts

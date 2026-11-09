@@ -83,6 +83,7 @@ inline int device_count(int wanted, const char * env_name, const char * tag) {
     CUDA_CHECK(cudaGetDeviceCount(&ndev));
     if (const char * e = getenv("HYPER_NDEV")) wanted = std::max(1, atoi(e));
     if (const char * e = env_name ? getenv(env_name) : nullptr) wanted = std::max(1, atoi(e));
+    if (wanted <= 0) wanted = ndev;   // (default: every visible device -- CUDA_VISIBLE_DEVICES picks the set)
     wanted = std::min(wanted, ndev);
     fprintf(stderr, "%s: %d of %d CUDA devices\n", tag, wanted, ndev);
     return wanted;
