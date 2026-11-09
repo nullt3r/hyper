@@ -166,14 +166,22 @@ constexpr int AR_SS_SPAN = 512;
 // packets, see ll_slots)
 bool allreduce_f32();
 inline size_t ll_slots(int ndev, int rows, int n_embd) { return (size_t) 2 * ndev * rows * n_embd; }
-void allreduce_add_ll16(float * x, const float * part, uint2 * slots, int g, int ndev, int n,
+// where a device's LL packets go and come from: rd = the buffer it polls (regions [parity][sender][n/2]); wr[k], k < nw =
+// the buffers it writes its own region into. Host mode: one mapped host buffer for everything (nw = 1, wr[0] = rd).
+// P2P mode: rd = the device's own VRAM buffer, wr = the peers' VRAM buffers (posted writes over PCIe, local polling)
+struct LLBuf {
+    uint2 * rd = nullptr;
+    uint2 * wr[8] = {};
+    int nw = 0;
+};
+void allreduce_add_ll16(float * x, const float * part, const LLBuf & slots, int g, int ndev, int n,
                         const int * counter, int call, cudaStream_t s, float * ss_out = nullptr);
 // hyper-connection variant: no x; the sum of row t is scattered into the hc streams of res,
 // res[t][s][e] += sum[t][e] * 2 * sigmoid(inj[t * 4 + s] / hc)   (n = nt * width, width = row length)
-void allreduce_hc_ll16(float * res, const float * inj, int width, int hc, const float * part, uint2 * slots, int g, int ndev, int n,
+void allreduce_hc_ll16(float * res, const float * inj, int width, int hc, const float * part, const LLBuf & slots, int g, int ndev, int n,
                        const int * counter, int call, cudaStream_t s);
 // mHC variant (glm5-next): res[t][d][e] = sum[t][e] * hcw[t][d] + sum_s hcw[t][4 + d + 4 s] * res[t][s][e]
-void allreduce_mhc_ll16(float * res, const float * hcw, int width, const float * part, uint2 * slots, int g, int ndev, int n,
+void allreduce_mhc_ll16(float * res, const float * hcw, int width, const float * part, const LLBuf & slots, int g, int ndev, int n,
                         const int * counter, int call, cudaStream_t s);
 // bulk variant (many tokens, no sum-of-squares output): data [2][ndev][n] fp16 and flags [2][ndev][n/1024]
 // in mapped host memory

@@ -486,8 +486,8 @@ void Engine5::record_main(int gi, int nt, int kind) {
     };
     auto out_begin = [&](int par, int ci) {
         if (!bulk) {
-            if (mtp) allreduce_add_ll16(R, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s, nullptr);
-            else if (!old_post) allreduce_mhc_ll16(R, hcwc, n, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
+            if (mtp) allreduce_add_ll16(R, d.part, d.ll, d.g, nd, nt * n, d.counter, call++, s, nullptr);
+            else if (!old_post) allreduce_mhc_ll16(R, hcwc, n, d.part, d.ll, d.g, nd, nt * n, d.counter, call++, s);
             else { int dc = 0; TpEngine::allreduce(d, nt, call, dc, false); mhc_post(R, d.bo, hcwc, n, nt, s); }
             return;
         }

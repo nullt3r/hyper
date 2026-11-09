@@ -86,6 +86,32 @@ void TpEngine::init() {
     const size_t ll = ll_slots(nd, MAX_NT, n);   // (fp32 parts: a packet per element)
     CUDA_CHECK(cudaHostAlloc(&ar_ll_, ll * sizeof(uint2), cudaHostAllocPortable | cudaHostAllocMapped));
     memset(ar_ll_, 0xff, ll * sizeof(uint2));
+    // peer access between every pair (a P2P-capable driver): the LL packets go straight into the peers' VRAM and the
+    // prefill partials into their receive buffers; <ENV>_P2P=0 keeps the host paths
+    p2p_ = nd > 1 && !(envp(env, "P2P", b) && atoi(envp(env, "P2P", b)) == 0);
+    for (int g = 0; g < nd && p2p_; ++g)
+        for (int p = 0; p < nd && p2p_; ++p) {
+            if (p == g) continue;
+            int ok = 0;
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&ok, devs_[g]->id, devs_[p]->id));
+            if (!ok) { p2p_ = false; break; }
+            CUDA_CHECK(cudaSetDevice(devs_[g]->id));
+            const cudaError_t e = cudaDeviceEnablePeerAccess(devs_[p]->id, 0);
+            if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) { (void) cudaGetLastError(); p2p_ = false; }
+        }
+    if (nd > 1) fprintf(stderr, "%s: allreduce %s\n", m_.tag.c_str(), p2p_ ? "through peer memory (P2P)" : "through host memory (no P2P)");
+    for (int g = 0; g < nd; ++g) {
+        TpDevice & d = *devs_[g];
+        if (p2p_) {
+            d.ll_buf = d.alloc<uint2>(ll);
+            CUDA_CHECK(cudaMemset(d.ll_buf, 0xff, ll * sizeof(uint2)));
+        }
+    }
+    for (int g = 0; g < nd; ++g) {
+        TpDevice & d = *devs_[g];
+        if (p2p_) { d.ll.rd = d.ll_buf; d.ll.nw = 0; for (int p = 0; p < nd; ++p) if (p != g) d.ll.wr[d.ll.nw++] = devs_[p]->ll_buf; }
+        else { d.ll.rd = ar_ll_; d.ll.nw = 1; d.ll.wr[0] = ar_ll_; }
+    }
     CUDA_CHECK(cudaHostAlloc(&h_ids_, (size_t) slots * mc_max_ * R() * m_.n_expert_used * sizeof(int), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_pred_, (size_t) std::max(1, m_.n_layer) * MOE_MAX_USED * sizeof(int), cudaHostAllocPortable));
     init_cpu_side(opt_.cpu_threads, n, m_.n_ff_exp, m_.n_expert_used, slots, m_.clamp_exp, pred_mode_ == 2 && pred_early_);
@@ -343,7 +369,7 @@ void TpEngine::allreduce(TpDevice & d, int nt, int & call, int & dcall, bool bul
     cudaStream_t s = d.stream;
     const int nd = opt_.n_devices, n = m_.n_embd;
     if (!x) { x = d.bo; CUDA_CHECK(cudaMemsetAsync(d.bo, 0, (size_t) nt * n * sizeof(float), s)); }
-    if (!bulk) { allreduce_add_ll16(x, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s, nullptr); return; }
+    if (!bulk) { allreduce_add_ll16(x, d.part, d.ll, d.g, nd, nt * n, d.counter, call++, s, nullptr); return; }
     const int par = dcall++ & 1;
     ar_begin(d, nt, 0, par);
     barrier_->wait();
@@ -363,7 +389,13 @@ void TpEngine::ar_begin(TpDevice & d, int nt, int slot, int par) {
     CUDA_CHECK(cudaStreamWaitEvent(cs, d.ev_a[par][slot], 0));
     // the staging slot is free once every peer took the previous use of it (their downloads were enqueued before the last barrier)
     for (int p = 0; p < nd; ++p) if (p != d.g) CUDA_CHECK(cudaStreamWaitEvent(cs, devs_[p]->ev_dn[par][slot], 0));
-    CUDA_CHECK(cudaMemcpyAsync(stage(d.g), p16, N * sizeof(half), cudaMemcpyDeviceToHost, cs));
+    if (p2p_) {   // straight into every peer's receive slot (its index of this device among its peers)
+        for (int p = 0; p < nd; ++p) {
+            if (p == d.g) continue;
+            const int j = d.g < p ? d.g : d.g - 1;
+            CUDA_CHECK(cudaMemcpyPeerAsync(devs_[p]->recvs[slot] + (size_t) j * R() * n, devs_[p]->id, p16, d.id, N * sizeof(half), cs));
+        }
+    } else CUDA_CHECK(cudaMemcpyAsync(stage(d.g), p16, N * sizeof(half), cudaMemcpyDeviceToHost, cs));
     CUDA_CHECK(cudaEventRecord(d.ev_up2[par][slot], cs));
 }
 
@@ -373,16 +405,18 @@ void TpEngine::ar_fetch(TpDevice & d, int nt, int slot, int par) {
     const size_t N = (size_t) nt * n;
     auto stage = [&](int g) { return h_stage_ + (((size_t) par * mc_alloc_ + slot) * nd + g) * R() * n; };
     half * recv = d.recvs[slot];
-    int j = 0;
-    for (int p = 0; p < nd; ++p) {
-        if (p == d.g) continue;
-        CUDA_CHECK(cudaStreamWaitEvent(cs, devs_[p]->ev_up2[par][slot], 0));
-        CUDA_CHECK(cudaMemcpyAsync(recv + (size_t) j * R() * n, stage(p), N * sizeof(half), cudaMemcpyHostToDevice, cs));
-        ++j;
+    if (!p2p_) {
+        int j = 0;
+        for (int p = 0; p < nd; ++p) {
+            if (p == d.g) continue;
+            CUDA_CHECK(cudaStreamWaitEvent(cs, devs_[p]->ev_up2[par][slot], 0));
+            CUDA_CHECK(cudaMemcpyAsync(recv + (size_t) j * R() * n, stage(p), N * sizeof(half), cudaMemcpyHostToDevice, cs));
+            ++j;
+        }
+        CUDA_CHECK(cudaEventRecord(d.ev_dn[par][slot], cs));   // (the host staging slot may be reused)
     }
-    CUDA_CHECK(cudaEventRecord(d.ev_dn[par][slot], cs));
-    if (!d.up_pend.empty()) {   // the next expert upload part, behind these downloads
-        CUDA_CHECK(cudaStreamWaitEvent(d.cstream, d.ev_dn[par][slot], 0));
+    if (!d.up_pend.empty()) {   // the next expert upload part, behind these downloads (P2P: behind this device's peer writes)
+        CUDA_CHECK(cudaStreamWaitEvent(d.cstream, p2p_ ? d.ev_up2[par][slot] : d.ev_dn[par][slot], 0));
         const auto q = d.up_pend.front();
         d.up_pend.pop_front();
         place_->upload_stage(d.g, q[0], q[1], q[2], up_parts_);
@@ -394,6 +428,12 @@ void TpEngine::ar_sum(TpDevice & d, int nt, int slot, int par, float * x) {
     const int nd = opt_.n_devices, n = m_.n_embd;
     const size_t N = (size_t) nt * n;
     if (!x) { x = d.bo; CUDA_CHECK(cudaMemsetAsync(d.bo, 0, N * sizeof(float), s)); }
+    if (p2p_) {
+        for (int p = 0; p < nd; ++p) if (p != d.g) CUDA_CHECK(cudaStreamWaitEvent(s, devs_[p]->ev_up2[par][slot], 0));   // their writes landed
+        add_parts(x, d.p16s[slot], d.recvs[slot], (size_t) R() * n, nd - 1, (int) N, s);
+        CUDA_CHECK(cudaEventRecord(d.ev_dn[par][slot], s));   // (the receive slot may be overwritten by the peers again)
+        return;
+    }
     CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_dn[par][slot], 0));
     add_parts(x, d.p16s[slot], d.recvs[slot], (size_t) R() * n, nd - 1, (int) N, s);
 }

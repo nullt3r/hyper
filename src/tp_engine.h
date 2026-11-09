@@ -108,6 +108,8 @@ struct TpDevice : DevBase {
     // p16 / recv alias slot 0
     std::vector<half *> p16s, recvs;
     cudaStream_t arstream = nullptr;   // the allreduce copies: off the compute stream, so a chunk's exchange overlaps the next one's kernels
+    uint2 * ll_buf = nullptr;          // P2P: this device's LL packet buffer (the peers write into it)
+    LLBuf ll;                          // where this device's LL allreduce writes and reads
     half * ggs = nullptr;            // KQ dense weights: fp16 slice for prefill GEMMs
     size_t ggs_elems = 0;
     float * topk = nullptr;          // sampling candidates [MAX_NT][TOPK][2]
@@ -267,7 +269,8 @@ protected:
     float * h_topk_ = nullptr;      // pinned [ndev][MAX_NT][TOPK][2]
     float * h_mtopk_ = nullptr;     // pinned [ndev][TOPK][2]: the MTP head's candidates per vocab slice
     half * h_stage_ = nullptr;      // pinned DMA allreduce staging [parity][mc_alloc][ndev][R * n_embd]
-    uint2 * ar_ll_ = nullptr;
+    uint2 * ar_ll_ = nullptr;       // host-mode LL packet buffer (mapped)
+    bool p2p_ = false;              // peer access between every pair: LL packets and prefill partials go into the peers' VRAM
     int * h_ids_ = nullptr;         // pinned [nl_tot][mc_max][R][K]: prefill routing from GPU 0
     int * h_pred_ = nullptr;        // pinned [n_layer][MOE_MAX_USED] (HYPER*_PREDSTAT)
     std::vector<std::pair<void *, size_t>> host_bufs_;

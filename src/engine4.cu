@@ -668,8 +668,8 @@ void Engine4::record_main(int gi, int nt, int kind) {
             ar_begin(d, nt, ci, 0); barrier_->wait(); ar_end(d, nt, ci, 0);
             if (c.plain) vec_add(R, d.bo, (size_t) nt * n, s); else hc_combine(R, d.bo, injc, 4, n, hc, nt, s);
         } else if (bulk) { ar_begin(d, nt, ci, 0); barrier_->wait(); ar_fetch(d, nt, ci, 0); }   // (the sum lands in phase B)
-        else if (c.plain) allreduce_add_ll16(R, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s, nullptr);   // R += sum of the parts
-        else allreduce_hc_ll16(R, injc, n, hc, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
+        else if (c.plain) allreduce_add_ll16(R, d.part, d.ll, d.g, nd, nt * n, d.counter, call++, s, nullptr);   // R += sum of the parts
+        else allreduce_hc_ll16(R, injc, n, hc, d.part, d.ll, d.g, nd, nt * n, d.counter, call++, s);
     }
     for (int ci = 0; ci < nck; ++ci) {   // ---- phase B: the mixer's sum, the MoE ----
         set_ck(ci);
@@ -786,8 +786,8 @@ void Engine4::record_main(int gi, int nt, int kind) {
             ar_begin(d, nt, ci, 1); barrier_->wait(); ar_end(d, nt, ci, 1);
             if (c.plain) vec_add(R, d.bo, (size_t) nt * n, s); else hc_combine(R, d.bo, injc, 4, n, hc, nt, s);
         } else if (bulk) { ar_begin(d, nt, ci, 1); barrier_->wait(); ar_fetch(d, nt, ci, 1); }
-        else if (c.plain) allreduce_add_ll16(R, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s, nullptr);
-        else allreduce_hc_ll16(R, injc, n, hc, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
+        else if (c.plain) allreduce_add_ll16(R, d.part, d.ll, d.g, nd, nt * n, d.counter, call++, s, nullptr);
+        else allreduce_hc_ll16(R, injc, n, hc, d.part, d.ll, d.g, nd, nt * n, d.counter, call++, s);
     }
     for (int ci = 0; ci < nck; ++ci) {   // ---- phase C: the MoE's sum ----
         set_ck(ci);

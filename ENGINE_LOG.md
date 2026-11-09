@@ -903,3 +903,17 @@ vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), 
 - GLM (engine5) stejný přepis (`out_begin` / `out_end`, mHC váhy na chunk): 16k prefill na 3 kartách 1 241 → 1 749 t/s
   (+41 %), na 4 kartách nová verze 1 964–2 235 t/s; dekód beze změny, 16k staré vs. nové pořadí shodný hash, MTP sekvence
   shodné s referencí. Default počtu karet: všechny viditelné (dřív 3 → dva testy omylem na třech kartách).
+
+## 2026-11-09 večer – P2P mezi kartami (ovladač 615.71.09 s patchem), allreduce přes paměť sousedů
+
+- Ovladač 580.173.02 → 615.71.09 (apt), kernelové moduly z forku aikitoria/open-gpu-kernel-modules větev 615.71.09-p2p
+  (BAR1 P2P i mezi generacemi; diff prošel, +891 řádků jen mapování paměti), libcuda patch (4 bajty v kontrole
+  kompatibility architektur), `amd_iommu=on iommu=pt`. `nvidia-smi topo -p2p` OK pro všech 12 párů; `tools/p2ptest.cu`:
+  zápis kernelu do VRAM souseda správný, 26 GB/s x16↔x16, 13 GB/s přes x8 (přes RAM 7–14). gpu_unlock (BF16 na 3090) drží.
+  Návrat: ~/p2p/rollback/ROLLBACK.txt. Balíčky nvidia na hold.
+- Engine: `LLBuf` (kam karta píše LL pakety a odkud čte): bez P2P jeden mapovaný host buffer, s P2P vlastní VRAM buffer na
+  kartu, zápisy posílané přímo sousedům, polling lokální. Prefill: `ar_begin` kopíruje částečný součet rovnou do receive
+  slotů sousedů (`cudaMemcpyPeerAsync`), `ar_sum` čeká na jejich události; staging přes RAM zůstává jako záloha
+  (`HYPER4_P2P=0` / `HYPER5_P2P=0`). Stejná aritmetika: hash logitů shodný host vs. P2P (a067f9342ca25a36 na 615).
+- Změna ovladače sama posunula poslední bity logitů (9cc54d28… → a067f934…, tokeny a MTP sekvence shodné); KL proti fp32
+  referenci 0,0501 (dřív 0,046–0,062) → bez vlivu na kvalitu, nová referenční binárka pro A/B je nutná.
