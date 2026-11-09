@@ -900,3 +900,6 @@ vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), 
   2000 proti referenční binárce při stejném rozmístění (`HYPER_QUOTA`), 16k staré vs. nové pořadí, mtpgen hash shodný.
   GLM používá dál `allreduce()` (= begin + barrier + end, stejná aritmetika), bez překryvu; jeho smyčku zbývá přepsat.
 - Pozor při A/B: nové buffery mění rozmístění expertů → hash logitů se liší, dokud se nepřipne `HYPER_QUOTA`.
+- GLM (engine5) stejný přepis (`out_begin` / `out_end`, mHC váhy na chunk): 16k prefill na 3 kartách 1 241 → 1 749 t/s
+  (+41 %), na 4 kartách nová verze 1 964–2 235 t/s; dekód beze změny, 16k staré vs. nové pořadí shodný hash, MTP sekvence
+  shodné s referencí. Default počtu karet: všechny viditelné (dřív 3 → dva testy omylem na třech kartách).
