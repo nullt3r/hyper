@@ -64,6 +64,10 @@ DW dense_rows_view(const DW & w, int r0, int r1);
 DW upload_hc_up(const Alloc & alloc, int dev, const GTensor & t, int hc);
 // part g of ndev of n units of `align`
 std::pair<int64_t, int64_t> split(int64_t n, int ndev, int g, int64_t align = 1);
+// uneven tensor-parallel shards: device g gets a share proportional to w[g] (largest-remainder rounding of the units);
+// empty: equal shards as before (<ENV>_TP_SHARES="1.5,1,1,1" sets them at engine init)
+void set_tp_shares(const std::vector<double> & w);
+const std::vector<double> & tp_shares();
 
 inline uint16_t f2bf(float f) {   // round to nearest even
     uint32_t u;

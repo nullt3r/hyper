@@ -160,6 +160,17 @@ void Engine4::load_layer(Device & dev, DevLayer & L, int il) {
         // some GPUs do no attention and keep that memory for experts
         const int hd = c.head_dim, group = c.n_head / c.n_head_kv;
         auto [kv0, kv1] = split(c.n_head_kv, nd, g);
+        // HYPER4_KV_DEVS="0,1": with fewer kv heads than GPUs, which GPUs take them (head j to the j-th listed) -- the
+        // attention layers' whole work lands on those GPUs, so the lighter ones should take it
+        static const std::vector<int> kv_devs = [] {
+            std::vector<int> v;
+            if (const char * e = getenv("HYPER4_KV_DEVS")) for (const char * q = e; *q;) { v.push_back(atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
+            return v;
+        }();
+        if ((int) kv_devs.size() == c.n_head_kv && c.n_head_kv <= nd) {
+            kv0 = kv1 = 0;
+            for (int j = 0; j < c.n_head_kv; ++j) if (kv_devs[j] == g) { kv0 = j; kv1 = j + 1; }
+        }
         L.kv_off = (int) kv0;
         L.n_kv_l = (int) (kv1 - kv0);
         L.head_off = L.kv_off * group;

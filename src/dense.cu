@@ -359,9 +359,30 @@ DW dense_rows_view(const DW & w, int r0, int r1) {
     return v;
 }
 
+static std::vector<double> g_tp_shares;
+void set_tp_shares(const std::vector<double> & w) { g_tp_shares = w; }
+const std::vector<double> & tp_shares() { return g_tp_shares; }
+
 std::pair<int64_t, int64_t> split(int64_t n, int ndev, int g, int64_t align) {
     const int64_t units = n / align;
-    return {units * g / ndev * align, units * (g + 1) / ndev * align};
+    if ((int) g_tp_shares.size() != ndev) return {units * g / ndev * align, units * (g + 1) / ndev * align};
+    // weighted: quotas, their floors, the remaining units to the largest fractional parts (ties: the lower device)
+    double tot = 0;
+    for (double w : g_tp_shares) tot += w;
+    std::vector<int64_t> cnt(ndev);
+    std::vector<std::pair<double, int>> rem;
+    int64_t given = 0;
+    for (int d = 0; d < ndev; ++d) {
+        const double q = tot > 0 ? units * g_tp_shares[d] / tot : (double) units / ndev;
+        cnt[d] = (int64_t) q;
+        given += cnt[d];
+        rem.push_back({q - (double) cnt[d], d});
+    }
+    std::stable_sort(rem.begin(), rem.end(), [](const std::pair<double, int> & a, const std::pair<double, int> & b) { return a.first > b.first; });
+    for (int64_t i = 0; given < units; ++i, ++given) cnt[rem[i % ndev].second]++;
+    int64_t lo = 0;
+    for (int d = 0; d < g; ++d) lo += cnt[d];
+    return {lo * align, (lo + cnt[g]) * align};
 }
 
 void dense_mm(const DenseRun & r, const DW & W, const float * x, int xs, float * y, int ys, int rows, const NormIn & ni) {

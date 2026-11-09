@@ -923,3 +923,10 @@ vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), 
   fp16 mezisoučty): 4 038 vs 3 967 t/s (+2 %), KL 0,0482 (přes RAM 0,0501), deterministický. Default s P2P zapnutý
   (`HYPER4_P2P=0` = RAM), LL dekód zůstává přes RAM (`HYPER4_LL_P2P=1` = push). Závěr: linky po překrytí nejsou kritická
   cesta; zbytek rozdílu 4,1 s vs 2,8 s kernelů je pravděpodobně nerovný výkon karet při rovném dělení TP (4500 čeká na 3090).
+- Profil per karta (druhý 16k prefill, 4,06 s): výpočet bez čekání 4500 2,0 s, 3090 č. 1 3,1 s, č. 2 2,3 s, č. 3 3,2 s;
+  karty 1 a 3 nesou obě KV hlavy plné attention (12 vrstev). Mezery bez jakékoli aktivity jen 0,06 s; zbytek je čekání
+  v ringu na pomalejší kartu. Přidány knoby `HYPER4_KV_DEVS` (které karty berou KV hlavy) a `HYPER4_TP_SHARES`
+  (vážené díly GDN hlav / sdíleného experta / vocab, largest-remainder): žádná varianta nepomohla (4 010–4 085 t/s),
+  protože ~0,9 s na kartu je replikovaná práce (hc mixování, převody, hc down/up GEMM, router), kterou dělá každá karta
+  celou. Příští páka: tuhle práci rozdělit po řádcích (výměna navíc), nebo zmenšit (fúze to_half, hc kernely).
+  p16 buffery po fázích (2× mc_alloc), aby výpočet nečekal na předchozí výměnu (bez měřitelného efektu).

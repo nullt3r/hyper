@@ -62,6 +62,12 @@ void TpEngine::init() {
     if (m_.max_pos_align > 1 && opt_.max_pos % m_.max_pos_align) opt_.max_pos += m_.max_pos_align - opt_.max_pos % m_.max_pos_align;
     if (m_.n_embd > CPU_ROW || m_.n_expert_used > MOE_MAX_USED) throw std::runtime_error(m_.tag + ": model dimensions unsupported");
     opt_.n_devices = device_count(opt_.n_devices, (env + "_NDEV").c_str(), m_.tag.c_str());
+    if (const char * sh = envp(env, "TP_SHARES", b)) {   // uneven shards: a faster device takes more heads / FFN columns
+        std::vector<double> w;
+        for (const char * q = sh; *q;) { w.push_back(atof(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
+        if ((int) w.size() == opt_.n_devices) { set_tp_shares(w); fprintf(stderr, "%s: tensor-parallel shares %s\n", m_.tag.c_str(), sh); }
+        else fprintf(stderr, "%s: %s_TP_SHARES needs %d values, ignored\n", m_.tag.c_str(), env.c_str(), opt_.n_devices);
+    }
     for (int g = 0; g < opt_.n_devices; ++g) {
         std::unique_ptr<TpDevice> dev = make_device();
         dev->init_base(g, g, false, m_.pstream_prio);   // (plain fp32 cuBLAS, no TF32: routing must not move)
@@ -94,10 +100,13 @@ void TpEngine::init() {
             if (p == g) continue;
             int ok = 0;
             CUDA_CHECK(cudaDeviceCanAccessPeer(&ok, devs_[g]->id, devs_[p]->id));
-            if (!ok) { p2p_ = false; break; }
+            if (!ok) { fprintf(stderr, "%s: no peer access %d -> %d\n", m_.tag.c_str(), devs_[g]->id, devs_[p]->id); p2p_ = false; break; }
             CUDA_CHECK(cudaSetDevice(devs_[g]->id));
             const cudaError_t e = cudaDeviceEnablePeerAccess(devs_[p]->id, 0);
-            if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) { (void) cudaGetLastError(); p2p_ = false; }
+            if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {
+                fprintf(stderr, "%s: enabling peer access %d -> %d failed: %s\n", m_.tag.c_str(), devs_[g]->id, devs_[p]->id, cudaGetErrorString(e));
+                (void) cudaGetLastError(); p2p_ = false;
+            }
         }
     ll_p2p_ = p2p_ && envp(env, "LL_P2P", b) && atoi(envp(env, "LL_P2P", b)) != 0;
     if (nd > 1) fprintf(stderr, "%s: prefill allreduce %s, decode LL packets %s\n", m_.tag.c_str(),
@@ -202,8 +211,9 @@ void TpEngine::alloc_common(TpDevice & dev, const CommonSizes & sz) {
         dev.ggs_elems = dense_ggs_elems();
         dev.ggs = dev.alloc<half>(dev.ggs_elems);
     }
+    for (int sl = 0; sl < 2 * mc_alloc_; ++sl) dev.p16s.push_back(dev.alloc<half>((size_t) Rr * n));   // [parity][slot]: the two
+                                                                                                     // exchanges of a layer never wait for each other
     for (int sl = 0; sl < mc_alloc_; ++sl) {   // (a slot per chunk of a multi-chunk pass: their exchanges are in flight together)
-        dev.p16s.push_back(dev.alloc<half>((size_t) Rr * n));
         if (p2p_) {   // the ring: hop slots in, two send buffers, the gathered row
             dev.rs_recv.push_back(dev.alloc<half>((size_t) std::max(1, nd - 1) * ring_ch_));
             dev.rs_send0.push_back(dev.alloc<half>(ring_ch_));
@@ -395,9 +405,9 @@ void TpEngine::ar_begin(TpDevice & d, int nt, int slot, int par) {
     const int nd = opt_.n_devices, n = m_.n_embd;
     const size_t N = (size_t) nt * n;
     auto stage = [&](int g) { return h_stage_ + (((size_t) par * mc_alloc_ + slot) * nd + g) * R() * n; };
-    half * p16 = d.p16s[slot];
-    // (the slot's previous partial -- the other phase's -- must have left for the host before it is overwritten)
-    CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_up2[par ^ 1][slot], 0));
+    half * p16 = d.p16s[(size_t) par * mc_alloc_ + slot];
+    // (the slot's previous partial -- the same phase's, a layer ago -- must have been sent before it is overwritten)
+    CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_up2[par][slot], 0));
     to_half(d.part, n, nullptr, n, 0.0f, p16, nt, s);
     CUDA_CHECK(cudaEventRecord(d.ev_a[par][slot], s));
     CUDA_CHECK(cudaStreamWaitEvent(cs, d.ev_a[par][slot], 0));
@@ -426,7 +436,7 @@ void TpEngine::ar_ring(TpDevice & d, int nt, int slot, int par) {
     unsigned long long * tagv = d.ring_tagv + (size_t) par * 8 + slot;
     // the addends: this chunk's partial as fp16 (p16, made on the compute stream before it moves on -- d.part is rewritten
     // by the next chunk); the peers' slots are free (ar_begin waited for their ev_dn on cs)
-    const half * mine = d.p16s[slot];
+    const half * mine = d.p16s[(size_t) par * mc_alloc_ + slot];
     half * rr = d.rs_recv[slot], * sb[2] = {d.rs_send0[slot], d.rs_send1[slot]}, * ag = d.ag[slot];
     ring_tag(tagv, d.counter, call, cs);
     auto send = [&](const half * src, half * dst, int cnt, int step) {   // to the next device, then its flag for this step
@@ -492,7 +502,7 @@ void TpEngine::ar_sum(TpDevice & d, int nt, int slot, int par, float * x) {
         return;
     }
     CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_dn[par][slot], 0));
-    add_parts(x, d.p16s[slot], d.recvs[slot], (size_t) R() * n, nd - 1, (int) N, s);
+    add_parts(x, d.p16s[(size_t) par * mc_alloc_ + slot], d.recvs[slot], (size_t) R() * n, nd - 1, (int) N, s);
 }
 
 // the streamed experts at the start of a recording over layers [il0, il1): one list per device: layer il's share goes
