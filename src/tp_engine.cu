@@ -45,6 +45,7 @@ void TpEngine::init() {
     if (const char * v = envp(env, "UP_PARTS", b)) up_parts_ = std::max(0, atoi(v));
     if (const char * v = envp(env, "MC", b)) mc_max_ = std::max(1, std::min(8, atoi(v)));
     mc_alloc_ = std::max(mc_max_, envp(env, "MC_ALLOC", b) ? atoi(envp(env, "MC_ALLOC", b)) : 0);
+    ar_sync_ = envp(env, "AR_SYNC", b) && atoi(envp(env, "AR_SYNC", b)) != 0;
     if (const char * v = envp(env, "MTP_PMIN", b)) mtp_pmin_ = atof(v);
     if (const char * v = envp(env, "MTP_CPU_MAX", b)) mtp_cpu_max_ = atof(v);
     mtp_full_ = envp(env, "MTP_FULL", b) != nullptr;
@@ -66,12 +67,15 @@ void TpEngine::init() {
         dev->init_base(g, g, false, m_.pstream_prio);   // (plain fp32 cuBLAS, no TF32: routing must not move)
         for (auto & ev : dev->ev_ar) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&dev->ev_arh, cudaEventDisableTiming));
+        for (auto * row : {dev->ev_a, dev->ev_up2, dev->ev_dn}) for (int pp = 0; pp < 2; ++pp) for (int sl = 0; sl < 8; ++sl)
+            CUDA_CHECK(cudaEventCreateWithFlags(&row[pp][sl], cudaEventDisableTiming));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&dev->arstream, cudaStreamNonBlocking));
         devs_.push_back(std::move(dev));
     }
     const int nd = opt_.n_devices, n = m_.n_embd, slots = nl_tot();
     CUDA_CHECK(cudaHostAlloc(&h_embd_, (size_t) mc_max_ * R() * n * sizeof(float), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_cpos_, 8 * sizeof(int), cudaHostAllocPortable));
-    CUDA_CHECK(cudaHostAlloc(&h_stage_, (size_t) 2 * nd * R() * n * sizeof(half), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc(&h_stage_, (size_t) 2 * mc_alloc_ * nd * R() * n * sizeof(half), cudaHostAllocPortable));
     barrier_ = std::make_unique<Barrier4>(nd);
     CUDA_CHECK(cudaHostAlloc(&h_pos_, 16 * sizeof(int), cudaHostAllocPortable));
     memset(h_pos_, 0, 16 * sizeof(int));
@@ -169,8 +173,12 @@ void TpEngine::alloc_common(TpDevice & dev, const CommonSizes & sz) {
         dev.ggs_elems = dense_ggs_elems();
         dev.ggs = dev.alloc<half>(dev.ggs_elems);
     }
-    dev.p16 = dev.alloc<half>((size_t) Rr * n);
-    dev.recv = dev.alloc<half>((size_t) std::max(1, nd - 1) * Rr * n);
+    for (int sl = 0; sl < mc_alloc_; ++sl) {   // (a slot per chunk of a multi-chunk pass: their exchanges are in flight together)
+        dev.p16s.push_back(dev.alloc<half>((size_t) Rr * n));
+        dev.recvs.push_back(dev.alloc<half>((size_t) std::max(1, nd - 1) * Rr * n));
+    }
+    dev.p16 = dev.p16s[0];
+    dev.recv = dev.recvs[0];
     dev.order = dev.alloc<int>((size_t) Rr * K);
     dev.order_n = dev.alloc<int>(2);
     dev.topk = dev.alloc<float>((size_t) MAX_NT * TOPK * 2);
@@ -337,27 +345,57 @@ void TpEngine::allreduce(TpDevice & d, int nt, int & call, int & dcall, bool bul
     if (!x) { x = d.bo; CUDA_CHECK(cudaMemsetAsync(d.bo, 0, (size_t) nt * n * sizeof(float), s)); }
     if (!bulk) { allreduce_add_ll16(x, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s, nullptr); return; }
     const int par = dcall++ & 1;
-    const size_t N = (size_t) nt * n;
-    auto stage = [&](int g) { return h_stage_ + ((size_t) par * nd + g) * R() * n; };
-    to_half(d.part, n, nullptr, n, 0.0f, d.p16, nt, s);
-    CUDA_CHECK(cudaMemcpyAsync(stage(d.g), d.p16, N * sizeof(half), cudaMemcpyDeviceToHost, s));
-    CUDA_CHECK(cudaEventRecord(d.ev_ar[par], s));
+    ar_begin(d, nt, 0, par);
     barrier_->wait();
+    ar_end(d, nt, 0, par, x);
+}
+
+void TpEngine::ar_begin(TpDevice & d, int nt, int slot, int par) {
+    cudaStream_t s = d.stream, cs = d.arstream;
+    const int nd = opt_.n_devices, n = m_.n_embd;
+    const size_t N = (size_t) nt * n;
+    auto stage = [&](int g) { return h_stage_ + (((size_t) par * mc_alloc_ + slot) * nd + g) * R() * n; };
+    half * p16 = d.p16s[slot];
+    // (the slot's previous partial -- the other phase's -- must have left for the host before it is overwritten)
+    CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_up2[par ^ 1][slot], 0));
+    to_half(d.part, n, nullptr, n, 0.0f, p16, nt, s);
+    CUDA_CHECK(cudaEventRecord(d.ev_a[par][slot], s));
+    CUDA_CHECK(cudaStreamWaitEvent(cs, d.ev_a[par][slot], 0));
+    // the staging slot is free once every peer took the previous use of it (their downloads were enqueued before the last barrier)
+    for (int p = 0; p < nd; ++p) if (p != d.g) CUDA_CHECK(cudaStreamWaitEvent(cs, devs_[p]->ev_dn[par][slot], 0));
+    CUDA_CHECK(cudaMemcpyAsync(stage(d.g), p16, N * sizeof(half), cudaMemcpyDeviceToHost, cs));
+    CUDA_CHECK(cudaEventRecord(d.ev_up2[par][slot], cs));
+}
+
+void TpEngine::ar_fetch(TpDevice & d, int nt, int slot, int par) {
+    cudaStream_t cs = d.arstream;
+    const int nd = opt_.n_devices, n = m_.n_embd;
+    const size_t N = (size_t) nt * n;
+    auto stage = [&](int g) { return h_stage_ + (((size_t) par * mc_alloc_ + slot) * nd + g) * R() * n; };
+    half * recv = d.recvs[slot];
     int j = 0;
     for (int p = 0; p < nd; ++p) {
         if (p == d.g) continue;
-        CUDA_CHECK(cudaStreamWaitEvent(s, devs_[p]->ev_ar[par], 0));
-        CUDA_CHECK(cudaMemcpyAsync(d.recv + (size_t) j * R() * n, stage(p), N * sizeof(half), cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaStreamWaitEvent(cs, devs_[p]->ev_up2[par][slot], 0));
+        CUDA_CHECK(cudaMemcpyAsync(recv + (size_t) j * R() * n, stage(p), N * sizeof(half), cudaMemcpyHostToDevice, cs));
         ++j;
     }
+    CUDA_CHECK(cudaEventRecord(d.ev_dn[par][slot], cs));
     if (!d.up_pend.empty()) {   // the next expert upload part, behind these downloads
-        CUDA_CHECK(cudaEventRecord(d.ev_arh, s));
-        CUDA_CHECK(cudaStreamWaitEvent(d.cstream, d.ev_arh, 0));
+        CUDA_CHECK(cudaStreamWaitEvent(d.cstream, d.ev_dn[par][slot], 0));
         const auto q = d.up_pend.front();
         d.up_pend.pop_front();
         place_->upload_stage(d.g, q[0], q[1], q[2], up_parts_);
     }
-    add_parts(x, d.p16, d.recv, (size_t) R() * n, nd - 1, (int) N, s);
+}
+
+void TpEngine::ar_sum(TpDevice & d, int nt, int slot, int par, float * x) {
+    cudaStream_t s = d.stream;
+    const int nd = opt_.n_devices, n = m_.n_embd;
+    const size_t N = (size_t) nt * n;
+    if (!x) { x = d.bo; CUDA_CHECK(cudaMemsetAsync(d.bo, 0, N * sizeof(float), s)); }
+    CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_dn[par][slot], 0));
+    add_parts(x, d.p16s[slot], d.recvs[slot], (size_t) R() * n, nd - 1, (int) N, s);
 }
 
 // the streamed experts at the start of a recording over layers [il0, il1): one list per device: layer il's share goes

@@ -104,6 +104,10 @@ struct TpDevice : DevBase {
     int * ilist = nullptr, * ilist_n = nullptr;
     unsigned * ihist = nullptr;      // indexer score histograms
     half * xh = nullptr, * p16 = nullptr, * recv = nullptr, * mix16 = nullptr, * h16 = nullptr;
+    // bulk allreduce in flight per chunk slot: the fp16 partial (its DMA source) and the peers' partials (the DMA targets);
+    // p16 / recv alias slot 0
+    std::vector<half *> p16s, recvs;
+    cudaStream_t arstream = nullptr;   // the allreduce copies: off the compute stream, so a chunk's exchange overlaps the next one's kernels
     half * ggs = nullptr;            // KQ dense weights: fp16 slice for prefill GEMMs
     size_t ggs_elems = 0;
     float * topk = nullptr;          // sampling candidates [MAX_NT][TOPK][2]
@@ -114,6 +118,9 @@ struct TpDevice : DevBase {
     std::deque<std::array<int, 3>> up_pend;
     cudaEvent_t ev_arh = nullptr;
     cudaEvent_t ev_ar[2] = {};
+    // per (phase parity, chunk slot): the partial converted (compute -> copy stream), uploaded (peers wait for it), the peers'
+    // partials downloaded (compute stream waits; peers may overwrite the staging slot after it)
+    cudaEvent_t ev_a[2][8] = {}, ev_up2[2][8] = {}, ev_dn[2][8] = {};
     // elastic placement: the per-position caches as segments of virtual-memory buffers, and their full-context size
     struct KvSeg { VmmBuf * b; size_t pitch, row_bytes; int heads, div; };
     std::vector<KvSeg> kvs;
@@ -126,7 +133,9 @@ struct TpDevice : DevBase {
         for (auto & gr : g_restore) if (gr) cudaGraphExecDestroy(gr);
         if (g_chain) cudaGraphExecDestroy(g_chain);
         for (auto & ev : ev_ar) if (ev) cudaEventDestroy(ev);
+        for (int pp = 0; pp < 2; ++pp) for (int sl = 0; sl < 8; ++sl) for (cudaEvent_t e : {ev_a[pp][sl], ev_up2[pp][sl], ev_dn[pp][sl]}) if (e) cudaEventDestroy(e);
         if (ev_arh) cudaEventDestroy(ev_arh);
+        if (arstream) cudaStreamDestroy(arstream);
     }
 };
 
@@ -200,6 +209,7 @@ protected:
         int pred_k_w = 0, pred_psg_w = 0;   // their widths (ids / weights per row; the gate scratch)
     };
     int mc_alloc_ = 4;   // chunk buffers allocated (<ENV>_MC_ALLOC: more than used, for an equal VRAM footprint)
+    bool ar_sync_ = false;   // <ENV>_AR_SYNC=1: every bulk allreduce completes before the next chunk's work (the old order; tests)
     void alloc_common(TpDevice & d, const CommonSizes & sz);
     template <typename T> T * kv_alloc(TpDevice & dev, int heads, size_t pitch_elems, size_t row_elems, int div);
     void * host_huge_alloc(size_t bytes);   // anonymous, transparent huge pages; freed with the engine
@@ -213,6 +223,14 @@ protected:
     void dbg(TpDevice & d, const char * what, int il, const float * buf, size_t cnt, int sum_layers, int rows = 1) const;
     // x += sum over the GPUs of d.part (x nullptr: d.bo = the sum); bulk: the copy-engine allreduce through pinned staging
     void allreduce(TpDevice & d, int nt, int & call, int & dcall, bool bulk, float * x = nullptr);
+    // the bulk allreduce in two halves, so a multi-chunk pass exchanges chunk c while computing chunk c + 1: ar_begin converts
+    // d.part and uploads it (copy stream), ar_end downloads the peers' partials and adds them all into x (d.bo when nullptr).
+    // Between every device's ar_begin of a phase and the first ar_end of it the host threads must pass barrier_ (the peers'
+    // events exist then); par: 0 / 1 for the two allreduces of a layer, slot: the chunk
+    void ar_begin(TpDevice & d, int nt, int slot, int par);
+    void ar_fetch(TpDevice & d, int nt, int slot, int par);   // after the barrier: the peers' partials start downloading (copy stream)
+    void ar_sum(TpDevice & d, int nt, int slot, int par, float * x = nullptr);   // compute stream: waits for them, adds them all
+    void ar_end(TpDevice & d, int nt, int slot, int par, float * x = nullptr) { ar_fetch(d, nt, slot, par); ar_sum(d, nt, slot, par, x); }
     // the streamed experts' uploads at the start of a recording (the first layer's share) and the upload-part queue
     void stream_begin(TpDevice & d, int il0, int il1);
     void stream_next(TpDevice & d, int il, int sb, int il1);   // after layer il's half sb is done: the next layer's half into the staging
@@ -248,7 +266,7 @@ protected:
     float * h_mres_ = nullptr;      // pinned [ndev][4]: MTP draft argmax, slice max logit, slice sum exp
     float * h_topk_ = nullptr;      // pinned [ndev][MAX_NT][TOPK][2]
     float * h_mtopk_ = nullptr;     // pinned [ndev][TOPK][2]: the MTP head's candidates per vocab slice
-    half * h_stage_ = nullptr;      // pinned DMA allreduce staging [parity][ndev][R * n_embd]
+    half * h_stage_ = nullptr;      // pinned DMA allreduce staging [parity][mc_alloc][ndev][R * n_embd]
     uint2 * ar_ll_ = nullptr;
     int * h_ids_ = nullptr;         // pinned [nl_tot][mc_max][R][K]: prefill routing from GPU 0
     int * h_pred_ = nullptr;        // pinned [n_layer][MOE_MAX_USED] (HYPER*_PREDSTAT)

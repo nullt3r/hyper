@@ -885,3 +885,18 @@ vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), 
   Nový test `hyper7 convo <ids> <n_gen> <more> <rounds>` (`HYPER7_CONVO_DROP`, `HYPER7_TEMP`) = tvar produkce; před opravou
   pád v 2. kole (K=3 i K=5), po opravě 4 kola na 8k a 3 kola na 16k bez chyby. Server nově loguje „generation failed“.
 - Nasazeno: DeepSeek `--draft 5` (17:45).
+
+## 2026-11-09 – prefill: výměna součtů mezi kartami souběžně s výpočtem (TpEngine)
+
+- Profil (Nsight, Flash-Next 16k tokenů, 4 GPU, 262k ctx): kernely ~45 % času, kopie allreduce přes RAM ~35–40 % (na chunk a
+  vrstvu 2× nahrání 21 MB + stažení 63 MB na kartu, dvě karty na x8), zbytek čekání na pomalejší karty. Kernely: GEMM
+  trunku 18 % (fp16 MMA s fp32 akumulací), experti 16 %, GDN 10 %, attention 9 %, to_half 7 %, hyper-connection 17 %,
+  cuBLAS fp32 5 %. P2P mezi kartami ovladač nepovoluje (NS/CNS, IOMMU translated).
+- Změna: `ar_begin` (převod + nahrání na copy streamu `arstream`), host barrier, `ar_fetch` (stažení peerů), `ar_sum`
+  (součet na compute streamu). Vrstva běží ve třech fázích přes chunky vícechunkového průchodu: mixer všech chunků →
+  součet + MoE všech chunků → součet; výměna chunku c tak běží během výpočtu chunku c+1. Sloty p16/recv/inj na chunk
+  (336 MB VRAM na kartu = ~2 experty na vrstvu méně), staging [parita][slot][dev]. `HYPER4_AR_SYNC=1` = staré pořadí.
+- Flash-Next 16k: 2 650 → 3 960 t/s (6,2 → 4,1 s). Dekód beze změny (plain 120, MTP K=7 197 t/s). Bitově shodné: pfrepeat
+  2000 proti referenční binárce při stejném rozmístění (`HYPER_QUOTA`), 16k staré vs. nové pořadí, mtpgen hash shodný.
+  GLM používá dál `allreduce()` (= begin + barrier + end, stejná aritmetika), bez překryvu; jeho smyčku zbývá přepsat.
+- Pozor při A/B: nové buffery mění rozmístění expertů → hash logitů se liší, dokud se nepřipne `HYPER_QUOTA`.

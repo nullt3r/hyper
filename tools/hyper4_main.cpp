@@ -442,14 +442,16 @@ static int run_cmd(int argc, char ** argv) {
             const int n = argc > 4 ? atoi(argv[4]) : (int) toks.size();
             const int R = getenv("HYPER4_REPEAT") ? atoi(getenv("HYPER4_REPEAT")) : 6;
             std::vector<float> lg;
+            std::vector<int> prompt(n);   // (longer than the reference: its tokens repeated -- multi-chunk passes)
+            for (int i = 0; i < n; ++i) prompt[i] = toks[i % toks.size()];
             for (int rep = 0; rep < R; ++rep) {
                 eng.reset();
-                eng.prefill(toks.data(), std::min<int>(n, (int) toks.size()), 0);
+                eng.prefill(prompt.data(), n, 0);
                 eng.get_logits(0, lg);
                 uint64_t h = 1469598103934665603ull;
                 for (float v : lg) { uint32_t u; memcpy(&u, &v, 4); h = (h ^ u) * 1099511628211ull; }
                 // then a few decode steps (single rows), hashed as well
-                int next = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin()), p = std::min<int>(n, (int) toks.size());
+                int next = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin()), p = n;
                 uint64_t hd = 1469598103934665603ull;
                 for (int i = 0; i < 16; ++i) { next = eng.forward(&next, 1, p++)[0]; hd = (hd ^ (uint32_t) next) * 1099511628211ull; }
                 printf("PFREPEAT %d: prefill %d, last-row logits hash %016llx, 16 greedy tokens hash %016llx\n", rep, p - 16,

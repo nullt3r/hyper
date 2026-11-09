@@ -355,7 +355,7 @@ void Engine4::load_device(TpDevice & td) {
     dev.res2 = dev.alloc<float>((size_t) R * hcn);
     dev.gate = dev.alloc<float>((size_t) R * hcn);
     dev.lo = dev.alloc<float>((size_t) R * c.hc_lr);
-    dev.inj = dev.alloc<float>((size_t) R * 4);
+    dev.inj = dev.alloc<float>((size_t) mc_alloc_ * R * 4);   // (a slot per chunk of a multi-chunk pass)
     dev.injp = dev.alloc<float>((size_t) MAX_NT * c.hc * 4);
     dev.inj_cnt = dev.alloc<unsigned>(MAX_NT);
     CUDA_CHECK(cudaMemset(dev.inj_cnt, 0, MAX_NT * sizeof(unsigned)));
@@ -453,6 +453,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
     int * P = ck[0].P;
     int pos_host = ck[0].pos;
     float * ple_emb = ck[0].ple;
+    float * injc = d.inj;   // the chunk's injection logits
     const size_t pe_row = (size_t) std::max(1, c.ple_n_heads() * c.ple_dim);
     for (int ci = 0; ci < nck; ++ci) {
         if (nck > 1) CUDA_CHECK(cudaMemcpyAsync(ck[ci].P, h_cpos_ + ci, sizeof(int), cudaMemcpyHostToDevice, s));
@@ -477,19 +478,18 @@ void Engine4::record_main(int gi, int nt, int kind) {
     // short chunks: the CPU computes its experts (the MTP block's FFN never runs over a whole chunk)
     const bool streaming = bulk && opt_.stream_experts && nt >= stream_min_ && (!kind || mtp_full_);
     if (streaming) stream_begin(d, kind ? c.n_layer : 0, kind ? c.n_layer + 1 : c.n_layer);
-    int call = 0, dcall = 0;
+    int call = 0;
     auto dbg = [&](const char * what, int il, const float * buf, size_t cnt) { TpEngine::dbg(d, what, il, buf, cnt, 2, nt); };
     dbg("embed", -1, d.res, (size_t) nt * hcn);
-    auto allreduce = [&] { TpEngine::allreduce(d, nt, call, dcall, bulk); };
     // hyper-connection mixer: res -> mixed (and the inject logits)
     auto hc_mix = [&](const float * norm, const DW & down, const DW & up, const float * inj, const float * res = nullptr, int rows = -1) {
         if (!res) res = R;
         if (rows < 0) rows = nt;
         if (c.plain) { rmsnorm(res, n, norm, d.mixed, n, n, rows, eps, s); return; }   // (qwen35moe: the block's RMSNorm)
         const bool finj = inj && rows <= MAX_NT;   // decode: the injection dots ride along the norm kernel
-        hc_norm(res, norm, d.xn, n, hc, eps, rows, s, finj ? inj : nullptr, d.injp, d.inj, d.inj_cnt);
+        hc_norm(res, norm, d.xn, n, hc, eps, rows, s, finj ? inj : nullptr, d.injp, injc, d.inj_cnt);
         mm(down, d.xn, hcn, d.lo, lr, rows);
-        if (inj && !finj) f32mm(inj, hc, hcn, d.xn, hcn, d.inj, 4, rows);
+        if (inj && !finj) f32mm(inj, hc, hcn, d.xn, hcn, injc, 4, rows);
         if (rows <= MAX_NT) {
             NormIn act; act.act = 1; act.act_scale = 1.0f / hc;   // silu(lo / hc) on load
             if (up.hcperm) { gemv_q8_hcmix(up.q8, d.lo, lr, act, d.xn, hcn, d.mixed, n, n, rows, s); return; }   // mixing fused
@@ -515,11 +515,33 @@ void Engine4::record_main(int gi, int nt, int kind) {
     }
     const int il0 = kind ? c.n_layer : 0, il1 = kind ? c.n_layer + 1 : c.n_layer;
     const bool snap = !kind && !bulk && nt > 1 && mtp_g_;   // verification: keep the state after every row for rollback
-    for (int il = il0; il < il1; ++il)
-    for (int ci = 0; ci < nck; ++ci) {
-        nt = ck[ci].nt; R = ck[ci].R; P = ck[ci].P; pos_host = ck[ci].pos; ple_emb = ck[ci].ple;
-        const bool last_ck = ci == nck - 1;   // (the streamed experts' staging is released after the last chunk)
-        DevLayer & L = kind ? d.mtp : d.layers[il];
+    auto set_ck = [&](int ci) {   // (a single chunk is set once: an MTP pass narrows nt mid-layer)
+        if (nck <= 1) return;
+        nt = ck[ci].nt; R = ck[ci].R; P = ck[ci].P; pos_host = ck[ci].pos; ple_emb = ck[ci].ple; injc = d.inj + (size_t) ci * R4 * 4;
+    };
+    // decode: independent work on a second stream (indexer || q/k/v + attention prep, alpha/beta || the GDN input
+    // projection, shared expert || routed experts): the small kernels' fixed latencies overlap. The second stream's
+    // split-K GEMVs use their own scratch slot. HYPER4_SERIAL_SHEXP: one stream
+    static const bool serial_shexp = getenv("HYPER4_SERIAL_SHEXP") != nullptr;
+    auto fork = [&] { CUDA_CHECK(cudaEventRecord(d.ev_fork, s)); CUDA_CHECK(cudaStreamWaitEvent(d.s2, d.ev_fork, 0)); };
+    auto on_s2 = [&](auto && f) {
+        const cudaStream_t sm = s;
+        s = d.s2;
+        gemv_scratch_slot(1);
+        f();
+        gemv_scratch_slot(0);
+        CUDA_CHECK(cudaEventRecord(d.ev_join, s));
+        s = sm;
+    };
+    auto join = [&] { CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_join, 0)); };
+    // a prefill pass exchanges the partial sums of chunk c (copy stream) while computing chunk c + 1: every layer runs in
+    // three phases over the chunks -- the token mixer (ar_begin, a host barrier, ar_fetch), the mixer's sum + the MoE (ar_sum,
+    // then the same hand-over), the MoE's sum (ar_sum). Decode rows keep the one-kernel LL allreduce; an MTP pass has one
+    // chunk, so its order is as before.
+    for (int il = il0; il < il1; ++il) {
+    DevLayer & L = kind ? d.mtp : d.layers[il];
+    for (int ci = 0; ci < nck; ++ci) {   // ---- phase A: the token mixer ----
+        set_ck(ci);
         if (L.ple) {
             const int pe = c.ple_n_heads() * c.ple_dim;
             mm(L.ple_key, ple_emb, pe, d.ple_key, hcn, nt);
@@ -534,22 +556,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
         hc_mix(L.hca_norm, L.hca_down, L.hca_up, L.hca_inj);
         if (il < 2) tr(3 + 4 * il, d.mixed, n);
         dbg("hc_mix_attn", il, d.mixed, (size_t) nt * n);
-        // decode: independent work on a second stream (indexer || q/k/v + attention prep, alpha/beta || the GDN input
-        // projection, shared expert || routed experts): the small kernels' fixed latencies overlap. The second stream's
-        // split-K GEMVs use their own scratch slot. HYPER4_SERIAL_SHEXP: one stream
-        static const bool serial_shexp = getenv("HYPER4_SERIAL_SHEXP") != nullptr;
         const bool par = !bulk && !serial_shexp;
-        auto fork = [&] { CUDA_CHECK(cudaEventRecord(d.ev_fork, s)); CUDA_CHECK(cudaStreamWaitEvent(d.s2, d.ev_fork, 0)); };
-        auto on_s2 = [&](auto && f) {
-            const cudaStream_t sm = s;
-            s = d.s2;
-            gemv_scratch_slot(1);
-            f();
-            gemv_scratch_slot(0);
-            CUDA_CHECK(cudaEventRecord(d.ev_join, s));
-            s = sm;
-        };
-        auto join = [&] { CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_join, 0)); };
         if (L.full && L.n_head_l == 0) {   // no kv head on this GPU: contributes nothing to the attention output
             CUDA_CHECK(cudaMemsetAsync(d.part, 0, (size_t) (last_att ? 1 : nt) * n * sizeof(float), s));
         } else if (L.full) {
@@ -652,16 +659,27 @@ void Engine4::record_main(int gi, int nt, int kind) {
         if (cache_only) continue;
         if (last_att && L.full) {   // the last row's residual streams and injection weights to row 0: it goes on alone, in decode mode
             CUDA_CHECK(cudaMemcpyAsync(R, R + (size_t) (nt - 1) * hcn, (size_t) hcn * sizeof(float), cudaMemcpyDeviceToDevice, s));
-            CUDA_CHECK(cudaMemcpyAsync(d.inj, d.inj + (size_t) (nt - 1) * 4, 4 * sizeof(float), cudaMemcpyDeviceToDevice, s));
+            CUDA_CHECK(cudaMemcpyAsync(injc, injc + (size_t) (nt - 1) * 4, 4 * sizeof(float), cudaMemcpyDeviceToDevice, s));
             nt = 1;
             bulk = false;
         }
         dbg(L.full ? "attn_part" : "gdn_part", il, d.part, (size_t) nt * n);
-        if (c.plain) {   // plain residual: R += sum over the GPUs of the parts
-            if (bulk) { allreduce(); vec_add(R, d.bo, (size_t) nt * n, s); }
-            else allreduce_add_ll16(R, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s, nullptr);
-        } else if (bulk) { allreduce(); hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s); }
-        else allreduce_hc_ll16(R, d.inj, n, hc, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
+        if (bulk && ar_sync_) {   // (tests: the old order, one exchange at a time)
+            ar_begin(d, nt, ci, 0); barrier_->wait(); ar_end(d, nt, ci, 0);
+            if (c.plain) vec_add(R, d.bo, (size_t) nt * n, s); else hc_combine(R, d.bo, injc, 4, n, hc, nt, s);
+        } else if (bulk) { ar_begin(d, nt, ci, 0); barrier_->wait(); ar_fetch(d, nt, ci, 0); }   // (the sum lands in phase B)
+        else if (c.plain) allreduce_add_ll16(R, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s, nullptr);   // R += sum of the parts
+        else allreduce_hc_ll16(R, injc, n, hc, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
+    }
+    for (int ci = 0; ci < nck; ++ci) {   // ---- phase B: the mixer's sum, the MoE ----
+        set_ck(ci);
+        const bool last_ck = ci == nck - 1;   // (the streamed experts' staging is released after the last chunk)
+        if (cache_only) continue;
+        const bool par = !bulk && !serial_shexp;
+        if (bulk && !ar_sync_) {
+            ar_sum(d, nt, ci, 0);
+            if (c.plain) vec_add(R, d.bo, (size_t) nt * n, s); else hc_combine(R, d.bo, injc, 4, n, hc, nt, s);
+        }
         if (il < 2) tr(4 + 4 * il, R, hcn);
         if (last_only && nt > 1) {   // the last row moves to row 0 and continues alone, in decode mode
             CUDA_CHECK(cudaMemcpyAsync(R, R + (size_t) (nt - 1) * hcn, (size_t) hcn * sizeof(float), cudaMemcpyDeviceToDevice, s));
@@ -764,15 +782,26 @@ void Engine4::record_main(int gi, int nt, int kind) {
         moe_reduce(d.shpart, d.sg, d.yexp, K, d.part, n, nt, d.ids, stream ? X.owner_bulk : X.owner, d.g, CPU_OWNER, cflag,
                    bulk ? &cpu_bulk_out_->y[0][0] : &cpu_out_[il].y[0][0], d.counter, (unsigned) il, s);
         dbg("moe_part", il, d.part, (size_t) nt * n);
-        if (c.plain) {   // plain residual: R += sum over the GPUs of the parts
-            if (bulk) { allreduce(); vec_add(R, d.bo, (size_t) nt * n, s); }
-            else allreduce_add_ll16(R, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s, nullptr);
-        } else if (bulk) { allreduce(); hc_combine(R, d.bo, d.inj, 4, n, hc, nt, s); }
-        else allreduce_hc_ll16(R, d.inj, n, hc, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
+        if (bulk && ar_sync_) {
+            ar_begin(d, nt, ci, 1); barrier_->wait(); ar_end(d, nt, ci, 1);
+            if (c.plain) vec_add(R, d.bo, (size_t) nt * n, s); else hc_combine(R, d.bo, injc, 4, n, hc, nt, s);
+        } else if (bulk) { ar_begin(d, nt, ci, 1); barrier_->wait(); ar_fetch(d, nt, ci, 1); }
+        else if (c.plain) allreduce_add_ll16(R, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s, nullptr);
+        else allreduce_hc_ll16(R, injc, n, hc, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
+    }
+    for (int ci = 0; ci < nck; ++ci) {   // ---- phase C: the MoE's sum ----
+        set_ck(ci);
+        const bool last_ck = ci == nck - 1;
+        if (cache_only) continue;
+        if (bulk && !ar_sync_) {
+            ar_sum(d, nt, ci, 1);
+            if (c.plain) vec_add(R, d.bo, (size_t) nt * n, s); else hc_combine(R, d.bo, injc, 4, n, hc, nt, s);
+        }
         dbg("l_last", il, R, (size_t) nt * hcn);
         if (d.trace && !kind && last_ck)
             CUDA_CHECK(cudaMemcpyAsync(d.trace + (size_t) il * hcn, R + (size_t) (nt - 1) * hcn, (size_t) hcn * sizeof(float),
                                        cudaMemcpyDeviceToDevice, s));
+    }
     }
     if (kind) {   // drafts: the last row only; its residual feeds the next chained step
         if (cache_only) return;
