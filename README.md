@@ -116,7 +116,8 @@ Shared backends (every engine uses the same code for these; a model-specific eng
 - **Tensor parallelism without P2P.** Attention heads, linear-attention heads and FFN hidden slices are split across the
   three GPUs. During decode, the per-layer allreduce runs through pinned, mapped host memory with an LL-style protocol
   (fp16 payload plus sequence flags in each packet). Prefill chunks use a copy-engine allreduce (device → pinned host →
-  device), which overlaps with compute.
+  device) on a separate copy stream: a layer runs in three phases over the chunks of a pass (token mixer, mixer sum + FFN,
+  FFN sum), so chunk c's exchange overlaps chunk c+1's kernels (Flash-Next 16k prefill 2 650 → 3 960 t/s on 4 GPUs).
 - **Weights in tensor-core fragment order.** Q8_0 weights are repacked at load time so that a single 16-byte load per lane
   forms an `mma.m16n8k16` operand. Decode uses a tensor-core GEMV (with split-K and a work-balanced variant for matrices
   that would otherwise leave a partial last wave). Prefill uses tiled GEMMs. K-quants (Q4_K, Q6_K) are repacked into
@@ -133,7 +134,7 @@ Shared backends (every engine uses the same code for these; a model-specific eng
     CPU is already working.
 - **Prefill streaming.** For long prompts, the CPU-resident experts of each layer are streamed over PCIe into
   double-buffered GPU staging memory (shares weighted by link speed). Prefill therefore runs entirely on the GPUs.
-  Up to four 2048-token chunks go through each layer together, so a layer's experts cross PCIe once for all of them.
+  Up to four 4096-token chunks go through each layer together, so a layer's experts cross PCIe once for all of them.
   Short chunks stay on the CPU, where they are faster.
 - **Adaptive expert placement (GLM, Flash-Next).** Routing counts from the prompt and from generation are tracked with decay. The
   hottest CPU experts are swapped with the coldest GPU experts at runtime (one PCIe copy per swap, under a millisecond),

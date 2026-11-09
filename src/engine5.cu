@@ -368,7 +368,7 @@ void Engine5::load_device(TpDevice & td) {
     dev.pos_last = dev.alloc<int>(1);
     dev.mix = dev.alloc<float>((size_t) R * 32);
     dev.mixpart = dev.alloc<float>((size_t) R * (hcn / 256) * 25);
-    dev.hcw = dev.alloc<float>((size_t) R * MHC_W);
+    dev.hcw = dev.alloc<float>((size_t) mc_alloc_ * R * MHC_W);   // (a slot per chunk of a multi-chunk pass)
     dev.qabs = dev.alloc<float>((size_t) R * nh_max * MLA_LAT);
     dev.olat = dev.alloc<float>((size_t) R * nh_max * MLA_LAT);
     if (pred_mode_ == 2) {
@@ -472,28 +472,50 @@ void Engine5::record_main(int gi, int nt, int kind) {
     const bool cache_only = mtp && mtp_shift_ && !mtp_full_;
     const bool streaming = bulk && opt_.stream_experts && nt >= stream_min_ && !cache_only;
     if (streaming) stream_begin(d, il0, il1);
-    int call = 0, dcall = 0;
+    int call = 0;
     auto dbg = [&](const char * what, int il, const float * buf, size_t cnt) { TpEngine::dbg(d, what, il, buf, cnt, 4, nt); };
-    auto allreduce = [&](float * x = nullptr) { TpEngine::allreduce(d, nt, call, dcall, bulk, x); };   // x += sum over the GPUs of d.part (default: d.bo = the sum)
-    // block output: allreduce of d.part over the GPUs, scattered into the residual streams (decode: in the allreduce epilogue)
+    float * hcwc = d.hcw;   // the chunk's mHC post / comb weights
+    // block output: allreduce of d.part over the GPUs, scattered into the residual streams (decode: in the allreduce epilogue;
+    // the MTP block's plain residual: R += the sum). A prefill chunk's exchange is in two halves: out_begin hands the partial
+    // to the copy stream (and starts the peers' downloads after the host barrier), out_end -- after the other chunks' work of
+    // the phase -- adds it in. HYPER4_AR_SYNC=1: the whole exchange at once (the old order)
     static const bool old_post = getenv("HYPER5_OLDPOST") != nullptr;
-    auto block_out = [&] {
-        if (!bulk && !old_post) { allreduce_mhc_ll16(R, d.hcw, n, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s); return; }
-        allreduce();
-        mhc_post(R, d.bo, d.hcw, n, nt, s);
+    auto out_post = [&](int par, int ci) {
+        if (mtp) ar_sum(d, nt, ci, par, R);
+        else { ar_sum(d, nt, ci, par); mhc_post(R, d.bo, hcwc, n, nt, s); }
     };
+    auto out_begin = [&](int par, int ci) {
+        if (!bulk) {
+            if (mtp) allreduce_add_ll16(R, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s, nullptr);
+            else if (!old_post) allreduce_mhc_ll16(R, hcwc, n, d.part, ar_ll_, d.g, nd, nt * n, d.counter, call++, s);
+            else { int dc = 0; TpEngine::allreduce(d, nt, call, dc, false); mhc_post(R, d.bo, hcwc, n, nt, s); }
+            return;
+        }
+        ar_begin(d, nt, ci, par);
+        barrier_->wait();
+        if (ar_sync_) { ar_end(d, nt, ci, par, mtp ? R : nullptr); if (!mtp) mhc_post(R, d.bo, hcwc, n, nt, s); }
+        else ar_fetch(d, nt, ci, par);
+    };
+    auto out_end = [&](int par, int ci) { if (bulk && !ar_sync_) out_post(par, ci); };
     // mHC pre-mix: res -> d.xn (block input after its RMS norm) and the post / comb weights
     static const bool old_mhc = getenv("HYPER5_OLDMHC") != nullptr;
     auto hc_pre = [&](const DW & fn, const uint8_t * raw, const float * scale, const float * base, const float * norm_w) {
-        if (raw && !old_mhc && !bulk) { mhc_pre_fused(R, raw, d.mixpart, scale, base, norm_w, eps, c.hc_eps, c.sinkhorn, n, d.hcw, d.xn, nt, s); return; }
+        if (raw && !old_mhc && !bulk) { mhc_pre_fused(R, raw, d.mixpart, scale, base, norm_w, eps, c.hc_eps, c.sinkhorn, n, hcwc, d.xn, nt, s); return; }
         mm(fn, R, hcn, d.mix, 32, nt);
-        mhc_pre(R, d.mix, 32, scale, base, norm_w, eps, c.hc_eps, c.sinkhorn, n, d.hcw, d.xn, nt, s);
+        mhc_pre(R, d.mix, 32, scale, base, norm_w, eps, c.hc_eps, c.sinkhorn, n, hcwc, d.xn, nt, s);
     };
     dbg("embed", -1, R, (size_t) nt * hcn);
-    for (int il = il0; il < il1; ++il)
-    for (int ci = 0; ci < nck; ++ci) {
-        nt = ck[ci].nt; R = ck[ci].R; P = ck[ci].P; pos_host = ck[ci].pos;
+    auto set_ck = [&](int ci) {   // (a single chunk is set once)
+        if (nck <= 1) return;
+        nt = ck[ci].nt; R = ck[ci].R; P = ck[ci].P; pos_host = ck[ci].pos; hcwc = d.hcw + (size_t) ci * R5 * MHC_W;
+    };
+    // a prefill pass exchanges chunk c's partial sums while computing chunk c + 1: every layer in three phases over the
+    // chunks -- the token mixer (out_begin), its sum + the FFN (out_end, out_begin), the FFN's sum (out_end)
+    for (int il = il0; il < il1; ++il) {
+    for (int ci = 0; ci < nck; ++ci) {   // ---- phase A: the token mixer ----
+        set_ck(ci);
         const bool last_ck = ci == nck - 1;   // (the streamed experts' staging is released after the last chunk)
+        (void) last_ck;
         DevLayer & L = d.layers[il];
         const int nh = L.nh;
         // HYPER5_PRED=2: this MoE layer's routing predicted from its input (the token mixer's contribution left out) on the side
@@ -572,7 +594,14 @@ void Engine5::record_main(int gi, int nt, int kind) {
         }
         dbg(L.mla ? "mla_part" : "kda_part", il, d.part, (size_t) nt * n);
         if (pred2) CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_pf1, 0));
-        if (mtp) allreduce(R); else block_out();
+        out_begin(0, ci);
+    }
+    for (int ci = 0; ci < nck; ++ci) {   // ---- phase B: the mixer's sum, the FFN ----
+        set_ck(ci);
+        const bool last_ck = ci == nck - 1;
+        DevLayer & L = d.layers[il];
+        if (cache_only) continue;
+        out_end(0, ci);
         dbg("attn_res", il, R, (size_t) nt * (mtp ? n : hcn));
         // ---- FFN ----
         if (mtp) rmsnorm(R, n, L.ffn_norm, d.xn, n, n, nt, eps, s);
@@ -667,8 +696,14 @@ void Engine5::record_main(int gi, int nt, int kind) {
                        bulk ? &cpu_bulk_out_->y[0][0] : &cpu_out_[il].y[0][0], d.counter, (unsigned) il, s);
         }
         dbg("ffn_part", il, d.part, (size_t) nt * n);
-        if (mtp) allreduce(R); else block_out();
+        out_begin(1, ci);
+    }
+    for (int ci = 0; ci < nck; ++ci) {   // ---- phase C: the FFN's sum ----
+        set_ck(ci);
+        if (cache_only) continue;
+        out_end(1, ci);
         dbg("l_out", il, R, (size_t) nt * (mtp ? n : hcn));
+    }
     }
     if (mtp) {   // draft: argmax after the last row (the head norm's output is the next chained hidden)
         if (cache_only) return;
