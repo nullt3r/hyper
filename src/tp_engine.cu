@@ -832,9 +832,20 @@ int TpEngine::forward_multi(const int * tokens, const int * lens, int nck, int p
 int TpEngine::prefill(const int * tokens, int n, int pos) {
     int next = -1;
     static const int chunk = getenv("HYPER4_CHUNK") ? std::max(1, std::min(R(), atoi(getenv("HYPER4_CHUNK")))) : R();
+    // a prompt that would be a single chunk is cut in two halves when it is longer than <ENV>_MIN_CHUNK (default 1024), so
+    // the layer-major pass has two chunks and one chunk's exchange runs under the other's kernels
+    std::string b;
+    static const int min_piece = envp(m_.env, "MIN_CHUNK", b) ? std::max(MAX_NT + 1, atoi(envp(m_.env, "MIN_CHUNK", b))) : 1024;
     for (int c0 = 0; c0 < n;) {
         int lens[8], nk = 0, q = c0;   // up to mc_max_ full chunks per layer-major pass
-        while (nk < mc_max_ && q < n) { lens[nk] = std::min(chunk, n - q); q += lens[nk++]; }
+        const int left = n - c0;
+        int piece = chunk;
+        if (left <= chunk && left > min_piece && mc_max_ > 1) {   // a single-chunk pass: two halves instead (one half's exchange
+            const int np = 2;                                          // runs under the other's kernels; 4096: 3560 -> 4070 t/s, quarters 3780)
+            piece = (left + np - 1) / np;
+            piece = (piece + 63) / 64 * 64;   // (whole tensor-core tiles)
+        }
+        while (nk < mc_max_ && q < n) { lens[nk] = std::min(piece, n - q); q += lens[nk++]; }
         if (nk > 1 && !multi_ok(lens, nk)) nk = 1;
         if (nk > 1) next = forward_multi(tokens + c0, lens, nk, pos + c0);
         else next = forward(tokens + c0, lens[0], pos + c0)[lens[0] - 1];

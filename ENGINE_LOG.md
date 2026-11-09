@@ -930,3 +930,7 @@ vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), 
   protože ~0,9 s na kartu je replikovaná práce (hc mixování, převody, hc down/up GEMM, router), kterou dělá každá karta
   celou. Příští páka: tuhle práci rozdělit po řádcích (výměna navíc), nebo zmenšit (fúze to_half, hc kernely).
   p16 buffery po fázích (2× mc_alloc), aby výpočet nečekal na předchozí výměnu (bez měřitelného efektu).
+- Produkce po ringu: 2 700 t/s (prompty 2–4k), ~3 200 (4–16k) při 40–50k cached; benchmark 4 070 je syntetický
+  (opakovaný text, pozice 0). Krátký prompt = jeden chunk = bez překrytí: `TpEngine::prefill` dělí jediný chunk na dvě
+  poloviny (`HYPER4_MIN_CHUNK`, default od 1024 tokenů): 4096 tokenů 3 562 → 4 066 t/s, 3000: 3 563 → 3 997, 1500: 3 802;
+  čtvrtiny horší (3 782), víc chunků dělit neškodí jen u jediného. KL proti referenci 0,0483 (beze změny). Nasazeno.
