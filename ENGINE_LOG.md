@@ -975,3 +975,20 @@ vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), 
   (512 tokenů 2 390 t/s, 2048: 3 290). „Jen routované experty" nepomůže (2k chunk se dotkne všech 512). Zbylé páky
   prefillu: vše do VRAM (menší kvant, rozhodnutí o kvalitě), rozdělení replikované hc práce (10–15 %), slučování
   elementwise průchodů (5–8 %); opakované to_half jen ~1 %.
+
+## 2026-11-10 noc – prefill Flash-Next: hyper-connection práce rozdělená po řádcích (+10 %)
+
+- Na každé kartě běžela celá hc práce každého řádku (norm, down/up projekce = 46 % trunk GEMM flopů karty, mixing,
+  combine, router): ~29 % kernelového času. Nově (`<ENV>_ROW_SHARD`, default zapnuto s P2P, chunky od `HYPER4_SHARD_MIN`
+  1400 řádků, vrstvy za PLE vrstvou): karta drží residual jen pro svou čtvrtinu řádků chunku (= díl ringu, který
+  dokončuje), allreduce je jen reduce-scatter po řádcích (`ar_begin(..., scatter)`), smíchané řádky jdou sousedům
+  all-gatherem (`ag_send` / `ag_wait`, vlastní stream `agstream`, příznaky ve VRAM) jako fp16, routing počítá vlastník
+  z přesných řádků a posílá ids / wts / sg (84 B na řádek). Residual se po poslední vrstvě jednou sesbírá (MTP průchod,
+  hlava). Buffery mixed / ids / wts / sg na chunk.
+- Cesta k tomu: fp32 gather + plný ring = pomalejší (3 410–3 830 vs 3 980; kopírovací enginy 2,4–3,3 s ze 4,2 s);
+  scatter-only + fp16 gather 4 260; + routing od vlastníka 4 415 (bez router sgemm na cizích řádcích).
+- KL bulk cesty (`HYPER4_ALLROWS=1 checkbulk`): 0,0487 vs 0,0467 nesharded (top1 90,23 vs 90,19 %); 24bitový transport
+  (`HYPER4_MIX24=1`) 0,0489 a 4 180 t/s → rozdíl KL není z fp16, je to šum změněné aritmetiky. MTP po sharded promptu:
+  stejné statistiky draftů (2,78 vs 2,78 tokenu/krok), sekvence shodné s plain.
+- Oprava: `ar_sum` v ring režimu s daným x přičítá (dřív přepisoval; dotklo by se GLM MTP bulk s `MTP_FULL`).
+- GLM (engine5) zatím nesharded.

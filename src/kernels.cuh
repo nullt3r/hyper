@@ -200,7 +200,9 @@ void allreduce_add_bulk(float * x, const float * part, half * data, unsigned * f
 void add_parts(float * x, const half * own, const half * recv, size_t stride, int nparts, int n, cudaStream_t s);
 // prefill ring allreduce over the copy engines (P2P): the pieces a device runs between its peer copies
 void ring_add(const half * in, const half * addend, half * out, int len, cudaStream_t s);      // out = f16(f32(in) + f32(addend))
-void ring_out(const half * in, float * x, int len, cudaStream_t s);                             // x = f32(in)
+void ring_out(const half * in, float * x, int len, cudaStream_t s, bool add = false);           // x = f32(in) (add: x += f32(in))
+void pack24(const float * x, uint8_t * out, int len, cudaStream_t s);     // 3 bytes a value: the fp32 pattern rounded to its top 24 bits
+void unpack24(const uint8_t * in, float * x, int len, cudaStream_t s);
 void ring_tag(unsigned long long * tag, const int * counter, int call, cudaStream_t s);         // tag = the exchange's id (sent as the flag)
 void ring_wait(const unsigned long long * flag, const int * counter, int call, unsigned * err, cudaStream_t s);   // spins until the flag shows the id
 // sum of squares of each token row into ss[t * nss] (remaining nss-1 entries zeroed)

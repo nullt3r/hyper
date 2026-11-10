@@ -47,6 +47,7 @@ void TpEngine::init() {
     mc_alloc_ = std::max(mc_max_, envp(env, "MC_ALLOC", b) ? atoi(envp(env, "MC_ALLOC", b)) : 0);
     ar_sync_ = envp(env, "AR_SYNC", b) && atoi(envp(env, "AR_SYNC", b)) != 0;
     moe_wait_ = !(envp(env, "MOE_WAIT", b) && atoi(envp(env, "MOE_WAIT", b)) == 0);
+    rshard_ = !(envp(env, "ROW_SHARD", b) && atoi(envp(env, "ROW_SHARD", b)) == 0);
     if (const char * v = envp(env, "MTP_PMIN", b)) mtp_pmin_ = atof(v);
     if (const char * v = envp(env, "MTP_CPU_MAX", b)) mtp_cpu_max_ = atof(v);
     mtp_full_ = envp(env, "MTP_FULL", b) != nullptr;
@@ -77,6 +78,7 @@ void TpEngine::init() {
         for (auto * row : {dev->ev_a, dev->ev_up2, dev->ev_dn}) for (int pp = 0; pp < 2; ++pp) for (int sl = 0; sl < 8; ++sl)
             CUDA_CHECK(cudaEventCreateWithFlags(&row[pp][sl], cudaEventDisableTiming));
         CUDA_CHECK(cudaStreamCreateWithFlags(&dev->arstream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&dev->agstream, cudaStreamNonBlocking));
         devs_.push_back(std::move(dev));
     }
     const int nd = opt_.n_devices, n = m_.n_embd, slots = nl_tot();
@@ -124,7 +126,7 @@ void TpEngine::init() {
         if (ll_p2p_) { d.ll.rd = d.ll_buf; d.ll.nw = 0; for (int p = 0; p < nd; ++p) if (p != g) d.ll.wr[d.ll.nw++] = devs_[p]->ll_buf; }
         else { d.ll.rd = ar_ll_; d.ll.nw = 1; d.ll.wr[0] = ar_ll_; }
     }
-    ring_ch_ = ((size_t) R() * n + nd - 1) / nd + 8;
+    ring_ch_ = (size_t) ((R() + nd - 1) / nd + 1) * n;
     // decode windows of <ENV>_LL_RING_MIN rows and more (default 2; 0: off, the old arithmetic) exchange their sums as a ring
     // of kernel stores into the next device (4 rows: 9.6 vs 18 us through the host, 8 rows: 12.8 vs 36); a single row stays
     // on the host transport (6.4 vs 8.0 us), with the ring's arithmetic, so a row's bits do not depend on the window
@@ -247,6 +249,9 @@ void TpEngine::alloc_common(TpDevice & dev, const CommonSizes & sz) {
     dev.p16 = dev.p16s[0];
     dev.recv = dev.recvs[0];
     if (p2p_) {
+        dev.ag_flags = dev.alloc<unsigned long long>((size_t) 64 * 8);
+        dev.ag_tag = dev.alloc<unsigned long long>(64);
+        for (auto & ev : dev.ev_ag) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         dev.ring_flags = dev.alloc<unsigned long long>((size_t) 2 * 8 * 16);   // [parity][slot][step]
         dev.ring_tagv = dev.alloc<unsigned long long>((size_t) 2 * 8);        // [parity][slot]
         dev.ring_err = dev.alloc<unsigned>(1);
@@ -422,7 +427,7 @@ void TpEngine::allreduce(TpDevice & d, int nt, int & call, int & dcall, bool bul
     ar_end(d, nt, 0, par, x);
 }
 
-void TpEngine::ar_begin(TpDevice & d, int nt, int slot, int par) {
+void TpEngine::ar_begin(TpDevice & d, int nt, int slot, int par, bool scatter) {
     cudaStream_t s = d.stream, cs = d.arstream;
     const int nd = opt_.n_devices, n = m_.n_embd;
     const size_t N = (size_t) nt * n;
@@ -435,7 +440,7 @@ void TpEngine::ar_begin(TpDevice & d, int nt, int slot, int par) {
     CUDA_CHECK(cudaStreamWaitEvent(cs, d.ev_a[par][slot], 0));
     // the staging slot is free once every peer took the previous use of it (their downloads were enqueued before the last barrier)
     for (int p = 0; p < nd; ++p) if (p != d.g) CUDA_CHECK(cudaStreamWaitEvent(cs, devs_[p]->ev_dn[par][slot], 0));
-    if (p2p_) { ar_ring(d, nt, slot, par); return; }
+    if (p2p_) { ar_ring(d, nt, slot, par, scatter); return; }
     CUDA_CHECK(cudaMemcpyAsync(stage(d.g), p16, N * sizeof(half), cudaMemcpyDeviceToHost, cs));
     CUDA_CHECK(cudaEventRecord(d.ev_up2[par][slot], cs));
 }
@@ -445,12 +450,11 @@ void TpEngine::ar_begin(TpDevice & d, int nt, int slot, int par) {
 // once more (all-gather). Copies on the copy stream, each followed by a flag written into the next device; the receiver
 // spins on the flag before touching the data, so no host barrier is needed. Transit in fp16 (the addends enter rounded
 // to fp16 as in the host path; the partial sums are rounded too). ar_sum waits for the last part and widens the row.
-void TpEngine::ar_ring(TpDevice & d, int nt, int slot, int par) {
+void TpEngine::ar_ring(TpDevice & d, int nt, int slot, int par, bool scatter) {
     cudaStream_t s = d.stream, cs = d.arstream;
     const int nd = opt_.n_devices, n = m_.n_embd, g = d.g, nx = (g + 1) % nd;
     TpDevice & N_ = *devs_[nx];
-    const size_t N = (size_t) nt * n;
-    auto lo = [&](int k) { return (size_t) k * N / nd; };
+    auto lo = [&](int k) { return (size_t) ((long long) k * nt / nd) * n; };   // (whole rows: chunk c = the rows a device owns)
     auto len = [&](int k) { return (int) (lo(k + 1) - lo(k)); };
     auto flag = [&](TpDevice & dev, int step) { return dev.ring_flags + ((size_t) par * 8 + slot) * 16 + step; };
     const int call = d.ar_calls++;
@@ -477,9 +481,9 @@ void TpEngine::ar_ring(TpDevice & d, int nt, int slot, int par) {
         const int c = (g + 1) % nd;
         wait(nd - 2, cs);
         ring_add(rr + (size_t) (nd - 2) * ring_ch_, mine + lo(c), ag + lo(c), len(c), cs);
-        send(ag + lo(c), N_.ag[slot] + lo(c), len(c), nd - 1);
+        if (!scatter) send(ag + lo(c), N_.ag[slot] + lo(c), len(c), nd - 1);
     }
-    for (int f = 1; f < nd - 1; ++f) {   // all-gather: part g - f + 1 arrived finished from the device before; forward it
+    for (int f = 1; f < nd - 1 && !scatter; ++f) {   // all-gather: part g - f + 1 arrived finished from the device before; forward it
         const int c = (g - f + 1 + nd) % nd;
         wait(nd - 2 + f, cs);
         send(ag + lo(c), N_.ag[slot] + lo(c), len(c), nd - 1 + f);
@@ -512,19 +516,50 @@ void TpEngine::ar_fetch(TpDevice & d, int nt, int slot, int par) {
     }
 }
 
-void TpEngine::ar_sum(TpDevice & d, int nt, int slot, int par, float * x) {
+void TpEngine::ar_sum(TpDevice & d, int nt, int slot, int par, float * x, bool scatter) {
     cudaStream_t s = d.stream;
     const int nd = opt_.n_devices, n = m_.n_embd;
     const size_t N = (size_t) nt * n;
-    if (!x) { x = d.bo; CUDA_CHECK(cudaMemsetAsync(d.bo, 0, N * sizeof(float), s)); }
+    const bool add = x != nullptr;   // (x given: x += the sum; else d.bo = the sum)
+    if (!x) { x = d.bo; if (!p2p_) CUDA_CHECK(cudaMemsetAsync(d.bo, 0, N * sizeof(float), s)); }
+    if (p2p_ && scatter) {   // the device's own rows only: finished by its last ring_add on the copy stream
+        int r0, r1;
+        own_rows(d, nt, r0, r1);
+        CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_up2[par][slot], 0));
+        ring_out(d.ag[slot] + (size_t) r0 * n, x + (size_t) r0 * n, (r1 - r0) * n, s, add);
+        CUDA_CHECK(cudaEventRecord(d.ev_dn[par][slot], s));
+        return;
+    }
     if (p2p_) {   // the ring: the last finished part has arrived when flag 2 nd - 3 shows this exchange's id
         ring_wait(d.ring_flags + ((size_t) par * 8 + slot) * 16 + (2 * nd - 3), d.counter, d.ar_call_of[par][slot], d.ring_err, s);
-        ring_out(d.ag[slot], x, (int) N, s);
+        ring_out(d.ag[slot], x, (int) N, s, add);
         CUDA_CHECK(cudaEventRecord(d.ev_dn[par][slot], s));   // (the slot's buffers may be written by the peers again)
         return;
     }
     CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_dn[par][slot], 0));
     add_parts(x, d.p16s[(size_t) par * mc_alloc_ + slot], d.recvs[slot], (size_t) R() * n, nd - 1, (int) N, s);
+}
+
+void TpEngine::ag_send(TpDevice & d, const void * src, const std::function<void * (TpDevice &)> & dst_of, size_t off, size_t bytes, int slot) {
+    cudaStream_t s = d.stream, cs = d.agstream;
+    const int nd = opt_.n_devices;
+    const int call = (1 << 16) + d.ag_calls++;   // (ids apart from the ring exchanges')
+    d.ag_id[slot] = call;
+    CUDA_CHECK(cudaEventRecord(d.ev_ag[slot], s));
+    CUDA_CHECK(cudaStreamWaitEvent(cs, d.ev_ag[slot], 0));
+    ring_tag(d.ag_tag + slot, d.counter, call, cs);
+    for (int p = 0; p < nd; ++p) {
+        if (p == d.g) continue;
+        TpDevice & P = *devs_[p];
+        CUDA_CHECK(cudaMemcpyPeerAsync((uint8_t *) dst_of(P) + off, P.id, src, d.id, bytes, cs));
+        CUDA_CHECK(cudaMemcpyPeerAsync(P.ag_flags + (size_t) slot * 8 + d.g, P.id, d.ag_tag + slot, d.id, sizeof(unsigned long long), cs));
+    }
+}
+
+void TpEngine::ag_wait(TpDevice & d, int slot) {
+    const int nd = opt_.n_devices;
+    for (int p = 0; p < nd; ++p)
+        if (p != d.g) ring_wait(d.ag_flags + (size_t) slot * 8 + p, d.counter, d.ag_id[slot], d.ring_err, d.stream);
 }
 
 // the streamed experts at the start of a recording over layers [il0, il1): one list per device: layer il's share goes
@@ -673,7 +708,7 @@ void TpEngine::run(int kind, int nt) {
         if (!slots.empty()) cpu_->expect(fwd_counter_, slots, bulk && mtp_full);
     }
     if (bulk) {   // record straight into the streams, one host thread per device (barriers inside the allreduces)
-        for (auto & dp : devs_) dp->ar_calls = 0;   // (the ring's exchange ids restart with the forward's counter)
+        for (auto & dp : devs_) { dp->ar_calls = 0; dp->ag_calls = 0; }   // (the ring's exchange ids restart with the forward's counter)
         std::vector<std::thread> th;
         std::vector<std::string> err(devs_.size());
         for (int gi = 0; gi < (int) devs_.size(); ++gi)

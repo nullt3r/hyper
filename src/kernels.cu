@@ -2595,9 +2595,9 @@ __global__ void k_ring_add(const half * __restrict__ in, const half * __restrict
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < len) out[i] = __float2half_rn(__half2float(in[i]) + __half2float(addend[i]));
 }
-__global__ void k_ring_out(const half * __restrict__ in, float * __restrict__ x, int len) {
+__global__ void k_ring_out(const half * __restrict__ in, float * __restrict__ x, int len, bool add) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < len) x[i] = __half2float(in[i]);
+    if (i < len) x[i] = add ? x[i] + __half2float(in[i]) : __half2float(in[i]);
 }
 __device__ __forceinline__ unsigned long long ring_id(const int * counter, int call) { return ((unsigned long long) (unsigned) *counter << 20) | (unsigned) call | (1ull << 63); }
 __global__ void k_ring_tag(unsigned long long * tag, const int * counter, int call) { *tag = ring_id(counter, call); }
@@ -2608,7 +2608,21 @@ __global__ void k_ring_wait(const unsigned long long * flag, const int * counter
         if (clock64() - t0 > 20000000000LL) { atomicOr(err, 1u); break; }   // (~10 s: a lost peer)
 }
 void ring_add(const half * in, const half * addend, half * out, int len, cudaStream_t s) { k_ring_add<<<(len + 255) / 256, 256, 0, s>>>(in, addend, out, len); }
-void ring_out(const half * in, float * x, int len, cudaStream_t s) { k_ring_out<<<(len + 255) / 256, 256, 0, s>>>(in, x, len); }
+void ring_out(const half * in, float * x, int len, cudaStream_t s, bool add) { k_ring_out<<<(len + 255) / 256, 256, 0, s>>>(in, x, len, add); }
+__global__ void k_pack24(const float * __restrict__ x, uint8_t * __restrict__ out, int len) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= len) return;
+    const unsigned u = (__float_as_uint(x[i]) + 0x80u) >> 8;
+    out[3 * (size_t) i] = (uint8_t) u; out[3 * (size_t) i + 1] = (uint8_t) (u >> 8); out[3 * (size_t) i + 2] = (uint8_t) (u >> 16);
+}
+__global__ void k_unpack24(const uint8_t * __restrict__ in, float * __restrict__ x, int len) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= len) return;
+    const unsigned u = (unsigned) in[3 * (size_t) i] | (unsigned) in[3 * (size_t) i + 1] << 8 | (unsigned) in[3 * (size_t) i + 2] << 16;
+    x[i] = __uint_as_float(u << 8);
+}
+void pack24(const float * x, uint8_t * out, int len, cudaStream_t s) { k_pack24<<<(len + 255) / 256, 256, 0, s>>>(x, out, len); }
+void unpack24(const uint8_t * in, float * x, int len, cudaStream_t s) { k_unpack24<<<(len + 255) / 256, 256, 0, s>>>(in, x, len); }
 void ring_tag(unsigned long long * tag, const int * counter, int call, cudaStream_t s) { k_ring_tag<<<1, 1, 0, s>>>(tag, counter, call); }
 void ring_wait(const unsigned long long * flag, const int * counter, int call, unsigned * err, cudaStream_t s) { k_ring_wait<<<1, 1, 0, s>>>(flag, counter, call, err); }
 

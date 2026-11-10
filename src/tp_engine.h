@@ -117,6 +117,12 @@ struct TpDevice : DevBase {
     unsigned long long * ring_flags = nullptr, * ring_tagv = nullptr;
     unsigned * ring_err = nullptr;
     int ar_calls = 0;                  // this forward's exchanges so far (the same sequence on every device: the flags' ids)
+    // P2P all-gather of rows a device alone computed (row-sharded hyper-connection work): flags [slot][sender], the tag
+    // source per slot, the id each slot's gather in flight uses, an event per slot handing the rows to the copy stream
+    unsigned long long * ag_flags = nullptr, * ag_tag = nullptr;
+    int ag_calls = 0, ag_id[64] = {};
+    cudaEvent_t ev_ag[64] = {};
+    cudaStream_t agstream = nullptr;   // the gathers' copies: their own stream (the ring's flag waits would hold them up on arstream)
     int ar_call_of[2][8] = {};         // the id each (parity, slot) exchange in flight uses
     half * ggs = nullptr;            // KQ dense weights: fp16 slice for prefill GEMMs
     size_t ggs_elems = 0;
@@ -145,6 +151,8 @@ struct TpDevice : DevBase {
         for (auto & ev : ev_ar) if (ev) cudaEventDestroy(ev);
         for (int pp = 0; pp < 2; ++pp) for (int sl = 0; sl < 8; ++sl) for (cudaEvent_t e : {ev_a[pp][sl], ev_up2[pp][sl], ev_dn[pp][sl]}) if (e) cudaEventDestroy(e);
         if (ev_arh) cudaEventDestroy(ev_arh);
+        for (auto & e : ev_ag) if (e) cudaEventDestroy(e);
+        if (agstream) cudaStreamDestroy(agstream);
         if (arstream) cudaStreamDestroy(arstream);
     }
 };
@@ -237,10 +245,20 @@ protected:
     // d.part and uploads it (copy stream), ar_end downloads the peers' partials and adds them all into x (d.bo when nullptr).
     // Between every device's ar_begin of a phase and the first ar_end of it the host threads must pass barrier_ (the peers'
     // events exist then); par: 0 / 1 for the two allreduces of a layer, slot: the chunk
-    void ar_begin(TpDevice & d, int nt, int slot, int par);
+    // scatter (P2P, row-sharded prefill): reduce-scatter only -- the device ends with the sums of its own rows (own_rows)
+    void ar_begin(TpDevice & d, int nt, int slot, int par, bool scatter = false);
+    void own_rows(const TpDevice & d, int nt, int & r0, int & r1) const {   // the ring chunk the device finishes: (g + 1) % ndev, whole rows
+        const int nd = opt_.n_devices, c = (d.g + 1) % nd;
+        r0 = (int) ((long long) c * nt / nd); r1 = (int) ((long long) (c + 1) * nt / nd);
+    }
     void ar_fetch(TpDevice & d, int nt, int slot, int par);   // after the barrier: the peers' partials start downloading (copy stream)
-    void ar_ring(TpDevice & d, int nt, int slot, int par);    // P2P: the whole exchange as a ring over the copy engines (ar_begin calls it)
-    void ar_sum(TpDevice & d, int nt, int slot, int par, float * x = nullptr);   // compute stream: waits for them, adds them all
+    void ar_ring(TpDevice & d, int nt, int slot, int par, bool scatter);    // P2P: the whole exchange as a ring over the copy engines (ar_begin calls it)
+    // P2P all-gather: `elems` floats at src (rows this device computed) go to the same place on every peer (dst_of(peer) =
+    // the peer's buffer base, `off` the element offset), each copy followed by a flag; ag_wait: the compute stream waits for
+    // every peer's rows of the slot. The same sequence of ag_send calls must run on every device (the flags' ids)
+    void ag_send(TpDevice & d, const void * src, const std::function<void * (TpDevice &)> & dst_of, size_t off_bytes, size_t bytes, int slot);
+    void ag_wait(TpDevice & d, int slot);
+    void ar_sum(TpDevice & d, int nt, int slot, int par, float * x = nullptr, bool scatter = false);   // compute stream: waits for them, adds them all
     void ar_end(TpDevice & d, int nt, int slot, int par, float * x = nullptr) { ar_fetch(d, nt, slot, par); ar_sum(d, nt, slot, par, x); }
     // the streamed experts' uploads at the start of a recording (the first layer's share) and the upload-part queue
     void stream_begin(TpDevice & d, int il0, int il1);
@@ -297,6 +315,7 @@ protected:
     unsigned fwd_counter_ = 0;
     bool graphs_ready_ = false;
     bool debug_ = false, nocpu_ = false;
+    bool rshard_ = true;     // <ENV>_ROW_SHARD=0: every device computes the hyper-connection mixing of every prefill row (the old way)
     bool moe_wait_ = true;   // <ENV>_MOE_WAIT=0: the peers do not wait for the CPU experts' flag before the allreduce (the old way)
     int last_nt_ = 0;
     int mc_max_ = 4;                // prefill chunks per layer pass (<ENV>_MC; 1: one at a time)

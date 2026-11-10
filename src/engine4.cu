@@ -75,6 +75,9 @@ struct Engine4::Device : TpDevice {
     DW head_down, head_up;
     // activations [MAX_NT] rows
     float * res2 = nullptr, * gate = nullptr, * lo = nullptr, * inj = nullptr, * mixed = nullptr, * injp = nullptr;
+    std::vector<float *> mixs;   // the mixed rows per chunk of a multi-chunk pass (mixed points at the current chunk's)
+    std::vector<uint8_t *> mixhs;   // ... packed (24 bits a value, or fp16): what a row-sharded prefill sends to the peers
+    std::vector<int *> idsx; std::vector<float *> wtsx, sgx;   // the routing per chunk (ids / wts / sg point at the current chunk's)
     unsigned * inj_cnt = nullptr;   // hc norm: per token, the stream blocks' tickets
     float * ple_emb = nullptr, * ple_key = nullptr, * ple_val = nullptr, * ple_sc = nullptr;
     std::vector<float *> ple_x;     // the further chunks of a multi-chunk prefill pass: PLE rows
@@ -371,6 +374,15 @@ void Engine4::load_device(TpDevice & td) {
     dev.inj_cnt = dev.alloc<unsigned>(MAX_NT);
     CUDA_CHECK(cudaMemset(dev.inj_cnt, 0, MAX_NT * sizeof(unsigned)));
     dev.mixed = dev.alloc<float>((size_t) R * n);
+    dev.mixs.push_back(dev.mixed);
+    for (int ci = 1; ci < mc_alloc_; ++ci) dev.mixs.push_back(dev.alloc<float>((size_t) R * n));
+    for (int ci = 0; ci < mc_alloc_; ++ci) dev.mixhs.push_back(dev.alloc<uint8_t>((size_t) R * n * 3));
+    dev.idsx.push_back(dev.ids); dev.wtsx.push_back(dev.wts); dev.sgx.push_back(dev.sg);
+    for (int ci = 1; ci < mc_alloc_; ++ci) {
+        dev.idsx.push_back(dev.alloc<int>((size_t) R * c.n_expert_used));
+        dev.wtsx.push_back(dev.alloc<float>((size_t) R * c.n_expert_used));
+        dev.sgx.push_back(dev.alloc<float>(R));
+    }
     dev.ple_emb = dev.alloc<float>((size_t) R * std::max(1, c.ple_n_heads() * c.ple_dim));
     dev.ple_key = dev.alloc<float>((size_t) R * hcn);
     dev.ple_val = dev.alloc<float>((size_t) R * n);
@@ -493,23 +505,25 @@ void Engine4::record_main(int gi, int nt, int kind) {
     auto dbg = [&](const char * what, int il, const float * buf, size_t cnt) { TpEngine::dbg(d, what, il, buf, cnt, 2, nt); };
     dbg("embed", -1, d.res, (size_t) nt * hcn);
     // hyper-connection mixer: res -> mixed (and the inject logits)
-    auto hc_mix = [&](const float * norm, const DW & down, const DW & up, const float * inj, const float * res = nullptr, int rows = -1) {
+    // (ro: the rows' offset in the chunk -- a row-sharded prefill mixes only its own rows, into their place of mixed / inj)
+    auto hc_mix = [&](const float * norm, const DW & down, const DW & up, const float * inj, const float * res = nullptr, int rows = -1, int ro = 0) {
         if (!res) res = R;
         if (rows < 0) rows = nt;
-        if (c.plain) { rmsnorm(res, n, norm, d.mixed, n, n, rows, eps, s); return; }   // (qwen35moe: the block's RMSNorm)
+        float * mixed_o = d.mixed + (size_t) ro * n, * inj_o = injc + (size_t) ro * 4;
+        if (c.plain) { rmsnorm(res, n, norm, mixed_o, n, n, rows, eps, s); return; }   // (qwen35moe: the block's RMSNorm)
         const bool finj = inj && rows <= MAX_NT;   // decode: the injection dots ride along the norm kernel
-        hc_norm(res, norm, d.xn, n, hc, eps, rows, s, finj ? inj : nullptr, d.injp, injc, d.inj_cnt);
+        hc_norm(res, norm, d.xn, n, hc, eps, rows, s, finj ? inj : nullptr, d.injp, inj_o, d.inj_cnt);
         mm(down, d.xn, hcn, d.lo, lr, rows);
-        if (inj && !finj) f32mm(inj, hc, hcn, d.xn, hcn, injc, 4, rows);
+        if (inj && !finj) f32mm(inj, hc, hcn, d.xn, hcn, inj_o, 4, rows);
         if (rows <= MAX_NT) {
             NormIn act; act.act = 1; act.act_scale = 1.0f / hc;   // silu(lo / hc) on load
-            if (up.hcperm) { gemv_q8_hcmix(up.q8, d.lo, lr, act, d.xn, hcn, d.mixed, n, n, rows, s); return; }   // mixing fused
+            if (up.hcperm) { gemv_q8_hcmix(up.q8, d.lo, lr, act, d.xn, hcn, mixed_o, n, n, rows, s); return; }   // mixing fused
             mm(up, d.lo, lr, d.gate, hcn, rows, act);
         } else {
             silu_scale(d.lo, lr, 1.0f / hc, rows, lr, s);
             mm(up, d.lo, lr, d.gate, hcn, rows);
         }
-        hc_mixed(d.xn, d.gate, d.mixed, n, hc, rows, s, up.hcperm);
+        hc_mixed(d.xn, d.gate, mixed_o, n, hc, rows, s, up.hcperm);
     };
     if (kind) {   // [rms(e) * enorm | rms(h_s) * hnorm_s] -> eh_proj, one row per hc stream
         const float * mH = kind == 1 ? (mtp_src_ > 0 ? d.res_x[mtp_src_ - 1] : d.res) : d.mh;
@@ -529,6 +543,60 @@ void Engine4::record_main(int gi, int nt, int kind) {
     auto set_ck = [&](int ci) {   // (a single chunk is set once: an MTP pass narrows nt mid-layer)
         if (nck <= 1) return;
         nt = ck[ci].nt; R = ck[ci].R; P = ck[ci].P; pos_host = ck[ci].pos; ple_emb = ck[ci].ple; injc = d.inj + (size_t) ci * R4 * 4;
+        d.mixed = d.mixs[ci];
+        d.ids = d.idsx[ci]; d.wts = d.wtsx[ci]; d.sg = d.sgx[ci];
+    };
+    // row-sharded hyper-connection work (prefill, P2P): every device keeps the residual rows of its share of a chunk only --
+    // norm, down / up projections, mixing and the residual update for a quarter of the rows -- and the mixed rows go to the
+    // peers by an all-gather; the layers up to the PLE layer stay whole (it reads every row's residual). The residual rows
+    // are gathered once after the last layer (the MTP pass and the head read them).
+    // (chunks of HYPER4_SHARD_MIN rows and more, default 1400: below, the gathers' fixed latency costs more than the rows save --
+    // 1000 rows 2570 vs 2780 t/s, 3000 as two halves 3420 vs 3230)
+    static const int shard_min = getenv("HYPER4_SHARD_MIN") ? atoi(getenv("HYPER4_SHARD_MIN")) : 1400;
+    const bool shard_ok = bulk && !kind && p2p_ && rshard_ && !ar_sync_ && !c.plain && nd > 1 && !d.trace && !d.trace2 && !debug_ && nt >= shard_min;
+    auto row0 = [&](int ci) { int a, b; own_rows(d, ck[ci].nt, a, b); return a; };
+    auto row1 = [&](int ci) { int a, b; own_rows(d, ck[ci].nt, a, b); return b; };
+    // the mixed rows travel as fp16 (what the GEMMs take anyway; the routing is the owner's, from its exact rows; the fp32
+    // consumers left -- alpha / beta of the linear-attention layers -- see fp16-rounded rows. HYPER4_MIX24=1: 24-bit floats,
+    // half as many bytes again: measured the same KL, 4180 vs 4420 t/s); the owner rounds its own rows the same way, so
+    // every device holds identical mixed rows
+    static const bool mix16 = getenv("HYPER4_MIX24") == nullptr;
+    const size_t mw = mix16 ? sizeof(half) : 3;   // bytes a value
+    auto mix_unpack = [&](int ci, int ra, int rb) {
+        if (rb <= ra) return;
+        if (mix16) ring_out((const half *) d.mixhs[ci] + (size_t) ra * n, d.mixed + (size_t) ra * n, (rb - ra) * n, s);
+        else unpack24(d.mixhs[ci] + (size_t) ra * n * 3, d.mixed + (size_t) ra * n, (rb - ra) * n, s);
+    };
+    auto mix_send = [&](int ci, int slot) {
+        const int r0 = row0(ci), nr = row1(ci) - r0;
+        uint8_t * mh = d.mixhs[ci] + (size_t) r0 * n * mw;
+        if (mix16) to_half(d.mixed + (size_t) r0 * n, n, nullptr, n, 0.0f, (half *) mh, nr, s);
+        else pack24(d.mixed + (size_t) r0 * n, mh, nr * n, s);
+        mix_unpack(ci, r0, r0 + nr);
+        ag_send(d, mh, [ci](TpDevice & p) { return (void *) static_cast<Device &>(p).mixhs[ci]; }, (size_t) r0 * n * mw, (size_t) nr * n * mw, slot);
+    };
+    // the routing of a row-sharded prefill: by the rows' owner from its exact mixed rows, then to the peers (84 bytes a row)
+    auto route_rows = [&](const DevLayer & L, const float * x, int * ids, float * wts, float * sg, int rows) {
+        if (!L.router16) f32mm(L.router, c.n_expert + 1, n, x, n, d.rlog, c.n_expert + 1, rows);
+        else if (rows <= MAX_NT) gemv_bf16w(L.router16, c.n_expert + 1, n, x, n, d.rlog, c.n_expert + 1, rows, s);
+        else {   // prefill: widened to fp32 for the same sgemm
+            bf16_to_f32(L.router16, (size_t) (c.n_expert + 1) * n, d.router32, s);
+            f32mm(d.router32, c.n_expert + 1, n, x, n, d.rlog, c.n_expert + 1, rows);
+        }
+        moe_route(d.rlog, c.n_expert + 1, c.n_expert, K, ids, wts, sg, rows, s);
+    };
+    auto route_send = [&](int ci) {
+        const int r0 = row0(ci), nr = row1(ci) - r0;
+        ag_send(d, d.ids + (size_t) r0 * K, [ci](TpDevice & p) { return (void *) static_cast<Device &>(p).idsx[ci]; }, (size_t) r0 * K * sizeof(int), (size_t) nr * K * sizeof(int), 24 + ci);
+        ag_send(d, d.wts + (size_t) r0 * K, [ci](TpDevice & p) { return (void *) static_cast<Device &>(p).wtsx[ci]; }, (size_t) r0 * K * sizeof(float), (size_t) nr * K * sizeof(float), 32 + ci);
+        ag_send(d, d.sg + r0, [ci](TpDevice & p) { return (void *) static_cast<Device &>(p).sgx[ci]; }, (size_t) r0 * sizeof(float), (size_t) nr * sizeof(float), 40 + ci);
+    };
+    auto route_recv = [&](int ci) { ag_wait(d, 24 + ci); ag_wait(d, 32 + ci); ag_wait(d, 40 + ci); };
+    auto mix_recv = [&](int ci, int slot) {
+        const int r0 = row0(ci), r1 = row1(ci);
+        ag_wait(d, slot);
+        mix_unpack(ci, 0, r0);
+        mix_unpack(ci, r1, nt);
     };
     // decode: independent work on a second stream (indexer || q/k/v + attention prep, alpha/beta || the GDN input
     // projection, shared expert || routed experts): the small kernels' fixed latencies overlap. The second stream's
@@ -551,7 +619,8 @@ void Engine4::record_main(int gi, int nt, int kind) {
     // chunk, so its order is as before.
     for (int il = il0; il < il1; ++il) {
     DevLayer & L = kind ? d.mtp : d.layers[il];
-    for (int ci = 0; ci < nck; ++ci) {   // ---- phase A: the token mixer ----
+    const bool sh = shard_ok && il > c.ple_layer;
+    for (int ci = 0; ci < nck; ++ci) {   // ---- phase A: the token mixer's input (own rows when sharded: then to the peers) ----
         set_ck(ci);
         if (L.ple) {
             const int pe = c.ple_n_heads() * c.ple_dim;
@@ -564,7 +633,15 @@ void Engine4::record_main(int gi, int nt, int kind) {
         if (il < 2) tr(2 + 4 * il, R, hcn);
         // ---- token mixer ----
         if (d.pe_pending) { CUDA_CHECK(cudaStreamWaitEvent(s, d.ev_pe1, 0)); d.pe_pending = false; }   // (it reads the mixed rows)
-        hc_mix(L.hca_norm, L.hca_down, L.hca_up, L.hca_inj);
+        if (sh) {
+            const int r0 = row0(ci), nr = row1(ci) - r0;
+            hc_mix(L.hca_norm, L.hca_down, L.hca_up, L.hca_inj, R + (size_t) r0 * hcn, nr, r0);
+            mix_send(ci, ci);
+        } else hc_mix(L.hca_norm, L.hca_down, L.hca_up, L.hca_inj);
+    }
+    for (int ci = 0; ci < nck; ++ci) {   // ---- phase A: the token mixer ----
+        set_ck(ci);
+        if (sh) mix_recv(ci, ci);
         if (il < 2) tr(3 + 4 * il, d.mixed, n);
         dbg("hc_mix_attn", il, d.mixed, (size_t) nt * n);
         const bool par = !bulk && !serial_shexp;
@@ -678,7 +755,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
         if (bulk && ar_sync_) {   // (tests: the old order, one exchange at a time)
             ar_begin(d, nt, ci, 0); barrier_->wait(); ar_end(d, nt, ci, 0);
             if (c.plain) vec_add(R, d.bo, (size_t) nt * n, s); else hc_combine(R, d.bo, injc, 4, n, hc, nt, s);
-        } else if (bulk) { ar_begin(d, nt, ci, 0); barrier_->wait(); ar_fetch(d, nt, ci, 0); }   // (the sum lands in phase B)
+        } else if (bulk) { ar_begin(d, nt, ci, 0, sh); barrier_->wait(); ar_fetch(d, nt, ci, 0); }   // (the sum lands in phase B)
         else if (c.plain) allreduce_add_ll16(R, d.part, d.ll, d.g, nd, nt * n, d.counter, call++, s, nullptr);   // R += sum of the parts
         else allreduce_hc_ll16(R, injc, n, hc, d.part, d.ll, d.g, nd, nt * n, d.counter, call++, s);
     }
@@ -688,8 +765,10 @@ void Engine4::record_main(int gi, int nt, int kind) {
         if (cache_only) continue;
         const bool par = !bulk && !serial_shexp;
         if (bulk && !ar_sync_) {
-            ar_sum(d, nt, ci, 0);
-            if (c.plain) vec_add(R, d.bo, (size_t) nt * n, s); else hc_combine(R, d.bo, injc, 4, n, hc, nt, s);
+            ar_sum(d, nt, ci, 0, nullptr, sh);
+            if (c.plain) vec_add(R, d.bo, (size_t) nt * n, s);
+            else if (sh) { const int r0 = row0(ci); hc_combine(R + (size_t) r0 * hcn, d.bo + (size_t) r0 * n, injc + (size_t) r0 * 4, 4, n, hc, row1(ci) - r0, s); }
+            else hc_combine(R, d.bo, injc, 4, n, hc, nt, s);
         }
         if (il < 2) tr(4 + 4 * il, R, hcn);
         if (last_only && nt > 1) {   // the last row moves to row 0 and continues alone, in decode mode
@@ -698,7 +777,20 @@ void Engine4::record_main(int gi, int nt, int kind) {
             bulk = false;
         }
         // ---- MoE ----
-        hc_mix(L.hcf_norm, L.hcf_down, L.hcf_up, L.hcf_inj);
+        if (sh) {
+            const int r0 = row0(ci), nr = row1(ci) - r0;
+            hc_mix(L.hcf_norm, L.hcf_down, L.hcf_up, L.hcf_inj, R + (size_t) r0 * hcn, nr, r0);
+            route_rows(L, d.mixed + (size_t) r0 * n, d.ids + (size_t) r0 * K, d.wts + (size_t) r0 * K, d.sg + r0, nr);
+            route_send(ci);
+            mix_send(ci, 8 + ci);
+        } else hc_mix(L.hcf_norm, L.hcf_down, L.hcf_up, L.hcf_inj);
+    }
+    for (int ci = 0; ci < nck; ++ci) {   // ---- phase B: the MoE ----
+        set_ck(ci);
+        const bool last_ck = ci == nck - 1;   // (the streamed experts' staging is released after the last chunk)
+        if (cache_only) continue;
+        const bool par = !bulk && !serial_shexp;
+        if (sh) { mix_recv(ci, 8 + ci); route_recv(ci); }
         if (il < 2) tr(5 + 4 * il, d.mixed, n);
         auto shexp = [&] {
             mm(L.sh_gu, d.mixed, n, d.shgu, 2 * L.n_sh_l, nt);
@@ -711,13 +803,15 @@ void Engine4::record_main(int gi, int nt, int kind) {
             }
         };
         if (par) { fork(); on_s2(shexp); }   // (the shared expert || routing and the routed experts, until moe_reduce)
-        if (!L.router16) f32mm(L.router, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt);
-        else if (nt <= MAX_NT) gemv_bf16w(L.router16, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt, s);
-        else {   // prefill: widened to fp32 for the same sgemm
-            bf16_to_f32(L.router16, (size_t) (c.n_expert + 1) * n, d.router32, s);
-            f32mm(d.router32, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt);
+        if (!sh) {
+            if (!L.router16) f32mm(L.router, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt);
+            else if (nt <= MAX_NT) gemv_bf16w(L.router16, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt, s);
+            else {   // prefill: widened to fp32 for the same sgemm
+                bf16_to_f32(L.router16, (size_t) (c.n_expert + 1) * n, d.router32, s);
+                f32mm(d.router32, c.n_expert + 1, n, d.mixed, n, d.rlog, c.n_expert + 1, nt);
+            }
+            dbg("router", il, d.rlog, (size_t) nt * (c.n_expert + 1));
         }
-        dbg("router", il, d.rlog, (size_t) nt * (c.n_expert + 1));
         MoeLayerDev & X = place_->dev(d.g, il);   // the layer's experts on this device
         const bool stream = streaming && X.owner_bulk;
         static const bool sep_pub = getenv("HYPER4_SEP_PUBLISH") != nullptr;
@@ -726,7 +820,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
             moe_route_publish(d.rlog, c.n_expert + 1, c.n_expert, K, d.ids, d.wts, d.sg, nt, &cpu_rec_[il].seq, &cpu_rec_[il].nt,
                               &cpu_rec_[il].ids[0][0], &cpu_rec_[il].wts[0][0], &cpu_rec_[il].x[0][0], d.mixed, n, n, d.counter,
                               (unsigned) il, d.ticket, s);
-        if (!fused_pub) moe_route(d.rlog, c.n_expert + 1, c.n_expert, K, d.ids, d.wts, d.sg, nt, s);
+        if (!fused_pub && !sh) moe_route(d.rlog, c.n_expert + 1, c.n_expert, K, d.ids, d.wts, d.sg, nt, s);
         dbg("route_w", il, d.wts, (size_t) nt * K);
         if (pred_mode_ && !bulk && !kind && d.g == 0 && nt <= MAX_NT && il + 1 < c.n_layer) {
             // HYPER4_PRED: the next layer's routing from this layer's MoE input (its router on the mixed rows), on the side stream
@@ -798,7 +892,7 @@ void Engine4::record_main(int gi, int nt, int kind) {
         if (bulk && ar_sync_) {
             ar_begin(d, nt, ci, 1); barrier_->wait(); ar_end(d, nt, ci, 1);
             if (c.plain) vec_add(R, d.bo, (size_t) nt * n, s); else hc_combine(R, d.bo, injc, 4, n, hc, nt, s);
-        } else if (bulk) { ar_begin(d, nt, ci, 1); barrier_->wait(); ar_fetch(d, nt, ci, 1); }
+        } else if (bulk) { ar_begin(d, nt, ci, 1, sh); barrier_->wait(); ar_fetch(d, nt, ci, 1); }
         else if (c.plain) allreduce_add_ll16(R, d.part, d.ll, d.g, nd, nt * n, d.counter, call++, s, nullptr);
         else allreduce_hc_ll16(R, injc, n, hc, d.part, d.ll, d.g, nd, nt * n, d.counter, call++, s);
     }
@@ -807,8 +901,10 @@ void Engine4::record_main(int gi, int nt, int kind) {
         const bool last_ck = ci == nck - 1;
         if (cache_only) continue;
         if (bulk && !ar_sync_) {
-            ar_sum(d, nt, ci, 1);
-            if (c.plain) vec_add(R, d.bo, (size_t) nt * n, s); else hc_combine(R, d.bo, injc, 4, n, hc, nt, s);
+            ar_sum(d, nt, ci, 1, nullptr, sh);
+            if (c.plain) vec_add(R, d.bo, (size_t) nt * n, s);
+            else if (sh) { const int r0 = row0(ci); hc_combine(R + (size_t) r0 * hcn, d.bo + (size_t) r0 * n, injc + (size_t) r0 * 4, 4, n, hc, row1(ci) - r0, s); }
+            else hc_combine(R, d.bo, injc, 4, n, hc, nt, s);
         }
         dbg("l_last", il, R, (size_t) nt * hcn);
         if (d.trace && !kind && last_ck)
@@ -816,6 +912,16 @@ void Engine4::record_main(int gi, int nt, int kind) {
                                        cudaMemcpyDeviceToDevice, s));
     }
     }
+    if (shard_ok && il1 - 1 > c.ple_layer) {   // the residual rows back together on every device
+        for (int ci = 0; ci < nck; ++ci) {
+            const int r0 = row0(ci);
+            ag_send(d, ck[ci].R + (size_t) r0 * hcn, [ci](TpDevice & p) { return (void *) (ci == 0 ? p.res : p.res_x[ci - 1]); },
+                    (size_t) r0 * hcn * sizeof(float), (size_t) (row1(ci) - r0) * hcn * sizeof(float), 16 + ci);
+        }
+        for (int ci = 0; ci < nck; ++ci) ag_wait(d, 16 + ci);
+    }
+    d.mixed = d.mixs[0];
+    d.ids = d.idsx[0]; d.wts = d.wtsx[0]; d.sg = d.sgx[0];
     if (kind) {   // drafts: the last row only; its residual feeds the next chained step
         if (cache_only) return;
         if (!c.plain) CUDA_CHECK(cudaMemcpyAsync(d.mh, d.mres + (size_t) (nt - 1) * hcn, (size_t) hcn * sizeof(float), cudaMemcpyDeviceToDevice, s));
