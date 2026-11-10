@@ -948,3 +948,7 @@ vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), 
   0,0516 (stará aritmetika 0,0483; PPL 6,5331 vs 6,5346, top1 90,48 vs 90,43 %). Nasazeno.
 - Otevřené: prefill ring je samostatně 2,4× rychlejší než host, ale celý prefill jen +2 % → čekání pomalých karet není
   transport; hledat jinde (bariéry, pořadí fází). ACS zatím zapnuté.
+- Ring slova přepsána na 2× 24bitový float + 16bitová značka (mezisoučty 32× jemnější než fp16, stejně bajtů); slovo
+  maže jeho jediný čtenář hned po přečtení, takže opakování značky po 65 535 výměnách nepotká staré slovo. Stejná
+  aritmetika i v cestě přes RAM. KL 0,0489 (fp16 ring 0,0516, původní 0,0483), okno 8 řádků 16,7 ms, 4 řádky 11,7;
+  mtpgen 1024 tokenů K=7 pmin 0,3: 248 t/s, 1024/1024 shodných s obyčejným dekódem. Nasazeno.

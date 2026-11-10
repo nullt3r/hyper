@@ -1634,20 +1634,28 @@ __global__ void __launch_bounds__(1024) k_topk_merge(int offset, float * __restr
 // LL exchange through mapped host memory, a float2 per thread: every GPU's part summed in GPU order. fp16 payload: each
 // part rounded to fp16 (one 8-byte packet {seq, half2}); F32: exact parts (a packet {seq, float} per element, twice the
 // slots). Every GPU sums identical numbers (its own part enters rounded like the others').
-__device__ __forceinline__ void rg_put(unsigned long long * p, __half2 h, unsigned seq) {
-    *(volatile unsigned long long *) p = ((unsigned long long) seq << 32) | (unsigned long long) *(const unsigned *) &h;
+// ring words: a 16-bit tag and two 24-bit floats (sign, exponent, 15 mantissa bits: the fp32 pattern rounded to its top
+// 24 bits). The partial sums travel 32x finer than fp16; the addends are the fp16 parts as before. A word is wiped by its
+// (single) consumer right after the read, so a tag that comes round again after 65535 exchanges never meets an old word.
+__device__ __forceinline__ float r24(float x) { return __uint_as_float((__float_as_uint(x) + 0x80u) & 0xffffff00u); }
+__device__ __forceinline__ float2 r24_2(float2 v) { return make_float2(r24(v.x), r24(v.y)); }
+__device__ __forceinline__ unsigned rg_tag(unsigned seq) { return seq % 0xffffu; }   // (0xffff: the wiped word)
+__device__ __forceinline__ void rg_put(unsigned long long * p, float2 v, unsigned seq) {   // v: 24-bit values
+    *(volatile unsigned long long *) p = ((unsigned long long) rg_tag(seq) << 48) | ((unsigned long long) (__float_as_uint(v.x) >> 8) << 24) |
+                                         (unsigned long long) (__float_as_uint(v.y) >> 8);
 }
-__device__ __forceinline__ __half2 rg_take(const unsigned long long * p, unsigned seq) {
+__device__ __forceinline__ float2 rg_take(unsigned long long * p, unsigned seq, bool wipe) {
     unsigned long long w;
-    do { w = *(const volatile unsigned long long *) p; } while ((unsigned) (w >> 32) != seq);
-    const unsigned b = (unsigned) w;
-    return *(const __half2 *) &b;
+    do { w = *(const volatile unsigned long long *) p; } while ((unsigned) (w >> 48) != rg_tag(seq));
+    if (wipe) *(volatile unsigned long long *) p = ~0ull;
+    return make_float2(__uint_as_float(((unsigned) (w >> 24) & 0xffffffu) << 8), __uint_as_float(((unsigned) w & 0xffffffu) << 8));
 }
-__device__ __forceinline__ __half2 rg_add(__half2 a, __half2 b) {
-    const float2 x = __half22float2(a), y = __half22float2(b);
-    return __floats2half2_rn(x.x + y.x, x.y + y.y);
+__device__ __forceinline__ float2 rg_add(float2 a, __half2 b) {
+    const float2 y = __half22float2(b);
+    return r24_2(make_float2(a.x + y.x, a.y + y.y));
 }
-// the ring transport: thread i = (row t, column pair col); the threads of the first ch columns carry the hops of every chunk
+// the ring transport: thread i = (row t, column pair col); the threads of the first ch columns carry the reduce hops of
+// every chunk; a finished chunk is forwarded and finally read by the thread that owns the column (the word's one consumer)
 __device__ __forceinline__ float2 ll_ring(const float * __restrict__ part, const LLBuf & L, int g, int nd, int i, unsigned seq, int call) {
     const int row2 = L.row2, chw = L.ch, t = i / row2, col = i % row2, set = call & 1;
     const size_t in_set = (size_t) (nd - 1) * L.maxt * chw, ag_set = (size_t) L.maxt * row2;
@@ -1657,26 +1665,29 @@ __device__ __forceinline__ float2 ll_ring(const float * __restrict__ part, const
     auto mine = [&](int c, int e) { const float2 v = p2[lo(c) + e]; return __floats2half2_rn(v.x, v.y); };
     if (col < chw) {
         const int e = col;
-        if (e < lo(g + 1) - lo(g)) rg_put(nin + (size_t) t * chw + e, mine(g, e), seq);
+        if (e < lo(g + 1) - lo(g)) rg_put(nin + (size_t) t * chw + e, __half22float2(mine(g, e)), seq);
         for (int s = 1; s < nd - 1; ++s) {
             const int c = (g - s + nd) % nd;
             if (e < lo(c + 1) - lo(c))
-                rg_put(nin + ((size_t) s * L.maxt + t) * chw + e, rg_add(rg_take(in + ((size_t) (s - 1) * L.maxt + t) * chw + e, seq), mine(c, e)), seq);
+                rg_put(nin + ((size_t) s * L.maxt + t) * chw + e, rg_add(rg_take(in + ((size_t) (s - 1) * L.maxt + t) * chw + e, seq, true), mine(c, e)), seq);
         }
         {
             const int c = (g + 1) % nd;
             if (e < lo(c + 1) - lo(c)) {
-                const __half2 v = rg_add(rg_take(in + ((size_t) (nd - 2) * L.maxt + t) * chw + e, seq), mine(c, e));
+                const float2 v = rg_add(rg_take(in + ((size_t) (nd - 2) * L.maxt + t) * chw + e, seq, true), mine(c, e));
                 rg_put(ag + (size_t) t * row2 + lo(c) + e, v, seq);
                 rg_put(nag + (size_t) t * row2 + lo(c) + e, v, seq);
             }
         }
-        for (int f = 1; f < nd - 1; ++f) {
-            const int c = (g - f + 1 + nd) % nd;
-            if (e < lo(c + 1) - lo(c)) rg_put(nag + (size_t) t * row2 + lo(c) + e, rg_take(ag + (size_t) t * row2 + lo(c) + e, seq), seq);
-        }
     }
-    return __half22float2(rg_take(ag + i, seq));
+    const float2 v = rg_take(ag + i, seq, true);
+    // chunks g, g - 1, .., g - nd + 3 came finished from the device before and go on to the next one
+    int c = (int) ((long long) col * nd / row2);
+    while (c + 1 < nd && lo(c + 1) <= col) ++c;
+    while (c > 0 && lo(c) > col) --c;
+    const int f = (g - c + 1 + nd) % nd;   // (the chunk's forwarding step here: 1 .. nd - 2 forwards)
+    if (f >= 1 && f <= nd - 2) rg_put(nag + i, v, seq);
+    return v;
 }
 
 template <bool F32>
@@ -1695,7 +1706,7 @@ __device__ __forceinline__ float2 ll_exchange(const float * __restrict__ part, c
         int c = (int) ((long long) col * ndev / row2);
         while (c + 1 < ndev && (c + 1) * row2 / ndev <= col) ++c;
         while (c > 0 && c * row2 / ndev > col) --c;
-        __half2 a;
+        float2 a = make_float2(0.0f, 0.0f);
         for (int sidx = 0; sidx < ndev; ++sidx) {
             const int dd = (c + sidx) % ndev;
             __half2 h;
@@ -1707,9 +1718,9 @@ __device__ __forceinline__ float2 ll_exchange(const float * __restrict__ part, c
                 const unsigned bits = (unsigned) (v & 0xffffffffu);
                 h = *(const __half2 *) &bits;
             }
-            a = sidx == 0 ? h : rg_add(a, h);
+            a = sidx == 0 ? __half22float2(h) : rg_add(a, h);   // (the ring's 24-bit partial sums)
         }
-        return __half22float2(a);
+        return a;
     }
     if (!F32) {
         const size_t poff = (size_t) (call & 1) * ndev * n2;

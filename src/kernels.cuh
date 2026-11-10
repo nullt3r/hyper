@@ -176,7 +176,7 @@ struct LLBuf {
     uint2 * rds[8] = {};   // optional: sender dd's region is read from rds[dd] instead of rd (pull: every device writes locally)
     int wide = 0;
     // ring arithmetic (row2 > 0: fp16 pairs a row): a row's columns in ndev chunks, chunk c summed in the order c, c + 1, ..
-    // with the partial sum rounded to fp16 after every addend -- what a ring over the devices computes, and what the host
+    // with the partial sum rounded to 24 bits after every addend -- what a ring over the devices computes, and what the host
     // transport then computes too, so a row's sum has the same bits whichever transport and row count carried it.
     // Ring transport (P2P; windows of ring_min rows and more): rin [2][ndev - 1][maxt][ch] partial sums in from the device
     // before, rag [2][maxt][row2] the gathered sums; nin / nag: the next device's
