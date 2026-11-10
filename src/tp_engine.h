@@ -109,6 +109,7 @@ struct TpDevice : DevBase {
     std::vector<half *> p16s, recvs;
     cudaStream_t arstream = nullptr;   // the allreduce copies: off the compute stream, so a chunk's exchange overlaps the next one's kernels
     uint2 * ll_buf = nullptr;          // P2P: this device's LL packet buffer (the peers write into it)
+    unsigned long long * ll_rin = nullptr, * ll_rag = nullptr;   // P2P: the decode ring's hop slots and gathered sums
     LLBuf ll;                          // where this device's LL allreduce writes and reads
     // P2P prefill ring (per chunk slot): the partial sums coming in from the device before (a slot per reduce-scatter hop),
     // the two send buffers, the all-gathered row (fp16), flags [parity][slot][step] the device before writes, the tag source

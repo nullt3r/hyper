@@ -934,3 +934,17 @@ vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), 
   (opakovaný text, pozice 0). Krátký prompt = jeden chunk = bez překrytí: `TpEngine::prefill` dělí jediný chunk na dvě
   poloviny (`HYPER4_MIN_CHUNK`, default od 1024 tokenů): 4096 tokenů 3 562 → 4 066 t/s, 3000: 3 563 → 3 997, 1500: 3 802;
   čtvrtiny horší (3 782), víc chunků dělit neškodí jen u jediného. KL proti referenci 0,0483 (beze změny). Nasazeno.
+
+## 2026-11-10 – P2P znovu změřeno: ring vyhrává pro okna i prefill výměnu
+
+- Mikrobenchmarky (`arbench` režimy host / push / pull / ring, nový `arxbench` pro jednu prefill výměnu), 4 karty:
+  dekód 1 řádek host 6,4 µs, push 7,8, pull 10,3, ring 8,0; 4 řádky host 18,1, ring **9,6**; 8 řádků host 35,7, ring
+  **12,8**. Prefill výměna 4096×2560: host 6,7 ms, all-to-all 7,6, ring **2,8 ms**. Dřívější závěr „P2P dekódu
+  nepomůže" platil jen pro push všem; ring (každá karta zapisuje jen následující, 1,5× řádku) je pro okna 2–3× rychlejší.
+- Engine: `LLBuf` nese ring buffery (`rin`/`rag`) a „ring aritmetiku" (sloupce řádku ve 4 dílech, díl c sčítán v pořadí
+  c, c+1, …, mezisoučet zaokrouhlen na fp16). Okna od `<ENV>_LL_RING_MIN` (default 2) řádků jdou ringem, jeden řádek
+  přes RAM se stejnou aritmetikou → `rowcheck` 8 řádků bitově shodné. `=0` vrací starou aritmetiku.
+- Flash-Next okno: 4 řádky 12,0 → 11,5 ms, 8 řádků 17,7 → 16,5 ms (−7 %), 1 řádek beze změny. KL proti fp32 referenci
+  0,0516 (stará aritmetika 0,0483; PPL 6,5331 vs 6,5346, top1 90,48 vs 90,43 %). Nasazeno.
+- Otevřené: prefill ring je samostatně 2,4× rychlejší než host, ale celý prefill jen +2 % → čekání pomalých karet není
+  transport; hledat jinde (bariéry, pořadí fází). ACS zatím zapnuté.

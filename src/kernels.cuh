@@ -173,7 +173,15 @@ struct LLBuf {
     uint2 * rd = nullptr;
     uint2 * wr[8] = {};
     int nw = 0;
-    int wide = 0;   // 1: plain (coalescable) stores + a system fence instead of volatile 8-byte stores (peer memory)
+    uint2 * rds[8] = {};   // optional: sender dd's region is read from rds[dd] instead of rd (pull: every device writes locally)
+    int wide = 0;
+    // ring arithmetic (row2 > 0: fp16 pairs a row): a row's columns in ndev chunks, chunk c summed in the order c, c + 1, ..
+    // with the partial sum rounded to fp16 after every addend -- what a ring over the devices computes, and what the host
+    // transport then computes too, so a row's sum has the same bits whichever transport and row count carried it.
+    // Ring transport (P2P; windows of ring_min rows and more): rin [2][ndev - 1][maxt][ch] partial sums in from the device
+    // before, rag [2][maxt][row2] the gathered sums; nin / nag: the next device's
+    unsigned long long * rin = nullptr, * rag = nullptr, * nin = nullptr, * nag = nullptr;
+    int row2 = 0, ch = 0, maxt = 0, ring_min = 0, ring = 0;   // 1: plain (coalescable) stores + a system fence instead of volatile 8-byte stores (peer memory)
 };
 void allreduce_add_ll16(float * x, const float * part, const LLBuf & slots, int g, int ndev, int n,
                         const int * counter, int call, cudaStream_t s, float * ss_out = nullptr);

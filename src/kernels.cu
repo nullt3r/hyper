@@ -1634,11 +1634,83 @@ __global__ void __launch_bounds__(1024) k_topk_merge(int offset, float * __restr
 // LL exchange through mapped host memory, a float2 per thread: every GPU's part summed in GPU order. fp16 payload: each
 // part rounded to fp16 (one 8-byte packet {seq, half2}); F32: exact parts (a packet {seq, float} per element, twice the
 // slots). Every GPU sums identical numbers (its own part enters rounded like the others').
+__device__ __forceinline__ void rg_put(unsigned long long * p, __half2 h, unsigned seq) {
+    *(volatile unsigned long long *) p = ((unsigned long long) seq << 32) | (unsigned long long) *(const unsigned *) &h;
+}
+__device__ __forceinline__ __half2 rg_take(const unsigned long long * p, unsigned seq) {
+    unsigned long long w;
+    do { w = *(const volatile unsigned long long *) p; } while ((unsigned) (w >> 32) != seq);
+    const unsigned b = (unsigned) w;
+    return *(const __half2 *) &b;
+}
+__device__ __forceinline__ __half2 rg_add(__half2 a, __half2 b) {
+    const float2 x = __half22float2(a), y = __half22float2(b);
+    return __floats2half2_rn(x.x + y.x, x.y + y.y);
+}
+// the ring transport: thread i = (row t, column pair col); the threads of the first ch columns carry the hops of every chunk
+__device__ __forceinline__ float2 ll_ring(const float * __restrict__ part, const LLBuf & L, int g, int nd, int i, unsigned seq, int call) {
+    const int row2 = L.row2, chw = L.ch, t = i / row2, col = i % row2, set = call & 1;
+    const size_t in_set = (size_t) (nd - 1) * L.maxt * chw, ag_set = (size_t) L.maxt * row2;
+    unsigned long long * in = L.rin + set * in_set, * nin = L.nin + set * in_set, * ag = L.rag + set * ag_set, * nag = L.nag + set * ag_set;
+    const float2 * p2 = (const float2 *) part + (size_t) t * row2;
+    auto lo = [&](int k) { return k * row2 / nd; };
+    auto mine = [&](int c, int e) { const float2 v = p2[lo(c) + e]; return __floats2half2_rn(v.x, v.y); };
+    if (col < chw) {
+        const int e = col;
+        if (e < lo(g + 1) - lo(g)) rg_put(nin + (size_t) t * chw + e, mine(g, e), seq);
+        for (int s = 1; s < nd - 1; ++s) {
+            const int c = (g - s + nd) % nd;
+            if (e < lo(c + 1) - lo(c))
+                rg_put(nin + ((size_t) s * L.maxt + t) * chw + e, rg_add(rg_take(in + ((size_t) (s - 1) * L.maxt + t) * chw + e, seq), mine(c, e)), seq);
+        }
+        {
+            const int c = (g + 1) % nd;
+            if (e < lo(c + 1) - lo(c)) {
+                const __half2 v = rg_add(rg_take(in + ((size_t) (nd - 2) * L.maxt + t) * chw + e, seq), mine(c, e));
+                rg_put(ag + (size_t) t * row2 + lo(c) + e, v, seq);
+                rg_put(nag + (size_t) t * row2 + lo(c) + e, v, seq);
+            }
+        }
+        for (int f = 1; f < nd - 1; ++f) {
+            const int c = (g - f + 1 + nd) % nd;
+            if (e < lo(c + 1) - lo(c)) rg_put(nag + (size_t) t * row2 + lo(c) + e, rg_take(ag + (size_t) t * row2 + lo(c) + e, seq), seq);
+        }
+    }
+    return __half22float2(rg_take(ag + i, seq));
+}
+
 template <bool F32>
 __device__ __forceinline__ float2 ll_exchange(const float * __restrict__ part, const LLBuf & slots, int g, int ndev, int n2, int i, unsigned seq,
                                               int call) {
+    if (!F32 && slots.ring) return ll_ring(part, slots, g, ndev, i, seq, call);
     const float2 mine = ((const float2 *) part)[i];
     float2 acc = make_float2(0.0f, 0.0f);
+    if (!F32 && slots.row2 > 0) {   // host transport, the ring's arithmetic: chunk c in the order c, c + 1, .. rounded to fp16 each time
+        const size_t poff = (size_t) (call & 1) * ndev * n2;
+        const uint2 * buf = slots.rd + poff;
+        const __half2 mh = __floats2half2_rn(mine.x, mine.y);
+        const unsigned long long pkt = ((unsigned long long) seq << 32) | (unsigned long long) *(const unsigned *) &mh;
+        for (int k = 0; k < slots.nw; ++k) *(volatile unsigned long long *) &slots.wr[k][poff + (size_t) g * n2 + i] = pkt;
+        const int row2 = slots.row2, col = i % row2;
+        int c = (int) ((long long) col * ndev / row2);
+        while (c + 1 < ndev && (c + 1) * row2 / ndev <= col) ++c;
+        while (c > 0 && c * row2 / ndev > col) --c;
+        __half2 a;
+        for (int sidx = 0; sidx < ndev; ++sidx) {
+            const int dd = (c + sidx) % ndev;
+            __half2 h;
+            if (dd == g) h = mh;
+            else {
+                volatile unsigned long long * src = (volatile unsigned long long *) &buf[(size_t) dd * n2 + i];
+                unsigned long long v;
+                do { v = *src; } while ((unsigned) (v >> 32) != seq);
+                const unsigned bits = (unsigned) (v & 0xffffffffu);
+                h = *(const __half2 *) &bits;
+            }
+            a = sidx == 0 ? h : rg_add(a, h);
+        }
+        return __half22float2(a);
+    }
     if (!F32) {
         const size_t poff = (size_t) (call & 1) * ndev * n2;
         const uint2 * buf = slots.rd + poff;
@@ -1654,7 +1726,8 @@ __device__ __forceinline__ float2 ll_exchange(const float * __restrict__ part, c
             if (dd == g) {
                 f = __half22float2(mh);   // rounded value, so every GPU sums identical numbers
             } else {
-                volatile unsigned long long * src = (volatile unsigned long long *) &buf[(size_t) dd * n2 + i];
+                const uint2 * bd = slots.rds[dd] ? slots.rds[dd] + poff : buf;
+                volatile unsigned long long * src = (volatile unsigned long long *) &bd[(size_t) dd * n2 + i];
                 unsigned long long v;
                 do { v = *src; } while ((unsigned) (v >> 32) != seq);
                 const unsigned bits = (unsigned) (v & 0xffffffffu);
@@ -1675,7 +1748,8 @@ __device__ __forceinline__ float2 ll_exchange(const float * __restrict__ part, c
         float2 f;
         if (dd == g) f = mine;
         else {
-            volatile unsigned long long * src = (volatile unsigned long long *) &buf[((size_t) dd * n2 + i) * 2];
+            const uint2 * bd = slots.rds[dd] ? slots.rds[dd] + poff : buf;
+            volatile unsigned long long * src = (volatile unsigned long long *) &bd[((size_t) dd * n2 + i) * 2];
             unsigned long long a, b;
             do { a = src[0]; } while ((unsigned) (a >> 32) != seq);
             do { b = src[1]; } while ((unsigned) (b >> 32) != seq);
@@ -2459,12 +2533,14 @@ void argmax_pairs(const float * x, int xs, int n, int offset, float * out, int n
     k_argmax_pairs<<<nt, 1024, 0, s>>>(x, xs, n, offset, out);
 }
 bool allreduce_f32() { static const bool v = getenv("HYPER_AR32") && atoi(getenv("HYPER_AR32")) != 0; return v; }
-void allreduce_add_ll16(float * x, const float * part, const LLBuf & slots, int g, int ndev, int n,
+void allreduce_add_ll16(float * x, const float * part, const LLBuf & slots_, int g, int ndev, int n,
                         const int * counter, int call, cudaStream_t s, float * ss_out) {
+    LLBuf sl = slots_;
+    sl.ring = sl.rin && sl.row2 > 0 && sl.ring_min > 0 && n / 2 / sl.row2 >= sl.ring_min ? 1 : 0;
     const int n2 = n / 2;
     // AR_SS_SPAN elements per block -> 256 threads x 2 elements
-    if (allreduce_f32()) k_allreduce_add_ll16<true><<<(n2 + 255) / 256, 256, 0, s>>>(x, part, slots, g, ndev, n2, counter, call, ss_out);
-    else k_allreduce_add_ll16<false><<<(n2 + 255) / 256, 256, 0, s>>>(x, part, slots, g, ndev, n2, counter, call, ss_out);
+    if (allreduce_f32()) k_allreduce_add_ll16<true><<<(n2 + 255) / 256, 256, 0, s>>>(x, part, sl, g, ndev, n2, counter, call, ss_out);
+    else k_allreduce_add_ll16<false><<<(n2 + 255) / 256, 256, 0, s>>>(x, part, sl, g, ndev, n2, counter, call, ss_out);
 }
 void allreduce_add_bulk(float * x, const float * part, half * data, unsigned * flags, int g, int ndev, int n,
                         const int * counter, int call, cudaStream_t s) {
@@ -2484,18 +2560,22 @@ void topk_pairs(const float * x, int xs, int n, int offset, float * out, int K, 
     }
     k_topk<<<nt, 1024, 0, s>>>(x, xs, n, offset, out, K);
 }
-void allreduce_mhc_ll16(float * res, const float * hcw, int width, const float * part, const LLBuf & slots, int g, int ndev, int n,
+void allreduce_mhc_ll16(float * res, const float * hcw, int width, const float * part, const LLBuf & slots_, int g, int ndev, int n,
                         const int * counter, int call, cudaStream_t s) {
+    LLBuf sl = slots_;
+    sl.ring = sl.rin && sl.row2 > 0 && sl.ring_min > 0 && n / 2 / sl.row2 >= sl.ring_min ? 1 : 0;
     if (n & 1 || width & 3) throw std::runtime_error("allreduce_mhc_ll16: n must be even, width a multiple of 4");
     const int n2 = n / 2;
-    if (allreduce_f32()) k_allreduce_mhc_ll16<true><<<(n2 + 255) / 256, 256, 0, s>>>(res, hcw, width, part, slots, g, ndev, n2, counter, call);
-    else k_allreduce_mhc_ll16<false><<<(n2 + 255) / 256, 256, 0, s>>>(res, hcw, width, part, slots, g, ndev, n2, counter, call);
+    if (allreduce_f32()) k_allreduce_mhc_ll16<true><<<(n2 + 255) / 256, 256, 0, s>>>(res, hcw, width, part, sl, g, ndev, n2, counter, call);
+    else k_allreduce_mhc_ll16<false><<<(n2 + 255) / 256, 256, 0, s>>>(res, hcw, width, part, sl, g, ndev, n2, counter, call);
 }
-void allreduce_hc_ll16(float * res, const float * inj, int width, int hc, const float * part, const LLBuf & slots, int g, int ndev, int n,
+void allreduce_hc_ll16(float * res, const float * inj, int width, int hc, const float * part, const LLBuf & slots_, int g, int ndev, int n,
                        const int * counter, int call, cudaStream_t s) {
+    LLBuf sl = slots_;
+    sl.ring = sl.rin && sl.row2 > 0 && sl.ring_min > 0 && n / 2 / sl.row2 >= sl.ring_min ? 1 : 0;
     const int n2 = n / 2;
-    if (allreduce_f32()) k_allreduce_hc_ll16<true><<<(n2 + 255) / 256, 256, 0, s>>>(res, inj, width, hc, part, slots, g, ndev, n2, counter, call);
-    else k_allreduce_hc_ll16<false><<<(n2 + 255) / 256, 256, 0, s>>>(res, inj, width, hc, part, slots, g, ndev, n2, counter, call);
+    if (allreduce_f32()) k_allreduce_hc_ll16<true><<<(n2 + 255) / 256, 256, 0, s>>>(res, inj, width, hc, part, sl, g, ndev, n2, counter, call);
+    else k_allreduce_hc_ll16<false><<<(n2 + 255) / 256, 256, 0, s>>>(res, inj, width, hc, part, sl, g, ndev, n2, counter, call);
 }
 void incr_counter(int * c, cudaStream_t s) { k_incr<<<1, 1, 0, s>>>(c); }
 

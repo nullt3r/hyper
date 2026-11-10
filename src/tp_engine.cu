@@ -124,6 +124,27 @@ void TpEngine::init() {
         else { d.ll.rd = ar_ll_; d.ll.nw = 1; d.ll.wr[0] = ar_ll_; }
     }
     ring_ch_ = ((size_t) R() * n + nd - 1) / nd + 8;
+    // decode windows of <ENV>_LL_RING_MIN rows and more (default 2; 0: off, the old arithmetic) exchange their sums as a ring
+    // of kernel stores into the next device (4 rows: 9.6 vs 18 us through the host, 8 rows: 12.8 vs 36); a single row stays
+    // on the host transport (6.4 vs 8.0 us), with the ring's arithmetic, so a row's bits do not depend on the window
+    const int ring_min = !p2p_ || ll_p2p_ || n % 2 ? 0 : envp(env, "LL_RING_MIN", b) ? atoi(envp(env, "LL_RING_MIN", b)) : 2;
+    if (ring_min > 0) {
+        const int row2 = n / 2, chw = row2 / nd + 1;
+        const size_t in_words = (size_t) 2 * (nd - 1) * MAX_NT * chw, ag_words = (size_t) 2 * MAX_NT * row2;
+        for (int g = 0; g < nd; ++g) {
+            TpDevice & d = *devs_[g];
+            d.ll_rin = d.alloc<unsigned long long>(in_words);
+            d.ll_rag = d.alloc<unsigned long long>(ag_words);
+            CUDA_CHECK(cudaMemset(d.ll_rin, 0xff, in_words * 8));
+            CUDA_CHECK(cudaMemset(d.ll_rag, 0xff, ag_words * 8));
+        }
+        for (int g = 0; g < nd; ++g) {
+            TpDevice & d = *devs_[g], & nx = *devs_[(g + 1) % nd];
+            d.ll.rin = d.ll_rin; d.ll.rag = d.ll_rag; d.ll.nin = nx.ll_rin; d.ll.nag = nx.ll_rag;
+            d.ll.row2 = row2; d.ll.ch = chw; d.ll.maxt = MAX_NT; d.ll.ring_min = ring_min;
+        }
+        fprintf(stderr, "%s: decode windows of %d+ rows sum as a ring over peer memory\n", m_.tag.c_str(), ring_min);
+    }
     CUDA_CHECK(cudaHostAlloc(&h_ids_, (size_t) slots * mc_max_ * R() * m_.n_expert_used * sizeof(int), cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc(&h_pred_, (size_t) std::max(1, m_.n_layer) * MOE_MAX_USED * sizeof(int), cudaHostAllocPortable));
     init_cpu_side(opt_.cpu_threads, n, m_.n_ff_exp, m_.n_expert_used, slots, m_.clamp_exp, pred_mode_ == 2 && pred_early_);

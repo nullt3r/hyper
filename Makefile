@@ -133,6 +133,8 @@ $(BUILD)/mmabench: tools/mmabench.cu $(BUILD)/kernels.o
 
 $(BUILD)/arbulk: tools/arbulk.cu $(BUILD)/kernels.o
 	$(NVCC) $(NVFLAGS) tools/arbulk.cu $(BUILD)/kernels.o -o $@ $(LIBS)
+$(BUILD)/arxbench: tools/arxbench.cu $(BUILD)/kernels.o
+	$(NVCC) $(NVFLAGS) tools/arxbench.cu $(BUILD)/kernels.o -o $@ $(LIBS)
 
 # OpenAI-compatible server: chat templates / tool-call parsing from mainline libcommon, vocab from libllama
 COMMON_LIBS := $(LLAMA)/build/common/libllama-common.a $(LLAMA)/build/common/libllama-common-base.a \
