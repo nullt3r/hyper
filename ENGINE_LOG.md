@@ -968,3 +968,10 @@ vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), 
   bez vlivu, ale méně tlaku na RAM); `cpumoebench` opraven pro NE > počet expertů vrstvy, POLLW / POLLDEVS.
 - Flash-Next dekód po kartách (nsys, graph-trace=node): ~1 000 kernelů na krok a kartu, vyvážené; trunk GEMV 3,0 ms,
   hc projekce (replikované na každé kartě, 41 % dense bajtů) ~1,9 ms; přesun práce nepomůže, zbývá slučování kernelů.
+- GLM s MTP při připnutém rozmístění: hash shodný s/bez `moe_wait_cpu`; plain 15,6 → 20,1 t/s, spec 22,1 → 22,9 (okna jdou
+  ringem přes VRAM, RAM nezahlcovala už předtím; zisk je v jednořádkových krocích).
+- Flash-Next prefill v hloubce (`pfsweep`): 4096 tokenů 3 648 t/s na 10k, 3 456 na 57k, 3 038 na 127k, 2 854 na 207k
+  (+28 % času přes 200k: indexer není dominantní). Pevná cena ~90–180 ms na průchod = streamování 14 % expertů z RAM
+  (512 tokenů 2 390 t/s, 2048: 3 290). „Jen routované experty" nepomůže (2k chunk se dotkne všech 512). Zbylé páky
+  prefillu: vše do VRAM (menší kvant, rozhodnutí o kvalitě), rozdělení replikované hc práce (10–15 %), slučování
+  elementwise průchodů (5–8 %); opakované to_half jen ~1 %.
