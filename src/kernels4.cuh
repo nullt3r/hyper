@@ -80,6 +80,11 @@ void moe_gemm_down(const MoeDev & m, const half * h16, const int * order, const 
                    const float * wts, float * y, cudaStream_t s);
 // out[t][r] = sg[t] * shexp[t][r] + sum_j [owner(e_j) == g] y[t*k + j][r] (+ cpu[t][r] once the CPU result for seq
 // is there, when any of token t's experts lives on the CPU: owner[e] == cpu_owner)
+// a device that does not take the CPU experts' result waits for it all the same, with one thread on the one flag word,
+// before it enters the allreduce: thousands of threads polling the peers' packets in host memory for the whole CPU job
+// cost the CPU's expert reads a quarter of their memory bandwidth (cpumoebench POLLW: 73 -> 38 GB/s with four cards)
+void moe_wait_cpu(const int * ids, const int * owner, int k, int nt, int cpu_owner, const volatile unsigned * cpu_flag, const int * counter,
+                  unsigned seq_tag, cudaStream_t s);
 void moe_reduce(const float * shexp, const float * sg, const float * y, int k, float * out, int n, int nt,
                 const int * ids, const int * owner, int g, int cpu_owner, const volatile unsigned * cpu_flag, const float * cpu_y,
                 const int * counter, unsigned seq_tag, cudaStream_t s, const float * yzc = nullptr,

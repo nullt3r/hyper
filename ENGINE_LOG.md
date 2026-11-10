@@ -952,3 +952,19 @@ vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), 
   maže jeho jediný čtenář hned po přečtení, takže opakování značky po 65 535 výměnách nepotká staré slovo. Stejná
   aritmetika i v cestě přes RAM. KL 0,0489 (fp16 ring 0,0516, původní 0,0483), okno 8 řádků 16,7 ms, 4 řádky 11,7;
   mtpgen 1024 tokenů K=7 pmin 0,3: 248 t/s, 1024/1024 shodných s obyčejným dekódem. Nasazeno.
+
+## 2026-11-10 večer – GLM dekód +29 %: čekající karty kradly procesoru pásmo RAM
+
+- Engine četl CPU experty 54 GB/s, `cpumoebench` 73–75. Vyloučeno: governor, mezery mezi úlohami, počet/rozmístění
+  expertů (až 114 GB fyzicky), 4K vs. 2M stránky, cudaHostRegister, cizí vytížená vlákna, plná RAM / page cache,
+  kcompactd, připnutí vláken, P2P, vrstvy. perf: stejné cykly, −30 % instrukcí, 2× LLC výpadků na úlohu.
+- Příčina: během CPU úlohy karty 1–3 stojí v LL allreduce a tisíci vlákny čtou z mapované RAM pakety karty 0 (ta čeká
+  na CPU). `cpumoebench POLL=64 POLLW=2048` (každé vlákno své slovo, jako engine): 73 → 38 GB/s se 4 kartami, 60 s jednou;
+  dotazování jediného slova nevadí.
+- Oprava: `moe_wait_cpu`: karty, které výsledek CPU nepřebírají, čekají jedním vláknem na příznak CPU a teprve pak jdou
+  do výměny (`<ENV>_MOE_WAIT=0` = po staru). GLM dekód po 1 řádku 4 GPU: 17,2 → 22,2 t/s (+29 %), CPU úlohy 77–81 GB/s
+  (bez predikce 16,4 → 21,4). Flash-Next beze změny (118 t/s, hash shodný): jeho CPU úlohy jsou krátké.
+- Vedlejší: `GGUF::drop_file_pages` uvolňuje přečtené tenzory i z page cache (cache 112 → 19 GB po načtení GLM; na rychlost
+  bez vlivu, ale méně tlaku na RAM); `cpumoebench` opraven pro NE > počet expertů vrstvy, POLLW / POLLDEVS.
+- Flash-Next dekód po kartách (nsys, graph-trace=node): ~1 000 kernelů na krok a kartu, vyvážené; trunk GEMV 3,0 ms,
+  hc projekce (replikované na každé kartě, 41 % dense bajtů) ~1,9 ms; přesun práce nepomůže, zbývá slučování kernelů.

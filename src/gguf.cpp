@@ -1,3 +1,4 @@
+#include <mutex>
 #include "gguf.h"
 
 #include <fcntl.h>
@@ -161,6 +162,22 @@ GGUF::GGUF(const std::string & path) {
     }
 }
 
+namespace { struct GMap { int fd; const uint8_t * p; size_t size; }; std::vector<GMap> g_maps; std::mutex g_maps_mx; }
+
+void GGUF::drop_file_pages(const void * ptr, size_t n) {
+    static const bool keep = getenv("HYPER_KEEP_FILE_CACHE") != nullptr;
+    const uintptr_t a0 = ((uintptr_t) ptr + 4095) & ~(uintptr_t) 4095, a1 = ((uintptr_t) ptr + n) & ~(uintptr_t) 4095;
+    if (a1 <= a0) return;
+    madvise((void *) a0, a1 - a0, MADV_DONTNEED);
+    if (keep) return;
+    std::lock_guard<std::mutex> lk(g_maps_mx);
+    for (const GMap & m : g_maps)
+        if (a0 >= (uintptr_t) m.p && a1 <= (uintptr_t) m.p + m.size) {
+            posix_fadvise(m.fd, (off_t) (a0 - (uintptr_t) m.p), (off_t) (a1 - a0), POSIX_FADV_DONTNEED);
+            return;
+        }
+}
+
 std::map<std::string, GValue> GGUF::load_shard(const std::string & path, bool first) {
     Map m;
     m.fd = open(path.c_str(), O_RDONLY);
@@ -169,6 +186,7 @@ std::map<std::string, GValue> GGUF::load_shard(const std::string & path, bool fi
     m.p = (uint8_t *) mmap(nullptr, m.size, PROT_READ, MAP_SHARED, m.fd, 0);
     if (m.p == MAP_FAILED) throw std::runtime_error("gguf: mmap failed");
     maps_.push_back(m);
+    { std::lock_guard<std::mutex> lk(g_maps_mx); g_maps.push_back({m.fd, m.p, m.size}); }
 
     Cursor c{m.p, m.p + m.size};
     if (c.get<uint32_t>() != 0x46554747) throw std::runtime_error("gguf: bad magic");

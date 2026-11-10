@@ -1,4 +1,5 @@
 #include "moe_place.h"
+#include "gguf.h"
 #include "cuda_check.h"
 
 #include <sys/mman.h>
@@ -160,10 +161,7 @@ void MoePlace::load_layer(int il, const ExpertTensors & t, const std::vector<int
         if (owner_bulk) H.owner_bulk = *owner_bulk;
         for (int h = 0; h < p_.halves; ++h) D.st_slot[h] = d.alloc<int>(E);
     }
-    for (const GTensor * tt : {t.g, t.u, t.d}) {   // (the file's pages are not needed any more)
-        const uintptr_t a0 = ((uintptr_t) tt->data + 4095) & ~(uintptr_t) 4095, a1 = ((uintptr_t) tt->data + tt->nbytes) & ~(uintptr_t) 4095;
-        if (a1 > a0) madvise((void *) a0, a1 - a0, MADV_DONTNEED);
-    }
+    for (const GTensor * tt : {t.g, t.u, t.d}) GGUF::drop_file_pages(tt->data, tt->nbytes);   // (not needed any more: mapping and page cache)
     // the CPU side: the compact copy, its index, what it owns
     CpuExpertLayer cl;
     cl.tg = t.tg; cl.td = t.td;

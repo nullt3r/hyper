@@ -21,7 +21,11 @@
 using namespace hyper;
 
 // POLL=B: B blocks on every GPU spin on a mapped host flag during each job, as k_moe_reduce's waits do in the engines
-__global__ void k_poll(const volatile unsigned * f, unsigned want) { if (threadIdx.x == 0) while (*f != want) {} }
+// POLLW=W: every thread polls its own word of W (as the LL allreduce's waiting threads: distinct packets)
+__global__ void k_poll(const volatile unsigned * f, unsigned want, int words) {
+    if (words > 0) { const int i = (blockIdx.x * blockDim.x + threadIdx.x) % words; while (f[i * 2] != want) {} return; }
+    if (threadIdx.x == 0) while (*f != want) {}
+}
 
 int main(int argc, char ** argv) {
     if (argc < 2) { fprintf(stderr, "usage: cpumoebench model.gguf [layer] [threads] [experts/job] [tokens/job] [jobs]\n"); return 1; }
@@ -36,11 +40,13 @@ int main(int argc, char ** argv) {
     const int poll_b = getenv("POLL") ? atoi(getenv("POLL")) : 0;
     int npoll = 0;
     unsigned * pflag = nullptr;
+    const int poll_w = getenv("POLLW") ? atoi(getenv("POLLW")) : 0;
     if (poll_b > 0) {
         cudaGetDeviceCount(&npoll);
-        if (cudaHostAlloc((void **) &pflag, 4096, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) { fprintf(stderr, "cudaHostAlloc failed\n"); return 1; }
-        *pflag = 0;
-        for (int d = 0; d < npoll; ++d) { cudaSetDevice(d); k_poll<<<1, 32>>>(pflag, 0); cudaDeviceSynchronize(); }   // (contexts up)
+        if (getenv("POLLDEVS")) npoll = std::min(npoll, atoi(getenv("POLLDEVS")));
+        if (cudaHostAlloc((void **) &pflag, 4096 + (size_t) poll_w * 8, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) { fprintf(stderr, "cudaHostAlloc failed\n"); return 1; }
+        memset(pflag, 0, 4096 + (size_t) poll_w * 8);
+        for (int d = 0; d < npoll; ++d) { cudaSetDevice(d); k_poll<<<1, 32>>>(pflag, 0, 0); cudaDeviceSynchronize(); }   // (contexts up)
         fprintf(stderr, "POLL: %d blocks on each of %d GPUs\n", poll_b, npoll);
     }
     std::vector<int> prev_ids;
@@ -99,11 +105,12 @@ int main(int argc, char ** argv) {
         std::shuffle(perm.begin(), perm.end(), rs);
         cl.cslot.assign(perm.begin(), perm.begin() + NE);
     }
-    for (int e = 0; e < NE; ++e) {   // experts E/2 .. E/2 + NE - 1 of the layer
-        const size_t i = cl.index(e);
-        memcpy((uint8_t *) cl.gate + i * gb, tg.data + (size_t) (E / 2 + e) * gb, gb);
-        memcpy((uint8_t *) cl.up + i * gb, tu.data + (size_t) (E / 2 + e) * gb, gb);
-        memcpy((uint8_t *) cl.down + i * db, td.data + (size_t) (E / 2 + e) * db, db);
+#pragma omp parallel for schedule(dynamic, 4)
+    for (int e = 0; e < NE; ++e) {   // experts E/2 .. of the layer (wrapping: NE may exceed the layer's count)
+        const size_t i = cl.index(e), src = (size_t) ((E / 2 + e) % E);
+        memcpy((uint8_t *) cl.gate + i * gb, tg.data + src * gb, gb);
+        memcpy((uint8_t *) cl.up + i * gb, tu.data + src * gb, gb);
+        memcpy((uint8_t *) cl.down + i * db, td.data + src * db, db);
     }
     if (getenv("DOWN_PM") && atoi(getenv("DOWN_PM")) > 1) {   // the down copies part-major ([part][row][part's super-blocks]), as the engines may store them
         const int S = atoi(getenv("DOWN_PM")), d_row = (int) (db / n), pb = d_row / S;
@@ -167,12 +174,13 @@ int main(int argc, char ** argv) {
             memcpy(r.x[t], x.data() + (size_t) t * n, n * sizeof(float));
         }
         const unsigned want = counter * 64u;
-        for (int d = 0; d < npoll; ++d) { cudaSetDevice(d); k_poll<<<poll_b, 32>>>(pflag, want); }
+        for (int d = 0; d < npoll; ++d) { cudaSetDevice(d); k_poll<<<poll_b, 32>>>(pflag, want, poll_w); }
         auto t0 = std::chrono::steady_clock::now();
         __atomic_store_n(&r.seq, want, __ATOMIC_RELEASE);
         while (__atomic_load_n(&outs[0].seq, __ATOMIC_ACQUIRE) != want) __builtin_ia32_pause();
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         if (npoll) {
+            if (poll_w > 0) for (int i = 0; i < poll_w; ++i) ((volatile unsigned *) pflag)[i * 2] = want;
             *(volatile unsigned *) pflag = want;
             for (int d = 0; d < npoll; ++d) { cudaSetDevice(d); cudaDeviceSynchronize(); }
         }

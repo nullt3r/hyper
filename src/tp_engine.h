@@ -297,6 +297,7 @@ protected:
     unsigned fwd_counter_ = 0;
     bool graphs_ready_ = false;
     bool debug_ = false, nocpu_ = false;
+    bool moe_wait_ = true;   // <ENV>_MOE_WAIT=0: the peers do not wait for the CPU experts' flag before the allreduce (the old way)
     int last_nt_ = 0;
     int mc_max_ = 4;                // prefill chunks per layer pass (<ENV>_MC; 1: one at a time)
     int mc_n_ = 1, mc_nt_[8] = {}, mc_pos_[8] = {};   // the chunks of the current bulk forward

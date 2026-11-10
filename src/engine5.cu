@@ -694,6 +694,8 @@ void Engine5::record_main(int gi, int nt, int kind) {
             const volatile unsigned * cflag = d.g == 0 && !nocpu_ && cpu_part ? (bulk ? &cpu_bulk_out_->seq : &cpu_out_[il].seq) : nullptr;
             moe_reduce(d.shpart, d.sg, d.yexp, K, d.part, n, nt, d.ids, stream ? X.owner_bulk : X.owner, d.g, CPU_OWNER, cflag,
                        bulk ? &cpu_bulk_out_->y[0][0] : &cpu_out_[il].y[0][0], d.counter, (unsigned) il, s);
+            if (moe_wait_ && !bulk && d.g != 0 && !nocpu_ && cpu_part)   // (the peers: one thread on the CPU's flag, then the allreduce)
+                moe_wait_cpu(d.ids, X.owner, K, nt, CPU_OWNER, &cpu_out_[il].seq, d.counter, (unsigned) il, s);
         }
         dbg("ffn_part", il, d.part, (size_t) nt * n);
         out_begin(1, ci);

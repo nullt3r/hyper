@@ -1205,6 +1205,17 @@ __global__ void k_moe_reduce(const float * __restrict__ shexp, const float * __r
     out[(size_t) t * n + r] = acc;
 }
 
+__global__ void k_moe_wait_cpu(const int * __restrict__ ids, const int * __restrict__ owner, int k, int nt, int cpu_owner,
+                               const volatile unsigned * cpu_flag, const int * counter, unsigned seq_tag) {
+    bool need = false;
+    for (int i = threadIdx.x; i < nt * k; i += blockDim.x) need |= owner[ids[i]] == cpu_owner;
+    need = __syncthreads_or(need);
+    if (need && threadIdx.x == 0) {
+        const unsigned want = (unsigned) (*counter) * 64u + seq_tag;
+        while (*cpu_flag != want) {}
+    }
+}
+
 // expert host (a GPU holding other layers' experts): the owner's decode record, once published (like the CPU takes it)
 __global__ void k_host_take(const volatile unsigned * seq, const int * counter, unsigned seq_tag, const int * rec_ids, const float * rec_wts,
                             const float * rec_x, int * ids, float * wts, float * x, int n, int k, int nt) {
@@ -2133,6 +2144,11 @@ void ple_apply(float * res, const float * key, const float * value, const float 
     if ((K - 1) * dil > 16) throw std::runtime_error("ple: conv history too long");
     k_ple_stats<<<dim3(hc, nt), 256, 0, s>>>(res, key, value, wk, wq, n, hc, scratch);
     k_ple_apply<<<(hc * n + 255) / 256, 256, 0, s>>>(res, value, wconv_norm, conv_w, conv_state, conv_snap, scratch, n, hc, K, dil, eps, nt);
+}
+
+void moe_wait_cpu(const int * ids, const int * owner, int k, int nt, int cpu_owner, const volatile unsigned * cpu_flag, const int * counter,
+                  unsigned seq_tag, cudaStream_t s) {
+    k_moe_wait_cpu<<<1, 64, 0, s>>>(ids, owner, k, nt, cpu_owner, cpu_flag, counter, seq_tag);
 }
 
 } // namespace hyper

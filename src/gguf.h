@@ -58,6 +58,9 @@ public:
     const GTensor & need(const std::string & name) const;     // throws if missing
     const std::map<std::string, GTensor> & tensors() const { return tensors_; }
     const std::string & arch() const { return arch_; }
+    // the file pages behind [p, p + n) of any mapped GGUF are not needed again: out of the mapping and out of the page cache
+    // (free memory stays free for the huge pages of the host expert copies; HYPER_KEEP_FILE_CACHE=1: the mapping only)
+    static void drop_file_pages(const void * p, size_t n);
 
 private:
     struct Map { int fd = -1; uint8_t * p = nullptr; size_t size = 0; };

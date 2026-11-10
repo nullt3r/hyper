@@ -46,6 +46,7 @@ void TpEngine::init() {
     if (const char * v = envp(env, "MC", b)) mc_max_ = std::max(1, std::min(8, atoi(v)));
     mc_alloc_ = std::max(mc_max_, envp(env, "MC_ALLOC", b) ? atoi(envp(env, "MC_ALLOC", b)) : 0);
     ar_sync_ = envp(env, "AR_SYNC", b) && atoi(envp(env, "AR_SYNC", b)) != 0;
+    moe_wait_ = !(envp(env, "MOE_WAIT", b) && atoi(envp(env, "MOE_WAIT", b)) == 0);
     if (const char * v = envp(env, "MTP_PMIN", b)) mtp_pmin_ = atof(v);
     if (const char * v = envp(env, "MTP_CPU_MAX", b)) mtp_cpu_max_ = atof(v);
     mtp_full_ = envp(env, "MTP_FULL", b) != nullptr;
