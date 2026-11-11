@@ -1,15 +1,16 @@
 # hyper
 
-A from-scratch LLM inference engine built for one specific machine: **3× RTX 3090** (24 GB each, no NVLink / P2P,
-one card on a PCIe x8 link), a **Threadripper 3970X** and **256 GB DDR4-3200** (4 channels). It reads GGUF files
-directly, runs on CUDA + C++, and ships an OpenAI-compatible server with a built-in web chat.
+A from-scratch LLM inference engine built for one specific machine: **an RTX PRO 4500 (32 GB) + 3× RTX 3090** (24 GB
+each; two cards on PCIe x8 links, no NVLink), a **Threadripper 3970X** and **256 GB DDR4-3200** (4 channels). It reads
+GGUF files directly, runs on CUDA + C++, and ships an OpenAI-compatible server with a built-in web chat.
 
 The main target is large mixture-of-experts models whose experts do not fit in VRAM: dense parts run tensor-parallel
-on the three GPUs, the experts are split between the GPUs and the CPU, and the engine moves expert weights around
+on the GPUs, the experts are split between the GPUs and the CPU, and the engine moves expert weights around
 (prefill streaming, adaptive placement) so that the slow parts of the machine are used as little as possible.
 
 This is a research / hobby project tuned for that hardware. It is not a general-purpose runtime: one request at a time,
-three GPUs assumed, sm_86 only.
+three or four GPUs (all visible ones are used), kernels tuned for sm_86. GPU-to-GPU copies (P2P) are used when the
+driver allows them (see Hardware notes); without them everything goes through pinned host memory.
 
 ## Supported models
 
@@ -17,7 +18,7 @@ three GPUs assumed, sm_86 only.
 |---|---|---|---|
 | Qwen3.8-Flash-Next | `qwen4exp` | Unsloth UD-Q4_K_XL (4 shards); fine-tunes such as Swift 1.5 Heretic (IQ4_NL mix) | MoE, hyper-connections, QSA sparse attention, PLE; optional separate NextN (MTP) GGUF; images with `--mmproj` |
 | Ornith-1.5-122B (Qwen3.5-122B-A10B style) | `qwen35moe` | Unsloth UD-Q5_K_XL | MoE, plain pre-norm residual, Gated DeltaNet + gated attention, NextN |
-| GLM-5.3-Flash | `glm5-next` | Unsloth UD-IQ4_XS, Maya-L; mainline tensor layout | MoE (288 experts), mHC residual streams, KDA linear attention, nope-MLA with a k-pool DSA indexer; optional NextN (MTP) block read from the original Unsloth split GGUF |
+| GLM-5.3-Flash | `glm5-next` | Unsloth UD-Q4_K_XL, UD-IQ4_XS, Maya-L; mainline tensor layout | MoE (288 experts), mHC residual streams, KDA linear attention, nope-MLA with a k-pool DSA indexer; optional NextN (MTP) block read from the original Unsloth split GGUF |
 | DeepSeek-V4.1-Flash-1017 | `deepseek41` | Maya-S, ISTA-DASLab GSQ IQ2_XS, Unsloth UD-IQ2_XXS | MoE (384 experts), mHC, compressed sparse attention with an indexer, Engram n-gram tables (in the GGUF or a separate file), DSpark drafter |
 
 The model is picked from the GGUF architecture. One engine serves them all: `EngineBase` (the CPU side of the experts,
@@ -30,35 +31,29 @@ in the git history.
 
 ## Performance
 
-All numbers: this machine, October 2026, greedy decoding, the same GGUF files for hyper and llama.cpp.
+### hyper (current version, four GPUs, November 2026)
 
-### hyper (current version)
+Greedy decoding, 262k context allocated, P2P on.
 
 | Model (quantization) | Decode | Decode, speculative | Prefill |
 |---|---|---|---|
-| Qwen3.8-Flash-Next (UD-Q4_K_XL) | **97.5 t/s** at 11k context | **~140 t/s** (NextN MTP, up to 3 drafts) | **1774 t/s** (11k-token prompt) |
-| Qwen3.8-Flash-Next Uncensored (Q4_K_M) | **93 t/s** at 11k context | **~130 t/s** (the base model's NextN MTP, up to 3 drafts) | **1806 t/s** (11k-token prompt) |
-| GLM-5.3-Flash (UD-IQ4_XS) | **30.7 t/s** at 16k context | **~35 t/s** at 16k (NextN MTP, up to 3 drafts) | **998 t/s** (16k-token prompt) |
+| Qwen3.8-Flash-Next (UD-Q4_K_XL) | **118–120 t/s** after a 16k prompt | **150–250 t/s** (NextN MTP, up to 7 drafts; ~300 t/s when copying text with prompt-lookup drafts) | **4 640 t/s** (16k-token prompt), 4 000 t/s (3k) |
+| GLM-5.3-Flash (UD-Q4_K_XL) | **19–22 t/s** after a 16k prompt | **31 t/s** mean over 169 real agent answers (NextN MTP, up to 3 drafts, adaptive placement) | **2 390 t/s** (16k-token prompt) |
 
-- Decode: `hyper4 tfbench` – a prefilled prompt of real text (source code and notes), then the reference
-  tokens fed one per step, so the expert routing is that of real text.
-- Speculative: `mtpgen`, 9–11k prompt. The speed depends on how predictable the text is; with greedy decoding
-  the output is token-for-token the plain output.
-- GLM decode depends on the content: about a third of its experts fit in VRAM, the rest are computed by the CPU at
-  the speed of system RAM.
+- Decode / prefill: `hyper4 pfbench` (a prompt of real text, then greedy decode).
+- Speculative speed depends on how predictable the text is; the output is token-for-token the plain output.
+- GLM decode is bound by system RAM: about a third of its experts fit in VRAM, the rest are computed by the CPU. The
+  GPUs waiting for the CPU must not poll host memory (see below): that alone was +29 %.
 - Drafts stop once the MTP head's own probability of the drafted run falls below a floor (GLM 0.85, Flash-Next 0.5):
   a verified row is not free, and a draft that is likely to be rejected costs more than it brings.
-- The Uncensored model has no MTP head of its own; the base Flash-Next NextN GGUF drafts for it (exact as always,
-  the main model verifies): +44 % at 9k context (90 → 130 t/s) vs +51 % for the base model.
-- GLM MTP: every verified row costs 0.6–0.75 of a plain step (consecutive tokens rarely share CPU-held experts), so
-  drafts are made only while the MTP block's own probability of the drafted run stays ≥ 0.85. Replay of 20 real Codex
-  requests: decode +10 % greedy (28.3 vs 25.8 t/s), +11 % at temperature 1 (27.1 vs 24.4 t/s); prefill −3 % (the MTP
-  block's weights and latent cache take VRAM from experts).
+- A fine-tune without an MTP head of its own (Flash-Next Uncensored, Swift Heretic) drafts with the base model's NextN
+  GGUF (exact as always, the main model verifies).
 
 ### Compared with llama.cpp
 
-Best llama.cpp configuration found for each model (mainline d812350 or ik_llama, tuned flags, experts that do not fit
-in VRAM on the CPU). The contexts are the closest ones that were measured on both sides.
+Measured in October 2026 on **three RTX 3090** (before the fourth GPU, P2P and the prefill rework), the same GGUF files
+on both sides (GLM: UD-IQ4_XS). Best llama.cpp configuration found for each model (mainline d812350 or ik_llama, tuned
+flags, experts that do not fit in VRAM on the CPU). The contexts are the closest ones that were measured on both sides.
 
 | Model | Metric | llama.cpp | hyper |
 |---|---|---|---|
@@ -96,7 +91,10 @@ which is why they agree with each other. Other checks:
 - Speculative verification rows round exactly like single-token steps (KL identical for 1–4 rows), so greedy
   speculative output equals plain greedy output.
 - Sampling is exact for any `top_k` / `top_p` / `min_p` (`samplertest`: the kept set equals a full sort of the row).
-- Partial sums cross the GPUs in fp16; fp32 (`HYPER_AR32=1`) measured: no KL change.
+- Partial sums cross the GPUs in fp16 (prefill, host decode path) or as 24-bit floats (P2P decode ring); fp32
+  (`HYPER_AR32=1`) measured: no KL change. The host path sums in the ring's order, so both transports give the same bits.
+- The row-sharded Flash-Next prefill (below) changes the arithmetic's order: bulk-path KL against the reference 0.0487
+  vs 0.0467 (top-1 90.2 % both), the same with a 24-bit transport, MTP draft statistics unchanged.
 - MoE models compute a CPU-held expert from 8-bit activations (as llama.cpp does) and a GPU-held one in fp16 / fp32,
   so output depends slightly on where the experts were placed (startup VRAM, adaptive placement); llama.cpp shows the
   same effect (Uncensored: GPU vs CPU experts KL 0.069).
@@ -113,16 +111,24 @@ Shared backends (every engine uses the same code for these; a model-specific eng
 | Routing prediction | engines | the next layer's routing published early for the CPU prefetch: `HYPER4_PRED=1` (Flash-Next), `HYPER5_PRED=2` + `HYPER5_PRED_EARLY=1` (GLM), `HYPER7_PRED=2` + `HYPER7_PRED_EARLY=1` (DeepSeek) |
 | Conversation parking, sampling, server | `park.h`, `sampling.h`, `tools/` | prompt cache across conversations, exact sampling, OpenAI API |
 
-- **Tensor parallelism without P2P.** Attention heads, linear-attention heads and FFN hidden slices are split across the
-  three GPUs. During decode, the per-layer allreduce runs through pinned, mapped host memory with an LL-style protocol
-  (fp16 payload plus sequence flags in each packet). Prefill chunks use a copy-engine allreduce (device → pinned host →
-  device) on a separate copy stream: a layer runs in three phases over the chunks of a pass (token mixer, mixer sum + FFN,
-  FFN sum), so chunk c's exchange overlaps chunk c+1's kernels (Flash-Next 16k prefill 2 650 → 3 960 t/s on 4 GPUs).
+- **Tensor parallelism.** Attention heads, linear-attention heads and FFN hidden slices are split across the GPUs.
+  - Decode: the per-layer allreduce runs through pinned, mapped host memory with an LL-style protocol (payload plus
+    sequence flags in each packet) for a single row, and as a ring over GPU-to-GPU copies for verification windows of
+    two rows and more (P2P; 8 rows: 35.7 → 12.8 µs per exchange).
+  - Prefill: a layer runs in three phases over the chunks of a pass (token mixer, mixer sum + FFN, FFN sum), so chunk
+    c's exchange overlaps chunk c+1's kernels. The exchange is a copy-engine allreduce through pinned host memory, or
+    with P2P a ring (reduce-scatter + all-gather, flags in device memory; 6.7 → 2.8 ms for 4096 rows).
+  - Row-sharded hyper-connections (Flash-Next prefill, P2P): the hyper-connection work (norm, projections, mixing,
+    residual update, router) used to run for every row on every GPU. Now a GPU keeps the residual of its quarter of a
+    chunk's rows, the allreduce is a reduce-scatter by rows, the mixed rows and the owner's routing go to the peers
+    (`HYPER4_ROW_SHARD=0` disables). Flash-Next 16k prefill: 2 650 (plain) → 3 960 (overlap) → 4 020 (ring) → 4 640 t/s.
+  - GPUs waiting for the CPU's experts wait on one flag word with one thread; polling the result packets in host memory
+    from every GPU cost the CPU a quarter of its memory bandwidth (GLM decode +29 %, `<ENV>_MOE_WAIT`).
 - **Weights in tensor-core fragment order.** Q8_0 weights are repacked at load time so that a single 16-byte load per lane
   forms an `mma.m16n8k16` operand. Decode uses a tensor-core GEMV (with split-K and a work-balanced variant for matrices
   that would otherwise leave a partial last wave). Prefill uses tiled GEMMs. K-quants (Q4_K, Q6_K) are repacked into
   the same fragment order in their own format (exact, no requantization); Q5_0 / Q4_0 become Q8_0 losslessly.
-- **CUDA graphs** for every decode shape (1–4 tokens). The decode critical path is mostly cross-GPU synchronization and
+- **CUDA graphs** for every decode shape (1–8 tokens). The decode critical path is mostly cross-GPU synchronization and
   memory bandwidth.
 - **Mixture of experts across GPU + CPU.**
   - Experts live in their GGUF block formats (Q4_K, Q5_K, Q6_K, Q8_0, IQ3_S, IQ4_XS, …), dequantized on the fly in
@@ -133,7 +139,8 @@ Shared backends (every engine uses the same code for these; a model-specific eng
     On GPU 0 one kernel computes the routing and writes the CPU's record; the shared expert runs after it, while the
     CPU is already working.
 - **Prefill streaming.** For long prompts, the CPU-resident experts of each layer are streamed over PCIe into
-  double-buffered GPU staging memory (shares weighted by link speed). Prefill therefore runs entirely on the GPUs.
+  double-buffered GPU staging memory (shares per GPU: `<ENV>_EP_WEIGHTS`, by default by link width; GLM on four GPUs runs
+  `HYPER5_EP_WEIGHTS=4.4,1.9,1.7,2`, which gives the fastest card the most: +8 %). Prefill therefore runs entirely on the GPUs.
   Up to four 4096-token chunks go through each layer together, so a layer's experts cross PCIe once for all of them.
   Short chunks stay on the CPU, where they are faster.
 - **Adaptive expert placement (GLM, Flash-Next).** Routing counts from the prompt and from generation are tracked with decay. The
@@ -184,7 +191,8 @@ Shared backends (every engine uses the same code for these; a model-specific eng
 Requirements:
 
 - CUDA 12.x (tested 12.9) and an sm_86 GPU. Change `ARCH` in the `Makefile` for other GPUs; most kernels are tuned for
-  the RTX 3090.
+  the RTX 3090. With a Blackwell card add its architecture:
+  `make ARCH="-gencode arch=compute_86,code=sm_86 -gencode arch=compute_120,code=sm_120" ...`
 - g++ with OpenMP, AVX2 on the CPU.
 - A **mainline llama.cpp** source tree, built with static libraries, at `$LLAMA` (default `~/llama.cpp-src`). hyper links
   against it for:
@@ -260,12 +268,12 @@ Options:
 | `--ctx` | 262144 (Flash-Next 131072, GLM 65536 when not given) | maximum context; KV / latent caches are allocated for it, which takes VRAM from experts |
 | `--alias` | file name | model name reported by the API |
 | `--temp`, `--top-p`, `--top-k`, `--min-p` | Qwen: 0.6, 0.95, 20, 0; GLM: 1.0, 0.95, 0 (off), 0 | sampling defaults (request fields override them); exact for any top_k: when the kept set reaches past the GPUs' 64 candidates per slice, the whole logit row is read |
-| `--draft` | 3 | speculative tokens per step (MTP or n-gram); `0` disables |
+| `--draft` | 3 | speculative tokens per step (MTP or n-gram), up to 7; `0` disables |
 | `--mtp file` | — | Flash-Next (and its fine-tunes): separate NextN GGUF; GLM: a GGUF with the NextN block `blk.<n_layer>` (the original split files) |
 | `--cpu-threads` | 30 | CPU expert threads (MoE models) |
 | `--gpu-frac` | 1.0 | cap on the fraction of each layer's experts placed on the GPUs |
 | `--expert-stats file` | — | routing statistics: read at start for placement, updated after every request |
-| `--snapshots` | 48 | prompt-cache snapshots kept in pinned RAM |
+| `--snapshots` | 48 | prompt-cache snapshots kept in pinned RAM (GLM with ~140 GB of pinned experts: keep it low, e.g. 4, with `HYPER_PARK_GB=8 HYPER_PARK_SLOTS=2`; pinned allocations stall when RAM runs out) |
 | `--reasoning-effort` | template default | GLM: `low`, `high`, `max` or `none` (requests may override) |
 | `--mmproj file` | — | vision encoder (mmproj GGUF, e.g. unsloth's `mmproj-F16.gguf` for Qwen3.8-Flash-Next): images in chat and Responses requests (`data:` or http(s) URLs, also in tool outputs). Encoded with mainline libmtmd on GPU 0, before the engine places its experts |
 | `--mcp name=url` | — | an MCP server (streamable HTTP) whose tools the chat page offers the model; repeatable (`tools/web-tools`: search and a real browser in Docker) |
@@ -280,6 +288,13 @@ Selected environment variables:
 | `HYPER_GUMBEL_DRAFT=0/1` | sampled MTP drafts coupled to the sampling noise (default on for Flash-Next and GLM) |
 | `HYPER5_MTP_PMIN`, `HYPER4_MTP_PMIN` | MTP drafts while the drafted run's MTP probability is at least this: GLM (default 0.85), Flash-Next (0.5); 0: count from recent acceptance |
 | `HYPER4_STREAM_MIN`, `HYPER5_STREAM_MIN` | shortest prefill chunk that streams CPU experts to the GPUs (default 256 / 280) |
+| `HYPER4_P2P=0`, `HYPER5_P2P=0` | prefill exchanges through host memory even when P2P works; `..._LL_P2P=0`: decode windows too; `..._LL_RING_MIN` (2): smallest window that uses the ring |
+| `HYPER4_ROW_SHARD=0` | Flash-Next prefill: every GPU does the hyper-connection work of every row again; `HYPER4_SHARD_MIN` (1400): smallest chunk that is sharded |
+| `HYPER4_EP_WEIGHTS`, `HYPER5_EP_WEIGHTS`, `HYPER7_EP_WEIGHTS` | shares of the streamed experts per GPU in prefill, e.g. `4.4,1.9,1.7,2` |
+| `HYPER4_TP_SHARES`, `HYPER5_TP_SHARES` | shares of the tensor-parallel dense work per GPU |
+| `HYPER4_MIN_CHUNK`, `HYPER5_MIN_CHUNK` | a single-chunk prompt of at least twice this many rows (1024) runs as two halves, so their exchanges overlap |
+| `HYPER_PARK_GB`, `HYPER_PARK_SLOTS` | pinned memory and slots for parked conversations |
+| `HYPER_KEEP_FILE_CACHE=1` | keep the GGUF in the page cache after loading (default: dropped, the RAM goes to the experts) |
 | `HYPER_DUMP_REQUEST=dir` | save every request body to `dir` (for replay benchmarks) |
 | `HYPER_CPUPROF=1` | CPU expert timing and bandwidth in the log |
 | `HYPER_SPIN_US` | how long CPU worker threads spin before sleeping (default 3000 µs) |
@@ -289,9 +304,9 @@ Selected environment variables:
 | Tool | Purpose |
 |---|---|
 | `ref` | runs mainline llama.cpp on a prompt and dumps the token ids and full logits (the reference). Supports experts on the CPU (`REF_CPU_MOE=1`), only the last N rows (`REF_LAST=N`), another batch size (`REF_UBATCH`), the tokens of an existing reference (`REF_TOKENS=file`) and the last token's value of named tensors (`REF_DUMPLAST=prefix,...`) |
-| `hyper4` | MoE engines (Flash-Next, GLM): `check` / `checkpf` (KL vs the reference), `bench`, `tfbench` (fixed-content decode), `pfbench` (prefill), `ntbench`, `calib` (routing statistics), `mtpgen` (plain vs speculative, must match; GLM with `HYPER5_ADAPT=0`, `HYPER_SWEEP=k:pmin,...` compares draft policies in one run), `cachetest`, `trace` (Flash-Next, `HYPER4_TRACE=dir`: residuals after every layer and stages of layers 0–1, named like llama.cpp's tensors) |
+| `hyper4` | MoE engines (Flash-Next, GLM): `check` / `checkpf` / `checkbulk` (KL vs the reference: decode, prefill then decode, the bulk prefill path with `HYPER4_ALLROWS=1`), `bench`, `tfbench` (fixed-content decode), `pfbench` (prefill), `pfrepeat` / `pfsweep` (prefill determinism, increments of every size), `rowcheck`, `ntbench`, `calib` (routing statistics), `mtpgen` (plain vs speculative, must match; GLM with `HYPER5_ADAPT=0`, `HYPER_SWEEP=k:pmin,...` compares draft policies in one run), `cachetest`, `trace` (Flash-Next, `HYPER4_TRACE=dir`: residuals after every layer and stages of layers 0–1, named like llama.cpp's tensors) |
 | `hyper7` | DeepSeek engine: `run` (pipelined prefill + greedy decode), `dump` (per-layer states for the oracle comparison), `ab` (CPU expert scheduling / prefetch modes in one process) |
-| `gemvbench`, `arbench`, `arbulk`, `iqkbench`, `bwtest`, `zctest` | microbenchmarks: Q8 GEMV per shape, allreduce, CPU expert dot products (mainline vs ik_llama), PCIe and zero-copy bandwidth |
+| `gemvbench`, `arbench`, `arxbench`, `arbulk`, `p2ptest`, `iqkbench`, `bwtest`, `zctest` | microbenchmarks: Q8 GEMV per shape, allreduce (prefill: host / push / pull / ring; decode windows: host vs ring), P2P copies between every pair of GPUs, CPU expert dot products (mainline vs ik_llama), PCIe and zero-copy bandwidth |
 | `samplertest` | exact sampling: the kept token set and probabilities from the GPUs' candidates or the whole row vs a full sort, on reference logits, for 90 settings |
 | `cpumoebench`, `iq3bench` | the CPU expert decode job on real expert weights (time per job, bandwidth, output bit hash); IQ3_S / IQ4_XS kernels vs ggml, bit for bit |
 | `moebench`, `mlabench`, `topkbench`, `f32bench` | GPU expert kernels for 1–4 local experts, GLM MLA decode attention, sampling candidates (top-64), fp32 router GEMV |
@@ -306,11 +321,15 @@ REF_CPU_MOE=1 ./build/ref model.gguf bench/prompt3.txt ref.bin 999 512
 
 ## Hardware notes
 
-- The PCIe split of streamed experts assumes GPU 1 sits on an x8 link (shares 2:1:2). Change it in
-  `load_experts` for other topologies.
+- GPU order is the PCI bus order (`CUDA_DEVICE_ORDER=PCI_BUS_ID`): RTX PRO 4500 (x16), 3090 (x8), 3090 (x8), 3090 (x16).
+  The default shares of streamed experts follow the link widths (2:1:2 with three GPUs, 2:1:1:2 with four); override
+  them with `<ENV>_EP_WEIGHTS`.
+- P2P between consumer GeForce cards needs patched NVIDIA open kernel modules (the development machine runs driver
+  615.71.09 with the `-p2p` branch of aikitoria's open-gpu-kernel-modules and a patched `libcuda`); `tools/p2ptest`
+  checks every pair. Without P2P the engine falls back to host-memory exchanges.
 - GLM-5.3-Flash keeps a host copy of all experts in pinned huge pages (~140 GB of RAM).
-- Running all three GPUs and the full CPU at the same time draws a lot of power. On the development machine the power
-  supply shut down under sustained GLM load until the GPU clocks were capped (`nvidia-smi -lgc 210,1750`).
+- Running all GPUs and the full CPU at the same time draws a lot of power. With three GPUs the power supply shut down
+  under sustained GLM load until the GPU clocks were capped (`nvidia-smi -lgc 210,1750`).
 
 ## Layout
 
