@@ -49,55 +49,33 @@ Greedy decoding, 262k context allocated, P2P on.
 - A fine-tune without an MTP head of its own (Flash-Next Uncensored, Swift Heretic) drafts with the base model's NextN
   GGUF (exact as always, the main model verifies).
 
-### Compared with llama.cpp
-
-Measured in October 2026 on **three RTX 3090** (before the fourth GPU, P2P and the prefill rework), the same GGUF files
-on both sides (GLM: UD-IQ4_XS). Best llama.cpp configuration found for each model (mainline d812350 or ik_llama, tuned
-flags, experts that do not fit in VRAM on the CPU). The contexts are the closest ones that were measured on both sides.
-
-| Model | Metric | llama.cpp | hyper |
-|---|---|---|---|
-| Qwen3.8-Flash-Next | decode | 36.1 t/s at 32k (mainline), 38.4 t/s short (ik_llama) | 97.5 t/s at 11k |
-| Qwen3.8-Flash-Next | prefill | 584 t/s (pp2048 at 32k, mainline) | 1774 t/s (11k prompt) |
-| GLM-5.3-Flash | decode | 15.2 t/s at 32k (mainline), 15.7 t/s at 32k (ik_llama, patched) | 30.7 t/s at 16k |
-| GLM-5.3-Flash | prefill | 280 t/s (32k, mainline) | 998 t/s (16k prompt) |
-
 ### Correctness
 
-Output is checked against llama.cpp logits (`ref` + `hyper4 check` / `hyper check`). Speed changes are additionally
-required to leave the output unchanged: the same KL / PPL on the reference text, the same chunked-prefill result and the
-same speculative output hash before and after; kernel rewrites are compared bit for bit in microbenchmarks.
-[ENGINE_LOG.md](ENGINE_LOG.md) (Czech) has the step-by-step log with every measurement.
+Output is checked against llama.cpp logits on the same GGUF file (`ref` + `hyper4 check` / `checkbulk`). Speed changes
+are additionally required to leave the output unchanged: bit-identical logits at a pinned expert placement
+(`HYPER_QUOTA`), or, where the order of the arithmetic changes, the same KL on the reference text; the same
+chunked-prefill result and the same speculative output before and after. [ENGINE_LOG.md](ENGINE_LOG.md) (Czech) has
+the step-by-step log with every measurement.
 
-Decode on reference text, the same GGUF files on both sides (this measures the implementation, not the quantization):
+Qwen3.8-Flash-Next (UD-Q4_K_XL), 2048 reference tokens, current version:
 
-| Model | Tokens | KL hyper vs llama.cpp | KL llama.cpp vs itself¹ | Top-1 agreement | Perplexity hyper / llama.cpp |
-|---|---|---|---|---|---|
-| GLM-5.3-Flash | 512 / 2048 | 0.038–0.040 / 0.027 | 0.043 | 90–92 % / 92.8 % | 11.19 / 10.90–11.05; 7.64 / 7.69 |
-| Qwen3.8-Flash-Next | 256 / 2048 | 0.046–0.062 / 0.049 | 0.029–0.038 | 89–91 % / 90.2 % | 11.18 / 11.00–11.47; 6.502 / 6.504 |
-| Flash-Next Uncensored | 256 | 0.104–0.111 | 0.069 | 86–88 % | 14.71 / 14.37–14.56 |
+| Path | KL vs llama.cpp | Top-1 agreement |
+|---|---|---|
+| decode, one token per step | 0.048–0.050 | — |
+| decode, P2P ring transport (24-bit partial sums) | 0.049 | — |
+| bulk prefill, hyper-connections on every GPU | 0.0467 | 90.2 % |
+| bulk prefill, row-sharded (default) | 0.0487 | 90.2 % |
 
-¹ llama.cpp against its own reference with another batch size (GLM, Flash-Next) or with the experts on the CPU
-instead of the GPU (Uncensored). For MoE models a KL of 0.03–0.1 is the usual effect of rounding changing which experts
-a token routes to. KL against the original unquantized models has not been measured (it would be dominated by the
-GGUF quantization, which hyper does not change).
+For MoE models a KL of 0.03–0.1 against another implementation is the usual effect of rounding changing which experts
+a token routes to. Other checks:
 
-Flash-Next sits above llama.cpp's own spread, and a layer-by-layer trace (`hyper4 trace`, `ref` with `REF_DUMPLAST`)
-shows where: the first hyper-connection mixer, from identical inputs. Computed exactly (double precision, the file's
-weights), hyper's result there is off by 3·10⁻⁵ (relative), llama.cpp's by 1.7 %: llama.cpp quantizes activations
-to 8 bits for its Q8_0 products, and the mixer's inputs have outliers. Its batch-size variants share that rounding,
-which is why they agree with each other. Other checks:
-
-- Speculative verification rows round exactly like single-token steps (KL identical for 1–4 rows), so greedy
-  speculative output equals plain greedy output.
+- Speculative verification rows round exactly like single-token steps, so greedy speculative output equals plain
+  greedy output (`mtpgen`, `rowcheck`).
 - Sampling is exact for any `top_k` / `top_p` / `min_p` (`samplertest`: the kept set equals a full sort of the row).
-- Partial sums cross the GPUs in fp16 (prefill, host decode path) or as 24-bit floats (P2P decode ring); fp32
-  (`HYPER_AR32=1`) measured: no KL change. The host path sums in the ring's order, so both transports give the same bits.
-- The row-sharded Flash-Next prefill (below) changes the arithmetic's order: bulk-path KL against the reference 0.0487
-  vs 0.0467 (top-1 90.2 % both), the same with a 24-bit transport, MTP draft statistics unchanged.
+- Partial sums cross the GPUs in fp16 (prefill, host decode path) or as 24-bit floats (P2P decode ring). The host path
+  sums in the ring's order, so both decode transports give the same bits.
 - MoE models compute a CPU-held expert from 8-bit activations (as llama.cpp does) and a GPU-held one in fp16 / fp32,
-  so output depends slightly on where the experts were placed (startup VRAM, adaptive placement); llama.cpp shows the
-  same effect (Uncensored: GPU vs CPU experts KL 0.069).
+  so output depends slightly on where the experts were placed (startup VRAM, adaptive placement).
 
 ## How it works
 
@@ -121,7 +99,7 @@ Shared backends (every engine uses the same code for these; a model-specific eng
   - Row-sharded hyper-connections (Flash-Next prefill, P2P): the hyper-connection work (norm, projections, mixing,
     residual update, router) used to run for every row on every GPU. Now a GPU keeps the residual of its quarter of a
     chunk's rows, the allreduce is a reduce-scatter by rows, the mixed rows and the owner's routing go to the peers
-    (`HYPER4_ROW_SHARD=0` disables). Flash-Next 16k prefill: 2 650 (plain) → 3 960 (overlap) → 4 020 (ring) → 4 640 t/s.
+    (`HYPER4_ROW_SHARD=0` disables): Flash-Next 16k prefill 4 020 → 4 640 t/s.
   - GPUs waiting for the CPU's experts wait on one flag word with one thread; polling the result packets in host memory
     from every GPU cost the CPU a quarter of its memory bandwidth (GLM decode +29 %, `<ENV>_MOE_WAIT`).
 - **Weights in tensor-core fragment order.** Q8_0 weights are repacked at load time so that a single 16-byte load per lane
@@ -146,18 +124,14 @@ Shared backends (every engine uses the same code for these; a model-specific eng
 - **Adaptive expert placement (GLM, Flash-Next).** Routing counts from the prompt and from generation are tracked with decay. The
   hottest CPU experts are swapped with the coldest GPU experts at runtime (one PCIe copy per swap, under a millisecond),
   so the GPU set follows what the conversation actually uses (prose, code, tool JSON, …). The swaps are decided from
-  complete counts only (the CPU queue is drained first), so the placement does not depend on timing. Flash-Next at
-  262k context (59–63 % of its experts in VRAM): decode +5.5 % on code, Codex replay +4.4 % decode / +8.3 % prefill.
+  complete counts only (the CPU queue is drained first), so the placement does not depend on timing.
 - **Elastic attention caches (Flash-Next, GLM).** The 262k-context K / V and indexer caches are reserved as virtual address ranges
   (CUDA virtual memory API) and only the positions in use are backed by memory, mapped in 8k-position steps. The rest of
   their full size holds extra expert slots: the hottest CPU experts are copied there in the background (the copies switch
   over at a fixed decode step, so the result does not depend on timing). When the conversation grows, the coldest extra
   experts turn back into CPU experts (no copy: the host keeps every expert) and their memory goes to the cache. Caches
-  plus extra slots never exceed what the full-context caches would take, so 262k still fits. At short and medium
-  contexts ~55 more experts per layer sit on the GPUs (59 % → ~70 %). Codex replay at 262k: decode 155 → 176 t/s, plain
-  decode +4 %, KL against llama.cpp unchanged (noise level), outputs identical between runs. GLM (the MLA latent cache lives
-  on every GPU, experts are 4x larger): ~17 more experts per MoE layer (29 % → 35 %), decode at 16k +10 % (26.4 → 28.7 t/s),
-  Codex replay +11 % (24.4 → 27.0 t/s). `HYPER4_ELASTIC=0` / `HYPER5_ELASTIC=0` disable it.
+  plus extra slots never exceed what the full-context caches would take, so 262k still fits. Outputs are identical
+  between runs. `HYPER4_ELASTIC=0` / `HYPER5_ELASTIC=0` disable it.
 - **Prompt cache for recurrent models.** Linear-attention layers (Gated DeltaNet, KDA) cannot be truncated like a KV
   cache, so the engine keeps snapshots of their state:
   - at message starts in the prompt,
@@ -177,7 +151,7 @@ Shared backends (every engine uses the same code for these; a model-specific eng
     speculative run produces the same text as a plain one, greedy or sampled (same seed).
   - Sampled drafts can use the same noise and truncation (top_k / top_p / min_p over the MTP head's candidates):
     the draft is then the main model's sample whenever the two distributions agree (idea from
-    [Strata](https://github.com/Niko1221/Strata)). Flash-Next at temperature 0.6: 128 → 132 t/s (`HYPER_GUMBEL_DRAFT=0/1`).
+    [Strata](https://github.com/Niko1221/Strata); `HYPER_GUMBEL_DRAFT=0/1`).
   - Rejected rows are rolled back from per-row state snapshots.
 - **GLM-5.3 specifics.**
   - mHC: 4 residual streams mixed by per-token Sinkhorn-normalized matrices, fused with the Q8_0 mixing projection.
@@ -213,21 +187,19 @@ make -j build/hyper-server build/hyper4 build/hyper7 build/ref
 ## Running the server
 
 ```sh
-# GLM-5.3-Flash, 262k context, CPU experts on 30 threads, routing statistics persisted between runs
-./build/hyper-server GLM-5.3-Flash-UD-IQ4_XS.gguf --ctx 262144 --cpu-threads 30 \
-    --expert-stats glm_stats.bin --alias glm-5.3-flash --temp 1.0 --top-p 0.95
+# Qwen3.8-Flash-Next with its NextN (MTP) head, up to 7 drafted tokens per step, images, routing statistics persisted
+CUDA_DEVICE_ORDER=PCI_BUS_ID ./build/hyper-server Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --ctx 262144 \
+    --cpu-threads 30 --expert-stats fn_stats.bin --mtp Qwen3.8-Flash-Next-MTP-Q4_K_M.gguf --draft 7 \
+    --mmproj mmproj-F16.gguf --alias qwen3.8-flash-next --temp 1.0 --top-p 0.95 --top-k 20
 
-# the same with its NextN (MTP) block from the original split GGUF (blk.45): up to 3 drafts per step
-./build/hyper-server GLM-5.3-Flash-UD-IQ4_XS.gguf --ctx 262144 --cpu-threads 30 --expert-stats glm_stats.bin \
-    --mtp GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf --draft 3 --alias glm-5.3-flash --temp 1.0 --top-p 0.95
+# a fine-tune without an MTP head (Swift Heretic, Uncensored) drafts with the base model's: the same --mtp file
 
-# Qwen3.8-Flash-Next with a NextN (MTP) head, 3 drafted tokens per step
-./build/hyper-server Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --ctx 262144 \
-    --mtp Qwen3.8-Flash-Next-MTP-Q4_K_M.gguf --draft 3 --expert-stats fn_stats.bin
-
-# the Uncensored fine-tune drafts with the base model's NextN head
-./build/hyper-server Qwen3.8-Flash-Next-Uncensored-Q4_K_M-00001-of-00003.gguf --ctx 262144 \
-    --mtp Qwen3.8-Flash-Next-MTP-Q4_K_M.gguf --draft 3 --expert-stats fnu_stats.bin
+# GLM-5.3-Flash (UD-Q4_K_XL) with the NextN block of the same split GGUF (blk.45), up to 3 drafts per step; CPU experts
+# on 32 pinned threads with routing prediction and prefetch; small pinned budgets for parking and snapshots
+CUDA_DEVICE_ORDER=PCI_BUS_ID HYPER5_EP_WEIGHTS=4.4,1.9,1.7,2 HYPER5_PRED=2 HYPER_CPU_PREFETCH=2 HYPER_CPU_PIN=2 \
+HYPER_PARK_GB=8 HYPER_PARK_SLOTS=2 ./build/hyper-server GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf --ctx 262144 \
+    --cpu-threads 32 --expert-stats glm_stats.bin --mtp GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf --draft 3 \
+    --snapshots 4 --alias glm-5.3-flash --temp 1.0 --top-p 0.95
 
 # DeepSeek-V4.1-Flash (unsloth UD-IQ2_XXS), thinking effort 75 by default (a request's reasoning_effort overrides it);
 # --vocab: libllama does not know deepseek41 (tokenizer and template only)
