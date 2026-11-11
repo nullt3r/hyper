@@ -992,3 +992,12 @@ vrstva 0 hustá, 47 MoE (256 expertů, top 8, sigmoid + bias, bez sdíleného), 
   stejné statistiky draftů (2,78 vs 2,78 tokenu/krok), sekvence shodné s plain.
 - Oprava: `ar_sum` v ring režimu s daným x přičítá (dřív přepisoval; dotklo by se GLM MTP bulk s `MTP_FULL`).
 - GLM (engine5) zatím nesharded.
+
+## 2026-11-11 – GLM prefill na 4 kartách: vyrovnání zátěže (+12 %)
+
+- Profil 16k (7,70 s): karta 3 (3090, x16) počítá 6,97 s, ostatní na ni čekají 1,4–1,8 s (dev0 5,04 s, dev1 5,60, dev2 5,77).
+  Streamovaní experti se dělili podle šířky slotu 2:1:1:2, tedy třetina na nejpomalejší kartu s x16.
+- `HYPER5_EP_WEIGHTS=4.4,1.9,1.7,2` (ve startovacím skriptu GLM): 2 203 → 2 386 t/s; 5,2,1.8,1.6 stejně, 6,2.2,2,1.4 OOM na 4500.
+- S P2P jdou části uploadu expertů hned, nečekají na konec ringu (`HYPER_UP_BEHIND_RING=1` vrací staré pořadí): 2 134 → 2 203.
+- 16 greedy tokenů po 16k prefillu shodných (hash logitů se liší: jiné pořadí sčítání mezi kartami). Dekód beze změny.
+- Row-sharding hc práce u GLM: potenciál ~0,75 s ze 7,7 s na kartu, zatím neuděláno.

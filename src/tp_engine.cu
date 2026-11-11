@@ -508,8 +508,12 @@ void TpEngine::ar_fetch(TpDevice & d, int nt, int slot, int par) {
         }
         CUDA_CHECK(cudaEventRecord(d.ev_dn[par][slot], cs));   // (the host staging slot may be reused)
     }
-    if (!d.up_pend.empty()) {   // the next expert upload part, behind these downloads (P2P: behind this device's peer writes)
-        CUDA_CHECK(cudaStreamWaitEvent(d.cstream, p2p_ ? d.ev_up2[par][slot] : d.ev_dn[par][slot], 0));
+    static const bool up_free = !(getenv("HYPER_UP_BEHIND_RING") && atoi(getenv("HYPER_UP_BEHIND_RING")) != 0);
+    if (!d.up_pend.empty()) {   // the next expert upload part, behind these downloads. P2P: at once -- the ring has its own
+        // stream, and waiting for its end (the peers' hops included) held the uploads, and with them the MoE, back
+        // (GLM 16k: every device idle 45-57 % of the pass)
+        if (!p2p_) CUDA_CHECK(cudaStreamWaitEvent(d.cstream, d.ev_dn[par][slot], 0));
+        else if (!up_free) CUDA_CHECK(cudaStreamWaitEvent(d.cstream, d.ev_up2[par][slot], 0));
         const auto q = d.up_pend.front();
         d.up_pend.pop_front();
         place_->upload_stage(d.g, q[0], q[1], q[2], up_parts_);
